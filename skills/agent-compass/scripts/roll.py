@@ -38,7 +38,6 @@ from worker_context import NATIVE_HOSTS, harness_session, require_parent_id, res
 PASEO_LAUNCHER_FAMILIES = tuple(registry.PASEO_LAUNCHER_MODES)
 SKILLS = Path(__file__).resolve().parents[2]
 DOT_RUNNER = SKILLS / 'dot-subagent' / 'scripts' / 'run_dot_task.py'
-CONSULT_BRIDGE = SKILLS / 'chatgpt-pro-consult' / 'scripts' / 'consult_bridge.py'
 STATE_DIR = Path(os.environ.get('ROUTER_STATE_DIR') or Path.home() / '.agent-compass').expanduser()
 CLI_RUNS_DIR = STATE_DIR / 'cli-workers'
 WORKER_PROMPTS_DIR = STATE_DIR / 'worker-prompts'

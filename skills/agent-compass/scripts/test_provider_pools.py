@@ -2,6 +2,7 @@
 models (`opencode/...`) and OpenCode Go (`opencode-go/...`) are separate products under provider `opencode`;
 Antigravity's Gemini models and its third-party (Claude/GPT) models draw different windows. A hold on one pool leaves
 the others dispatchable; an account with a single pool is held as a whole, as before."""
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -25,7 +26,9 @@ def accounts():
     fleet = account_fleet.load_accounts(account_fleet.reference_fleet_path())
     catalog = {'providers': {'opencode': {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
                                           'models': [{'id': m} for m in (*ZEN, *GO)]}}}
-    return auto_bundles.merge_into(fleet, auto_bundles.derive(fleet, catalog, 2))
+    for bid, b in auto_bundles.derive(fleet, catalog, 2)['bundles'].get('opencode', {}).items():
+        fleet['accounts']['opencode'].setdefault('bundles', {}).setdefault(bid, b)
+    return fleet
 
 
 @pytest.fixture
@@ -192,7 +195,9 @@ def test_an_account_hold_from_a_single_pool_account_narrows_to_its_pool_once_go_
     assert provider_retry.scope_account_holds(fleet) == []
     catalog = {'providers': {'opencode': {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
                                           'models': [{'id': m} for m in (*ZEN, *GO)]}}}
-    with_go = auto_bundles.merge_into(fleet, auto_bundles.derive(fleet, catalog, 2))
+    with_go = copy.deepcopy(fleet)
+    for bid, b in auto_bundles.derive(fleet, catalog, 2)['bundles'].get('opencode', {}).items():
+        with_go['accounts']['opencode'].setdefault('bundles', {}).setdefault(bid, b)
     assert provider_retry.scope_account_holds(with_go) == ['opencode#opencode']
     held = provider_retry.active(now=NOW + timedelta(days=30))
     assert set(held) == {'opencode#opencode'}   # still indefinite; the model hold elsewhere has expired

@@ -2124,18 +2124,6 @@ def _fetch_grok_cli_billing_with_payload() -> tuple[tuple[float, str | None] | N
         return None, None, login, 0, None
 
 
-def _fetch_grok_cli_billing_detailed() -> tuple[tuple[float, str | None] | None, int | None, str | None]:
-    """Return (parsed_result, error_status, error_code). (None, None, None) when no unexpired CLI login exists."""
-    parsed, _, _, status, code = _fetch_grok_cli_billing_with_payload()
-    return parsed, status, code
-
-
-def fetch_grok_cli_billing() -> tuple[float, str | None] | None:
-    """Usage from the Grok CLI's billing endpoint, or None so the caller falls back."""
-    parsed, _, _ = _fetch_grok_cli_billing_detailed()
-    return parsed
-
-
 def _grok_failure_rank(status: int | None, code: str | None) -> tuple[int, int, int, int]:
     return (
         1 if status in (401, 402, 403) else 0,
@@ -2658,19 +2646,6 @@ def _metered_sent_digest(account: MeteredUsdAccount) -> str | None:
     if account.source == "harness":
         return account.credential_key or None
     return hashlib.sha256((account.endpoint + "\0" + account.api_key).encode()).hexdigest()
-
-
-def _cached_metered_spend(provider_id: str, credential_key: str | None) -> dict[str, Any] | None:
-    """A spend number already stored for this key and base. It proves the category, not the latest amount."""
-    if not credential_key:
-        return None
-    raw = (load_usage_cache().get("providers") or {}).get(provider_id)
-    if not isinstance(raw, dict):
-        return None
-    import provider_inventory
-    if provider_inventory._metered_spend_evidence(raw, credential_key) is None:
-        return None
-    return raw
 
 
 def _proved_metered_category(provider_id: str, credential_key: str | None) -> bool:

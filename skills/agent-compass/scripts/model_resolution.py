@@ -106,12 +106,6 @@ def slash_suffixes(spelling):
     return tuple('/'.join(parts[i:]) for i in range(len(parts)))
 
 
-def provider_declarations(raw_model_name, endpoints, table):
-    """[(provider, declaration)] of `table` (provider_name_table) `rows` for the serving providers of the name; providers
-    and their names are looked up lowercase across slash_suffixes."""
-    return [(p, d) for p, _, d in _declared_at(serving_providers(raw_model_name, endpoints), table)]
-
-
 def _declared_at(pairs, table):
     rows = table['rows']
     out = []
@@ -308,14 +302,6 @@ def resolve_model(raw_model_name, known_models, aliases, families, provider_name
             if match := exact(prefix):
                 return found(match, 'family')
     return found(None, 'unknown')
-
-
-def resolve_canonical_model(raw_model_name, known_models, aliases, families, provider_names, providers=()):
-    """Return a known canonical ID, or None for the generic baseline.
-
-    Unknown launch IDs remain untouched by callers: matching affects scores only.
-    """
-    return resolve_model(raw_model_name, known_models, aliases, families, provider_names, providers)['key']
 
 
 def resolve_in(raw_model_name, accounts, providers=()):

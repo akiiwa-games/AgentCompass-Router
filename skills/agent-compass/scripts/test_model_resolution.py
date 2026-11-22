@@ -4,7 +4,7 @@ import unittest
 import account_fleet
 import auto_bundles
 import axis_scores
-from model_resolution import family_patterns, provider_name_table, resolve_canonical_model
+from model_resolution import family_patterns, provider_name_table, resolve_model
 
 from router_test_support import isolated_router_state
 
@@ -98,8 +98,8 @@ class ModelResolutionTests(unittest.TestCase):
         self.assertEqual(account_fleet.canonical('vendor/gpt-5-custom-latest', self.accounts), 'gpt-5-custom')
         # Alias cycles and metadata strings must not become model specifications.
         none = {'defaults': {}, 'rows': {}}
-        self.assertIsNone(resolve_canonical_model('loop', {}, {'loop': 'other', 'other': 'loop'}, [], none))
-        self.assertIsNone(resolve_canonical_model('basis', self.accounts['models'], {}, family_patterns(self.accounts), none))
+        self.assertIsNone(resolve_model('loop', {}, {'loop': 'other', 'other': 'loop'}, [], none)['key'])
+        self.assertIsNone(resolve_model('basis', self.accounts['models'], {}, family_patterns(self.accounts), none)['key'])
 
     def test_a_document_without_a_families_table_is_a_named_error_not_an_empty_table(self):
         doc = {key: value for key, value in self.accounts.items() if key != 'families'}
@@ -135,8 +135,8 @@ class ModelResolutionTests(unittest.TestCase):
                      'grok-4.7-mini', 'grok-4.7-fast', 'llama-5']:
             self.assertNotIn(name, self.accounts['models'])
         for name in ['llama-future', 'gpt-4-future', 'unknown-vendor']:
-            self.assertIsNone(resolve_canonical_model(name, self.accounts['models'], self.accounts['aliases'],
-                                                      family_patterns(self.accounts), provider_name_table(self.accounts)))
+            self.assertIsNone(resolve_model(name, self.accounts['models'], self.accounts['aliases'],
+                                            family_patterns(self.accounts), provider_name_table(self.accounts))['key'])
 
     def test_current_frontier_tiers_and_context_windows(self):
         shipped = axis_scores.load_five_axis()['models']

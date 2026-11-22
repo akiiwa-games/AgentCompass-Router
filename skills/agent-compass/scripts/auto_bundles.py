@@ -16,7 +16,6 @@ is that provider's row (calibrated) or no row there (retired, other_weights: out
 still launches); else a name its maker moved to a newer dated snapshot is that snapshot's row (calibrated).
 No default row, score or price is supplied here.
 """
-import copy
 import hashlib
 import json
 import os
@@ -512,16 +511,6 @@ def derive(accounts, catalog, now, overrides=None, seen=None, account_families=N
 def _harness_of(bundle, account, bid):
     from account_fleet import bundle_harness
     return bundle_harness(bundle, account, bid)
-
-
-def merge_into(accounts, derived):
-    """Copy of accounts with the auto bundles added. Manual bundles are never replaced."""
-    merged = copy.deepcopy(accounts)
-    for account, rows in derived['bundles'].items():
-        target = merged['accounts'].setdefault(account, {}).setdefault('bundles', {})
-        for bid, bundle in rows.items():
-            target.setdefault(bid, bundle)
-    return merged
 
 
 # --- `seen` persistence (last detection time per auto bundle) -------------------------------------

@@ -21,7 +21,6 @@ WORK_KINDS = (
     'live_loop',
     'gui_control',
 )
-PROFILE_KINDS = WORK_KINDS + ('other_or_mixed',)
 SECONDARY_KINDS = ('none',) + WORK_KINDS
 GENERIC_CALLER_KINDS = (None, 'code_implementation', 'other_or_mixed')
 
@@ -122,9 +121,11 @@ TASK_PROFILE_SCHEMA = {
     'type': 'object',
     'properties': {
         'work_kind': {'type': 'string', 'enum': list(WORK_KINDS), 'description': WORK_KIND_QUESTION},
-        'primary_level': {'type': 'integer', 'minimum': 1, 'maximum': 3, 'description': PRIMARY_LEVEL_QUESTION},
+        'primary_level': {'type': 'integer', 'minimum': PROFILE_INTEGERS['primary_level'][0],
+                          'maximum': PROFILE_INTEGERS['primary_level'][1], 'description': PRIMARY_LEVEL_QUESTION},
         'secondary_kind': {'type': 'string', 'enum': list(SECONDARY_KINDS), 'description': SECONDARY_KIND_QUESTION},
-        'secondary_level': {'type': 'integer', 'minimum': 0, 'maximum': 3, 'description': SECONDARY_LEVEL_QUESTION},
+        'secondary_level': {'type': 'integer', 'minimum': PROFILE_INTEGERS['secondary_level'][0],
+                            'maximum': PROFILE_INTEGERS['secondary_level'][1], 'description': SECONDARY_LEVEL_QUESTION},
         'access': {'type': 'string', 'enum': list(ACCESS_LEVELS), 'description': ACCESS_QUESTION},
         'local_only': {'type': 'boolean', 'description': LOCAL_ONLY_QUESTION},
         'needs_visual': {'type': 'boolean', 'description': NEEDS_VISUAL_QUESTION},
@@ -147,12 +148,14 @@ def project_axis_demand(work_kind, primary_level, secondary_kind='none', seconda
     """Project `(work_kind, primary_level, secondary_kind, secondary_level)` onto 4D `axis_demand` via tropical max envelope."""
     if work_kind not in WORK_KIND_SIGNATURES:
         raise ValueError('task.profile.work_kind must be one of ' + ', '.join(WORK_KINDS))
-    if isinstance(primary_level, bool) or not isinstance(primary_level, int) or not 1 <= primary_level <= 3:
-        raise ValueError('task.profile.primary_level must be an integer from 1 to 3')
+    p_low, p_high = PROFILE_INTEGERS['primary_level']
+    if isinstance(primary_level, bool) or not isinstance(primary_level, int) or not p_low <= primary_level <= p_high:
+        raise ValueError(f'task.profile.primary_level must be an integer from {p_low} to {p_high}')
     if secondary_kind not in SECONDARY_KINDS:
         raise ValueError('task.profile.secondary_kind must be one of ' + ', '.join(SECONDARY_KINDS))
-    if isinstance(secondary_level, bool) or not isinstance(secondary_level, int) or not 0 <= secondary_level <= 3:
-        raise ValueError('task.profile.secondary_level must be an integer from 0 to 3')
+    s_low, s_high = PROFILE_INTEGERS['secondary_level']
+    if isinstance(secondary_level, bool) or not isinstance(secondary_level, int) or not s_low <= secondary_level <= s_high:
+        raise ValueError(f'task.profile.secondary_level must be an integer from {s_low} to {s_high}')
     primary = [ROLE_FN[r](primary_level) for r in WORK_KIND_SIGNATURES[work_kind]]
     if secondary_kind != 'none' and secondary_level > 0:
         secondary = [ROLE_FN[r](secondary_level) for r in WORK_KIND_SIGNATURES[secondary_kind]]
@@ -181,11 +184,11 @@ def validate_profile(raw):
     work_kind = raw.get('work_kind')
     if not isinstance(work_kind, str) or work_kind not in WORK_KINDS:
         raise ValueError('task.profile.work_kind must be one of ' + ', '.join(WORK_KINDS))
-    primary_level = _check_int(raw, 'primary_level', 1, 3)
+    primary_level = _check_int(raw, 'primary_level', *PROFILE_INTEGERS['primary_level'])
     secondary_kind = raw.get('secondary_kind')
     if not isinstance(secondary_kind, str) or secondary_kind not in SECONDARY_KINDS:
         raise ValueError('task.profile.secondary_kind must be one of ' + ', '.join(SECONDARY_KINDS))
-    secondary_level = _check_int(raw, 'secondary_level', 0, 3)
+    secondary_level = _check_int(raw, 'secondary_level', *PROFILE_INTEGERS['secondary_level'])
     if secondary_kind == 'none' and secondary_level != 0:
         raise ValueError("task.profile.secondary_level must be 0 when secondary_kind is 'none'")
     if secondary_kind != 'none' and secondary_level == 0:

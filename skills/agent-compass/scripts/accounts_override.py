@@ -224,9 +224,6 @@ def preference_account(bundle, owner, accounts):
     return owner
 
 
-MANUAL_ONLY_BILLING = ('metered', 'unknown')
-
-
 def manual_only_billing(account, accounts):
     """Billing that keeps an account out of automatic routing by default, else None.
 

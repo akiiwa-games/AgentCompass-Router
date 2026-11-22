@@ -138,7 +138,9 @@ class Derive(unittest.TestCase):
 
     def test_merge_feeds_allocator(self):
         out = ab.derive(proxy_accounts(), catalog('llmproxy', ['zzz-unknown-9']), NOW)
-        merged = ab.merge_into(proxy_accounts(), out)
+        merged = proxy_accounts()
+        for bid, b in out['bundles']['llmproxy'].items():
+            merged['accounts']['llmproxy'].setdefault('bundles', {}).setdefault(bid, b)
         flat = account_fleet.bundles(merged)
         bid = 'auto:llmproxy:codex:zzz-unknown-9@high'
         self.assertIn(bid, flat)

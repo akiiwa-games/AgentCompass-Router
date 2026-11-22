@@ -123,10 +123,6 @@ def exact_pin(task, bundle, accounts, pool=None):
     return bool(task.get('constraint_effort')) and model_pin_matches(task, bundle, accounts, pool=pool)
 
 
-def bundle_named(task, bundle, accounts, pool=None):
-    return exact_pin(task, bundle, accounts, pool=pool) or model_pin_matches(task, bundle, accounts, pool=pool)
-
-
 def has_fixed_effort(bundle, accounts):
     """`model:effort` and `model-effort` launch ids run at that level only."""
     if (bundle or {}).get('effort_fixed'):

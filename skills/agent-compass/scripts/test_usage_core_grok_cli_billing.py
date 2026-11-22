@@ -147,7 +147,8 @@ class GrokCliBillingTests(unittest.TestCase):
         self.write_login(datetime.now(timezone.utc) - timedelta(minutes=1))
         before = (self.home / "auth.json").read_bytes()
         with patch.object(usage.urllib.request, "urlopen") as call:
-            self.assertIsNone(usage.fetch_grok_cli_billing())
+            parsed, _, _, _, _ = usage._fetch_grok_cli_billing_with_payload()
+            self.assertIsNone(parsed)
         call.assert_not_called()
         self.assertEqual((self.home / "auth.json").read_bytes(), before)
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["auth.json"])

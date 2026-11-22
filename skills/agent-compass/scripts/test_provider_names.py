@@ -237,7 +237,9 @@ class DerivedBundles(unittest.TestCase):
         out = auto_bundles.derive(acc, catalog([a, 'zed/gone']), NOW)['bundles']['gw']
         by_launch = {bundle['launch_model']: bundle for bundle in out.values()}
         self.assertEqual(by_launch[a]['model'], b)
-        merged = auto_bundles.merge_into(acc, {'bundles': {'gw': out}})
+        merged = copy.deepcopy(acc)
+        for bid, bundle in out.items():
+            merged['accounts']['gw'].setdefault('bundles', {}).setdefault(bid, bundle)
         self.assertIs(account_fleet.model_spec(merged, by_launch[a]['model']), merged['models'][b])
         # an endpoint's id is its own namespace: zed's declaration does not reach `zed/gone` listed by gw
         self.assertNotEqual(by_launch['zed/gone'].get('score_source'), 'retired')
@@ -761,7 +763,11 @@ class PinIdentityMatchesBundle(unittest.TestCase):
             'codex': {'ok': True, 'type': 'paseo_provider', 'checked_at': NOW, 'models': listed},
             'opencode': {'ok': True, 'type': 'openai_compatible', 'checked_at': NOW, 'models': [{'id': 'deepseek-v4-flash'}]},
         }}, NOW)
-        fleet = auto_bundles.merge_into(doc, derived)
+        fleet = copy.deepcopy(doc)
+        for acct, rows in derived['bundles'].items():
+            target = fleet['accounts'].setdefault(acct, {}).setdefault('bundles', {})
+            for bid, b in rows.items():
+                target.setdefault(bid, b)
         fleet['accounts']['codex']['bundles']['vb_novel_med'] = {
             'provider': 'codex', 'harness': 'codex', 'model': 'vendor-b/novel-unmeasured',
             'launch_model': 'vendor-b/novel-unmeasured', 'effort': 'medium', 'draws': ['usage'],
