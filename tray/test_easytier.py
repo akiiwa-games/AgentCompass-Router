@@ -19,10 +19,9 @@ def reading(state, pids=(), peers=None):
 
 class PathTests(unittest.TestCase):
     def test_everything_lives_under_one_home(self):
-        for path in (easytier.CORE, easytier.CLI, easytier.CONFIG, easytier.LOGS, easytier.STATE, easytier.SUPERVISOR):
+        for path in (easytier.CORE, easytier.CLI, easytier.LOGS, easytier.STATE):
             self.assertTrue(path.is_relative_to(easytier.HOME), path)
         self.assertEqual(easytier.CORE, easytier.HOME / "bin" / "easytier-core.exe")
-        self.assertEqual(easytier.CONFIG, easytier.HOME / "private" / "node.toml")
 
     def test_installed_looks_at_the_home_found_now_not_at_import(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -108,13 +107,6 @@ class LabelTests(unittest.TestCase):
         self.assertEqual(easytier.label(reading("running", [1], PEERS[:1])), "运行中（无对端）")
         self.assertEqual(easytier.label(reading("missing")), "未安装")
         self.assertEqual(easytier.label(reading("foreign", [9])), "外部实例在运行")
-
-    def test_peer_report_lists_hosts_and_never_the_config(self):
-        text = easytier.peer_report(reading("running", [1], PEERS))
-        self.assertIn("OTHER 192.0.2.2 p2p 7.7ms", text)
-        self.assertIn("relay 中继", text)
-        self.assertNotIn("ME", text)
-        self.assertEqual(easytier.peer_report(reading("stopped")), "EasyTier：已停止")
 
 
 class ActionTests(unittest.TestCase):

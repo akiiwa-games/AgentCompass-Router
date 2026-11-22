@@ -106,7 +106,7 @@ def test_new_bundle_is_discovered_without_a_hardcoded_model_list(tmp_path, monke
         'codex': {'ok': True, 'models': [{'id': 'new-model', 'label': 'New Model'}]}}}))
     row = next(row for row in router_data.harness_model_rows() if row['harness'] == 'codex')
     assert next(model for model in row['models'] if model['model'] == 'new-model')['routed'] is False
-    reference = router_data._accounts_path()
+    reference = account_fleet.REFERENCES / 'accounts.json'
     document = json.loads(reference.read_text())
     document['accounts']['codex']['bundles']['new_high'] = {'model': 'new-model', 'effort': 'high'}
     reference.write_text(json.dumps(document))

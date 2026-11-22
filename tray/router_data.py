@@ -30,10 +30,6 @@ from display_names import model_label  # noqa: F401
 STATE_DIR = Path(os.environ.get("ROUTER_STATE_DIR") or Path.home() / ".agent-compass").expanduser()
 
 
-def get_ui_language() -> str:
-    return i18n.get_language()
-
-
 def save_ui_language(lang: str) -> str:
     return i18n.set_language(lang)
 
@@ -47,7 +43,7 @@ def strategy_preset_key(name: str) -> str:
 FAMILY_ORDER = ("claude", "codex", "antigravity", "opencode", "dot", "chatgpt-web", "pi", "grok", "grok-bot", "omp", "dsh")
 FAMILY_LABELS = {"claude": "Claude", "codex": "Codex", "antigravity": "Antigravity", "opencode": "OpenCode",
                  "dot": "Dot", "chatgpt-web": "ChatGPT Web", "pi": "Pi", "grok": "Grok", "grok-bot": "Grok Bot",
-                 "api-proxy": "API Proxy", "llmproxy": "LLM Proxy", "omp": "Oh My Pi", "dsh": "DeepSeek Harness"}
+                 "llmproxy": "LLM Proxy", "omp": "Oh My Pi", "dsh": "DeepSeek Harness"}
 # Families whose quota the usage collector reads.
 USAGE_FAMILIES = ("claude", "codex", "pi", "antigravity", "grok")
 
@@ -271,11 +267,6 @@ def recent_ledger_with_skipped(limit: int = 30, path: Path | None = None) -> tup
         else:
             valid.append(r)
     return list(reversed(valid[-limit:])), skipped
-
-
-def recent_ledger(limit: int = 30, path: Path | None = None) -> list[dict]:
-    """The latest plan decisions, newest first (skipping older-shape rows)."""
-    return recent_ledger_with_skipped(limit, path)[0]
 
 
 def ledger_summary(row: dict) -> dict:
@@ -1459,13 +1450,6 @@ def _reference_state() -> Path:
     return public_data.cache_dir() / "state.json"
 
 
-def _accounts_path() -> Path:
-    """The shipped references/accounts.json (the file a checkout edits; routing reads _public_accounts())."""
-    modules()
-    import account_fleet
-    return account_fleet.REFERENCES / "accounts.json"
-
-
 def _user_accounts_path(create: bool = False) -> Path:
     user_file = STATE_DIR / "accounts-override.json"
     if create:
@@ -2173,42 +2157,6 @@ def toggle_harness(harness: str, account: str, enabled: bool) -> str:
         if rows[0]["host_enabled"] != enabled:
             toggle_account_host(account)
     return f"{HARNESS_LABELS.get(harness, harness)} · {account_label(account)} · {_tr('启用') if enabled else _tr('停用')}"
-
-
-def toggle_bundle(account: str, bundle_id: str, path: Path | None = None) -> str:
-    """Toggle exactly one effort bundle; harnesses never change together."""
-    modules()
-    import accounts_override
-    if path is None:
-        import account_fleet
-        bundles = ((account_fleet.load_accounts().get("accounts") or {}).get(account) or {}).get("bundles") or {}
-        if bundle_id not in bundles:
-            raise ValueError(_tr('未知档位 {0}').format(bundle_id))
-        enable_now = bool(bundles[bundle_id].get("_model_disabled", bundles[bundle_id].get("disabled")))
-        _edit_preferences(lambda doc: accounts_override.set_bundle_choice(
-            doc, account, bundle_id, not enable_now, bundles[bundle_id].get("_choice_ids") or ()))
-        return _tr('{0} · {1}：{2}').format(account_label(account), bundle_id,
-                                            _tr('参与自动派发') if enable_now else _tr('不参与自动派发'))
-    target = path or _user_accounts_path(create=True)
-    doc = accounts_override.normalize(accounts_override.upgrade_document(json.loads(target.read_text(encoding="utf-8-sig"))))
-    bundles = ((doc.get("accounts") or {}).get(account) or {}).get("bundles") or {}
-    if bundle_id not in bundles:
-        modules()
-        live_acc = (account_fleet.load_accounts().get("accounts") or {}).get(account) or {}
-        live_bundles = live_acc.get("bundles") or {}
-        if bundle_id not in live_bundles:
-            raise ValueError(_tr('未知档位 {0}').format(f'{bundle_id}'))
-        acc_entry = doc.setdefault("accounts", {}).setdefault(account, {})
-        bundles = acc_entry.setdefault("bundles", {})
-        for bid, bspec in live_bundles.items():
-            if bid not in bundles and isinstance(bspec, dict):
-                bundles[bid] = dict(bspec)
-    enable_now = bool(bundles[bundle_id].get("disabled"))
-    bundles[bundle_id]["disabled"] = not enable_now
-    _backup(target, "accounts-json")
-    _atomic_json(target, doc)
-    return _tr('{0} · {1}：{2}').format(account_label(account), bundle_id,
-                                        _tr('参与自动派发') if enable_now else _tr('不参与自动派发'))
 
 
 def toggle_account_host(account: str) -> str:

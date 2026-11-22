@@ -78,16 +78,6 @@ def test_a_window_ahead_of_its_line_is_spared_in_the_earlier_decision():
     assert demo.EARLIER["claude-a"][2] < demo.WINDOWS["claude-a"][2]
 
 
-def test_window_geometry_uses_each_window_s_own_clock():
-    assert quota_line.window_geometry(dict(capacity_usd=400, elapsed_hours=166, reset_in_hours=2)) == pytest.approx(
-        (166 / 168, 400 * 166 / 168))
-    assert quota_line.window_geometry(dict(capacity_usd=400, elapsed_hours=24, reset_in_hours=144)) == pytest.approx(
-        (1 / 7, 400 / 7))
-    # A starter allowance never resets: nothing recovers, so its line stays at 0.
-    assert quota_line.window_geometry(dict(capacity_usd=50, elapsed_hours=300, reset_in_hours=None)) == (0., 0.)
-    assert quota_line.window_geometry({}) == (0., 0.)
-
-
 def test_model_reads_the_snapshot_as_recorded_and_never_mutates_it():
     source = snapshot()
     original = copy.deepcopy(source)

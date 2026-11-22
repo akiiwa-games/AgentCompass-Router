@@ -617,18 +617,6 @@ def restart_services(config: dict | None = None) -> str:
     return "；".join(messages) if messages else _tr("没有需要重启的服务")
 
 
-def services_up(config: dict | None = None) -> bool:
-    config = config or plugins.load()
-    ready = True
-    if plugins.enabled("dot2api", config):
-        ready = ready and dot_ready()
-    if plugins.enabled("chatgpt-web", config):
-        ready = ready and chatgpt_ready()
-    if plugins.autostarts("muse2api", config):
-        ready = ready and muse_ready()
-    return ready
-
-
 def refresh_plugin_roots() -> None:
     """Refresh module-level root paths after a plugin is cloned into ~/.agent-compass/plugins/."""
     global DOT_ROOT, CHATGPT_ROOT, CHATGPT_LAUNCHER, USAGE_FLOAT_ROOT, USAGE_FLOAT_SCRIPT
@@ -814,7 +802,6 @@ def maintain_subscription() -> str | None:
 
 # Capacity statistics: worker-hours and burn rates from the session logs, for the router's allocator.
 CAPACITY_SCRIPT = ROOT / "tray" / "capacity_stats.py"
-CAPACITY_OUTPUT = STATE_DIR / "capacity.json"
 CAPACITY_INTERVAL = 300
 _capacity: dict = {"proc": None, "started": None}
 
@@ -904,17 +891,6 @@ _dispatch_notice: dict = {
     "doubled": False,
     "evaluated_reasons": None,
 }
-
-
-def _reset_dispatch_notice() -> None:
-    _dispatch_notice.update(
-        proc=None,
-        started=None,
-        last_reasons=None,
-        interval=DISPATCH_NOTICE_INTERVAL,
-        doubled=False,
-        evaluated_reasons=None,
-    )
 
 
 def _reset_dispatch_notice_backoff() -> None:

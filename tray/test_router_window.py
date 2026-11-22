@@ -511,7 +511,6 @@ class SettingsTests(unittest.TestCase):
         self.addCleanup(environment.stop)
         for patcher in (
             mock.patch.object(router_data, 'modules', return_value=(allocator, mock.Mock())),
-            mock.patch.object(router_data, '_accounts_path', return_value=self.accounts),
             mock.patch.object(provider_inventory, 'apply', return_value=None),
         ):
             patcher.start()
@@ -638,30 +637,6 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(router_data.countdown(90061), "1天1小时")
         self.assertEqual(router_data.countdown(3660), "1小时01分")
         self.assertEqual(router_data.countdown(None), "—")
-
-    def test_toggle_bundle_writes_to_override(self):
-        override = self.dir / "accounts-override.json"
-        b_msg = router_data.toggle_bundle("claude", "opus55_xhigh")
-        self.assertIn("不参与自动派发", b_msg)
-        doc2 = json.loads(override.read_text(encoding="utf-8"))
-        self.assertTrue(doc2["accounts"]["claude"]["bundles"]["opus55_xhigh"].get("disabled"))
-        fake_alloc = mock.Mock()
-        fake_alloc.load_accounts.return_value = {
-            "accounts": {
-                "claude-magpie": {
-                    "bundles": {
-                        "claude-magpie__sonnet55_high": {"model": "claude-sonnet-5-5", "provider": "claude-magpie"}
-                    }
-                }
-            }
-        }
-        with mock.patch.object(router_data, "modules", return_value=(fake_alloc, mock.Mock())), \
-                mock.patch.object(account_fleet, "load_accounts", fake_alloc.load_accounts):
-            dyn_msg = router_data.toggle_bundle("claude-magpie", "claude-magpie__sonnet55_high")
-            self.assertIn("Claude Magpie", dyn_msg)
-            self.assertIn("不参与自动派发", dyn_msg)
-        doc3 = json.loads(override.read_text(encoding="utf-8"))
-        self.assertTrue(doc3["accounts"]["claude-magpie"]["bundles"]["claude-magpie__sonnet55_high"].get("disabled"))
 
     def test_save_dot_repo_writes_dot_plugin_json(self):
         msg = router_data.save_dot_repo("owner/dot-transfer")
@@ -982,13 +957,6 @@ class WindowHelperTests(unittest.TestCase):
 
         self.assertEqual([p[0] for p in router_window.PAGES], ["scoring", "quota", "policy", "plugins"])
         self.assertEqual([s[0] for s in panel_widgets.SETTINGS], ["models", "strategy", "system"])
-
-    def test_duplicate_bundle_labels_fall_back_to_ids(self):
-        import panel_scoring
-
-        bundles = [{"id": "sol_xhigh", "label": "Sol 6.1·xhigh"}, {"id": "sol", "label": "Sol 6.1"},
-                   {"id": "work_sol_xhigh", "label": "Sol 6.1·xhigh"}]
-        self.assertEqual(panel_scoring.bundle_labels(bundles), ["sol_xhigh", "Sol 6.1", "work_sol_xhigh"])
 
     def test_matching_preset_marks_the_saved_strategy(self):
         import panel_strategy

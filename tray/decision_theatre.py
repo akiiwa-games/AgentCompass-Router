@@ -126,11 +126,6 @@ def _tempo_terms():
 TEMPO = _tempo_terms()
 
 
-def tempo(wall):
-    """Story seconds per wall second: C2, never flat, minimum ~0.78."""
-    return 1 + sum(a * _bump((wall - c) / w) for c, w, a in TEMPO)
-
-
 def story_time(wall):
     """Master time warp: story time for a wall-clock time; story_time(DURATION) == DURATION."""
     if wall >= DURATION:

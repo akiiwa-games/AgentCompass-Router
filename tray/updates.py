@@ -1494,14 +1494,6 @@ def read_local_runtime_info(root: Path) -> dict | None:
     return None
 
 
-def read_local_runtime_fingerprint(root: Path) -> str | None:
-    info = read_local_runtime_info(root)
-    if not isinstance(info, dict):
-        return None
-    fp = str(info.get("runtime_fingerprint") or "").strip()
-    return fp or None
-
-
 def _load_release_manifest(release: dict, opener=None) -> dict | None:
     if not isinstance(release, dict):
         return None
@@ -1580,23 +1572,6 @@ def can_use_code_package(local_runtime: dict | None, manifest: dict | None) -> t
     if local_fp != required_fp:
         return False, f"required_runtime_fingerprint_mismatch:{local_fp[:12]}!={required_fp[:12]}"
     return True, "runtime_fingerprint_match"
-
-
-def _remove_dir_or_link(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    try:
-        path.unlink()
-        return
-    except OSError:
-        pass
-    if os.name == "nt":
-        try:
-            os.rmdir(path)
-            return
-        except OSError:
-            pass
-    shutil.rmtree(path, ignore_errors=True)
 
 
 def _validate_extracted_app_dir(
@@ -1713,47 +1688,6 @@ def _sync_dir_in_place(src_dir: Path, dest_dir: Path) -> None:
                     existing.rmdir()
                 except OSError:
                     shutil.rmtree(existing, ignore_errors=True)
-
-
-def rollback_code_package(root: Path, reason: str = "") -> Path | None:
-    """Roll back <root>/app/current to <root>/app/previous and record rollback state."""
-    root = Path(root)
-    app_root = root / "app"
-    current_dir = app_root / "current"
-    previous_dir = app_root / "previous"
-    if not previous_dir.is_dir():
-        return None
-    prev_manifest = _validate_extracted_app_dir(previous_dir)
-    broken_dir = app_root / f"broken-{int(time.time())}"
-    shutil.rmtree(broken_dir, ignore_errors=True)
-    try:
-        if current_dir.exists():
-            current_dir.replace(broken_dir)
-        previous_dir.replace(current_dir)
-        shutil.rmtree(broken_dir, ignore_errors=True)
-    except PermissionError:
-        shutil.rmtree(broken_dir, ignore_errors=True)
-        _sync_dir_in_place(previous_dir, current_dir)
-        shutil.rmtree(previous_dir, ignore_errors=True)
-    state_file = app_root / "state.json"
-    state: dict = {}
-    if state_file.is_file():
-        try:
-            loaded = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state = loaded
-        except Exception:
-            state = {}
-    restored_ver = str(prev_manifest.get("version") or local_version(current_dir))
-    state["current_version"] = restored_ver
-    state["active_version"] = restored_ver
-    state["rolled_back_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    state["rollback_reason"] = reason
-    try:
-        state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
-    except OSError:
-        pass
-    return current_dir
 
 
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"

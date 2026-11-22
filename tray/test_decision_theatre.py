@@ -157,18 +157,19 @@ def test_camera_is_one_c2_curve_that_creeps_and_never_stops_mid_film():
 def test_master_tempo_is_smooth_slow_when_read_and_preserves_total_time():
     step=.001
     walls=[i*step for i in range(round(dt.DURATION/step)+1)]
-    r=[dt.tempo(t) for t in walls]
     assert dt.story_time(0)==0 and dt.story_time(dt.DURATION)==dt.DURATION
     assert dt.story_time(dt.DURATION-1e-6)==pytest.approx(dt.DURATION,abs=1e-5)
     story=[dt.story_time(t) for t in walls]
     assert story==sorted(story)
+    r=[(b-a)/step for a,b in zip(story,story[1:])]
     assert min(r)>.7 and max(r)<1.25
     assert max(abs(b-a) for a,b in zip(r,r[1:])) < .002
     # Slower through each readable moment than between them.
+    rate=lambda t: (dt.story_time(t+step)-dt.story_time(t-step))/(2*step)
     for centre,_,amount in dt.SLOW_PASSAGES:
-        assert dt.tempo(centre) < 1
+        assert rate(centre) < 1
     for centre,_ in dt.FAST_CENTRES:
-        assert dt.tempo(centre) > 1
+        assert rate(centre) > 1
 
 
 def test_title_breathes_but_stays_readable_before_the_kind():

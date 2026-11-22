@@ -130,17 +130,6 @@ def number(value, missing=None):
     return float(value)
 
 
-def window_geometry(window):
-    """(now as a fraction of the period, recovery line ℓ(now) in USD) for one window on its own clock."""
-    elapsed, left, capacity = (number(window.get(name), default) for name, default in
-                               (("elapsed_hours", 0.), ("reset_in_hours", None), ("capacity_usd", 0.)))
-    if left is None or elapsed is BAD or left is BAD:
-        return 0., 0.       # never resets: nothing recovers, the line stays at 0
-    period = max(0., elapsed) + max(0., left)
-    at = clamp(max(0., elapsed) / period) if period > 0 else 0.
-    return at, (0. if capacity is BAD else max(0., capacity)) * at
-
-
 def read_window(key, window):
     """One recorded window as the view shows it, or None when its usage or its clock is not a number."""
     if not isinstance(window, dict):

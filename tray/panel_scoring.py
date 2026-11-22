@@ -61,14 +61,6 @@ def pair_ids(pair: list[dict]) -> str:
     return "ID  " + " · ".join(str(r.get("id")) for r in pair) if pair else ""
 
 
-def bundle_labels(bundles: list[dict]) -> list[str]:
-    """Display names for an account's bundles; a name shared by two bundles falls back to the bundle id."""
-    counts = {}
-    for b in bundles:
-        counts[b["label"]] = counts.get(b["label"], 0) + 1
-    return [b["label"] if counts[b["label"]] == 1 else b["id"] for b in bundles]
-
-
 class ScoringPage:
     # ---------- page 1: decision compass ----------
     def build_scoring(self, page):

@@ -325,10 +325,14 @@ class DispatchNoticeUnitTests(unittest.TestCase):
             pass
 
     def reset_notice_state(self) -> None:
-        if hasattr(services, "_reset_dispatch_notice"):
-            services._reset_dispatch_notice()
-        else:
-            services._dispatch_notice.update(proc=None, started=None)
+        services._dispatch_notice.update(
+            proc=None,
+            started=None,
+            last_reasons=None,
+            interval=services.DISPATCH_NOTICE_INTERVAL,
+            doubled=False,
+            evaluated_reasons=None,
+        )
 
     def child(self, running: bool):
         proc = mock.Mock(pid=5150)
@@ -1470,10 +1474,14 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
         state_patch.start()
         self.addCleanup(state_patch.stop)
         self.addCleanup(self._cleanup_processes)
-        if hasattr(services, "_reset_dispatch_notice"):
-            services._reset_dispatch_notice()
-        else:
-            services._dispatch_notice.update(proc=None, started=None)
+        services._dispatch_notice.update(
+            proc=None,
+            started=None,
+            last_reasons=None,
+            interval=services.DISPATCH_NOTICE_INTERVAL,
+            doubled=False,
+            evaluated_reasons=None,
+        )
 
     def _stop_daemon_listener(self) -> None:
         self._daemon_stop.set()
@@ -1490,10 +1498,14 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if hasattr(services, "_reset_dispatch_notice"):
-            services._reset_dispatch_notice()
-        else:
-            services._dispatch_notice.update(proc=None, started=None)
+        services._dispatch_notice.update(
+            proc=None,
+            started=None,
+            last_reasons=None,
+            interval=services.DISPATCH_NOTICE_INTERVAL,
+            doubled=False,
+            evaluated_reasons=None,
+        )
         notif_dir = self.state_dir / "paseo-notifications"
         if notif_dir.is_dir():
             for item in notif_dir.glob("*.json"):

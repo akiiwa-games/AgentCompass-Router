@@ -118,14 +118,6 @@ def card_window_name(card: dict, window: dict) -> str:
     return short_window_name(window) + suffix
 
 
-def quota_window_title(card: dict, window: dict) -> str:
-    """Compact cell title combining account short name and window short tag."""
-    acct = "AGY" if card.get("account") == "antigravity" else (card.get("label") or card.get("account") or "")
-    multi = len(card.get("windows") or ()) > 1
-    w_short = short_window_name(window, multi=multi)
-    return f"{acct} {w_short}".strip()
-
-
 def card_read_stamp(card: dict) -> str:
     """Short reading time or stale/failure note for a quota card."""
     import router_data

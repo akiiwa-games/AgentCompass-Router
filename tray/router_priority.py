@@ -77,11 +77,6 @@ def model_label(model, accounts=None, account=None):
     return configured or _display()[1](key or model)
 
 
-def window_label(wid, spec):
-    hours = spec.get('hours')
-    return _tr('{0}（周额度）').format(f'{wid}') if hours == 168 else _tr('{0}（{1}小时）').format(f'{wid}', f'{hours:g}') if isinstance(hours, (float, int)) else wid
-
-
 def stamp(value):
     import quota_pools
     moment = quota_pools.parse_time(value)

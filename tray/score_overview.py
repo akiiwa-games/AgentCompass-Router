@@ -353,16 +353,6 @@ def targets_choices(category: str) -> list[tuple[str, str]]:
     return out
 
 
-def current_manual(row: dict, target: str) -> tuple[float | None, str]:
-    """(the current level of a model on a target, its source) for the editor."""
-    category, _, facet = target.partition(".")
-    cell = row["cells"][category]
-    if facet:
-        fc = cell["facets"][facet]
-        return fc["level"], fc["status"]
-    return cell["level"], cell["status"]
-
-
 def editor_current_text(row: dict, target: str) -> str:
     category, _, facet = target.partition(".")
     cell = row["cells"][category]

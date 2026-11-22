@@ -38,10 +38,6 @@ def product_parent(environ=None) -> Path | None:
     return product_home(environ).parent
 
 
-def installed_at(home: Path) -> bool:
-    return (Path(home) / "bin" / CORE_NAME).is_file()
-
-
 def home(environ=None) -> Path:
     """The fixed per-machine EasyTier home."""
     return product_home(environ)

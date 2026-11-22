@@ -53,7 +53,7 @@ def settings(tmp_path, monkeypatch):
 
 def test_first_write_is_sparse_and_partial_model_toggle_is_harness_scoped(tmp_path, monkeypatch):
     target = settings(tmp_path, monkeypatch)
-    router_data.toggle_bundle('codex', 'sol_high')
+    router_data._edit_preferences(lambda doc: accounts_override.set_bundle_choice(doc, 'codex', 'sol_high', True))
     assert json.loads(target.read_text()) == {'schema_version': accounts_override.SCHEMA_VERSION,
                                               'accounts': {'codex': {'bundles': {'sol_high': {'disabled': True}}}}}
     rows = router_data.harness_model_rows()
@@ -139,21 +139,6 @@ def test_a_string_disabled_in_an_earlier_releases_override_is_read_as_a_boolean(
         before = target.read_bytes()
         account_fleet.load_accounts()
         assert target.read_bytes() == before
-
-
-def test_direct_file_toggle_writes_explicit_boolean_state(tmp_path, monkeypatch):
-    settings(tmp_path, monkeypatch)
-    target = tmp_path / 'custom-accounts.json'
-    data = document()
-    target.write_text(json.dumps(data))
-    router_data.toggle_bundle('codex', 'sol_high', target)
-    saved = json.loads(target.read_text())['accounts']['codex']['bundles']
-    assert saved['sol_high']['disabled'] is True
-    assert saved['experimental']['disabled'] is True
-    router_data.toggle_bundle('codex', 'sol_high', target)
-    assert json.loads(target.read_text())['accounts']['codex']['bundles']['sol_high']['disabled'] is False
-    router_data.save_tuning({'safety_margin_pct': 7}, target)
-    assert json.loads(target.read_text())['accounts']['codex']['bundles']['experimental']['disabled'] is True
 
 
 def test_harness_suspension_keeps_model_memory_and_other_harness(tmp_path, monkeypatch):

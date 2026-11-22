@@ -34,8 +34,6 @@ LOGS = HOME / "logs"
 STATE = HOME / "state"
 CORE = BIN / "easytier-core.exe"
 CLI = BIN / "easytier-cli.exe"
-SUPERVISOR = BIN / "easytier-supervisor.ps1"
-CONFIG = PRIVATE / "node.toml"
 TASK_NAME = "AgentCompass EasyTier"
 RPC_PORTAL = f"127.0.0.1:{ports.get('easytier_rpc')}"
 # Task Scheduler's TASK_STATE values.
@@ -150,16 +148,6 @@ def label(reading: dict) -> str:
         MISSING: _tr("未安装"), STOPPED: _tr("已停止"), STARTING: _tr("启动中"), DISABLED: _tr("任务已禁用"),
         FOREIGN: _tr("外部实例在运行"),
     }[state]
-
-
-def peer_report(reading: dict) -> str:
-    if reading["state"] != RUNNING:
-        return f"EasyTier：{label(reading)}"
-    rows = []
-    for peer in remote_peers(reading["peers"]):
-        address = peer.get("ipv4") or _tr("中继")
-        rows.append(f"{peer.get('hostname', '?')} {address} {peer.get('cost', '?')} {peer.get('lat_ms', '-')}ms")
-    return "EasyTier：" + ("；".join(rows) if rows else _tr("暂无对端"))
 
 
 def start() -> str:
