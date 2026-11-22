@@ -125,10 +125,6 @@ def set_user_path(prepend):
         winreg.CloseKey(key)
 
 
-def machine_path_has(fragment):
-    return any(fragment.lower() in p.lower() for p in os.environ.get("PATH", "").split(os.pathsep))
-
-
 def agentcompass(*args, **kwargs):
     return run([VENV / "Scripts" / "agentcompass.exe", *args], **kwargs)
 

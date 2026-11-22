@@ -403,11 +403,6 @@ def at(delta_seconds: float) -> str:
     return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delta_seconds)).isoformat()
 
 
-def codex_row(used: float, fetched: str, **extra) -> dict:
-    return {"provider_id": "codex", "display_name": "codex", "available": True, "stale": False, "fetched_at": fetched,
-            "windows": [{"id": "five_hour", "label": "5h", "used_pct": used, "resets_at": at(3 * 3600)}], **extra}
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # scenarios
 

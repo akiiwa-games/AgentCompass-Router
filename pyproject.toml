@@ -52,8 +52,6 @@ only-include = [
   "pyproject.toml",
 ]
 exclude = [
-  "setup/host_sync",
-  "setup/host_sync/out",
   "**/node_modules",
   "**/__pycache__",
   "**/*.pyc",
@@ -70,8 +68,8 @@ path = "packaging/hatch_build.py"
 
 [tool.pytest.ini_options]
 addopts = "--capture=sys"
-testpaths = ["agentcompass", "skills/agent-compass", "setup", "tray", "audit", "skills/chatgpt-pro-consult", "skills/dot-subagent", "usage-float"]
-norecursedirs = ["host_sync", "node_modules", ".staged", ".build", "verify-release", ".git", "__pycache__", ".*", "dist", "build", "scratch", "route-agent-work"]
+testpaths = ["agentcompass", "skills/agent-compass", "setup", "tray", "audit", "skills/chatgpt-pro-consult", "skills/dot-subagent"]
+norecursedirs = ["node_modules", ".staged", ".build", "verify-release", ".git", "__pycache__", ".*", "dist", "build", "scratch"]
 markers = [
   "slow: tests that start real subprocesses, packaging, sandbox checks or real Tk main loops",
 ]
