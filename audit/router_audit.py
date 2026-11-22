@@ -36,7 +36,6 @@ PLAN_SHARE = 0.99          # target share of worker dispatches chosen by `plan` 
 PLAN_MIN_SAMPLES = 10      # dispatches needed before that share is judged
 FIXED_SHARE = 0.80         # plan/record decisions whose route was fixed by instruction or by the specialist table
 LOW_REMAINING_PCT = 20
-STALE_FLAG_SECONDS = 24 * 3600
 HEAVY_SESSION_CALLS = 500  # calls in one local day for a session to count as heavy
 HEAVY_SESSIONS_PER_DAY = 4
 BLOAT_CONTEXT_TOKENS = 100_000
@@ -44,10 +43,8 @@ LONG_SESSION_CALLS = 1000
 POLL_OUTPUT_PER_CALL = 300
 PRO_BURST = 5              # Pro web dispatches inside PRO_WINDOW_HOURS
 PRO_WINDOW_HOURS = 12
-# Ledger rows of the select and delegate stages (removed 2026-11-21): derived state an older version wrote, skipped.
-RETIRED_STAGES = ("select", "delegate")
 DECISION_STAGES = ("plan", "record")     # the stages whose row decides a route
-METERED = {"api-proxy"}
+LEDGER_STAGES = (*DECISION_STAGES, "split", "fallback", "override")
 CAPACITY = Path(os.environ.get("ROUTER_CAPACITY", HOME / ".agent-compass" / "capacity.json"))
 USAGE_STATS = Path(os.environ.get("ROUTER_USAGE_STATS", HOME / ".agent-compass" / "usage-stats.json"))
 CAPACITY_STALE_HOURS = 2   # the tray service rewrites capacity.json every five minutes
@@ -100,7 +97,7 @@ def from_ledger(path: Path, skipped: list[int] | None = None):
             r = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(r, dict) or r.get("stage") in RETIRED_STAGES:
+        if not isinstance(r, dict) or r.get("stage") not in LEDGER_STAGES:
             continue
         if state_upgrade.row_has_old_profile(r):
             skipped_count += 1
@@ -129,14 +126,11 @@ def classify(row: dict) -> str:
         return f"fixed:{row.get('constraint')}"
     bundle = row.get("bundle") or {}
     model = str(bundle.get("model") or "")
-    if bundle.get("provider") in ("chatgpt-web", "pro-consult") or "pro" in str(row.get("choice") or "").lower():
+    if bundle.get("provider") == "chatgpt-web" or "pro" in str(row.get("choice") or "").lower():
         return "specialist:pro"
     if "astra" in model:
         return "specialist:astra"
-    choice = str(row.get("choice") or "")
-    if (row.get("constraint") or row.get("chain")
-            or row.get("action") in ("resume", "retained")
-            or choice.startswith("same_") or choice == "retained"):
+    if row.get("constraint") or row.get("chain") or row.get("action") == "resume":
         return "fixed:instruction"
     return "open"
 
@@ -522,13 +516,11 @@ def build_findings(ctx: dict) -> list[dict]:
     now_usage = ctx["usage_now"]
     accounts = now_usage.get("accounts", {})
     for name, row in accounts.items():
-        if name.lower() in METERED:
-            continue
         window = ctx["usage_reading"].tightest_window(row)
         if window and window["remaining_pct_before_reset"] <= LOW_REMAINING_PCT and window["seconds_until_reset"] > 48 * 3600:
             idle = [f"{a}({ctx['router'].tightest_window(r)['remaining_pct_before_reset']:.0f}% 余,近期峰值已用 "
                     f"{max([v for (acc, _), v in ctx['peaks'].items() if acc == a] or [0]):.0f}%)" for a, r in accounts.items()
-                    if a != name and a.lower() not in METERED and r.get("status") == "fresh" and ctx["usage_reading"].tightest_window(r)
+                    if a != name and r.get("status") == "fresh" and ctx["usage_reading"].tightest_window(r)
                     and ctx["usage_reading"].tightest_window(r)["remaining_pct_before_reset"] >= 80]
             add("crit", f"cliff-{name}", f"{name} 额度见底且重置还很远",
                 f"{name}/{window['id']} 仅剩 {window['remaining_pct_before_reset']:.0f}%,{window['seconds_until_reset'] / 86400:.1f} 天后重置。"
@@ -659,7 +651,7 @@ def render(ctx: dict, days: int, detail_days: int, commentary: str) -> str:
         window = usage_reading.tightest_window(row)
         flag = " ⚠标志冲突" if row.get("flag_conflict") else ""
         reset_days = "—" if not window else f"{window['seconds_until_reset'] / 86400:.1f}d"
-        lines.append(f"| {name}{' (按量)' if name.lower() in METERED else ''} | {row.get('status')}{flag} | {(window or {}).get('id', '—')} | "
+        lines.append(f"| {name} | {row.get('status')}{flag} | {(window or {}).get('id', '—')} | "
                      f"{fmt_pct((window or {}).get('remaining_pct_before_reset'))} | "
                      f"{reset_days} | {(row.get('fetched_at') or '—')[:16]} |")
     series = quota_series(rows + [ctx["now_row"]])
