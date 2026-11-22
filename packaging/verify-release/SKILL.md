@@ -1,7 +1,7 @@
 ---
 name: verify-release
 description: >
-  Pre-release behavioral verification for AgentCompass (router + tray) and usage-float.
+  Pre-release behavioral verification for AgentCompass (router + tray).
   Installs from the built release artifacts (wheel and Inno Setup installer) into clean,
   foreign-looking machine profiles and Windows Sandbox, proving user-visible behaviors
   before tagging or syncing to another computer.
@@ -9,11 +9,11 @@ description: >
 
 # Release Verification Skill (`verify-release`)
 
-Verify **AgentCompass** (router + tray) and **usage-float** from their packaged artifacts in a clean, foreign-looking machine profile and Windows Sandbox before cutting a release or syncing to a second host (`LITTLESPRING` / `LS`).
+Verify **AgentCompass** (router + tray) from its packaged artifacts in a clean, foreign-looking machine profile and Windows Sandbox before cutting a release or syncing to a second host (`LITTLESPRING` / `LS`).
 
 ## Principles (pstack)
 
-1. **Test behavior, not implementation** (`principle-test-behavior-not-implementation`): invoke the installed `agentcompass` console script, `router_gate_hook.py`, `router_data` / `router_window`, `usage_float.py`, and `AgentCompass.exe` against local HTTP fixtures and fake provider CLIs.
+1. **Test behavior, not implementation** (`principle-test-behavior-not-implementation`): invoke the installed `agentcompass` console script, `router_gate_hook.py`, `router_data` / `router_window`, and `AgentCompass.exe` against local HTTP fixtures and fake provider CLIs.
 2. **Prove it works from packaged artifacts** (`principle-prove-it-works`): build the `.whl` and `AgentCompass-Setup-X.exe` from an isolated git copy, install into a fresh venv / Windows Sandbox guest, and verify that `site-packages` (never the repo checkout) is executing.
 3. **Never touch the real user profile**: all non-guest harnesses run inside throwaway `HOME`/`USERPROFILE`/`ROUTER_STATE_DIR` directories with `sitecustomize.py` network interception (`sandbox_net.json`) and verify `real_state_snapshot()` is unpolluted afterwards.
 
@@ -32,9 +32,9 @@ python -X utf8 packaging/verify_release.py
 ```
 
 This runs:
-- `packaging/foreign_machine_check.py`: builds the wheel + isolated `usage-float` repo, installs into a clean venv, and executes `F01`–`F11` across foreign profiles (`--only F10` runs one feature; F09 always runs).
+- `packaging/foreign_machine_check.py`: builds the wheel, installs into a clean venv, and executes `F01`–`F11` across foreign profiles (`--only F10` runs one feature; F09 always runs).
 - `packaging/zero_dispatch_check.py`: verifies every dispatch surface (`D01`–`D13`) from the installed wheel.
-- Pytest behavior & regression suites across `setup/`, `skills/agent-compass/scripts/`, `tray/`, and `usage-float/`.
+- Pytest behavior & regression suites across `agentcompass/`, `setup/`, `skills/agent-compass/`, `tray/`, and `audit/`.
 
 ### 2. Full Release Verification (including Windows Sandbox Installer & GUI)
 
@@ -47,9 +47,9 @@ This additionally boots an offline Windows Sandbox (`packaging/windows_sandbox_c
 ### 3. Second-Host (`LITTLESPRING` / `LS`) Post-Release Acceptance
 
 After pushing the release tag and waiting for `.github/workflows/release.yml` to publish the release assets:
-1. Upgrade the wheel on `LS` (`pip install --upgrade <wheel or git tag>`) and update `usage-float`.
+1. Upgrade the wheel on `LS` (`pip install --upgrade <wheel or git tag>`).
 2. Run `agentcompass data --refresh`, `agentcompass doctor`, `agentcompass providers`, `agentcompass usage`, and `agentcompass plan --demo --dry-run` on `LS` and verify zero errors, no upgrade-check items, a `Reference data:` line naming the release's published set (`schema` as in `references/public-data.json`), and fresh quota readings.
 
 ## Feature Inventory
 
-Tracked in [`features.json`](features.json). Update both `features.json` and `packaging/foreign_machine_check.py` whenever a user-visible routing, quota, gate, setup, tray, or `usage-float` behavior changes (`maintain-verification-skill`).
+Tracked in [`features.json`](features.json). Update both `features.json` and `packaging/foreign_machine_check.py` whenever a user-visible routing, quota, gate, setup, or tray behavior changes (`maintain-verification-skill`).
