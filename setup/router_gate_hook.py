@@ -1309,11 +1309,10 @@ def check_own_worker_legacy(target: dict, account: str | None, accounts: dict | 
 
 
 def check_route_authority(row: dict, trigger: str) -> str | None:
-    """A native launch matched to a record that is not the user's own naming (`hard_constraint`, `dot_closed_loop`) on
-    an account outside this host's automatic routing (`host_policy_violation`). Decided on the row's constraint: a
-    `user_override` row is launch authority whatever else it carries (v0.7.0 wrote the field on those rows too)."""
+    """Refuse a native launch matched to a record carrying `host_policy_violation` (written by `record` when a
+    non-`user_override` constraint targets an account outside this host's automatic routing)."""
     violation = row.get("host_policy_violation")
-    if row.get("constraint") == "user_override" or not isinstance(violation, dict):
+    if not isinstance(violation, dict):
         return None
     return (f"[Router Gate] 拦截 ({trigger})：{violation.get('reason')}。"
             f"这条 {row.get('constraint')} 记录不是启动授权：项目规则不覆盖本机的自动派发开关。"
@@ -1403,12 +1402,22 @@ def check_account_quota_exhausted(
     )
 
 
-def is_dot_route(row: dict | None) -> bool:
-    if not isinstance(row, dict):
+LAUNCH_STAGES = ("plan", "record")
+ROUTE_BUNDLE_FIELDS = ("provider", "account", "model")
+
+
+def carries_route(row: object) -> bool:
+    """A ledger row authorizes a launch only as a plan/record row whose bundle names what to launch."""
+    if not isinstance(row, dict) or row.get("stage") not in LAUNCH_STAGES:
         return False
-    if row.get("choice") == "dot_text":
-        return True
     bundle = row.get("bundle")
+    return isinstance(bundle, dict) and all(
+        isinstance(bundle.get(k), str) and bool(bundle[k].strip()) for k in ROUTE_BUNDLE_FIELDS
+    )
+
+
+def is_dot_route(row: dict | None) -> bool:
+    bundle = row.get("bundle") if isinstance(row, dict) else None
     return isinstance(bundle, dict) and bundle.get("provider") == "dot"
 
 
@@ -1437,13 +1446,7 @@ def recent_routes(
             row = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(row, dict):
-            continue
-        stage = row.get("stage")
-        choice = row.get("choice")
-        if stage not in ("plan", "record"):
-            continue
-        if choice in (None, "", "none", "self"):
+        if not carries_route(row):
             continue
         at = parse_ts(row.get("at"))
         if at is None:
@@ -1478,35 +1481,25 @@ def correlation_fields(*sources: dict) -> dict[str, str]:
 
 
 def _merged_route_bundle(row: dict, accounts: dict | None = None) -> dict:
-    raw_bundle = row.get("bundle") or row.get("selected_bundle") or {}
-    raw_dict = raw_bundle if isinstance(raw_bundle, dict) else {}
-    choice = raw_dict.get("bundle_id") or row.get("choice")
+    raw_bundle = row.get("bundle")
+    if not isinstance(raw_bundle, dict):
+        return {}
+    bundle_id = raw_bundle.get("bundle_id")
     catalog_bundle = {}
-    if isinstance(choice, str) and choice and isinstance(accounts, dict):
-        acct, matches = resolve_target({"bundle_id": choice}, accounts)
+    if isinstance(bundle_id, str) and bundle_id and isinstance(accounts, dict):
+        acct, matches = resolve_target({"bundle_id": bundle_id}, accounts)
         if matches:
             catalog_bundle = dict(matches[0])
             if acct and not catalog_bundle.get("account"):
                 catalog_bundle["account"] = acct
-    merged = {**catalog_bundle, **raw_dict}
-    for key in ("provider", "account", "model", "effort"):
-        val = row.get(key)
-        if isinstance(val, str) and val and not merged.get(key):
-            merged[key] = val
-    return merged
+    return {**catalog_bundle, **raw_bundle}
 
 
 def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
     merged = _merged_route_bundle(row, accounts)
     if isinstance(merged.get("launch_model"), str) and merged["launch_model"].strip():
         merged = {**merged, "model": merged["launch_model"]}
-    spec = normalize_launch(merged)
-    if not spec.get("provider"):
-        if is_dot_route(row):
-            spec["provider"] = "dot"
-        elif isinstance(merged.get("account"), str) and merged["account"]:
-            spec["provider"] = merged["account"]
-    return spec
+    return normalize_launch(merged)
 
 
 # Claude's Agent/Task tool takes only a family alias and runs the host's current
@@ -1537,6 +1530,8 @@ def match_route(
     """
     candidates = []
     for row in rows:
+        if not carries_route(row):
+            continue
         task = row.get("task") if isinstance(row.get("task"), dict) else {}
         identity = correlation_fields(row, task)
         shared = context.keys() & identity.keys()
@@ -1628,7 +1623,7 @@ def check_workflow_record(rows: list[dict], identities: set[str]) -> str | None:
     if not identities:
         return workflow_deny_reason("hook 输入里没有会话 ID，无法确认授权记录属于本会话")
     for row in rows:
-        if (row.get("stage") == "record" and row.get("constraint") == "user_override"
+        if (carries_route(row) and row.get("stage") == "record" and row.get("constraint") == "user_override"
                 and row.get("trigger") == "workflow" and written_by(row, identities)):
             return None
     return workflow_deny_reason("最近 15 分钟内本会话没有 `--trigger workflow` 的 user_override 记录")
@@ -1643,7 +1638,7 @@ def check_schedule_plan(rows: list[dict], args: dict, context: dict, trigger: st
         return schedule_deny_reason(trigger, f"未指定 {'/'.join(missing)}，无法与路由比对")
     if not identities:
         return schedule_deny_reason(trigger, "hook 输入里没有会话 ID，无法确认 plan 属于本会话")
-    plans = [row for row in rows if row.get("stage") == "plan" and written_by(row, identities)]
+    plans = [row for row in rows if carries_route(row) and row.get("stage") == "plan" and written_by(row, identities)]
     if not plans:
         return schedule_deny_reason(trigger, "最近 15 分钟内本会话没有 plan 记录")
     row, diagnostic = match_route(plans, requested, context, trigger, accounts=accounts)

@@ -53,6 +53,93 @@ def tearDownModule():
     _state.cleanup()
 
 
+_UNSET = object()
+
+
+def _default_account(provider: str) -> str:
+    if provider == "pi":
+        return "codex"
+    if provider == "antigravity-resilient":
+        return "antigravity"
+    return provider
+
+
+def writer_ledger_row(
+    provider: str = "codex",
+    model: object = _UNSET,
+    effort: object = _UNSET,
+    *,
+    account: str | None = None,
+    bundle_id: str | None = None,
+    stage: str = "plan",
+    choice: str | None = None,
+    source: str | None = None,
+    constraint: str | None = None,
+    trigger: str | None = None,
+    basis: str | None = None,
+    at: dt.datetime | str | None = None,
+    session_ids: object = _UNSET,
+    parent_id: str | None = None,
+    parent_agent_id: str | None = None,
+    task_id: str | None = None,
+    host_session_id: str | None = None,
+    host_policy_violation: dict | None = None,
+    bundle_extra: dict | None = None,
+    **extra,
+) -> dict:
+    """Build a plan/record ledger row through `decision_ledger.finalize` so writer shape changes reach gate tests."""
+    decision_ledger = gate.router_module("decision_ledger")
+    if provider == "dot" and model is _UNSET:
+        resolved_model = "dot"
+        resolved_effort = None if effort is _UNSET else effort
+        bundle_id = bundle_id or "dot_text"
+        choice = choice or "dot_text"
+    else:
+        resolved_model = "gpt-6-astra" if model is _UNSET else model
+        resolved_effort = "high" if effort is _UNSET else effort
+    resolved_account = account if account is not None else _default_account(provider)
+    resolved_choice = choice if choice is not None else ("constraint" if stage == "record" else f"{provider}_choice")
+    resolved_source = source or ("constraint_record" if stage == "record" else "deterministic_allocator")
+    when = (gate.parse_ts(at) if isinstance(at, str) else at) or (T0 - dt.timedelta(minutes=1))
+    selected_bundle = {
+        "provider": provider,
+        "account": resolved_account,
+        "model": resolved_model,
+        "effort": resolved_effort,
+        **({"bundle_id": bundle_id} if bundle_id is not None else {}),
+        **(bundle_extra or {}),
+    }
+    parent = parent_id or parent_agent_id
+    result = {
+        "stage": stage,
+        "source": resolved_source,
+        "choice": resolved_choice,
+        "constraint": constraint,
+        "basis": basis,
+        "selected_bundle": selected_bundle,
+        "usage": {},
+        **({"trigger": trigger} if trigger else {}),
+        **({"parent_id": parent} if parent else {}),
+        **({"host_policy_violation": host_policy_violation} if host_policy_violation is not None else {}),
+    }
+    task_doc = {
+        **({"task_id": task_id} if task_id else {}),
+        **({"host_session_id": host_session_id} if host_session_id else {}),
+    }
+    written: list[dict] = []
+    sids = [] if session_ids is _UNSET else (list(session_ids) if session_ids else [])
+    with mock.patch.object(decision_ledger.dispatch_registry, "issue", return_value={}), \
+            mock.patch.object(decision_ledger, "own_session_ids", return_value=sids), \
+            mock.patch.object(decision_ledger, "append_ledger", side_effect=lambda row: written.append(dict(row)) or True):
+        decision_ledger.finalize(result, 0.0, task=task_doc, records=(), now=when)
+    row = written[-1]
+    if isinstance(at, str):
+        row["at"] = at
+    if extra:
+        row.update(extra)
+    return row
+
+
 class RouterGateHookTests(unittest.TestCase):
     def test_confirmed_exhaustion_blocks_without_cache_and_recovers(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'ROUTER_STATE_DIR': directory}):
@@ -291,10 +378,8 @@ process.stdout.write(JSON.stringify(out));
         inventory.start()
         self.addCleanup(inventory.stop)
 
-    def route(self, provider="codex", model="gpt-6-astra", effort="high", **identity):
-        return {"at": (T0 - dt.timedelta(minutes=1)).isoformat(), "stage": "plan",
-                "choice": provider + "_choice", "bundle": {
-                    "provider": provider, "model": model, "effort": effort}, **identity}
+    def route(self, provider="codex", model=_UNSET, effort=_UNSET, **fields):
+        return writer_ledger_row(provider, model, effort, **fields)
 
     def test_worker_questions_are_blocked_but_main_questions_and_messages_pass(self):
         worker_id = self.existing_agent()
@@ -546,7 +631,8 @@ process.stdout.write(JSON.stringify(out));
         """Plan lines carry a decision snapshot (up to ~24 KB); the tail read must still reach the route behind them."""
         with tempfile.TemporaryDirectory() as tmp:
             heavy = {"at": (T0 - dt.timedelta(minutes=1)).isoformat(), "stage": "snapshot-only", "pad": "x" * 24000}
-            route = {"at": (T0 - dt.timedelta(minutes=4)).isoformat(), "stage": "plan", "choice": "sol_high"}
+            route = self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
+                               at=(T0 - dt.timedelta(minutes=4)).isoformat())
             ledger = self.write_ledger(tmp, [route] + [dict(heavy, n=i) for i in range(30)])
             self.assertGreater(ledger.stat().st_size, 64 * 1024 * 8)
             routes = gate.recent_routes(ledger, now=T0)
@@ -554,64 +640,100 @@ process.stdout.write(JSON.stringify(out));
 
     def test_allows_subagent_when_recent_plan_or_record_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(
-                tmp,
-                [
-                    {
-                        "at": (T0 - dt.timedelta(minutes=4)).isoformat(),
-                        "stage": "plan",
-                        "choice": "sol_high",
-                        "source": "deterministic_allocator",
-                    }
-                ],
-            )
-            res = gate.evaluate_payload(
-                {"tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
-                ledger_path=ledger,
-                now=T0,
-            )
-            self.assertEqual(res, {})
+            for row in (
+                self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
+                           at=(T0 - dt.timedelta(minutes=4)).isoformat()),
+                self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="user_override",
+                           bundle_id="sol_high", at=(T0 - dt.timedelta(minutes=4)).isoformat()),
+            ):
+                ledger = self.write_ledger(tmp, [row])
+                with self.subTest(stage=row["stage"]):
+                    res = gate.evaluate_payload(
+                        {"tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
+                        ledger_path=ledger,
+                        now=T0,
+                    )
+                    self.assertEqual(res, {})
 
-            agy_res = gate.evaluate_payload(
-                {"toolCall": {"name": "invoke_subagent", "args": {"Subagents": []}}},
-                ledger_path=ledger,
-                now=T0,
-            )
-            self.assertEqual(agy_res, {"decision": "allow"})
+                    agy_res = gate.evaluate_payload(
+                        {"toolCall": {"name": "invoke_subagent", "args": {"Subagents": []}}},
+                        ledger_path=ledger,
+                        now=T0,
+                    )
+                    self.assertEqual(agy_res, {"decision": "allow"})
 
     def test_expired_or_self_only_ledger_entry_still_blocks(self):
+        """Rule: a plan/record row without a route bundle (or outside the TTL window) authorizes nothing."""
+        decision_ledger = gate.router_module("decision_ledger")
+        route_judge = gate.router_module("route_judge")
+        captured: list[dict] = []
+        with mock.patch.object(decision_ledger.dispatch_registry, "issue", return_value={}), \
+                mock.patch.object(decision_ledger, "append_ledger", side_effect=lambda r: captured.append(dict(r)) or True):
+            route_judge.scorer_unavailable_result(
+                {"objective": "x"}, {"source": "scorer_unavailable", "model": None}, 0.0)
+            scorer_unavailable_row = dict(captured[-1], at=(T0 - dt.timedelta(minutes=1)).isoformat())
+            decision_ledger.finalize(
+                {"stage": "plan", "choice": "none", "selected_bundle": None, "decision": {"action": "none"}},
+                0.0, task={"objective": "x"}, records=(), now=T0 - dt.timedelta(minutes=1))
+            no_eligible_row = captured[-1]
+
+        recent = (T0 - dt.timedelta(minutes=1)).isoformat()
+        expired = self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
+                             at=(T0 - dt.timedelta(minutes=30)).isoformat())
+        self.assertTrue(gate.carries_route(expired))
+        routeless_rows = [
+            scorer_unavailable_row,
+            no_eligible_row,
+            {"at": recent, "stage": "plan", "choice": "self"},
+            {"at": recent, "stage": "plan", "choice": "sol_high"},
+            {"at": recent, "stage": "plan", "choice": "sol_high", "bundle": None},
+            {"at": recent, "stage": "plan", "choice": "sol_high",
+             "bundle": {"account": "codex", "model": "gpt-6.1-sol"}},
+            {"at": recent, "stage": "plan", "choice": "sol_high",
+             "bundle": {"provider": "codex", "model": "gpt-6.1-sol"}},
+            {"at": recent, "stage": "plan", "choice": "sol_high",
+             "bundle": {"provider": "codex", "account": "codex", "model": "   "}},
+            {"at": recent, "stage": "plan", "choice": "sol_high",
+             "selected_bundle": {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}},
+            {"at": recent, "stage": "plan", "choice": "sol_high",
+             "provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"},
+        ]
+        for row in routeless_rows:
+            self.assertFalse(gate.carries_route(row), row)
+
         with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(
-                tmp,
-                [
-                    {
-                        "at": (T0 - dt.timedelta(minutes=30)).isoformat(),
-                        "stage": "plan",
-                        "choice": "sol_high",
-                    },
-                    {
-                        "at": (T0 - dt.timedelta(minutes=1)).isoformat(),
-                        "stage": "plan",
-                        "choice": "self",
-                    },
-                ],
-            )
+            ledger = self.write_ledger(tmp, [expired, *routeless_rows])
+            self.assertEqual(gate.recent_routes(ledger, now=T0), [])
             res = gate.evaluate_payload(
                 {"tool_name": "spawn_agent", "tool_input": {"message": "hi"}},
                 ledger_path=ledger,
                 now=T0,
             )
             self.assertEqual(res["decision"], "block")
+            # Direct match_route callers also refuse routeless rows even when requested carries no launch fields.
+            matched, _ = gate.match_route(routeless_rows, {}, {}, "tool:spawn_agent")
+            self.assertIsNone(matched)
 
     def test_rows_of_the_removed_select_and_delegate_stages_authorize_nothing(self):
-        """An old ledger may hold rows of the select and delegate stages (removed 2026-11-21): the gate skips them."""
+        """Rule: a row of any stage other than plan/record authorizes nothing, even if it carries a bundle."""
+        recent = (T0 - dt.timedelta(minutes=1)).isoformat()
+        full_bundle = {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        non_launch_rows = [
+            {"at": recent, "stage": "select", "choice": "sol_high", "bundle": full_bundle},
+            {"at": recent, "stage": "delegate", "choice": "delegate", "bundle": full_bundle},
+            {"at": recent, "stage": "split", "choice": "split", "bundle": full_bundle},
+            {"at": recent, "stage": "fallback", "action": "relaunch", "failed": full_bundle, "bundle": full_bundle},
+            {"at": recent, "stage": "override", "action": "upsert", "account": "codex", "model": "gpt-6.1-sol",
+             "bundle": full_bundle},
+        ]
+        for row in non_launch_rows:
+            self.assertFalse(gate.carries_route(row), row)
+        # Conversely, un-efforted bundles (dot_text) and record rows without bundle_id do carry a route.
+        self.assertTrue(gate.carries_route(self.route("dot")))
+        self.assertTrue(gate.carries_route(self.route("claude", "claude-opus-5-5", "high", stage="record",
+                                                      constraint="user_override", bundle_id=None)))
         with tempfile.TemporaryDirectory() as tmp:
-            recent = (T0 - dt.timedelta(minutes=1)).isoformat()
-            ledger = self.write_ledger(tmp, [
-                {"at": recent, "stage": "select", "choice": "sol_high", "source": "subscription_model_judgment",
-                 "bundle": {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}},
-                {"at": recent, "stage": "delegate", "choice": "delegate", "source": "subscription_model_judgment"},
-            ])
+            ledger = self.write_ledger(tmp, non_launch_rows)
             self.assertEqual(gate.recent_routes(ledger, now=T0), [])
             res = gate.evaluate_payload(
                 {"tool_name": "spawn_agent", "tool_input": {"message": "hi"}},
@@ -635,17 +757,12 @@ process.stdout.write(JSON.stringify(out));
                 )
                 self.assertEqual(res, {}, msg=cmd)
 
-            dot_ledger = self.write_ledger(
-                tmp,
-                [
-                    {
-                        "at": (T0 - dt.timedelta(minutes=2)).isoformat(),
-                        "stage": "plan",
-                        "choice": "dot_text",
-                        "bundle": {"provider": "dot", "account": "dot", "model": "gpt-6-astra", "bundle_id": "dot_text"},
-                    }
-                ],
-            )
+            dot_row = self.route("dot", at=(T0 - dt.timedelta(minutes=2)).isoformat())
+            self.assertNotIn("effort", dot_row["bundle"])
+            self.assertTrue(gate.is_dot_route(dot_row))
+            self.assertFalse(gate.is_dot_route({"stage": "plan", "choice": "dot_text"}))
+            self.assertFalse(gate.is_dot_route(self.route("codex", "gpt-6-astra", "high", choice="dot_text")))
+            dot_ledger = self.write_ledger(tmp, [dot_row])
             # Allowing run_dot_task.py when dot_text is selected
             ok_dot = gate.evaluate_payload(
                 {
@@ -705,14 +822,7 @@ process.stdout.write(JSON.stringify(out));
                 )
                 claude_ledger = self.write_ledger(
                     tmp,
-                    [
-                        {
-                            "at": (T0 - dt.timedelta(minutes=1)).isoformat(),
-                            "stage": "plan",
-                            "choice": choice_name,
-                            "bundle": {"provider": account_name, "account": account_name, "model": "claude-sonnet-5-5"},
-                        }
-                    ],
+                    [self.route(account_name, "claude-sonnet-5-5", "high", account=account_name, choice=choice_name)],
                 )
                 # 1. Blocks new secondary Claude create_agent / CLI when five_hour is below its floor even if ledger matches
                 res_create = gate.evaluate_payload(
@@ -780,14 +890,7 @@ process.stdout.write(JSON.stringify(out));
                 )
                 other_ledger = self.write_ledger(
                     tmp,
-                    [
-                        {
-                            "at": (T0 - dt.timedelta(minutes=1)).isoformat(),
-                            "stage": "plan",
-                            "choice": "pi_astra_high",
-                            "bundle": {"provider": "pi", "account": "codex", "model": "gpt-6-astra"},
-                        }
-                    ],
+                    [self.route("pi", "gpt-6-astra", "high", choice="pi_astra_high", bundle_id="pi_astra_high")],
                 )
                 res_mismatch = gate.evaluate_payload(
                     {
@@ -1035,8 +1138,8 @@ process.stdout.write(JSON.stringify(out));
             f"sonnet55_{e}": {"disabled": True} for e in ("low", "medium", "high", "xhigh", "max")}}})
         with mock.patch.object(gate, "load_dispatch_accounts", side_effect=claude_only):
             for constraint, refused in (("user_override", False), ("hard_constraint", True), (None, True)):
-                row = dict(self.route("claude", "claude-sonnet-5-5", "high"),
-                           **({"stage": "record", "constraint": constraint} if constraint else {}))
+                row = self.route("claude", "claude-sonnet-5-5", "high",
+                                 **({"stage": "record", "constraint": constraint} if constraint else {}))
                 ledger = self.write_ledger(str(self.state), [row])
                 with self.subTest(launch="native", constraint=constraint):
                     result = gate.evaluate_payload(native, ledger_path=ledger, now=T0)
@@ -1076,9 +1179,8 @@ process.stdout.write(JSON.stringify(out));
             ({}, None, False), (ambiguous, None, False),    # not recorded / not one account: unresolved, as before
         )
         def opus_row(constraint):
-            row = self.route("claude", "claude-opus-5-5", "high")
-            row["bundle"]["bundle_id"] = "opus55_high"     # the shape decision_ledger writes
-            return dict(row, **({"stage": "record", "constraint": constraint} if constraint else {}))
+            return self.route("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                              **({"stage": "record", "constraint": constraint} if constraint else {}))
 
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(own_home)}):
             for rows, constraint, refused in cases:
@@ -1167,25 +1269,38 @@ process.stdout.write(JSON.stringify(out));
                         self.assertIn("old meter fields remain", result["reason"])
 
     def test_a_native_launch_on_a_refused_record_is_blocked_and_a_named_one_passes(self):
-        # A record that its router refused as launch authority (a project rule on an account out of automatic routing,
-        # `host_policy_violation`) does not authorize a native launch; the same record as the user's own naming does.
+        # Gate contract (parent-address-gate.md): `record` writes `host_policy_violation` only on constraints other
+        # than `user_override` when the account is out of automatic routing; `check_route_authority` decides on that
+        # `host_policy_violation` fact alone, so a project rule carrying it is blocked and a `user_override` row from
+        # the writer (which never carries it) is launch authority.
         launch = {"tool_name": "Agent", "tool_input": {"subagent_type": "general-purpose", "prompt": "work",
                                                          "model": "claude-sonnet-5-5"}}
-        violation = {"account": "claude", "dispatch_allowed": False, "policy_path": "host-policy.json",
-                     "reason": "account claude is out of automatic routing on this host"}
-        # Decided on the row's constraint: v0.7.0 wrote host_policy_violation on user_override rows too, and those rows
-        # are the user's naming, so they pass with the field present.
-        for constraint, carries, refused in (("hard_constraint", True, True), ("dot_closed_loop", True, True),
-                                             ("user_override", False, False), ("user_override", True, False)):
-            row = dict(self.route("claude", "claude-sonnet-5-5", "high"), stage="record", constraint=constraint,
-                       **({"host_policy_violation": violation} if carries else {}))
-            ledger = self.write_ledger(str(self.state), [row])
-            with self.subTest(constraint=constraint, carries=carries):
-                result = gate.evaluate_payload(launch, ledger_path=ledger, now=T0)
+        self.write_settings(allowed=["codex"])  # claude is out of automatic routing on this host
+        route_judge = gate.router_module("route_judge")
+        decision_ledger = gate.router_module("decision_ledger")
+        env_vars = gate.router_module("env_vars")
+        ledger = self.state / "ledger.jsonl"
+        for constraint, refused in (("hard_constraint", True), ("dot_closed_loop", True), ("user_override", False)):
+            ledger.unlink(missing_ok=True)
+            args = route_judge.build_parser().parse_args([
+                "record", "--constraint", constraint, "--basis", "user or project rule quote",
+                "--provider", "claude", "--account", "claude", "--model", "claude-sonnet-5-5", "--effort", "high",
+                "--no-score", "--hours", "0.5",
+            ])
+            with mock.patch.object(env_vars, "user_env", side_effect=os.environ.get):
+                route_judge.record_constraint(args)
+            written = decision_ledger.read_ledger(ledger)[-1]
+            self.assertEqual("host_policy_violation" in written, refused, written)
+            with self.subTest(constraint=constraint):
+                result = gate.evaluate_payload(launch, ledger_path=ledger, now=dt.datetime.now(UTC))
                 self.assertEqual("reason" in result, refused, result)
                 if refused:
                     self.assertIn("out of automatic routing", result["reason"])
                     self.assertIn("--constraint user_override", result["reason"])
+        # Fact-only check: `check_route_authority` does not exempt `constraint == "user_override"` if a violation dict is present.
+        synthetic = dict(self.route("claude", "claude-sonnet-5-5", "high", stage="record", constraint="user_override"),
+                         host_policy_violation={"reason": "account claude is out of automatic routing on this host"})
+        self.assertIsNotNone(gate.check_route_authority(synthetic, "tool:Agent"))
 
     def test_running_owner_control_exempts_disabled_and_context_rotation_gates(self):
         wid = self.existing_agent()
@@ -1435,20 +1550,39 @@ process.stdout.write(JSON.stringify(out));
     def test_route_spec_resolves_account_from_ledger_or_bundle_catalog_without_name_inference(self):
         self.assertFalse(hasattr(gate, "secondary_claude_provider"))
         accounts = gate.load_dispatch_accounts()
-        # Choice resolved from catalog when ledger row carries only choice
-        spec = gate.route_spec({"choice": "lab_sonnet55_high"}, accounts)
+        # Real writer row resolves launch fields and catalog `launch_model` via `bundle.bundle_id`
+        spec = gate.route_spec(
+            self.route("claude-lab", "claude-sonnet-5-5", "high", choice="lab_sonnet55_high", bundle_id="lab_sonnet55_high"),
+            accounts,
+        )
         self.assertEqual(spec["provider"], "claude-lab")
+        self.assertEqual(spec["account"], "claude-lab")
         self.assertEqual(spec["model"], "claude-sonnet-5-5")
         self.assertEqual(spec["effort"], "high")
+        wire_accounts = json.loads(json.dumps(accounts))
+        wire_accounts["accounts"]["codex"]["bundles"]["wire_only"] = {
+            "provider": "codex", "model": "canonical-row", "launch_model": "vendor/wire-row", "effort": "high",
+        }
+        wire_spec = gate.route_spec(
+            self.route("codex", "canonical-row", "high", choice="other_choice", bundle_id="wire_only"),
+            wire_accounts,
+        )
+        self.assertEqual(wire_spec["model"], "vendor/wire-row")
         # Arbitrary account resolved from ledger bundle without claude-2 suffix guessing
         custom = gate.route_spec(
-            {"choice": "custom_worker", "bundle": {"account": "team-east", "model": "claude-sonnet-5-5", "effort": "high"}},
+            self.route("team-east", "claude-sonnet-5-5", "high", account="team-east", choice="custom_worker"),
             accounts,
         )
         self.assertEqual(custom["provider"], "team-east")
-        # Unrecognized choice with no bundle or catalog match does not invent claude-2
-        unknown = gate.route_spec({"choice": "sonnet55_high_2"}, accounts)
-        self.assertNotIn("provider", unknown)
+        self.assertEqual(custom["account"], "team-east")
+        # Shapes no writer produces (`choice` without `bundle`, `selected_bundle`, top-level fields) resolve nothing
+        for unproduced in (
+            {"choice": "lab_sonnet55_high"},
+            {"choice": "sonnet55_high_2"},
+            {"stage": "plan", "selected_bundle": {"provider": "claude-lab", "account": "claude-lab", "model": "claude-sonnet-5-5"}},
+            {"stage": "plan", "provider": "claude-lab", "account": "claude-lab", "model": "claude-sonnet-5-5", "effort": "high"},
+        ):
+            self.assertEqual(gate.route_spec(unproduced, accounts), {}, unproduced)
 
     def test_quota_gate_counts_other_inflight_reservations_like_routing(self):
         # Antigravity gemini-weekly (the shipped capacity of the fixture account's plan) at 93% used has 7% left (> 5%
@@ -1865,10 +1999,8 @@ process.stdout.write(JSON.stringify(out));
 
     def test_recorded_project_review_sub_agent_stays_exempt_under_a_prefix(self):
         """`agentcompass record` for a project review sub-agent authorizes its native Agent launch."""
-        record = {"at": (T0 - dt.timedelta(minutes=2)).isoformat(), "stage": "record", "choice": "constraint",
-                  "source": "constraint_record", "constraint": "user_override",
-                  "selected_bundle": {"provider": "claude", "account": "claude", "model": "claude-opus-5-5",
-                                      "effort": "high"}}
+        record = self.route("claude", "claude-opus-5-5", "high", stage="record", constraint="user_override",
+                            at=(T0 - dt.timedelta(minutes=2)).isoformat())
         ledger = self.write_ledger(str(self.state), [record])
         args = {"subagent_type": "code-reviewer", "prompt": "review", "model": "opus"}
         for name in ("Agent", "mcp__magpie__Agent"):
@@ -1912,22 +2044,29 @@ process.stdout.write(JSON.stringify(out));
 
     def workflow_record(self, **fields):
         """A record row as route_judge writes it: parent_id/host_session_id are the parent link, session_ids the writer."""
-        return {"at": (T0 - dt.timedelta(minutes=2)).isoformat(), "stage": "record", "choice": "constraint",
-                "source": "constraint_record", "constraint": "user_override", "trigger": "workflow",
-                "parent_id": "paseo-parent", "host_session_id": "parent-claude-session",
-                "session_ids": ["claude-session", "paseo-agent"],
-                "selected_bundle": {"provider": "claude", "account": "claude", "model": "claude-opus-5-5",
-                                    "effort": "high"}, **fields}
+        defaults = dict(
+            provider="claude", model="claude-opus-5-5", effort="high",
+            stage="record", constraint="user_override", trigger="workflow",
+            at=(T0 - dt.timedelta(minutes=2)).isoformat(),
+            parent_id="paseo-parent", host_session_id="parent-claude-session",
+            session_ids=["claude-session", "paseo-agent"],
+        )
+        defaults.update(fields)
+        return writer_ledger_row(**defaults)
 
     def session_plan(self, provider="codex", model="gpt-6-astra", effort="high", **fields):
-        return dict(self.route(provider, model, effort), session_ids=["claude-session"], **fields)
+        defaults = dict(session_ids=["claude-session"])
+        defaults.update(fields)
+        return writer_ledger_row(provider, model, effort, **defaults)
 
     def test_workflow_needs_this_sessions_workflow_record(self):
         call = {"tool_input": {"script": "export const meta = {name: 'x', description: 'y'}"}}
         unrelated_review = self.workflow_record(trigger=None)          # e.g. a code-reviewer record
+        routeless_workflow = dict(self.workflow_record(), bundle=None)
         cases = (
             ("no ledger", [], {"session_id": "claude-session"}, "--trigger workflow"),
             ("unrelated record", [unrelated_review], {"session_id": "claude-session"}, "--trigger workflow"),
+            ("routeless workflow record", [routeless_workflow], {"session_id": "claude-session"}, "--trigger workflow"),
             ("worker plan", [self.session_plan("claude", "claude-opus-5-5")],
              {"session_id": "claude-session"}, "--trigger workflow"),
             ("hard constraint", [self.workflow_record(constraint="hard_constraint")],
@@ -1956,6 +2095,8 @@ process.stdout.write(JSON.stringify(out));
                         self.assertNotIn("roll --brief", result["reason"].split("不要调用")[0])
                     else:
                         self.assertEqual(result, {})
+        # Direct check_workflow_record also rejects a workflow record lacking a route bundle.
+        self.assertIsNotNone(gate.check_workflow_record([routeless_workflow], {"claude-session"}))
         # Under Paseo the calling agent's own ID identifies the session too; the parent's ID does not.
         ledger = self.write_ledger(str(self.state), [self.workflow_record()])
         for agent_id, allowed in (("paseo-agent", True), ("paseo-parent", False)):
@@ -1965,12 +2106,15 @@ process.stdout.write(JSON.stringify(out));
 
     def test_schedule_needs_this_sessions_recent_plan_with_its_provider_and_model(self):
         plan = self.session_plan()
+        routeless_plan = dict(plan, bundle=None)
         review_record = self.workflow_record(trigger=None)
         same_as_plan_record = dict(plan, stage="record", choice="constraint", constraint="user_override")
         mcp_cases = (
             ("no provider", [plan], {"prompt": "x", "cron": "7 * * * *"}, "未指定 provider/model"),
             ("provider only", [plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex"}, "未指定 model"),
             ("no plan", [review_record], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"},
+             "没有 plan 记录"),
+            ("routeless plan", [routeless_plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"},
              "没有 plan 记录"),
             ("record is not a plan", [same_as_plan_record],
              {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}, "没有 plan 记录"),
@@ -1995,6 +2139,8 @@ process.stdout.write(JSON.stringify(out));
                         self.assertNotIn("roll --brief", result["reason"])
                     else:
                         self.assertEqual(result, {})
+        self.assertIn("没有 plan 记录", gate.check_schedule_plan(
+            [routeless_plan], {"provider": "codex/gpt-6-astra"}, {}, "tool:create_schedule", None, {"claude-session"}) or "")
         ledger = self.write_ledger(str(self.state), [plan])
         with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": ""}):
             anonymous = gate.evaluate_payload({"tool_name": "create_schedule", "tool_input": {
@@ -2702,10 +2848,9 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
             ("plan", bid, {}),
             ("record", "constraint", {"constraint": "user_override"}),
         ):
-            ledger_path.write_text(json.dumps({
-                "at": (T0 - dt.timedelta(minutes=1)).isoformat(), "stage": stage, "choice": choice, **extra,
-                "bundle": {"provider": "codex", "account": "codex", "model": row_model, "effort": "high", "bundle_id": bid},
-            }) + "\n", encoding="utf-8")
+            ledger_path.write_text(json.dumps(writer_ledger_row(
+                "codex", row_model, "high", stage=stage, choice=choice, bundle_id=bid, **extra,
+            )) + "\n", encoding="utf-8")
             ok = gate.evaluate_payload({
                 "tool_name": "delegate_task",
                 "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
@@ -2734,11 +2879,9 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
         },
     }
     monkeypatch.setattr(gate, "load_dispatch_accounts", lambda: m12c_accounts)
-    ledger_path.write_text(json.dumps({
-        "at": (T0 - dt.timedelta(minutes=1)).isoformat(), "stage": "plan", "choice": "b_va_high@medium",
-        "bundle": {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured",
-                   "launch_model": "vendor-a/novel-unmeasured", "effort": "medium"},
-    }) + "\n", encoding="utf-8")
+    ledger_path.write_text(json.dumps(writer_ledger_row(
+        "codex", "vendor-a/novel-unmeasured", "medium", choice="b_va_high@medium",
+    )) + "\n", encoding="utf-8")
     res_m12c = gate.evaluate_payload({
         "tool_name": "delegate_task",
         "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "medium"}},
@@ -2762,11 +2905,9 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
         ("record", {"constraint": "hard_constraint"}, False),
         ("record", {"constraint": "user_override"}, True),
     ):
-        ledger_path.write_text(json.dumps({
-            "at": (T0 - dt.timedelta(minutes=1)).isoformat(), "stage": stage, "choice": "b_va_high", **extra,
-            "bundle": {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured",
-                       "launch_model": "vendor-a/novel-unmeasured", "effort": "high"},
-        }) + "\n", encoding="utf-8")
+        ledger_path.write_text(json.dumps(writer_ledger_row(
+            "codex", "vendor-a/novel-unmeasured", "high", stage=stage, choice="b_va_high", bundle_id="b_va_high", **extra,
+        )) + "\n", encoding="utf-8")
         verdict = gate.evaluate_payload({
             "tool_name": "delegate_task",
             "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "high"}},
