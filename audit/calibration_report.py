@@ -45,7 +45,7 @@ ENDINGS = ("completed", "failed", "relaunched", "canceled", "other_terminal", "o
 # An external runner's dispatch (Dot, Grok Bot, ChatGPT Web) whose end its runner never reported: not an ending.
 END_UNKNOWN_STATES = ("external_launched",)
 USER_PIN = "user_override"
-NON_DISPATCH_CHOICES = (None, "none", "self", "split")   # a decision that deliberately starts no worker
+NON_DISPATCH_CHOICES = (None, "none", "split")   # a decision that deliberately starts no worker
 DECISION_STAGES = ("plan", "record")
 
 

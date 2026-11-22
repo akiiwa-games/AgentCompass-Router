@@ -1321,8 +1321,8 @@ def status_of(result, code):
         return 'pending'
     if mode == 'scorer_unavailable' or result.get('error') == 'scorer_unavailable':
         return 'blocked'
-    if mode in ('self', 'split'):
-        return mode
+    if mode == 'split':
+        return 'split'
     if mode == 'native' and code == 0:
         return 'native'
     if mode == 'dry_run':
@@ -1358,8 +1358,7 @@ def compact(result, status, detail_path):
     worker = result.get('worker') or {}
     bundle = (result.get('route') or {}).get('bundle') or {}
     argv = worker.get('continuation_argv') or result.get('continuation_argv') or result.get('next_argv')
-    nxt = {'self': 'Do this task yourself in the current session; do not spawn a subagent.',
-           'dry_run': 'Nothing was recorded or launched.'}.get(status) or result.get('next')
+    nxt = 'Nothing was recorded or launched.' if status == 'dry_run' else result.get('next')
     if status == 'launched':
         nxt = launched_next(result, worker, argv)
     elif status == 'pending' and argv:
@@ -1691,9 +1690,6 @@ def _run(args, judge):
                     next='Dry run: nothing recorded or launched.'), 0
     bundle = decision.get('selected_bundle') or {}
     provider = bundle.get('provider')
-    if decision.get('choice') == 'self':
-        return dict(out, launched=False, dispatch_mode='self', caller_action='execute_self',
-                    next='Execute this task directly in the current session; do not spawn a subagent.'), 2
     if decision.get('choice') in (None, 'none') or not bundle:
         return dict(out, launched=False, dispatch_mode='none', caller_action='execute_self_or_ask_user',
                     next=decision.get('next') or none_next(decision)), 2

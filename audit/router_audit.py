@@ -383,7 +383,7 @@ def find_unrouted_spawns(spawns: list[dict], rows: list[dict], window_seconds: i
     valid_routes = [
         r["at"] for r in rows
         if r.get("stage") in DECISION_STAGES
-        and r.get("choice") not in (None, "", "none", "self")
+        and r.get("choice") not in (None, "", "none")
         and r.get("at") is not None
     ]
     unrouted = []

@@ -570,7 +570,7 @@ class Chain:
         for _ in range(len(excluded) + 64):
             decision, _ = self.judge.plan_stage({'task': self.task, 'unavailable': sorted(excluded)}, args)
             bundle = decision.get('selected_bundle') or {}
-            if (decision.get('error') or decision.get('choice') in (None, 'none', 'self', 'split') or not bundle
+            if (decision.get('error') or decision.get('choice') in (None, 'none', 'split') or not bundle
                     or (decision.get('decision') or {}).get('needs_user_decision')
                     or not decision.get('decision_id')):
                 return None

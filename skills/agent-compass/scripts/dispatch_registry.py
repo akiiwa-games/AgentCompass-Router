@@ -271,7 +271,7 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
     plan; only a user_override or explicit resume record keeps them."""
     now = now or utcnow()
     bundle = dict(result.get('selected_bundle') or {})
-    if not bundle or result.get('choice') in (None, 'none', 'self'):
+    if not bundle or result.get('choice') in (None, 'none'):
         return {}
     bundle.setdefault('bundle_id', result.get('choice'))
     import account_fleet

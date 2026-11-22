@@ -2035,7 +2035,7 @@ class RollTests(unittest.TestCase):
         line = '第{}行：修复“解析器”\t\\路径 `code` $HOME %PATH% "quote" \'x\' 🙂\r\n'
         text = ''.join(line.format(i) for i in range(4000)) + '  尾部空白  \n\n'
         self.assertGreater(len(text), 100_000)  # far beyond any command-line limit
-        decision = dict(stage='plan', choice='self', decision={'action': 'start'})
+        decision = dict(stage='plan', choice='none', selected_bundle={}, decision={'action': 'none'})
         stdin = type('S', (), {'buffer': io.BytesIO(text.encode('utf-8'))})()
         with patch.object(roll_module.sys, 'stdin', stdin):
             (result, code), seen = self.roll(decision, brief=None, task='-', hours=None, task_id=None)
@@ -2056,19 +2056,19 @@ class RollTests(unittest.TestCase):
         self.assertEqual(roll_module.read_task_text(argparse.Namespace(brief=brief, task=None)), text)
 
     def test_verbose_keeps_the_full_result(self):
-        decision = dict(stage='plan', choice='self', decision={'action': 'start'})
+        decision = dict(stage='plan', choice='none', selected_bundle={}, decision={'action': 'none'})
         (result, code), seen = self.roll(decision, hours=2)
-        self.assertEqual((code, result['status'], result['dispatch_mode'], seen['task']['expected_hours']), (2, 'self', 'self', 2.0))
+        self.assertEqual((code, result['status'], result['dispatch_mode'], seen['task']['expected_hours']), (2, 'blocked', 'none', 2.0))
         self.assertNotIn('assumptions', result)
 
     def test_a_brief_gets_the_same_short_result_as_inline_text(self):
-        decision = dict(stage='plan', choice='self', decision={'action': 'start'})
+        decision = dict(stage='plan', choice='none', selected_bundle={}, decision={'action': 'none'})
         with patch.object(roll_module_for_tests(), 'RESULTS_DIR', self.root / 'results'):
             (result, code), _ = self.roll(decision, verbose=False)
-        self.assertEqual((code, result['status']), (2, 'self'))
+        self.assertEqual((code, result['status']), (2, 'blocked'))
         self.assertEqual(sorted(result), ['details', 'next_action', 'status'])
         self.assertTrue(Path(result['details']).is_file())
-        self.assertEqual(json.loads(Path(result['details']).read_text(encoding='utf-8'))['dispatch_mode'], 'self')
+        self.assertEqual(json.loads(Path(result['details']).read_text(encoding='utf-8'))['dispatch_mode'], 'none')
 
     def test_status_never_reports_uncertain_delivery_as_not_launched(self):
         import roll as roll_module
@@ -2123,7 +2123,7 @@ class RollTests(unittest.TestCase):
 
         def plan_stage(document, _):
             order.append(document['task']['objective'])
-            return dict(stage='plan', choice='self', selected_bundle={}, decision={'action': 'self'}), 0
+            return dict(stage='plan', choice='none', selected_bundle={}, decision={'action': 'none'}), 0
         judge = type('Judge', (), {'plan_stage': staticmethod(plan_stage)})
         self.enterContext(patch.object(scorer_client, 'prefetch_scores', side_effect=lambda tasks, timeout: prefetched.append(
             [t['objective'] for t in tasks])))
@@ -2136,7 +2136,7 @@ class RollTests(unittest.TestCase):
             result, code = roll.run_batch(args, judge)
             self.assertEqual(prefetched, [['# Line 1', '# Line 2']])
             self.assertEqual(order, ['# Line 1', '# Line 2'])
-            self.assertEqual((result['status'], [r['status'] for r in result['results']], code), ('batch', ['self', 'self'], 2))
+            self.assertEqual((result['status'], [r['status'] for r in result['results']], code), ('batch', ['blocked', 'blocked'], 2))
             with self.assertRaisesRegex(ValueError, '--hours'):
                 roll.run_batch(argparse.Namespace(**{**vars(args), 'hours': 2.0}), judge)
             with self.assertRaisesRegex(ValueError, 'twice'):
@@ -2513,18 +2513,6 @@ class RollTests(unittest.TestCase):
         self.assertEqual((std_res['launched'], std_code), (True, 0))
         self.assertEqual(std_res['dispatch_mode'], 'cli')
         self.assertEqual(std_res['parent_id'], 'agy-conv-123')
-
-        self_decision = dict(stage='plan', choice='self', selected_bundle={}, decision={'action': 'self'})
-        (self_res, self_code), _ = self.roll(
-            self_decision,
-            parent='',
-            parent_id=None,
-            env={'ANTIGRAVITY_CONVERSATION_ID': 'agy-conv-123'},
-        )
-        self.assertEqual((self_res['launched'], self_code), (False, 2))
-        self.assertEqual(self_res['dispatch_mode'], 'self')
-        self.assertEqual(self_res['caller_action'], 'execute_self')
-        self.assertEqual(self_res['parent_id'], 'agy-conv-123')
 
     def test_dot_route_hands_the_brief_and_files_to_the_dot_runner(self):
         import roll

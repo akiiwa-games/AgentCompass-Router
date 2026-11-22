@@ -212,7 +212,7 @@ def g_setup_and_uninstall():
     shown = parse(agentcompass("usage", "--show", "--accounts", "codex", "claude").stdout)
     check("setup's usage collection read both accounts from the local fixture", all(((shown.get("accounts") or {}).get(a) or {}).get("status") == "fresh" for a in ("codex", "claude")), shown)
     plan = agentcompass("roll", "--task", TASK, "--parent-host", "paseo", "--parent-id", PARENT, "--dry-run", "--score")   # a dry run classifies only with --score
-    check("a dry-run roll classifies and routes without launching", plan.returncode == 0 and (parse(plan.stdout).get("status") in ("dry_run", "self", "launched", "native", None)) and "Traceback" not in plan.stderr, plan.stdout[:300] + plan.stderr[-200:])
+    check("a dry-run roll classifies and routes without launching", plan.returncode == 0 and (parse(plan.stdout).get("status") in ("dry_run", "launched", "native", None)) and "Traceback" not in plan.stderr, plan.stdout[:300] + plan.stderr[-200:])
     undone = agentcompass("uninstall", "--yes")
     check("uninstall exits 0", undone.returncode == 0, (undone.stdout + undone.stderr)[-400:])
     final = snapshot(HOME, skip=("agent compass test", "AppData", "NTUSER.DAT"))

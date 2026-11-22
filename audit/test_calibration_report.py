@@ -215,7 +215,7 @@ class CalibrationReportTests(unittest.TestCase):
     def test_a_plan_whose_dispatch_lands_after_the_range_end_is_not_lost(self):
         ledger = [{"stage": "plan", "decision_id": "late", "choice": "m1", "at": "2026-11-10T23:59:00+00:00"},
                   {"stage": "plan", "decision_id": "lost", "choice": "m1", "at": STAMP},
-                  {"stage": "plan", "decision_id": "mine", "choice": "self", "at": STAMP},
+                  {"stage": "plan", "decision_id": "none_left", "choice": "none", "at": STAMP},
                   {"stage": "plan", "decision_id": "split", "choice": "split", "at": STAMP}]
         write_state(self.root, [dispatch(1, decision="late", created="2026-11-11T00:00:30+00:00")], ledger=ledger)
         cov = build(self.root)["coverage"]

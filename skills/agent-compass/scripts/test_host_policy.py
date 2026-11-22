@@ -231,7 +231,6 @@ class HostPolicyTests(unittest.TestCase):
             'split': {'stage': 'split', 'choice': 'split'},
             'select': {'stage': 'select', 'choice': 'opus55_high', 'bundle': bundle},      # a stage removed 2026-11-21
             'scorer_unavailable': {'stage': 'plan', 'choice': 'none', 'error': 'scorer_unavailable'},
-            'self': {'stage': 'plan', 'choice': 'self', 'bundle': bundle},
             'override': {'stage': 'override', 'action': 'upsert', 'account': 'claude', 'model': 'claude-opus-5-5'},
             'refused': {'stage': 'record', 'choice': 'opus55_high', 'bundle': bundle,
                         'host_policy_violation': {'dispatch_allowed': False}},

@@ -46,7 +46,7 @@ def automatic_routing_marker(entry):
     computed for it (launched at or over the limit), never from a second reading. Only a row that carries a launch has
     one: a plan/record row with a chosen bundle that its writer did not refuse (`host_policy_violation`)."""
     bundle = entry.get('bundle')
-    if (entry.get('stage') not in LAUNCH_STAGES or entry.get('choice') in (None, 'none', 'self', 'split')
+    if (entry.get('stage') not in LAUNCH_STAGES or entry.get('choice') in (None, 'none', 'split')
             or entry.get('host_policy_violation') or not isinstance(bundle, dict) or not bundle.get('account')):
         return None
     import account_fleet
