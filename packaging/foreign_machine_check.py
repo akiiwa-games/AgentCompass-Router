@@ -884,8 +884,7 @@ def write_ledger(choice, bundle, parent_id="parent-1", extra_rows=()):
         "stage": "record",
         "choice": choice,
         "parent_agent_id": parent_id,
-        "bundle": bundle,
-        "selected_bundle": bundle,
+        "bundle": {{**bundle, "bundle_id": choice}},
     }}
     lines = [json.dumps(r) for r in extra_rows] + [json.dumps(row)]
     ledger_path.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
