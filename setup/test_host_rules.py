@@ -62,8 +62,23 @@ class HostRulesTests(unittest.TestCase):
             for machine_path in (host_rules.DISPATCH_RULES, host_rules.SKILL_DIR, host_rules.agentcompass_command()):
                 text = text.replace(machine_path, '@')
             return len(text)
-        self.assertLess(text_length('shared'), 2600)
+        # The shared default quotes the ownership rule in full: it is needed before the skill is loaded.
+        self.assertLess(text_length('shared'), 3000)
         self.assertLess(text_length('daemon-append'), 1000)
+
+    def test_the_ownership_rule_has_one_copy_and_one_meaning_of_parallel(self):
+        # One copy: the skill's first paragraph, quoted by the shared default (SKILL.md, Execution ownership).
+        skill = (Path(host_rules.SKILL_DIR) / 'SKILL.md').read_text(encoding='utf-8')
+        self.assertEqual(skill.count(host_rules.OWNERSHIP_RULE), 1)
+        self.assertIn(host_rules.OWNERSHIP_RULE, host_rules.load('shared', self.home)[0])
+        self.assertNotIn('\n', host_rules.OWNERSHIP_RULE)
+        # The classifier's split check and the rule mean the same thing by parallel units.
+        import sys
+        sys.path.insert(0, str(Path(host_rules.SKILL_DIR) / 'scripts'))
+        import task_intake
+        phrase = 'in parallel without waiting on'
+        self.assertIn(phrase, host_rules.OWNERSHIP_RULE)
+        self.assertIn(phrase, task_intake.TASK_COUNT_QUESTION)
 
     def test_a_personal_dispatch_file_is_named_not_copied(self):
         personal = host_rules.personal_dispatch_path(self.home)

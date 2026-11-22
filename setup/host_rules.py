@@ -60,10 +60,11 @@ ROUTER_HOOK_SCRIPT = router_hook_reference()
 
 OVERLAY_FILES = {"shared": "shared.md", "codex": "codex.md", "daemon-append": "daemon-append.md"}
 
-# Keep the installed skill and generated host prompts on the same ownership policy.
-EXECUTION_POLICY = (REPO / "skills/agent-compass/SKILL.md").read_text(encoding="utf-8").split(
+# The ownership rule has one copy: the first paragraph of the skill's "Execution ownership" section. The rules written
+# to every host quote it from there.
+OWNERSHIP_RULE = (REPO / "skills/agent-compass/SKILL.md").read_text(encoding="utf-8").split(
     "## Execution ownership\n", 1
-)[1].split("\n## ", 1)[0].strip()
+)[1].split("\n## ", 1)[0].strip().split("\n\n", 1)[0]
 
 LARGE_DATA_POLICY = """For large CSV, JSON, tables or logs, filter columns/rows and compute summaries in the tool invocation before returning output to this conversation. Keep complete research artifacts on disk and report their paths; do not silently truncate or discard source data or persisted user research.
 """
@@ -86,7 +87,7 @@ Cross-project rules for agents that can delegate work through the AgentCompass r
 
 ## 2. Delegation goes through AgentCompass
 
-1. No default owner: judge each job by its size and structure. Do small or serial work yourself. When a large job has independent parts that parallel workers would finish clearly sooner, delegate those parts. Delegate also for an isolated large context, a specialist capability or quota offloading. A delegated worker (`AGENTCOMPASS_WORKER=1` or a `Parent session agent ID:` contract) does its assignment without delegating again. Follow-up or related work goes back to the worker that already holds its context, not to a fresh worker (dispatch rules, section 3).
+1. """ + OWNERSHIP_RULE + """ A delegated worker (`AGENTCOMPASS_WORKER=1` or a `Parent session agent ID:` contract) does its assignment without delegating again. Follow-up or related work goes back to the worker that already holds its context, not to a fresh worker (dispatch rules, section 3).
 2. Dispatch only with `@@AGENTCOMPASS@@ roll --task "<assignment>"` (or `--brief <file>`, one brief per independent task). Never call `create_agent`, `Agent`/`Task`, `spawn_agent` or `invoke_subagent` directly. A host's built-in tool agent is tool use, not a dispatch: in Claude Code `web-fetch` (reads a web page), `statusline-setup` (what `/statusline` runs) and `claude-code-guide` (answers questions about Claude Code). Codex and Antigravity have none; `Explore`, `Plan`, `general-purpose` and every other agent type are dispatches.
 3. Read the result's `status` and do exactly `next_action` (if awaiting a notification, end your turn; never poll in a shell).
 4. Never pick a model or effort yourself; the router does.
@@ -101,7 +102,7 @@ Cross-project rules for agents that can delegate work through the AgentCompass r
 DEFAULT_CODEX = DEFAULT_SHARED
 
 DEFAULT_DAEMON_APPEND = (
-    "AgentCompass: judge each job by its size and structure: small or serial work you do yourself, the independent parts of a large job you delegate in parallel; a delegated worker (AGENTCOMPASS_WORKER=1 or a Parent session agent ID contract) does not delegate again. "
+    "AgentCompass: delegate a unit of work when it does not depend on the conversation and delegating pays for the handoff, and do the rest yourself; a delegated worker (AGENTCOMPASS_WORKER=1 or a Parent session agent ID contract) does not delegate again. "
     "Dispatch only with `@@AGENTCOMPASS@@ roll --task \"<assignment>\"`, never create_agent / Agent / spawn_agent / invoke_subagent directly "
     "(Claude Code's built-in tool agents web-fetch, statusline-setup and claude-code-guide are tool use, not dispatch); "
     "read the result's status and do exactly next_action (if awaiting a notification, end your turn; never poll in a shell); "
