@@ -1,5 +1,6 @@
 """Hermetic router fixtures shared by contract tests and their subprocesses."""
 from contextlib import ExitStack
+import copy
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -57,6 +58,16 @@ def usage_windows(now, accounts):
         {'id': wid, 'remaining_pct_before_reset': rem, 'observed_remaining_pct': rem,
          'seconds_until_reset': hours * 3600, 'resets_at': (now + timedelta(hours=hours)).isoformat()}
         for wid, rem, hours in rows]} for name, rows in accounts.items()}}
+
+
+def fleet_with_derived_bundles(accounts, derived):
+    """Copy of `accounts` with the bundles from `auto_bundles.derive` added; manual bundles are never replaced."""
+    merged = copy.deepcopy(accounts)
+    for account, rows in (derived.get('bundles') or {}).items():
+        target = merged['accounts'].setdefault(account, {}).setdefault('bundles', {})
+        for bid, bundle in rows.items():
+            target.setdefault(bid, bundle)
+    return merged
 
 
 LEVEL_OF_DIFFICULTY = {'routine': 1, 'hard': 2, 'coupled': 3, 'frontier': 3}

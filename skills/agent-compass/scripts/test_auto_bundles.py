@@ -137,10 +137,9 @@ class Derive(unittest.TestCase):
         self.assertEqual(table['superseded'], REAL['superseded'])
 
     def test_merge_feeds_allocator(self):
+        from router_test_support import fleet_with_derived_bundles
         out = ab.derive(proxy_accounts(), catalog('llmproxy', ['zzz-unknown-9']), NOW)
-        merged = proxy_accounts()
-        for bid, b in out['bundles']['llmproxy'].items():
-            merged['accounts']['llmproxy'].setdefault('bundles', {}).setdefault(bid, b)
+        merged = fleet_with_derived_bundles(proxy_accounts(), out)
         flat = account_fleet.bundles(merged)
         bid = 'auto:llmproxy:codex:zzz-unknown-9@high'
         self.assertIn(bid, flat)

@@ -57,6 +57,17 @@ def start_loopback_listener() -> tuple[socket.socket, int, threading.Event]:
     return srv, port, stop
 
 
+def reset_dispatch_notice() -> None:
+    services._dispatch_notice.update(
+        proc=None,
+        started=None,
+        last_reasons=None,
+        interval=services.DISPATCH_NOTICE_INTERVAL,
+        doubled=False,
+        evaluated_reasons=None,
+    )
+
+
 def bridge_done_statuses() -> set[str]:
     text = (services.ROOT / "setup" / "paseo_dispatch_bridge.mjs").read_text(encoding="utf-8")
     match = re.search(r"const DONE = new Set\(\[([^\]]+)\]\);", text)
@@ -325,14 +336,7 @@ class DispatchNoticeUnitTests(unittest.TestCase):
             pass
 
     def reset_notice_state(self) -> None:
-        services._dispatch_notice.update(
-            proc=None,
-            started=None,
-            last_reasons=None,
-            interval=services.DISPATCH_NOTICE_INTERVAL,
-            doubled=False,
-            evaluated_reasons=None,
-        )
+        reset_dispatch_notice()
 
     def child(self, running: bool):
         proc = mock.Mock(pid=5150)
@@ -1474,14 +1478,7 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
         state_patch.start()
         self.addCleanup(state_patch.stop)
         self.addCleanup(self._cleanup_processes)
-        services._dispatch_notice.update(
-            proc=None,
-            started=None,
-            last_reasons=None,
-            interval=services.DISPATCH_NOTICE_INTERVAL,
-            doubled=False,
-            evaluated_reasons=None,
-        )
+        reset_dispatch_notice()
 
     def _stop_daemon_listener(self) -> None:
         self._daemon_stop.set()
@@ -1498,14 +1495,7 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        services._dispatch_notice.update(
-            proc=None,
-            started=None,
-            last_reasons=None,
-            interval=services.DISPATCH_NOTICE_INTERVAL,
-            doubled=False,
-            evaluated_reasons=None,
-        )
+        reset_dispatch_notice()
         notif_dir = self.state_dir / "paseo-notifications"
         if notif_dir.is_dir():
             for item in notif_dir.glob("*.json"):

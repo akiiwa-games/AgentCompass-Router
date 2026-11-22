@@ -219,13 +219,11 @@ class StoredChoiceFollowsTheNameTests(unittest.TestCase):
     def read(acc, names, doc, now):
         """{advertised name: (disabled from accounts_override.apply, from derive(overrides=), the bundle, its id)} for
         the names on account `acct`, the choices in `doc` carried by `upgrade_document` as `load_override` reads them."""
-        import copy
         import auto_bundles
+        from router_test_support import fleet_with_derived_bundles
         doc = accounts_override.upgrade_document(doc)
         cat = {'providers': {'acct': {'ok': True, 'checked_at': now, 'models': [{'id': n} for n in names]}}}
-        merged = copy.deepcopy(acc)
-        for bid, b in (auto_bundles.derive(acc, cat, now)['bundles'].get('acct') or {}).items():
-            merged['accounts']['acct'].setdefault('bundles', {}).setdefault(bid, b)
+        merged = fleet_with_derived_bundles(acc, auto_bundles.derive(acc, cat, now))
         accounts_override.apply(merged, doc)
         direct = auto_bundles.derive(acc, cat, now, overrides=doc)['bundles'].get('acct') or {}
         return {b['launch_model']: (b['disabled'], direct[bid]['disabled'], b, bid)

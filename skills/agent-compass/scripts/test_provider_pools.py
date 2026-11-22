@@ -2,7 +2,6 @@
 models (`opencode/...`) and OpenCode Go (`opencode-go/...`) are separate products under provider `opencode`;
 Antigravity's Gemini models and its third-party (Claude/GPT) models draw different windows. A hold on one pool leaves
 the others dispatchable; an account with a single pool is held as a whole, as before."""
-import copy
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -11,6 +10,7 @@ import pytest
 import account_fleet
 import auto_bundles
 import provider_retry
+from router_test_support import fleet_with_derived_bundles
 
 MESSAGE = 'Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.'
 QUOTA = 'You have reached the quota for these models. It resets in 4 hours.'
@@ -26,9 +26,7 @@ def accounts():
     fleet = account_fleet.load_accounts(account_fleet.reference_fleet_path())
     catalog = {'providers': {'opencode': {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
                                           'models': [{'id': m} for m in (*ZEN, *GO)]}}}
-    for bid, b in auto_bundles.derive(fleet, catalog, 2)['bundles'].get('opencode', {}).items():
-        fleet['accounts']['opencode'].setdefault('bundles', {}).setdefault(bid, b)
-    return fleet
+    return fleet_with_derived_bundles(fleet, auto_bundles.derive(fleet, catalog, 2))
 
 
 @pytest.fixture
@@ -195,9 +193,7 @@ def test_an_account_hold_from_a_single_pool_account_narrows_to_its_pool_once_go_
     assert provider_retry.scope_account_holds(fleet) == []
     catalog = {'providers': {'opencode': {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
                                           'models': [{'id': m} for m in (*ZEN, *GO)]}}}
-    with_go = copy.deepcopy(fleet)
-    for bid, b in auto_bundles.derive(fleet, catalog, 2)['bundles'].get('opencode', {}).items():
-        with_go['accounts']['opencode'].setdefault('bundles', {}).setdefault(bid, b)
+    with_go = fleet_with_derived_bundles(fleet, auto_bundles.derive(fleet, catalog, 2))
     assert provider_retry.scope_account_holds(with_go) == ['opencode#opencode']
     held = provider_retry.active(now=NOW + timedelta(days=30))
     assert set(held) == {'opencode#opencode'}   # still indefinite; the model hold elsewhere has expired
