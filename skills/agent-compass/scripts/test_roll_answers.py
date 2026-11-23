@@ -147,7 +147,9 @@ class BlockedHandBuilt(HandBuilt):
 
     def test_defer_names_the_window_that_sets_the_wait_and_only_the_ways_out_that_work(self):
         """Rule (`roll.defer_next`): a deferral launches nothing and names the window and the wait; rolling again without
-        `--can-wait-hours` is offered only when the plan found a candidate that can start now (`decision.starts_now`)."""
+        `--can-wait-hours` is offered only when the plan found a candidate that can start now (`decision.starts_now`); when a
+        model or route was already named, `next_action` omits telling the caller to name a route with `--provider --account
+        --model --basis` and tells it not to substitute another model."""
         waiting = {'action': 'defer', 'start_after_hours': 2.5, 'wait_for': {'bundle': 'lab_sonnet55_high', 'account': 'claude-lab',
                                                                               'window': 'five_hour', 'hours': 2.5}}
         for label, plan in (('something starts now', dict(waiting, starts_now='lab_other')), ('nothing starts now', waiting)):
@@ -157,6 +159,18 @@ class BlockedHandBuilt(HandBuilt):
                 self.assertEqual((code, res['status']), (2, 'blocked'))
                 for fact in ("claude-lab's five_hour window", '2.5h', '--basis', 'yourself'):
                     self.assertIn(fact, res['next_action'])
+                self.assertEqual('without --can-wait-hours' in res['next_action'], 'starts_now' in plan)
+                self.assertEqual('lab_other' in res['next_action'], 'starts_now' in plan)
+                self.setUp()
+            with self.subTest('named ' + label):
+                named_plan = dict(plan, task={'named_model': 'claude-sonnet-5-5'})
+                decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision=named_plan)
+                (res, code), _ = HandBuilt.roll(self, decision, task='x')
+                self.assertEqual((code, res['status'], res.get('caller_action')), (2, 'blocked', 'wait_for_reset'))
+                for fact in ("claude-lab's five_hour window", '2.5h', 'yourself', 'do not substitute'):
+                    self.assertIn(fact, res['next_action'])
+                self.assertNotIn('--basis', res['next_action'])
+                self.assertNotIn('name a route', res['next_action'])
                 self.assertEqual('without --can-wait-hours' in res['next_action'], 'starts_now' in plan)
                 self.assertEqual('lab_other' in res['next_action'], 'starts_now' in plan)
                 self.setUp()

@@ -47,8 +47,8 @@ def advised_hours(hours):
     return round(advised, 1)
 
 
-def named_pin_block(task, candidates, can_wait=0.0):
-    """Why what the user named cannot run within `can_wait` hours, one line per row; [] when the task names nothing."""
+def named_pin_block(task, candidates):
+    """Why what the user named cannot run, one line per row; [] when the task names nothing."""
     if not (task.get('constraint_model') or task.get('constraint_bundle') or task.get('constraint_effort') or task.get('pinned_bundle')):
         return []
     off_pin = ('explicit model constraint', 'explicit effort constraint')
@@ -63,16 +63,7 @@ def named_pin_block(task, candidates, can_wait=0.0):
              or ':'.join(x for x in (spelled, eff_part) if x))
     if not rows:
         return [f'{named}: no configured bundle offers it']
-    out = []
-    for c in rows:
-        reasons = list(c['excluded'])
-        if not reasons and (c.get('available_in_hours') or 0) > can_wait:
-            reasons = [f'{w} quota exhausted (resets in {advised_hours(h)}h)'
-                       for w, h in (c.get('waits') or {}).items() if h > can_wait] or [
-                f"available in {advised_hours(c['available_in_hours'])}h"]
-        if reasons:
-            out.append(f"{named} via {c['id']}: {'; '.join(reasons)}")
-    return out
+    return [f"{named} via {c['id']}: {'; '.join(c['excluded'])}" for c in rows if c['excluded']]
 
 
 def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None, capabilities=None, overrides=None,
@@ -161,6 +152,9 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
         decision['task']['read_only_review'] = True
     if task.get('metered_fallback'):
         decision['task']['metered_fallback'] = True
+    if task.get('constraint_model') or task.get('constraint_bundle') or task.get('pinned_bundle'):
+        decision['task']['named_model'] = (task.get('pinned_bundle') or task.get('constraint_bundle')
+                                           or task.get('constraint_raw_model') or task.get('constraint_model'))
     if task['profile']:
         decision['task'].update(profile=task['profile'], profile_difficulty=task['profile_difficulty'])
     if applied:
@@ -173,7 +167,7 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
             (c for c in candidates if c['excluded']),
             key=lambda c: (len(c['excluded']), -(c['components']['fit'] if c['components'].get('fit') is not None else float('-inf'))),
         )[:2]
-        named_block = named_pin_block(task, candidates, task['can_wait_hours'])
+        named_block = named_pin_block(task, candidates)
         decision.update({'action': 'none',
                          'reason': 'No eligible bundle. Closest: ' + ' | '.join(
                              f"{c['id']}: {'; '.join(candidate_eval.said_exclusions(c))}" for c in closest)})
@@ -194,19 +188,10 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
         return result
     can_wait = task['can_wait_hours']
     ready = [c for c in eligible if (c['available_in_hours'] or 0) <= can_wait]
-    if not ready and not task.get('user_named_bundle') and (named_block := named_pin_block(task, candidates, can_wait)):
-        # What the user named cannot run within can_wait_hours. Say why and stop; nothing else stands in for it.
-        decision['action'] = 'none'
-        decision['blocked'] = 'named_model_unavailable'
-        decision.setdefault('warnings', []).extend(named_block)
-        decision['reason'] = ' | '.join(named_block)
-        result['next'] = ('The model the user named cannot run now: ' + '; '.join(named_block)[:300]
-                          + '. Tell the user; do not substitute another model.')
-        result['choice'] = 'none'
-        return result
-    # Rule: `can_wait_hours` is the one limit on waiting. Within it, candidates compete by `five_axis_order` (net score
-    # first, then wait). When nothing eligible can start within it, defer to the candidate that can start soonest (equal
-    # waits broken by `five_axis_order`), never to a higher score days away; the caller rolls again once that window resets.
+    # Rule: `can_wait_hours` is the one limit on waiting, named or not. Within it, candidates compete by `five_axis_order`
+    # (net score first, then wait). When nothing eligible can start within it, defer to the candidate that can start soonest
+    # (equal waits broken by `five_axis_order`), never to a higher score days away and never to another model when one was named;
+    # the caller rolls again once that window resets.
     pool = ready or sorted(
         eligible,
         key=lambda c: (round(float(c['available_in_hours'] or 0.0), 4), *candidate_ranking.five_axis_order(c)),

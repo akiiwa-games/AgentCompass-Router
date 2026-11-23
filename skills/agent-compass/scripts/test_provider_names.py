@@ -1037,10 +1037,12 @@ class PinIdentityMatchesBundle(unittest.TestCase):
             # --- Clause 2: prefixed `openai/gpt-5.5` when A lists `openai/gpt-5.5` verbatim and Codex lists bare `gpt-5.5` ---
             pref_a = dict(base_a, launch_model='openai/gpt-5.5')
             pref_b = dict(base_b, launch_model='gpt-5.5')
+            usage_a_stale_exhausted = copy.deepcopy(usage_a_exhausted)
+            usage_a_stale_exhausted['accounts']['acct_a'].update(status='stale', fetched_at=self.at.isoformat())
             for state_name, a_mod, u_doc, hpol, unavail in (
                 ('unchecked', dict(pref_a, disabled=True), usage_both, None, ()),
                 ('host_policy', pref_a, usage_both, {'allowed_accounts': ['codex'], 'known_accounts': ['acct_a', 'codex']}, ()),
-                ('exhausted', pref_a, usage_a_exhausted, None, ()),
+                ('exhausted_stale', pref_a, usage_a_stale_exhausted, None, ()),
                 ('unavailable', pref_a, usage_both, None, ('b_a',)),
                 ('discovery_unavailable', dict(pref_a, discovery_unavailable='not detected for 7+ days'), usage_both, None, ()),
             ):
@@ -1052,14 +1054,27 @@ class PinIdentityMatchesBundle(unittest.TestCase):
                 self.assertEqual((p_pref['choice'], p_pref['decision']['blocked']), ('none', 'named_model_unavailable'), state_name)
                 self.assertIn('b_a:', p_pref['decision']['reason'])
                 self.assertNotIn('b_b:', p_pref['decision']['reason'])
+            # When `acct_a` is held only by a resetting window, prefixed `openai/gpt-5.5` defers to `b_a` (never `b_b`):
+            p_pref_wait = allocator.plan(
+                {'objective': 'x', 'profile': self.prof, 'expected_hours': 0.5, 'constraints': {'model': 'openai/gpt-5.5'}},
+                copy.deepcopy(usage_a_exhausted), self.at,
+                accounts=two_acct_fleet(pref_a, pref_b), overrides=[], read_local_state=False,
+            )
+            self.assertEqual((p_pref_wait['choice'], p_pref_wait['decision']['action'], p_pref_wait['decision']['start_after_hours']),
+                             ('b_a', 'defer', 100.0))
 
             # --- Clause 2 by account/provider/`bundle_providers`: `codex/gpt-5.5` when `codex` advertises bare `gpt-5.5` ---
             bare_both = two_acct_fleet(pref_b | {'provider': 'acct_a'}, pref_b)
             p_codex_ok = self.plan_pin(bare_both, model='codex/gpt-5.5', usage=usage_both)
             self.assertEqual(p_codex_ok['choice'], 'b_b')
-            p_acct_a_down = allocator.plan(
+            p_acct_a_wait = allocator.plan(
                 {'objective': 'x', 'profile': self.prof, 'expected_hours': 0.5, 'constraints': {'model': 'acct_a/gpt-5.5'}},
                 copy.deepcopy(usage_a_exhausted), self.at, accounts=copy.deepcopy(bare_both), overrides=[], read_local_state=False,
+            )
+            self.assertEqual((p_acct_a_wait['choice'], p_acct_a_wait['decision']['action']), ('b_a', 'defer'))
+            p_acct_a_down = allocator.plan(
+                {'objective': 'x', 'profile': self.prof, 'expected_hours': 0.5, 'constraints': {'model': 'acct_a/gpt-5.5'}},
+                copy.deepcopy(usage_a_stale_exhausted), self.at, accounts=copy.deepcopy(bare_both), overrides=[], read_local_state=False,
             )
             self.assertEqual(p_acct_a_down['choice'], 'none')
 

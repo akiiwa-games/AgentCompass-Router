@@ -533,17 +533,32 @@ def none_next(decision):
             'or ask the user.')
 
 
-def defer_next(decision, wait):
+def defer_next(decision, wait, *, named=False):
     plan = decision.get('decision') or {}
     bundle = decision.get('selected_bundle') or {}
     wait_for = plan.get('wait_for') or {}
     window = (f"{wait_for['account']}'s {wait_for['window']} window" if wait_for.get('account') and wait_for.get('window')
               else 'its quota window')
+    alloc_task = decision.get('_allocation_task') or {}
+    alloc_constraints = alloc_task.get('constraints') if isinstance(alloc_task.get('constraints'), dict) else {}
+    is_named = bool(
+        named
+        or (plan.get('task') or {}).get('named_model')
+        or alloc_constraints.get('model')
+        or alloc_constraints.get('bundle')
+        or alloc_task.get('pinned_model')
+        or decision.get('constraint') == 'user_override'
+    )
+    target = bundle.get('bundle_id') or bundle.get('id') or decision.get('choice')
+    base = f'Defer {target} for {wait}h until {window} resets; do not launch now. Roll again then.'
+    if is_named:
+        if plan.get('starts_now'):
+            return (f"{base} To launch sooner roll again without --can-wait-hours ({plan['starts_now']} can start now), "
+                    'do the task yourself, or tell the user; do not substitute another model.')
+        return f'{base} Otherwise do the task yourself or tell the user; do not substitute another model.'
     # A way out is offered only when it works: rolling without the wait helps when something can start now.
     sooner = (f"roll again without --can-wait-hours ({plan['starts_now']} can start now), " if plan.get('starts_now') else '')
-    return (f"Defer {bundle.get('bundle_id') or bundle.get('id') or decision.get('choice')} for {wait}h until {window} "
-            f'resets; do not launch now. Roll again then. To launch sooner {sooner}name a route with --provider --account '
-            '--model --basis, or do the task yourself.')
+    return f'{base} To launch sooner {sooner}name a route with --provider --account --model --basis, or do the task yourself.'
 
 
 def paseo_choice(provider, parent_host, args):
@@ -1676,7 +1691,7 @@ def _run(args, judge):
     if (decision.get('decision') or {}).get('action') == 'defer':
         wait = (decision.get('decision') or {}).get('start_after_hours')
         return dict(out, launched=False, dispatch_mode='defer', caller_action='wait_for_reset',
-                    start_after_hours=wait, next=defer_next(decision, wait)), 2
+                    start_after_hours=wait, next=defer_next(decision, wait, named=bool(named_route_given(args)))), 2
     if provider in host_placement.REMOTE_SURFACES:
         placed = host_placement.place(provider, canonical_ws)
         if not placed['ok']:

@@ -281,8 +281,17 @@ class UserPinTests(RouterCase):
         self.assertIn('gemini-2.5-pro', plan['decision']['reason'])
 
     def test_named_model_blocked_by_quota_or_cooldown_never_falls_back(self):
+        # Rule (`allocator.plan`): a named model held back only by a resetting window defers to itself (never falling back to
+        # another model), while a named model excluded by a quota fact (e.g. stale exhausted reading) or cooldown returns
+        # `choice: 'none'` / `named_model_unavailable`.
         exhausted = usage_windows(NOW, {**FULL_QUOTA, 'codex': [('usage', 0, 100)]})
-        plan = self.plan(self.task(constraints={'model': 'gpt-6-astra'}), usage=exhausted)
+        deferred = self.plan(self.task(constraints={'model': 'gpt-6-astra'}), usage=exhausted)
+        self.assertEqual(deferred['selected_bundle']['model'], 'gpt-6-astra')
+        self.assertEqual((deferred['decision']['action'], deferred['decision']['start_after_hours']), ('defer', 100.0))
+
+        stale_exhausted = copy.deepcopy(exhausted)
+        stale_exhausted['accounts']['codex'].update(status='stale', fetched_at=NOW.isoformat())
+        plan = self.plan(self.task(constraints={'model': 'gpt-6-astra'}), usage=stale_exhausted)
         self.assertEqual(plan['choice'], 'none')
         self.assertEqual(plan['decision']['blocked'], 'named_model_unavailable')
         self.assertTrue(any('usage' in w for w in plan['decision']['warnings']), plan['decision']['warnings'])

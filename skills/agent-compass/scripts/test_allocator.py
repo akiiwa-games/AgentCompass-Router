@@ -949,6 +949,77 @@ class AllocatorTests(unittest.TestCase):
             else:
                 self.assertNotIn('fast_not_applied', decision)
 
+    def test_named_model_held_only_by_resetting_windows_defers_to_its_earliest_bundle_at_any_wait_limit(self):
+        """Rule (`allocator.plan`, `allocator.named_pin_block`): a named model whose matching bundles are held back only by
+        quota windows (or `cadence`) with an observed reset is a deferral (`decision.action == 'defer'`, `start_after_hours`),
+        never `choice: 'none'` / `named_model_unavailable` and never a substitute model, whether the wait is within or beyond
+        `can_wait_hours`. Beyond `can_wait_hours` it defers to the matching bundle with the least `available_in_hours`; only
+        when every matching bundle is excluded by a fact does `plan` return `choice: 'none'` / `named_model_unavailable`
+        (`named_pin_block` reports `c['excluded']` only, never `'cadence quota exhausted'`)."""
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        # Give a second Claude account (`claude-lab`) `claude-opus-5-5` too so bare naming spans two accounts with different waits.
+        accounts['accounts']['claude-lab']['bundles']['lab_opus55_high'] = dict(
+            accounts['accounts']['claude']['bundles']['opus55_high'],
+            id='lab_opus55_high', account='claude-lab', provider='claude-lab',
+        )
+        usage = self.usage(
+            claude=[('five_hour', 2, 2.0), ('seven_day', 90, 100.0), ('weekly_fable', 100, 100.0)],
+            codex=[('usage', 90, 100.0)],
+            **{'claude-lab': [('five_hour', 0, 8.0), ('seven_day', 90, 100.0), ('weekly_fable', 100, 100.0)]},
+        )
+        policy_cfg = {'allowed_accounts': ['claude', 'codex', 'claude-lab']}
+        for can_wait in (0.0, 1.0, 3.0, 10.0):
+            planned = allocator.plan(
+                with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.3,
+                           'needs': {'local_only': True}, 'can_wait_hours': can_wait,
+                           'constraints': {'model': 'claude-opus-5-5'}}),
+                copy.deepcopy(usage), self.now, accounts=copy.deepcopy(accounts), overrides=[],
+                host_policy_config=policy_cfg,
+            )
+            elig_waits = {c['bundle']['account']: c['available_in_hours'] for c in planned['ranking'] if not c['excluded']}
+            self.assertEqual(elig_waits, {'claude': 2.0, 'claude-lab': 8.0})
+            self.assertNotEqual(planned['choice'], 'none', (can_wait, planned['decision']))
+            self.assertNotIn('blocked', planned['decision'])
+            self.assertEqual(planned['decision']['action'], 'defer')
+            self.assertEqual(planned['selected_bundle']['model'], 'claude-opus-5-5')
+            if can_wait < 2.0:
+                # Beyond limit: earliest-starting matching bundle (2.0h on `claude`, never 8.0h on `claude-lab` or ready `codex`).
+                self.assertEqual(planned['decision']['start_after_hours'], 2.0)
+
+        # Cadence hold on a named model also defers rather than claiming "cadence quota exhausted":
+        cad_accounts = copy.deepcopy(accounts)
+        cad_accounts['accounts']['codex']['cadence'] = {'window_seconds': 12 * 3600, 'limit': 1}
+        cad_records = [{'stage': 'launch', 'dispatch_id': 'd-1', 'decision_id': 'dec-1',
+                        'at': (self.now - timedelta(hours=10)).isoformat(),
+                        'bundle': {'account': 'codex', 'provider': 'codex', 'model': 'gpt-6.1-sol', 'bundle_id': 'sol_high'}}]
+        cad_plan = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.5,
+                       'needs': {'local_only': True}, 'can_wait_hours': 0.0,
+                       'constraints': {'model': 'gpt-6.1-sol'}}),
+            self.usage(codex=[('usage', 90, 100.0)], claude=[('five_hour', 90, 3.0), ('seven_day', 90, 100.0)]),
+            self.now, records=cad_records, accounts=cad_accounts, overrides=[],
+            host_policy_config={'allowed_accounts': ['claude', 'codex']},
+        )
+        self.assertEqual(cad_plan['decision']['action'], 'defer')
+        self.assertEqual(cad_plan['selected_bundle']['model'], 'gpt-6.1-sol')
+        self.assertEqual(cad_plan['decision']['wait_for']['window'], 'cadence')
+        self.assertNotIn('cadence quota exhausted', json.dumps(cad_plan))
+
+        # Every matching bundle excluded by a fact still returns `choice: 'none'` / `named_model_unavailable`:
+        stale_opus = copy.deepcopy(usage)
+        stale_opus['accounts']['claude'].update(status='stale', fetched_at=self.now.isoformat())
+        stale_opus['accounts']['claude']['windows'][0]['remaining_pct_before_reset'] = 0
+        stale_opus['accounts']['claude-lab'].update(status='stale', fetched_at=self.now.isoformat())
+        blocked = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 1.0,
+                       'needs': {'local_only': True}, 'can_wait_hours': 10.0,
+                       'constraints': {'model': 'claude-opus-5-5'}}),
+            stale_opus, self.now, accounts=copy.deepcopy(accounts), overrides=[],
+            host_policy_config=policy_cfg,
+        )
+        self.assertEqual((blocked['choice'], blocked['decision'].get('blocked')), ('none', 'named_model_unavailable'))
+
 
 class OverrideContractTests(unittest.TestCase):
     """Contract tests for temporary priority overrides, reset confirmation, receipts, and atomic store."""
