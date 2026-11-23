@@ -60,8 +60,16 @@ def roll_judge(test, plan_stage):
             return route_judge.record_resume(argparse.Namespace(**{'accounts': None, **vars(args)}), task, classified,
                                              bundle, agent_id)
 
-    return type('Judge', (), {'plan_stage': staticmethod(plan_stage), 'classify_pinned': staticmethod(classify_pinned),
-                              'record_resume': staticmethod(record_resume)})
+    return planning_judge(plan_stage, classify_pinned=classify_pinned, record_resume=record_resume)
+
+
+def planning_judge(plan_stage, **more):
+    """A fake judge whose `plan_stage` plans a roll; a relaunch plans the stored task (route_judge.plan_task), which
+    this fake plans as its plan_stage plans a roll."""
+    def plan_task(task, args, unavailable=None):
+        return plan_stage({'task': task, 'unavailable': list(unavailable or ())}, args)
+    return type('Judge', (), {'plan_stage': staticmethod(plan_stage), 'plan_task': staticmethod(plan_task),
+                              **{name: staticmethod(call) for name, call in more.items()}})
 
 
 def setUpModule():
@@ -4186,7 +4194,7 @@ class ModelLatchTests(unittest.TestCase):
             self.choices.append(planned['choice'])
             self.chosen.append(planned.get('selected_bundle') or {})
             return dict(planned, **registry.issue(planned, document['task'], self.now)), 0
-        judge = type('Judge', (), {'plan_stage': staticmethod(plan_stage)})
+        judge = planning_judge(plan_stage)
         self.enterContext(fake_owners(self))
         with patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a', 'ROUTER_PARENT_AGENT_ID': ''}), \
                 patch.object(roll, 'WORKER_PROMPTS_DIR', self.root / 'worker-prompts'), \
@@ -4752,9 +4760,7 @@ class LiveModelCheckTests(unittest.TestCase):
             self.choices.append(planned['choice'])
             return dict(planned, **registry.issue(planned, document['task'], self.now)), 0
 
-        judge = type('Judge', (), {
-            'plan_stage': staticmethod(plan_stage),
-        })
+        judge = planning_judge(plan_stage)
         self.enterContext(fake_owners(self))
         with patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a', 'ROUTER_PARENT_AGENT_ID': ''}), \
                 patch.object(roll, 'WORKER_PROMPTS_DIR', self.root / 'worker-prompts'), \

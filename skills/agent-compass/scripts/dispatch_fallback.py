@@ -568,7 +568,9 @@ class Chain:
                                   keep_whole=(f'AgentCompass relaunch of dispatch {self.root_id}: the original roll '
                                               'kept this brief whole') if profile.get('multi_task') else None)
         for _ in range(len(excluded) + 64):
-            decision, _ = self.judge.plan_stage({'task': self.task, 'unavailable': sorted(excluded)}, args)
+            # The stored allocation task, as AgentCompass keeps it: never through a caller's entry (plan_stage), whose
+            # rewrite of the router's own marks would bind the new decision to another task than the one prepared.
+            decision, _ = self.judge.plan_task(self.task, args, sorted(excluded))
             bundle = decision.get('selected_bundle') or {}
             if (decision.get('error') or decision.get('choice') in (None, 'none', 'split') or not bundle
                     or (decision.get('decision') or {}).get('action') == 'defer'

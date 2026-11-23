@@ -110,11 +110,11 @@ class FallbackTests(unittest.TestCase):
 
         class Judge:
             @staticmethod
-            def plan_stage(document, args):
-                test.plans.append(sorted(document.get('unavailable') or ()))
-                planned = allocator.plan(dict(document['task']), test.usage, registry.utcnow(),
-                                         unavailable=document.get('unavailable') or (), accounts=test.accounts)
-                return dict(planned, **registry.issue(planned, document['task'])), 0
+            def plan_task(task, args, unavailable=None):
+                test.plans.append(sorted(unavailable or ()))
+                planned = allocator.plan(dict(task), test.usage, registry.utcnow(),
+                                         unavailable=unavailable or (), accounts=test.accounts)
+                return dict(planned, **registry.issue(planned, task)), 0
         self.judge = Judge
         self.enterContext(patch.object(usage_reading, 'usage_snapshot', side_effect=lambda *_, **__: test.usage))
         self.enterContext(patch.object(decision_ledger, 'append_ledger', side_effect=test.ledger.append))
@@ -720,12 +720,12 @@ class FallbackTests(unittest.TestCase):
                     self.host.end(root['dispatch_id'], 'running', attentionReason='error')   # Paseo keeps the stale flag
                     out = self.handle(root['dispatch_id'])
                 else:
-                    real_plan = self.judge.plan_stage
+                    real_plan = self.judge.plan_task
 
-                    def resume_then_plan(document, args):
+                    def resume_then_plan(task, args, unavailable=None):
                         self.host.end(root['dispatch_id'], 'running', attentionReason='error')   # Paseo keeps the stale flag
-                        return real_plan(document, args)
-                    with patch.object(self.judge, 'plan_stage', side_effect=resume_then_plan):
+                        return real_plan(task, args, unavailable)
+                    with patch.object(self.judge, 'plan_task', side_effect=resume_then_plan):
                         out = self.handle(root['dispatch_id'])
                 self.assertEqual((out['action'], out['result']), ('final', 'resumed'))
                 self.assertEqual(len(self.host.creates), creates_before + 1)
@@ -769,7 +769,10 @@ class RollFallbackTests(unittest.TestCase):
                                      unavailable=document.get('unavailable') or (), accounts=test.accounts,
                                      route={'pinned_bundle': 'lab_sonnet55_high'} if first else None)
             return dict(planned, **registry.issue(planned, document['task'])), 0
-        judge = type('Judge', (), {'plan_stage': staticmethod(plan_stage)})
+
+        def plan_task(task, args, unavailable=None):
+            return plan_stage({'task': task, 'unavailable': list(unavailable or ())}, args)
+        judge = type('Judge', (), {'plan_stage': staticmethod(plan_stage), 'plan_task': staticmethod(plan_task)})
         self.enterContext(test_dispatch.fake_owners(self))
         with patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a', 'ROUTER_PARENT_AGENT_ID': ''}), \
                 patch.object(roll, 'WORKER_PROMPTS_DIR', self.root / 'worker-prompts'), \
@@ -848,6 +851,99 @@ class RollFallbackTests(unittest.TestCase):
             self.assertEqual(out['action'], 'relaunched')
             self.assertEqual(len(self.host.creates), 2)
             self.assertTrue(launch_failures.active(path=cooldown_store))
+
+
+
+class StoredTaskRelaunchTests(unittest.TestCase):
+    """The relaunch plans the task AgentCompass stored for the brief, never a caller's document: the stored task is built
+    by the real path (roll -> route_judge.plan_stage with the classifier -> dispatch_registry), and the relaunch is
+    planned by the real route_judge. The host refuses the first create (a covered failure), so roll promises a relaunch."""
+    setUp = FallbackTests.setUp
+    setUp_dispatch = test_dispatch.DispatchTests.setUp
+    snapshot = test_dispatch.DispatchTests.snapshot
+    issue = test_dispatch.DispatchTests.issue
+    at = FallbackTests.at
+
+    def roll_refused_first(self, task_id, *extra, refuse=True, can_wait_hours=None):
+        """roll with the real judge; the classifier marks the brief local-only; the first create is refused. `extra`:
+        more patches for this roll. Returns (roll's details, exit code, the providers the host was asked to create)."""
+        import argparse
+        import contextlib
+        import roll
+        import scorer_client
+        creates = []
+
+        def host(request):
+            if request['operation'] == 'create':
+                creates.append(request['request']['provider'])
+                if refuse and len(creates) == 1:
+                    return {'ok': False, 'sent': False, 'error': 'host_creation_failed', 'failure_class': 'model_unavailable'}
+            return self.host(request)
+        brief = self.root / f'{task_id}.md'
+        brief.write_bytes(b'# Fixture brief\n\nKeep only the current rules.\n')
+        args = argparse.Namespace(brief=brief, file=[], apply_to=None, local_only=None, hours=0.5, title=None,
+                                  workspace=None, task_id=task_id, wait=0, parent_id=None, parent_host=None,
+                                  parent_address=None, provider=None, model=None, effort=None, basis=None,
+                                  usage_cache=None, dry_run=False, verbose=False, task=None, new_worker=True,
+                                  resume=None, fast=False, keep_whole=None, access=None, allow_concurrent=None,
+                                  account=None, can_wait_hours=can_wait_hours, no_score=False, score=False, demo=False,
+                                  score_timeout=5)
+        classified = profile(local_only=True, reason='the fixture classifier keeps this work on this machine')
+        meta = {'source': 'system_one', 'scorer_type': 'fixture'}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(test_dispatch.fake_owners(self))
+            stack.enter_context(patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a', 'ROUTER_PARENT_AGENT_ID': ''}))
+            stack.enter_context(patch.object(scorer_client, 'score_task', return_value=(classified, meta)))
+            stack.enter_context(patch.object(roll, 'WORKER_PROMPTS_DIR', self.root / 'worker-prompts'))
+            stack.enter_context(patch.object(roll, 'RESULTS_DIR', self.root / 'roll-results'))
+            stack.enter_context(patch.object(flow, 'paseo_reachable', return_value=True))
+            stack.enter_context(patch.object(flow, 'host_call', host))
+            for one in extra:
+                stack.enter_context(one)
+            result, code = roll.run(args, route_judge)
+        return json.loads(Path(result['details']).read_text(encoding='utf-8')), code, creates
+
+    def test_the_other_ways_a_stored_task_relaunches_plan_it_as_stored(self):
+        """The watcher's step after a worker error (it claims the failure first: `dispatch --dispatch-action fallback`)
+        re-plans the stored task; a transient failure's scheduled retry issues its decision on the stored task itself."""
+        for task_id in ('watcher-worker-error', 'transient-retry'):
+            with self.subTest(task_id=task_id):
+                transient = task_id == 'transient-retry'
+                result, code, creates = self.roll_refused_first(task_id, refuse=False,
+                                                                can_wait_hours=1 if transient else None)
+                self.assertEqual((result['caller_action'], len(creates)), ('already_launched_do_not_respawn', 1))
+                root = self.root_of(result)
+                self.assertEqual(registry.decision_record(root['decision_id'])['allocation_task']['needs']
+                                 .get('local_only_by'), 'classifier')
+                terminal = {'reason': 'error'}
+                if transient:
+                    self.scopes = ['transient']
+                    terminal.update(failure_code='provider_turn_failed', provider_message='429 retry later')
+                self.host.end(root['dispatch_id'], 'error', terminal=terminal)
+                out = fallback.handle(root['dispatch_id'], judge=route_judge, host=self.host)
+                if transient:
+                    self.assertEqual(out['action'], 'scheduled', out)
+                    with self.at(minutes=3):
+                        out = fallback.handle(root['dispatch_id'], judge=route_judge, host=self.host)
+                self.assertEqual(out['action'], 'relaunched', out)
+                new = registry.inspect(out['dispatch_id'])
+                self.assertEqual(new['bundle']['bundle_id'] == root['bundle']['bundle_id'], transient)
+
+    def root_of(self, result):
+        worker = result['worker']
+        return registry.inspect(worker.get('root_dispatch_id') or worker['dispatch_id'])
+
+    def test_a_brief_the_classifier_marked_local_only_is_relaunched_on_the_next_candidate(self):
+        result, code, creates = self.roll_refused_first('stored-local-only')
+        root = self.root_of(result)
+        stored = registry.decision_record(root['decision_id'])['allocation_task']
+        self.assertEqual(stored['needs'].get('local_only_by'), 'classifier')
+        self.assertEqual((result['caller_action'], code), ('already_launched_do_not_respawn', 0), result.get('next'))
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(len(result['attempts']), 2)
+        self.assertNotIn('not_prepared', ' '.join(result['attempts']))
+        self.assertEqual(root['fallback']['state'], 'relaunched')
+
 
 
 if __name__ == '__main__':

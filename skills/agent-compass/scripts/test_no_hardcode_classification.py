@@ -276,19 +276,19 @@ ALLOWED_TAINT_SINK_STATEMENTS = {
     ): 'falls back to default self-test sample objective when --objective is blank',
     (
         'skills/agent-compass/scripts/route_judge.py',
-        'plan_stage',
+        'plan_task',
         "or (not args.dry_run and bool((task.get('objective') or '').strip()) and not isinstance(task.get('profile'), dict))",
     ): 'checks whether task has non-empty objective to invoke System-One classifier',
     (
         'skills/agent-compass/scripts/route_judge.py',
-        'plan_stage',
+        'plan_task',
         "keep_whole = (getattr(args, 'keep_whole', None) or '').strip()",
     ): 'trims optional --keep-whole CLI reason before checking non-empty override',
     (
         'skills/agent-compass/scripts/route_judge.py',
         'classify_pinned',
         "keep_whole = (getattr(args, 'keep_whole', None) or '').strip()",
-    ): 'trims optional --keep-whole CLI reason before checking non-empty override (pinned roll, same as plan_stage)',
+    ): 'trims optional --keep-whole CLI reason before checking non-empty override (pinned roll, same as plan_task)',
     (
         'tray/decision_theatre.py',
         'scene_from_result',

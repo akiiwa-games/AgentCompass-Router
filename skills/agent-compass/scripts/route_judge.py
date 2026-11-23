@@ -801,7 +801,8 @@ def classify_pinned(task, args):
 
 
 def plan_stage(document, args):
-    """Classify, allocate and record one task; shared by the plan and roll stages."""
+    """Classify, allocate and record one task a caller wrote (plan --input, roll); shared by the plan and roll stages.
+    The caller's document enters here (`_plan_input_task`), and only here; the rest is `plan_task`'s."""
     task = _plan_input_task(document, args)
     if getattr(args, 'demo', False):
         if args.stage != 'plan' or not args.dry_run:
@@ -809,6 +810,16 @@ def plan_stage(document, args):
         from demo_plan import plan as reference_plan
         result = reference_plan({**document, 'task': task})
         return result, 0 if result.get('choice') != 'none' else 2
+    return plan_task(task, args, document.get('unavailable'))
+
+
+def plan_task(task, args, unavailable=None):
+    """Classify (when the task has no profile and args allow it), allocate and record a task already in AgentCompass's
+    own shape: a caller's document after `plan_stage`'s entry, or a task AgentCompass stored itself, such as the
+    allocation task of a decision a relaunch plans again (dispatch_fallback). A stored task never passes the caller's
+    entry a second time: that entry refuses or rewrites what only AgentCompass sets (`task_intake.check_caller_task`,
+    `own_local_only_mark`), and the decision recorded here is bound to exactly the task it is given
+    (`dispatch_registry.prepare` compares its hash). `unavailable`: bundle ids out of this plan."""
     reviewed_task = task
     started = time.monotonic()
     if not getattr(args, 'dry_run', False):
@@ -820,7 +831,7 @@ def plan_stage(document, args):
             pass
     now = datetime.now(timezone.utc)
     usage = usage_reading.usage_snapshot(args.usage_cache, None, now)
-    unavailable = list(document['unavailable']) if isinstance(document.get('unavailable'), list) else []
+    unavailable = list(unavailable) if isinstance(unavailable, (list, tuple)) else []
     needs = dict(task.get('needs')) if isinstance(task.get('needs'), dict) else {}
     if getattr(args, 'fast', False):
         needs['fast'] = True
