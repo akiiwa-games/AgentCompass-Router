@@ -1020,6 +1020,50 @@ class AllocatorTests(unittest.TestCase):
         )
         self.assertEqual((blocked['choice'], blocked['decision'].get('blocked')), ('none', 'named_model_unavailable'))
 
+    def test_post_wait_window_renewal_enforces_full_capacity_on_short_and_long_windows(self):
+        """Rule (`candidate_eval.renewal_capacity_refusal`, `candidate_eval.evaluate_bundle`): every place a window is read
+        as renewed—including a second short window whose reset falls at or before a longer window's `available_in_hours`—checks
+        full renewed capacity against the period's spend plus margin, so a candidate excluded after the wait is never deferred
+        before the wait (invariant to window order)."""
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        task = with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 3.8,
+                          'needs': {'local_only': True}})
+        # Step 1 (t=0, seven_day ample, five_hour at 90% resetting in 1.0h): 3.8h splits as 1.0h before reset + 2.8h after,
+        # so candidates whose 3.8h exceeds one 5h period's `100% - 5%` margin but whose 1.0h and 2.8h pieces each fit are eligible now.
+        u_now = self.usage(claude=[('five_hour', 90, 1.0), ('seven_day', 90, 100.0), ('weekly_fable', 100, 100.0)])
+        p_now = allocator.plan(copy.deepcopy(task), u_now, self.now, accounts=copy.deepcopy(accounts), overrides=[],
+                               host_policy_config={'allowed_accounts': ['claude']})
+        # Step 3 (t=10h after waiting: five_hour unstarted at 100%, seven_day renewed at 100%): all 3.8h falls inside one 5h period.
+        u_after = self.usage(claude=[('five_hour', 100, 5.0), ('seven_day', 100, 168.0), ('weekly_fable', 100, 90.0)])
+        u_after['accounts']['claude']['windows'][0].update(used_pct=0, resets_at=None, seconds_until_reset=None)
+        p_after = allocator.plan(copy.deepcopy(task), u_after, self.now + timedelta(hours=10),
+                                 accounts=copy.deepcopy(accounts), overrides=[],
+                                 host_policy_config={'allowed_accounts': ['claude']})
+        split_only = [cid for cid, row in self.rows(p_now).items()
+                      if not row['excluded'] and any('five_hour full capacity' in e for e in self.rows(p_after)[cid]['excluded'])]
+        self.assertTrue(split_only, 'expected at least one bundle that fits split across 1h+2.8h but exceeds one 5h period')
+
+        # Step 2 (t=0, seven_day at 0% resetting in 10.0h, in both window orders): deferring to 10.0h crosses five_hour's 1.0h
+        # reset, so every `split_only` bundle must already carry the same `five_hour full capacity` exclusion as Step 3.
+        for rev in (False, True):
+            wins = [('five_hour', 90, 1.0), ('seven_day', 0, 10.0), ('weekly_fable', 100, 100.0)]
+            if rev:
+                wins.reverse()
+            u_defer = self.usage(claude=wins)
+            acc_defer = copy.deepcopy(accounts)
+            if rev:
+                acc_defer['accounts']['claude']['windows'] = dict(reversed(list(acc_defer['accounts']['claude']['windows'].items())))
+            p_defer = allocator.plan(copy.deepcopy(task), u_defer, self.now, accounts=acc_defer, overrides=[],
+                                     host_policy_config={'allowed_accounts': ['claude']})
+            for cid in split_only:
+                self.assertEqual(
+                    [e for e in self.rows(p_defer)[cid]['excluded'] if 'five_hour full capacity' in e],
+                    [e for e in self.rows(p_after)[cid]['excluded'] if 'five_hour full capacity' in e],
+                    (rev, cid),
+                )
+            self.assertEqual(p_defer['choice'], p_after['choice'])
+
 
 class OverrideContractTests(unittest.TestCase):
     """Contract tests for temporary priority overrides, reset confirmation, receipts, and atomic store."""
