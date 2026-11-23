@@ -852,7 +852,7 @@ class SystemOneScorerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             unavail_code, unavail_res, _ = self.run_cli(directory, 'plan', {'objective': 'Explore local logs'}, stdout='not json')
             self.assertEqual((unavail_code, unavail_res['choice'], unavail_res['error'], unavail_res['caller_action']),
-                             (2, 'none', 'scorer_unavailable', 'parent_autonomous_choice'))
+                             (2, 'none', 'scorer_unavailable', 'execute_self_or_roll_later'))
         # Short/edit-only reasons intentionally fail the caller validator but remain trusted classifier output.
         cases = [
             ({}, 'Uses the local pytest environment.', True, 'Uses the local pytest environment.'),

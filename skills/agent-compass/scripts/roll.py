@@ -1663,7 +1663,7 @@ def _run(args, judge):
     if decision.get('error') == 'scorer_unavailable':
         out['route']['reason'] = decision.get('reason') or 'scorer_unavailable'
         return dict(out, launched=False, dispatch_mode='scorer_unavailable',
-                    caller_action='parent_autonomous_choice', error='scorer_unavailable',
+                    caller_action='execute_self_or_roll_later', error='scorer_unavailable',
                     reason='scorer_unavailable', cause=decision.get('reason'),
                     scorer=decision.get('scorer'), next=decision.get('next')), 2
     if (decision.get('task_profile') or {}).get('urgency') == 'high' and not (decision.get('task_profile') or {}).get('wants_fast'):

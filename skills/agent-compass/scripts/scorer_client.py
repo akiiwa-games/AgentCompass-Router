@@ -788,7 +788,7 @@ def scorer_attempt_order(config):
 def score_task(task, capabilities, timeout=SCORER_TIMEOUT_SECONDS, use_model=True, scorer_config=None):
     """(task profile or None, scorer metadata). A profile the caller wrote wins; then the System-One scorer cascade
     (`jev` -> `claude_haiku_low` -> `codex_terra_low` -> `agy_flash_low`). When all System-One scorers time out or
-    fail, returns `(None, meta)` with `source: 'scorer_unavailable'` so the parent session chooses autonomously;
+    fail, returns `(None, meta)` with `source: 'scorer_unavailable'` and nothing is routed;
     never falls back to mechanical keyword guessing."""
     import task_intake
     if isinstance(task.get('profile'), dict):

@@ -643,24 +643,26 @@ def split_result(task, count, scorer, started):
     return result
 
 
+# A named route is the user's own naming and reaches past this machine's automatic-routing switches, so a session's own
+# choice is never offered as one: with no classifier the ways out are the session itself, or the classifier back.
 SCORER_UNAVAILABLE_NEXT = (
-    'All System-One classifiers timed out or failed; mechanical keyword fallback has been removed. '
-    'As the parent session, choose autonomously: either execute the task directly in this session (self), '
-    'or dispatch with an explicit parent choice (`--provider <p> --account <a> --model <m> --effort <e> '
-    '--basis "scorer_unavailable: parent autonomous choice"`).'
+    'All System-One classifiers timed out or failed, and the router does not guess a route from keywords: nothing was '
+    'launched. Do the task yourself in this session, or roll again when the classifier answers (`agentcompass scorer '
+    '--action test` checks it). Name a route (`--provider --account --model --effort --basis` with `--hours`) only when '
+    'the user named one in this request; a choice of your own is not a named route.'
 )
 
 
 def scorer_unavailable_result(task, scorer, started):
-    """When all System-One classifiers fail or time out, do not guess mechanically; return control to the parent session."""
+    """When all System-One classifiers fail or time out, do not guess mechanically: nothing is routed without a profile."""
     why = (scorer or {}).get('fallback_detail') or (scorer or {}).get('fallback_reason') or 'scorer_unavailable'
-    reason = f'System-One classifier unavailable ({why}); mechanical fallback is disabled so the parent session chooses autonomously.'
+    reason = f'System-One classifier unavailable ({why}); nothing is routed without a task profile.'
     objective = task.get('objective')
     result = {
         'stage': 'plan', 'status': 'blocked', 'choice': 'none', 'error': 'scorer_unavailable',
-        'caller_action': 'parent_autonomous_choice',
+        'caller_action': 'execute_self_or_roll_later',
         'scorer': scorer, 'task_profile': None, 'reason': reason,
-        'decision': {'action': 'parent_choice', 'reason': reason},
+        'decision': {'action': 'none', 'reason': reason},
         'next': SCORER_UNAVAILABLE_NEXT,
     }
     decision_ledger.append_ledger({
