@@ -216,28 +216,28 @@ def validate_document(doc, path):
     names a fix that works when followed: delete the file (the tray then writes a new one), or, for an `allowed_cwd` that
     was not carried over, edit the one account."""
     if not isinstance(doc, dict):
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             path, 'invalid accounts-override format (expected JSON object)', _delete_fix(path),
         ))
     version = doc.get('schema_version')
     if version != SCHEMA_VERSION:
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             path, f'accounts-override schema_version {version!r} has no upgrade step (expected {SCHEMA_VERSION})',
             _delete_fix(path),
         ))
     accounts = doc.get('accounts')
     if accounts is not None:
         if not isinstance(accounts, dict):
-            raise ValueError(state_upgrade.format_issue(
+            raise state_upgrade.StateIssue(state_upgrade.format_issue(
                 path, 'invalid accounts-override.accounts (expected JSON object)', _delete_fix(path),
             ))
         for name, spec in accounts.items():
             if not isinstance(spec, dict):
-                raise ValueError(state_upgrade.format_issue(
+                raise state_upgrade.StateIssue(state_upgrade.format_issue(
                     path, f'invalid accounts-override entry for {name!r} (expected JSON object)', _delete_fix(path),
                 ))
             if 'allowed_cwd' in spec:
-                raise ValueError(state_upgrade.format_issue(path, *_allowed_cwd_refusal(name, spec)))
+                raise state_upgrade.StateIssue(state_upgrade.format_issue(path, *_allowed_cwd_refusal(name, spec)))
 
 
 def load_override(path):
@@ -249,13 +249,13 @@ def load_override(path):
     try:
         raw = target.read_text(encoding='utf-8-sig')
     except (OSError, UnicodeError) as exc:
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             target, f'accounts-override unreadable ({exc})', _delete_fix(target),
         )) from exc
     try:
         doc = json.loads(raw)
     except ValueError as exc:
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             target, f'accounts-override invalid JSON ({exc})', _delete_fix(target),
         )) from exc
     doc = upgrade_document(doc)

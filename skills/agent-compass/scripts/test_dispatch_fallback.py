@@ -721,6 +721,33 @@ class FallbackTests(unittest.TestCase):
         cause = fallback.Chain.cause_of(registry.Refused('the workspace has a writer'))
         self.assertEqual(cause, {'kind': 'refused', 'text': route_judge.failure_cause(registry.Refused('the workspace has a writer'))})
 
+    def test_a_refusal_of_the_local_state_reaches_the_parent_with_its_fix(self):
+        """Round 3 review R3-2: a local-state file the re-plan reads and this version refuses on purpose
+        (state_upgrade.StateIssue, here the real accounts_override.load_override on a schema it has no upgrade step
+        for) reaches the parent as a refusal with the file and its fix, not as a defect with its text withheld."""
+        root = self.worker_error_root()
+        override = self.root / 'accounts-override.json'
+        override.write_text(json.dumps({'schema_version': 999}), encoding='utf-8')
+        import accounts_override
+
+        class Override:
+            @staticmethod
+            def plan_task(task, args, unavailable=None):
+                accounts_override.load_override(override)
+        out = fallback.handle(root['dispatch_id'], judge=Override, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn('schema_version 999 has no upgrade step', out['text'])
+        self.assertIn(f'Fix: delete "{override}"', out['text'])
+        self.assertNotIn('internal error of its own', out['text'])
+        self.assertEqual(self.fallback_lines()[-1]['error_kind'], 'refused')
+        # The other owners the re-plan reaches refuse with the same type.
+        import provider_inventory
+        import state_upgrade
+        broken = self.root / 'provider-inventory.json'
+        broken.write_text('{not json', encoding='utf-8')
+        with self.assertRaises(state_upgrade.StateIssue):
+            provider_inventory.previous_inventory(broken)
+
     def test_a_refusal_of_the_local_state_reads_as_one_in_the_owners_words(self):
         root = self.worker_error_root()
         real_prepare = registry.prepare

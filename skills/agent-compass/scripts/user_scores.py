@@ -372,13 +372,13 @@ def load_local(path=None, environ=None) -> dict:
     try:
         raw = json.loads(target.read_text(encoding='utf-8-sig'))
     except (OSError, UnicodeError, ValueError) as exc:
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             target, f'corrupt local user-scores file ({exc})', _fix(target),
         )) from exc
     try:
         return validate_document(upgrade_local_document(raw), expected_kind='user')
     except ValueError as exc:
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             target, f'invalid local user-scores file ({exc})', _fix(target),
         )) from exc
 

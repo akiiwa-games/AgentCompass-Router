@@ -152,9 +152,10 @@ def refusals():
     import host_placement
     import host_policy
     import launch_values
+    import state_upgrade
     import task_intake
     return (registry.Refused, host_placement.InvalidWorkspace, host_policy.HostPolicyError, launch_values.LaunchValueError,
-            task_intake.InvalidCallerProfile)
+            task_intake.InvalidCallerProfile, state_upgrade.StateIssue)
 
 
 def frames(exc):

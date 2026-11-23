@@ -664,12 +664,12 @@ def previous_inventory(path):
     import state_upgrade
     doc, why = read_json(path)
     if why not in (None, 'missing'):
-        raise ValueError(state_upgrade.format_issue(path, f'provider inventory unreadable ({why})', _inventory_fix(path)))
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(path, f'provider inventory unreadable ({why})', _inventory_fix(path)))
     for has_shape, step in LOCAL_UPGRADES.values():
         if has_shape(doc):
             doc = step(doc)
     if doc.get('schema') != INVENTORY_SCHEMA and doc.get('removed'):
-        raise ValueError(state_upgrade.format_issue(
+        raise state_upgrade.StateIssue(state_upgrade.format_issue(
             path, f'provider inventory of schema {doc.get("schema")!r} holds removals that cannot be read', _inventory_fix(path)))
     return doc
 

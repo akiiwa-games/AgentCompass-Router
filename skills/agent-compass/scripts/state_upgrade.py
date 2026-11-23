@@ -65,6 +65,12 @@ def fix_delete(path: Path | str, discards: str | None = None) -> str:
     return f'delete "{path}"' + (f' ({discards})' if discards else '')
 
 
+class StateIssue(ValueError):
+    """The local state under ~/.agent-compass refused on purpose: a file in a shape this version does not read or
+    cannot carry over. Its text is `format_issue`'s (the file, what is wrong, the fix that works when followed), so a
+    reader that tells a refusal from a defect of AgentCompass (dispatch_fallback.refusals) passes it on whole."""
+
+
 def format_issue(path: Path | str, detail: str, fix: str) -> str:
     return f'{path}: {detail}. Fix: {fix}.'
 
