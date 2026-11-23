@@ -1574,7 +1574,80 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
             if value:
                 return value
             time.sleep(step)
-        self.fail("condition was not met before deadline")
+        self.fail(f"condition was not met before deadline ({timeout:.0f} s)\n{self.wait_state()}")
+
+    def wait_state(self) -> str:
+        """What a run that ran out of time was waiting on: each dispatch row's state and fallback, the claim on each
+        failed attempt with its age, each watcher receipt (its pid alive or not) and the reconcile log's tail. The
+        watchers' own stdio is discarded by the bridge, so the receipts are their only record. Paths under this test's
+        root (its home) are shortened, and no token is printed."""
+        now = datetime.now(timezone.utc)
+        lines = []
+        try:
+            connection = sqlite3.connect(f"file:{self.db_path.as_posix()}?mode=ro", uri=True, timeout=2)
+            try:
+                rows = [json.loads(data) for (data,) in connection.execute("SELECT data FROM dispatches")]
+            finally:
+                connection.close()
+        except (sqlite3.Error, ValueError) as exc:
+            rows, lines = [], [f"dispatch rows unreadable: {type(exc).__name__}"]
+        for row in rows:
+            fallback = row.get("fallback") or {}
+            lines.append(
+                f"dispatch {row.get('dispatch_id')}: state={row.get('state')} attempt_of={row.get('attempt_of')} "
+                f"failure_code={row.get('failure_code')} fallback={fallback.get('state')} "
+                f"retry_at={fallback.get('retry_at')} until={fallback.get('until')}"
+            )
+            for failed, claim in (fallback.get("handled") or {}).items():
+                claim = claim if isinstance(claim, dict) else {}
+                try:
+                    age = f"{(now - registry.parse(claim['at'])).total_seconds():.1f} s"
+                except (KeyError, TypeError, ValueError):
+                    age = "unknown"
+                lines.append(
+                    f"  claim on {failed}: action={claim.get('action')} age={age} until={claim.get('until')} "
+                    f"resume={claim.get('resume', False)}"
+                )
+        for receipt in sorted((self.state_dir / "paseo-notifications").glob("*.json")):
+            try:
+                record = json.loads(receipt.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                lines.append(f"receipt {receipt.name}: unreadable")
+                continue
+            pid = record.get("pid")
+            lines.append(
+                f"receipt {receipt.name}: status={record.get('status')} pid={pid} "
+                f"alive={isinstance(pid, int) and pid > 0 and psutil.pid_exists(pid)} "
+                f"fallback={json.dumps(record.get('fallback'))[:300]} terminal={json.dumps(record.get('terminal'))[:300]} "
+                f"pending={(record.get('pending') or {}).get('key')}"
+            )
+        log = self.state_dir / "dispatch-notice.log"
+        tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:] if log.is_file() else []
+        lines.append("dispatch-notice.log tail:" + ("".join(f"\n  {line}" for line in tail) or " (none)"))
+        text = "\n".join(lines)
+        for home, mark in ((str(self.root), "<test-root>"), (str(Path.home()), "<home>")):
+            text = text.replace(home, mark).replace(home.replace("\\", "/"), mark).replace(home.replace("\\", "\\\\"), mark)
+        return text
+
+    def test_a_wait_that_runs_out_says_what_it_was_waiting_on(self):
+        """A CI run that timed out said only that it did (2026-11-22): the message now carries the rows, the claim and
+        its age, the watcher receipts and the log tail, without this test's home path."""
+        now = datetime.now(timezone.utc)
+        row = base_paseo_row("d-waiting", state="failed", now=now)
+        row["fallback"] = {"state": "relaunching", "handled": {"d-waiting": {
+            "action": "pending", "at": registry.stamp(now - timedelta(seconds=42)),
+            "until": registry.stamp(now + timedelta(seconds=558))}}}
+        seed_dispatch_row(self.db_path, row)
+        self.write_dead_watcher_receipt("d-waiting")
+        (self.state_dir / "dispatch-notice.log").write_text(f"pass started in {self.state_dir}\n", encoding="utf-8")
+        with self.assertRaises(AssertionError) as raised:
+            self.wait_until(lambda: False, timeout=0.2)
+        text = str(raised.exception)
+        self.assertIn("dispatch d-waiting: state=failed", text)
+        self.assertRegex(text, r"claim on d-waiting: action=pending age=4\d\.\d s")
+        self.assertRegex(text, r"receipt d-waiting\.json: status=watching pid=\d+ alive=False")
+        self.assertIn("pass started in <test-root>", text)
+        self.assertNotIn(str(self.root), text)
 
     def run_pass_and_wait(self, *, force: bool = False) -> subprocess.Popen:
         started = services.dispatch_notice_tick(force=force)
