@@ -681,7 +681,8 @@ class Play:
                 sub = {**chain, "id": f"{chain['id']}.{position}", "briefs": [key], "answers": [], "outcome": None, "commands": 0, "waits": [],
                        "batch_of": chain["id"]}
                 self.chains.append(sub)
-                mine = next((r for r in written if str(r.get("objective") or "")[:60] == self.corpus[key]["text"][:60]), {})
+                # A batch routes its briefs in order, and each writes one plan, record or split row.
+                mine = written[position] if position < len(written) else {}
                 self.answer(sub, item, argv, None, None, key, part_of_batch=True, row=mine)
                 self.settle(op, sub, item, {**act, "fault": None}, key, argv, depth, in_batch=True)
             return
