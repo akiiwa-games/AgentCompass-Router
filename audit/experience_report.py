@@ -42,6 +42,101 @@ def limit(name: str):
 
 LEVELS = ("L1", "L2", "L3")
 NOT_A_WAY_OUT = ("", None)
+ROOT = Path(__file__).resolve().parents[1]
+ESTIMATED = ("expected_usd charged at launch over each drawn window's capacity, on the simulated clock; not measured "
+             "provider use")
+
+
+def fixture_error_texts() -> list[str]:
+    """The worker error texts the fixture writes and its classifier answers a scope for (briefs.json error_scopes)."""
+    doc = json.loads((ROOT / "packaging" / "experience" / "briefs.json").read_text(encoding="utf-8"))
+    return list(doc.get("error_scopes") or {})
+
+
+def snapshot_caps() -> tuple[int, int]:
+    """(eligible, excluded): the most candidates of each kind a plan's ledger row keeps, from the product's ledger_snapshot."""
+    scripts = str(ROOT / "skills" / "agent-compass" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import ledger_snapshot
+    return ledger_snapshot.SNAPSHOT_FULL + ledger_snapshot.SNAPSHOT_COMPACT, ledger_snapshot.SNAPSHOT_EXCLUDED
+
+
+def fixture_clis(run: dict) -> tuple[list[str], str]:
+    """The provider CLIs the run's fixture installed, and where that was read: the run's rows, or (rows written before they
+    recorded it) the experience run's own FIXTURE_CLIS."""
+    if run.get("fixture_clis") is not None:
+        return list(run["fixture_clis"]), "the run's rows"
+    packaging = str(ROOT / "packaging")
+    if packaging not in sys.path:
+        sys.path.insert(0, packaging)
+    import experience_run
+    return list(experience_run.FIXTURE_CLIS), "packaging/experience_run.py FIXTURE_CLIS (these rows predate the record)"
+
+
+def fixture_errors(run: dict) -> str:
+    """What is the fixture's in a worker error the router acted on: the error, and the scope answer that decided how the
+    chain ended (relaunch, or end at once) and whether a hold followed."""
+    scopes = run.get("scopes_answered")
+    told = ", ".join(f"{k} ×{v}" for k, v in sorted(scopes.items())) if scopes else "not recorded"
+    return ("the worker errors here are the fixture's, and so is the scope answer that decided how each chain ended "
+            f"(briefs.json error_scopes; answered this run: {told})")
+
+
+def ranking_cut(scenario: dict) -> dict:
+    """How many of a scenario's plans kept as many candidates as their ledger row holds (ledger_snapshot caps each row), so
+    a bundle in no recorded ranking may have been cut there rather than absent. Each plan's own count when the rows carry
+    it (`snapshot_rows`); for rows written before that, the excluded count is derived from the per-bundle tallies (excluded
+    rows recorded in all, against the cap times the plans) and the eligible count from each plan's ranking."""
+    eligible_cap, excluded_cap = snapshot_caps()
+    answers = scenario.get("answers") or []
+    counted = [a["snapshot_rows"] for a in answers if a.get("snapshot_rows")]
+    if counted:
+        return {"plans": len(counted), "excluded_at_cap": sum(1 for c in counted if c["excluded"] >= excluded_cap),
+                "eligible_at_cap": sum(1 for c in counted if c["eligible"] >= eligible_cap), "bound": "exact",
+                "excluded_cap": excluded_cap, "eligible_cap": eligible_cap, "source": "each plan's own count (snapshot_rows)"}
+    plans = [a for a in answers if a.get("ledger_stage") == "plan" and not a.get("batch")]
+    excluded = sum(e.get("plans", 0) - e.get("eligible", 0) for e in (scenario.get("exclusions") or {}).values())
+    n = len(plans)
+    if n and excluded == excluded_cap * n:
+        at_cap, bound = n, "exact"
+    elif n and excluded <= excluded_cap * n:
+        at_cap, bound = max(0, excluded - (excluded_cap - 1) * n), "at least"
+    else:
+        at_cap, bound = None, "unknown"
+    return {"plans": n, "excluded_at_cap": at_cap, "eligible_at_cap": sum(1 for a in plans if len(a.get("ranking") or []) >= eligible_cap),
+            "bound": bound, "excluded_cap": excluded_cap, "eligible_cap": eligible_cap,
+            "source": f"derived from these rows: {excluded} excluded rows recorded over {n} plan(s), each row holding at most {excluded_cap}"}
+
+
+def not_in_ranking(cut: dict) -> tuple[str, str, str]:
+    """(recorded, note, short note): a bundle in no plan's recorded ranking, and what that means in this scenario against
+    the ledger's caps: possibly cut there, or absent. The short note has no per-scenario figures, so the first look can
+    group the same fact across scenarios."""
+    if cut["excluded_at_cap"] is None:
+        return ("not in any plan's recorded ranking", f"whether a plan's ledger row was cut at its cap of {cut['excluded_cap']} "
+                f"excluded candidates cannot be told from these rows ({cut['source']})",
+                "cut at the ledger's cap or absent: cannot be told from these rows")
+    if cut["excluded_at_cap"] or cut["eligible_at_cap"]:
+        bound = "" if cut["bound"] == "exact" else f"{cut['bound']} "
+        return ("not in any plan's recorded ranking", f"may have been cut there: {bound}{cut['excluded_at_cap']} of {cut['plans']} "
+                f"plan(s) kept the ledger's cap of {cut['excluded_cap']} excluded candidates and {cut['eligible_at_cap']} its cap of "
+                f"{cut['eligible_cap']} eligible ones (ledger_snapshot; {cut['source']})",
+                f"may have been cut: the scenario's plans reached the ledger's cap of {cut['excluded_cap']} excluded or "
+                f"{cut['eligible_cap']} eligible candidates")
+    return ("absent from every plan's recorded ranking", f"no plan reached the ledger's cap of {cut['excluded_cap']} excluded or "
+            f"{cut['eligible_cap']} eligible candidates ({cut['source']})", "absent: no plan reached the ledger's caps")
+
+
+def fixture_notes(said: str, provider: str | None, clis: list[str]) -> str | None:
+    """What in a recorded reason is the fixture's, or None."""
+    notes = []
+    if "missing_client" in said and provider and provider not in clis:
+        notes.append(f"the fixture installs no {provider} executable (only {', '.join(clis)}): this is the fixture's gap, "
+                     "not a finding of discovery")
+    if "provider failure hold" in said:
+        notes.append("the hold follows a worker error the fixture made, and its scope was the fixture's answer (briefs.json error_scopes)")
+    return "; ".join(notes) or None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -208,6 +303,8 @@ def usd_by_level(launched: list[dict]) -> dict:
 
 def summarize(rows: dict) -> dict:
     scenarios = []
+    clis = fixture_clis(rows.get("run") or {})[0]
+    texts = fixture_error_texts()
     for scenario in rows.get("scenarios") or []:
         answers, chains = scenario.get("answers") or [], scenario.get("chains") or []
         launched = launches(answers, chains)
@@ -239,7 +336,8 @@ def summarize(rows: dict) -> dict:
             "counts": answer_counts(answers), "chains": len(top_level), "outcomes": dict(Counter(c.get("outcome") for c in chains).most_common()),
             "workers": len(launched),
             "not_launched": [ref(scenario, a) | {"status": a.get("status"), "caller_action": a.get("caller_action"), "brief": a["brief"],
-                                                 "reason": a.get("reason"), "cause": a.get("cause")}
+                                                 "reason": a.get("reason"), "cause": a.get("cause"),
+                                                 "fixture_error": any(t in json.dumps(a, ensure_ascii=False) for t in texts)}
                              for a in read if a.get("status") not in ("launched", "batch")],
             "dead_ends": [c["id"] for c in chains if is_dead_end(scenario, c)],
             "broken_promises": [c["id"] for c in chains if promise_broken(scenario, c)],
@@ -247,7 +345,8 @@ def summarize(rows: dict) -> dict:
             "kind_x_model": share_table(launched, lambda a: a.get("work_kind"), model_label),
             "model_share": dict(Counter(model_label(a) for a in launched).most_common()),
             "bundles_won": dict(got.most_common()),
-            "models_with_nothing": models_with_nothing(scenario, launched), "questions": questions, "routine_cost": dict(costs),
+            "models_with_nothing": models_with_nothing(scenario, launched, clis), "ranking_cut": ranking_cut(scenario),
+            "questions": questions, "routine_cost": dict(costs),
             "usd_by_level": usd_by_level(launched),
             "windows": {k: {"start": v[0][1] if v else None, "peak": max((u for _, u in v), default=None), "end": v[-1][1] if v else None}
                         for k, v in window_timelines(scenario).items()},
@@ -267,11 +366,14 @@ def summarize(rows: dict) -> dict:
     return {"run": rows.get("run") or {}, "scenarios": scenarios}
 
 
-def models_with_nothing(scenario: dict, launched: list[dict]) -> dict:
+def models_with_nothing(scenario: dict, launched: list[dict], clis: list[str]) -> dict:
     """The signed-in models (accounts, efforts and harnesses folded) no worker of this scenario ran, once each. Models only on
     accounts the user left outside allowed_accounts, or only in bundles the user unchecked, are kept apart. For the others
     each bundle (its own harness) carries what its plans recorded about it: its exclusions in the plans' rankings, or how
-    often it was eligible and never the top score; a bundle in no recorded ranking is "not recorded"."""
+    often it was eligible and never the top score; a bundle in no recorded ranking says whether the ledger's caps may have
+    cut it (ranking_cut). What in a reason is the fixture's (a CLI it does not install, a hold from its error) is said beside
+    it (fixture_notes)."""
+    absent = None
     bundles = scenario.get("bundles") or {}
     outside = set(((scenario.get("spec") or {}).get("switches") or {}).get("outside_allowed") or ())
     got = {a.get("model") for a in launched}
@@ -292,12 +394,17 @@ def models_with_nothing(scenario: dict, launched: list[dict]) -> dict:
             entry = (scenario.get("exclusions") or {}).get(bid) or {}
             gaps = entry.get("gaps") or []
             reasons = Counter(entry.get("excluded") or {}).most_common(2)
-            said = ("; ".join(f"{r} ×{n}" for r, n in reasons) if reasons
-                    else f"eligible in {entry['eligible']} plan(s), never the top score" if entry.get("eligible")
-                    else "not recorded (in no plan's recorded ranking)")
+            if reasons:
+                said = "; ".join(f"{r} ×{n}" for r, n in reasons)
+                note = short = fixture_notes(said, bundle.get("provider"), clis)
+            elif entry.get("eligible"):
+                said, note, short = f"eligible in {entry['eligible']} plan(s), never the top score", None, None
+            else:
+                absent = absent or not_in_ranking(ranking_cut(scenario))
+                said, note, short = absent
             rows.append({"bundle": bid, "provider": bundle.get("provider"), "account": bundle["account"], "plans": entry.get("plans", 0),
                          "eligible": entry.get("eligible", 0), "median_gap_to_top": round(statistics.median(gaps), 4) if gaps else None,
-                         "recorded": said})
+                         "recorded": said, "note": note, "note_short": short})
         out["models"].append({"model": model, "bundles": rows})
     return out
 
@@ -345,21 +452,26 @@ def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
             handed_rows[key].append(row)
     for key, n in handed.most_common(limit("not_launched_kinds")):
         why = Counter(masked(r.get("reason") or r.get("cause")) for r in handed_rows[key]).most_common(2)
-        items.append({"weight": 40 + n, "title": f"{n} answer(s) did not launch: {key}; most common reason: " + " | ".join(f"{w} ×{c}" for w, c in why),
-                      "rows": [{k: v for k, v in r.items() if k not in ("reason", "cause")} for r in handed_rows[key][:shown]]})
+        fixture = ("; " + fixture_errors(rows.get("run") or {}) if any(r.get("fixture_error") for r in handed_rows[key]) else "")
+        items.append({"weight": 40 + n, "title": f"{n} answer(s) did not launch: {key}; most common reason: "
+                      + " | ".join(f"{w} ×{c}" for w, c in why) + fixture,
+                      "rows": [{k: v for k, v in r.items() if k not in ("reason", "cause", "fixture_error")}
+                               for r in handed_rows[key][:shown]]})
     nothing = defaultdict(set)
     nothing_said = defaultdict(Counter)
-    apart = Counter()
+    apart = defaultdict(set)
     for s in summary["scenarios"]:
         for entry in s["models_with_nothing"]["models"]:
             nothing[entry["model"]].add(s["name"])
             for row in entry["bundles"]:
-                nothing_said[entry["model"]][f"{row['provider']}: {masked(row['recorded'], 140)}"] += 1
+                note = f" [{row['note_short']}]" if row.get("note_short") else ""
+                nothing_said[entry["model"]][f"{row['provider']}: {masked(row['recorded'], 140)}{note}"] += 1
         for kind in ("outside_allowed", "unchecked"):
-            apart[kind] += len(s["models_with_nothing"][kind])
+            apart[kind].update(s["models_with_nothing"][kind])
     if nothing:
         items.append({"weight": 30 + len(nothing), "title": f"{len(nothing)} signed-in model(s) got no work in at least one scenario "
-                      f"(not counted: {apart['outside_allowed']} model(s) only on accounts outside allowed_accounts, {apart['unchecked']} unchecked by the user)",
+                      f"(not counted: {len(apart['outside_allowed'])} model(s) only on accounts outside allowed_accounts, "
+                      f"{len(apart['unchecked'])} unchecked by the user)",
                       "rows": [{"model": m, "scenarios": len(names), "recorded, per harness": nothing_said[m].most_common(2)}
                                for m, names in sorted(nothing.items(), key=lambda kv: -len(kv[1]))[:shown]]})
     concentrated = []
@@ -399,7 +511,8 @@ def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
     unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"]
               if r["unused"] >= limit("unused_at_reset_pp") and r["window"] not in ("five_hour",) and not r["overnight"]]
     if unused:
-        items.append({"weight": 15 + len(unused), "title": f"{len(unused)} long window(s) reset during the day with {limit('unused_at_reset_pp')} pp or more unused",
+        items.append({"weight": 15 + len(unused), "title": f"{len(unused)} long window(s) reset during the day with {limit('unused_at_reset_pp')} pp or more unused "
+                      f"({ESTIMATED})",
                       "rows": [{"scenario": n, **r} for n, r in unused[:shown]]})
     slow = [(s["name"], s["roll_seconds"]) for s in summary["scenarios"] if (s["roll_seconds"].get("max") or 0) > limit("slow_roll_seconds")]
     if slow:
@@ -468,7 +581,7 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
         for row in item["rows"][:limit("rows_per_item")]:
             out.append(f"   - `{json.dumps(row, ensure_ascii=False, default=str)[:400]}`")
     out += ["", "## Across scenarios", ""]
-    head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets in the day / overnight (pp)", "roll s median/p90/max", "error"]
+    head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets in the day / overnight (pp, estimated)", "roll s median/p90/max", "error"]
     out += md_table(head, [[s["name"], s["chains"], s["workers"], len(s["not_launched"]), len(s["dead_ends"]), len(s["broken_promises"]), f'{s["unused_at_reset"]} / {s["unused_overnight"]}',
                             f"{s['roll_seconds']['median']}/{s['roll_seconds']['p90']}/{s['roll_seconds']['max']}", "yes" if s["error"] else ""]
                            for s in summary["scenarios"]])
@@ -485,11 +598,11 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
     out += ["", "The router's primary_level against model:effort (all scenarios, accounts folded):", ""]
     out += matrix({k: dict(v) for k, v in shares.items()}, LEVELS)
     for s in summary["scenarios"]:
-        out += render_scenario(by_name[s["name"]], s)
+        out += render_scenario(by_name[s["name"]], s, run)
     return "\n".join(out) + "\n"
 
 
-def render_scenario(scenario: dict, s: dict) -> list[str]:
+def render_scenario(scenario: dict, s: dict, run: dict) -> list[str]:
     spec = scenario.get("spec") or {}
     accounts = ", ".join(f"{a['name']} ({a.get('plan') or a['family']})" for a in spec.get("accounts") or [])
     out = ["", f"## {s['name']}", "",
@@ -506,12 +619,15 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
     chains = {c["id"]: c for c in scenario.get("chains") or []}
     if s["not_launched"]:
         out += ["", "Every answer that did not launch, and what following it led to:", ""]
+        if any(row.get("fixture_error") for row in s["not_launched"]):
+            out += [f"Rows marked [fixture error] end on a worker error the fixture made: {fixture_errors(run)}.", ""]
         rows_ = []
         for row in s["not_launched"]:
             chain = chains.get(row["chain"]) or {}
             a = answers[chain["answers"][row["step"]]] if chain.get("answers") and row["step"] < len(chain["answers"]) else {}
             rows_.append([row["chain"], row["step"], a.get("brief"), f"{a.get('status')} / {a.get('caller_action')}", clip(a.get("cause"), 80),
-                          clip(a.get("next_action"), 260), clip(a.get("reason"), 160), f"{chain.get('outcome')} {clip(chain.get('note'), 120)}"])
+                          clip(a.get("next_action"), 260), clip(a.get("reason"), 160),
+                          f"{chain.get('outcome')} {clip(chain.get('note'), 120)}" + (" [fixture error]" if row.get("fixture_error") else "")])
         out += md_table(["chain", "step", "brief", "answer", "cause", "next_action", "reason", "led to"], rows_)
     dead = s["dead_ends"] + [c for c in s["broken_promises"] if c not in s["dead_ends"]]
     if dead:
@@ -536,7 +652,8 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
     if nothing["models"]:
         out += ["", "Signed-in models that got nothing, each bundle with what the plans' recorded rankings say about it:", ""]
         out += md_table(["model", "bundle", "harness", "account", "plans", "eligible", "median score gap to the top", "recorded"],
-                        [[e["model"], r["bundle"], r["provider"], r["account"], r["plans"], r["eligible"], r["median_gap_to_top"], clip(r["recorded"], 240)]
+                        [[e["model"], r["bundle"], r["provider"], r["account"], r["plans"], r["eligible"], r["median_gap_to_top"],
+                          clip(r["recorded"], 240) + (f" [{r['note']}]" if r.get("note") else "")]
                          for e in nothing["models"] for r in e["bundles"]])
     for kind, what in (("outside_allowed", "only on accounts outside allowed_accounts"), ("unchecked", "unchecked by the user")):
         if nothing[kind]:
@@ -559,10 +676,11 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
     out += ["", "### What it cost", ""]
     timelines = window_timelines(scenario)
     if timelines:
-        out += md_table(["window", "start", "peak", "end", "timeline (simulated hour, used %)"],
+        out += [f"Window use is the router's own estimate ({ESTIMATED}).", ""]
+        out += md_table(["window", "start", "peak", "end", "timeline (simulated hour, estimated used %)"],
                         [[k, v["start"], v["peak"], v["end"], sparkline(timelines.get(k, []))] for k, v in s["windows"].items()])
     if s["resets"]:
-        out += ["", "Resets (quota left unused at each):", ""]
+        out += ["", f"Resets (quota left unused at each, {ESTIMATED}):", ""]
         out += md_table(["hour", "window", "used before", "unused", "overnight"],
                         [[r["at"], f"{r['account']}/{r['window']}", r["used_before"], r["unused"], "yes" if r["overnight"] else ""] for r in s["resets"]])
     if s["deferrals"]:

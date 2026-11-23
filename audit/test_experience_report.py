@@ -75,13 +75,42 @@ def test_models_with_nothing_count_a_model_once_keep_the_users_switches_apart_an
                             "opus": {"account": "claude", "provider": "claude", "model": "opus", "disabled": True}},
                 "exclusions": {"astra": {"plans": 4, "eligible": 4, "won": 0, "gaps": [0.1, 0.3], "excluded": {}},
                                "pi_astra": {"plans": 4, "eligible": 0, "won": 0, "gaps": [], "excluded": {"provider discovery: missing_client": 4}}}}
-    nothing = report.models_with_nothing(scenario, [answer("0", model="sonnet")])
+    nothing = report.models_with_nothing(scenario, [answer("0", model="sonnet")], ["codex", "claude", "opencode"])
     assert [e["model"] for e in nothing["models"]] == ["astra", "fable"]
     assert nothing["outside_allowed"] == ["sol"] and nothing["unchecked"] == ["opus"]
-    astra = {r["bundle"]: r["recorded"] for r in nothing["models"][0]["bundles"]}
-    assert astra["astra"] == "eligible in 4 plan(s), never the top score"           # pi's missing client is not codex's
-    assert astra["pi_astra"] == "provider discovery: missing_client ×4"
-    assert nothing["models"][1]["bundles"][0]["recorded"].startswith("not recorded")
+    astra = {r["bundle"]: r for r in nothing["models"][0]["bundles"]}
+    assert astra["astra"]["recorded"] == "eligible in 4 plan(s), never the top score"   # pi's missing client is not codex's
+    assert astra["pi_astra"]["recorded"] == "provider discovery: missing_client ×4"
+    # Said where the reader meets it: the fixture installs no pi executable.
+    assert "fixture installs no pi executable" in astra["pi_astra"]["note"] and astra["astra"]["note"] is None
+    assert nothing["models"][1]["bundles"][0]["recorded"] == "not in any plan's recorded ranking"
+
+
+def test_a_bundle_in_no_recorded_ranking_says_whether_the_ledgers_cap_may_have_cut_it():
+    """ledger_snapshot keeps at most SNAPSHOT_EXCLUDED excluded candidates per plan: a plan at that cap may have cut one."""
+    eligible_cap, excluded_cap = report.snapshot_caps()
+    at_cap = {"answers": [answer("0", snapshot_rows={"eligible": 2, "excluded": excluded_cap}),
+                          answer("1", snapshot_rows={"eligible": 2, "excluded": 3})]}
+    cut = report.ranking_cut(at_cap)
+    assert (cut["plans"], cut["excluded_at_cap"], cut["eligible_at_cap"], cut["bound"]) == (2, 1, 0, "exact")
+    assert report.not_in_ranking(cut)[0] == "not in any plan's recorded ranking"
+    assert f"1 of 2 plan(s) kept the ledger's cap of {excluded_cap}" in report.not_in_ranking(cut)[1]
+    under = report.ranking_cut({"answers": [answer("0", snapshot_rows={"eligible": 2, "excluded": 3})]})
+    assert report.not_in_ranking(under)[0] == "absent from every plan's recorded ranking"
+    # Rows written before snapshot_rows: derived from the per-bundle tallies (excluded rows in all against cap x plans).
+    old = {"answers": [answer(str(n), ledger_stage="plan", ranking=[]) for n in range(3)],
+           "exclusions": {f"b{n}": {"plans": 3, "eligible": 0} for n in range(excluded_cap)}}
+    cut = report.ranking_cut(old)
+    assert (cut["excluded_at_cap"], cut["bound"]) == (3, "exact") and "derived from these rows" in cut["source"]
+    fewer = dict(old, exclusions={"b0": {"plans": 3, "eligible": 0}})
+    assert report.ranking_cut(fewer)["excluded_at_cap"] == 0
+
+
+def test_fixture_errors_and_estimates_are_said_where_they_appear():
+    assert report.fixture_notes("provider failure hold on this account ×2", "codex", ["codex"]).startswith("the hold follows a worker error")
+    assert report.fixture_notes("provider discovery: missing_client ×1", "codex", ["codex"]) is None
+    assert "unknown ×2" in report.fixture_errors({"scopes_answered": {"unknown": 2}})
+    assert report.fixture_error_texts()          # briefs.json declares the texts its classifier answers
 
 
 def test_one_headline_per_event_and_models_counted_once_per_scenario():
@@ -95,12 +124,16 @@ def test_one_headline_per_event_and_models_counted_once_per_scenario():
                                         "outside_allowed": [], "unchecked": []},
                 "level_x_model": share}
     folded = {"L1": {"sonnet:medium@claude": 3, "sol:high@codex": 1}, "L2": {"sonnet:high@claude": 3}, "L3": {"sonnet:high@claude-2": 2}}
-    items = report.look_first({}, {"scenarios": [scenario("one", folded), scenario("two", {})]})
+    first, second = scenario("one", folded), scenario("two", {})
+    for one in (first, second):
+        one["models_with_nothing"]["outside_allowed"] = ["sol"]     # the same model in two scenarios is one model
+    items = report.look_first({}, {"scenarios": [first, second]})
     titles = [i["title"] for i in items]
     assert not any("error / check_error" in t for t in titles)          # the broken promise's answer is counted once
     assert any("blocked / tell_user" in t for t in titles)
     nothing = next(i for i in items if "got no work" in i["title"])
     assert nothing["title"].startswith("2 signed-in model(s)") and {r["scenarios"] for r in nothing["rows"]} == {2}
+    assert "not counted: 1 model(s) only on accounts outside allowed_accounts" in nothing["title"]
     concentrated = next(i for i in items if "one model" in i["title"])
     assert concentrated["rows"] == [{"scenario": "one", "model": "sonnet", "share": 0.89, "workers": 9, "models_that_worked": 2}]
 

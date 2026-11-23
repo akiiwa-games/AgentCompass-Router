@@ -88,6 +88,9 @@ NIGHT_HOURS = 14.0
 # scenario in the middle of the product's own behaviour. The limit only stops a command that hangs; a command that reaches
 # it is recorded as an answer with status `timed_out` (its process tree ended) and the scenario goes on.
 COMMAND_TIMEOUT_SECONDS = 3600
+# The provider CLIs the fixture installs (each a copy of fake-cli.exe). A harness whose executable is not among them is
+# reported by discovery as missing_client: that is the fixture's gap, and the report says so where it shows it.
+FIXTURE_CLIS = ("codex", "claude", "opencode")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -368,7 +371,7 @@ class Scenario:
         self.state = self.box.root / "fixture" / "state"
         self.work = self.box.root / "work dir"
         shutil.copytree(world.fakecli, self.bin)
-        for name in ("codex", "claude", "opencode"):
+        for name in FIXTURE_CLIS:
             shutil.copy2(self.bin / "fake-cli.exe", self.bin / f"{name}.exe")
         (self.bin / "fake-cli.exe").unlink()
         self.state.mkdir(parents=True)
@@ -899,6 +902,11 @@ class Play:
             "expected_hours": bundle.get("expected_hours"), "router_difficulty": (decision.get("task") or {}).get("difficulty"),
             "decision_reason": decision.get("reason"), "decision_action": decision.get("action"), "ledger_stage": row.get("stage"),
             "ledger_constraint": row.get("constraint"), "ranking": compact_ranking(snap.get("ranking") or []),
+            # How many candidates the plan's ledger row kept, eligible and excluded: the row caps each (ledger_snapshot), so a
+            # count at its cap may have cut the rest.
+            "snapshot_rows": ({"eligible": sum(1 for c in snap["ranking"] if not c.get("excluded") and c.get("score") is not None),
+                               "excluded": sum(1 for c in snap["ranking"] if c.get("excluded") or c.get("score") is None)}
+                              if isinstance(snap.get("ranking"), list) else None),
             "part_of_batch": part_of_batch, "batch": batch, "carried_launch": False,
         }
         if snap.get("ranking"):
@@ -1213,6 +1221,7 @@ def main(argv=None) -> int:
                     raise
             meta["scorer_requests"], meta["scorer_unknown"] = scorer.requests, scorer.unknown[:20]
             meta["scopes_answered"] = scorer.scopes_answered
+            meta["fixture_clis"] = list(FIXTURE_CLIS)
             meta["usage_requests"] = usage.requests
     except KeyboardInterrupt:
         meta["interrupted"] = True
