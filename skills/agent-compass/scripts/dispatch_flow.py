@@ -81,6 +81,7 @@ TASK_INPUT_NEXT = ('Paseo created this worker and its turn ended in error. Agent
                    'caused by this task\'s own input (for example a prompt too long for the model), not by the provider '
                    'or the model, so nothing is held and another model may refuse it too. Read its error '
                    '(get_agent_activity on agent_id) and change the brief before rolling it again.')
+WORKER_ERROR_TEXT = " The worker's turn ended with this error: {error}"
 RETRY_STUCK_CLEAN = ('The worker did no work before it got stuck; AgentCompass relaunches the brief on another model by '
                      'itself: do not roll it again.')
 RETRY_STUCK_PARTIAL = ('The worker had already done part of the work (it is stopped, not removed); AgentCompass relaunches '
@@ -368,6 +369,11 @@ def public(row, now=None):
                               else WORKER_TURN_FAILED_NEXT if row.get('failure_code') == 'worker_turn_failed'
                               else TASK_INPUT_NEXT if row.get('failure_code') == 'task_input_rejected'
                               else WORKER_FAILED_NEXT if auto else MANUAL_NEXT['worker_failed'])
+        worker_error = (row.get('failure_detail') or {}).get('worker_error')
+        if isinstance(worker_error, str) and worker_error:
+            # The worker's own words, as the watcher's notice prints them: the reason no other model is tried.
+            out['worker_error'] = worker_error
+            out['next_action'] += WORKER_ERROR_TEXT.format(error=worker_error)
     elif row['state'] == 'canceled' and (row.get('creation') or {}).get('removed'):
         out['next_action'] = REMOVED_NEXT
     elif creating(row):

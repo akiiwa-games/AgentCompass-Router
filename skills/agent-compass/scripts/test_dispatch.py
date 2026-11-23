@@ -4481,7 +4481,8 @@ class ProviderRetryTests(unittest.TestCase):
                 self.assertEqual((done['state'], done['failure_code']), ('failed', code))
                 self.assertEqual(provider_retry.dispatch_scope(row['dispatch_id']), scope)
                 next_action = flow.public(done)['next_action']
-                self.assertEqual(next_action, expected)
+                # The worker's own words close the answer (the reason no other model is tried), never provider wording.
+                self.assertEqual(next_action, expected + flow.WORKER_ERROR_TEXT.format(error=message))
                 self.assertNotIn('Its provider ended the turn', next_action)
                 self.assertNotIn('Provider error', next_action)
                 self.assertEqual(provider_retry.active(now=at), {})

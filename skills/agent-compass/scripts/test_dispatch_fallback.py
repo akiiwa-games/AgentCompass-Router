@@ -481,7 +481,51 @@ class FallbackTests(unittest.TestCase):
         out = self.handle(root['dispatch_id'])
         self.assertEqual((out['action'], out['result'], out['covered']), ('final', 'declined', False))
         self.assertEqual(len(self.host.creates), 1)
-        self.assertEqual(flow.public(registry.inspect(root['dispatch_id']))['next_action'], flow.TASK_INPUT_NEXT)
+        public = flow.public(registry.inspect(root['dispatch_id']))
+        self.assertEqual(public['next_action'], flow.TASK_INPUT_NEXT + flow.WORKER_ERROR_TEXT.format(error='prompt is too long'))
+        self.assertEqual(public['worker_error'], 'prompt is too long')
+
+    # A worker error an observation sees first is read by the classifier like the watcher's (snapshot_turn_failure).
+
+    def observed_error(self, message='Error: the test suite failed in tests/test_parser.py'):
+        root = self.first()
+        self.host.end(root['dispatch_id'], 'error', lastError=message)     # no watcher terminal: observe reads it
+        return root, self.handle(root['dispatch_id'])
+
+    def test_a_worker_error_the_classifier_reads_as_the_works_own_ends_the_chain_and_carries_it(self):
+        """Rule (provider_retry.WORKER_CODES, failure_of): a turn failure the classifier scopes `none` is the worker's
+        own, so no other candidate is tried and the one answer carries the worker's error."""
+        self.scopes = ['none']
+        root, out = self.observed_error()
+        self.assertEqual((out['action'], out['result'], out['covered']), ('final', 'declined', False))
+        self.assertEqual(len(self.host.creates), 1)
+        row = registry.inspect(root['dispatch_id'])
+        self.assertEqual((row['state'], row['failure_code']), ('failed', 'worker_turn_failed'))
+        public = flow.public_chain(row)
+        self.assertTrue(public['next_action'].startswith(flow.WORKER_TURN_FAILED_NEXT))
+        self.assertIn('the test suite failed in tests/test_parser.py', public['next_action'])
+        self.assertEqual(public['worker_error'], 'Error: the test suite failed in tests/test_parser.py')
+
+    def test_a_worker_error_the_classifier_reads_as_the_providers_moves_to_the_next_candidate(self):
+        self.scopes = ['model']
+        root, out = self.observed_error('429 model overloaded, try again later')
+        self.assertEqual(out['action'], 'relaunched', out.get('text'))
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertEqual(registry.inspect(root['dispatch_id'])['failure_code'], 'provider_turn_failed')
+
+    def test_a_worker_error_the_classifier_cannot_read_is_relaunched_as_before(self):
+        """Rule: with no classifier answer (scope `unknown`), or no error text at all, the next candidate is tried."""
+        root, out = self.observed_error()                                    # no scope queued: unknown
+        self.assertEqual(out['action'], 'relaunched', out.get('text'))
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotIn('worker_error', flow.public(registry.inspect(root['dispatch_id'])))
+
+    def test_a_worker_error_with_no_text_is_relaunched_as_before(self):
+        self.scopes = ['none']
+        root, out = self.observed_error(message='')
+        self.assertEqual(out['action'], 'relaunched', out.get('text'))
+        self.assertIsNone(registry.inspect(root['dispatch_id']).get('failure_code'))
+        self.assertEqual(self.scopes, ['none'])                              # the classifier was not asked
 
     def ends_with_a_reason_when_recorded_earlier(self, edit):
         import json

@@ -2058,6 +2058,47 @@ def provider_replied(terminal, launched_at):
         return False
 
 
+# The worker's error a failed turn the classifier read as not the provider's doing carries in its answer, bounded.
+WORKER_ERROR_LIMIT = 600
+
+
+def snapshot_turn_failure(dispatch_id, snapshot, terminal, path=None):
+    """`terminal` as the notifier would have written it when this observation, not the notifier, is the first to see the
+    launch's turn end in error: the host snapshot's `lastError` read as a turn failure (the bridge's turnFailure), so the
+    classifier's scope attributes it to the provider or to the work like every other turn failure. Anything else, or a
+    terminal that already names a provider failure, is returned unchanged."""
+    import provider_retry
+    if not isinstance(snapshot, dict) or (isinstance(terminal, dict)
+                                          and terminal.get('failure_code') in provider_retry.FAILURE_CODES):
+        return terminal
+    message = snapshot.get('lastError').strip() if isinstance(snapshot.get('lastError'), str) else ''
+    updated = snapshot.get('updatedAt')
+    if not message or not isinstance(updated, str) or not (
+            snapshot.get('status') == 'error' or snapshot.get('attentionReason') == 'error'):
+        return terminal
+    try:
+        row = inspect(dispatch_id, path)
+    except (ValueError, OSError):
+        return terminal
+    launched_at = row.get('launched_at')
+    labels = snapshot.get('labels') or {}
+    if (row.get('state') in TERMINAL or not isinstance(launched_at, str) or snapshot.get('id') != row.get('agent_id', snapshot.get('id'))
+            or any(labels.get(k) != row['request']['labels'][k] for k in LABELS)):
+        return terminal
+    try:
+        if parse(updated) < parse(launched_at):
+            return terminal
+        # A resumed worker's error is this turn's only once the turn was seen or its message sent after the launch.
+        last_message = snapshot.get('lastUserMessageAt')
+        if row.get('operation') == 'resume' and not row.get('started_at') and not (
+                isinstance(last_message, str) and parse(last_message) >= parse(launched_at)):
+            return terminal
+    except ValueError:
+        return terminal
+    return {**(terminal if isinstance(terminal, dict) else {}), 'reason': 'error', 'at': updated,
+            'failure_code': provider_retry.TURN_FAILED_CODE, 'provider_message': message[:provider_retry.MESSAGE_LIMIT]}
+
+
 def classify_provider_failure(dispatch_id, terminal, path=None):
     """Record a provider failure the notifier saw (provider_retry asks the classifier, so outside the registry's
     transaction) and return the scope it was recorded with, or None."""
@@ -2130,6 +2171,7 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
     `terminal` is the notifier's first terminal sighting of this dispatch, when it has one."""
     now = now or utcnow()
     import provider_retry
+    terminal = snapshot_turn_failure(dispatch_id, snapshot, terminal, path)
     scope = classify_provider_failure(dispatch_id, terminal, path)
     with transaction(path, upkeep=True) as connection:
         row = get(connection, 'dispatches', dispatch_id)
@@ -2225,6 +2267,9 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             # A failed turn the classifier read as the worker's own error (or this task's input) is not the provider's.
             row['failure_code'] = provider_retry.outcome_code(terminal['failure_code'], scope)
             row['failure_detail'] = {k: terminal[k] for k in ('partial_work', 'cancelled') if k in terminal}
+            if row['failure_code'] in provider_retry.WORKER_CODES and isinstance(terminal.get('provider_message'), str):
+                # The worker's own error ends the chain: its answer carries the text, as the watcher's notice does.
+                row['failure_detail']['worker_error'] = terminal['provider_message'][:WORKER_ERROR_LIMIT]
         elif finished_before(terminal, row['launched_at']) and status != 'running':
             target = 'completed'
         elif status == 'error' or reason == 'error' or snapshot.get('providerUnavailable'):

@@ -58,6 +58,8 @@ FAILURE_CODES = (FAILURE_CODE, TURN_FAILED_CODE)
 # A failed turn whose message the classifier reads as not the provider's doing.
 WORKER_TURN_FAILED_CODE = 'worker_turn_failed'
 TASK_INPUT_CODE = 'task_input_rejected'
+# No other model is tried after these (dispatch_fallback.failure_of): the work, not the provider, failed.
+WORKER_CODES = (WORKER_TURN_FAILED_CODE, TASK_INPUT_CODE)
 # Every exclusion `reason` returns starts with this, so prepare can let an explicitly named model through as a probe.
 EXCLUSION_PREFIX = 'provider failure hold'
 CLEAR_COMMAND = 'agentcompass hold --clear'
