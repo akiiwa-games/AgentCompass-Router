@@ -2151,9 +2151,11 @@ def later(first, second):
 
 def process_started(pid):
     """When process `pid` started, as the OS counts it (Windows: its creation FILETIME; Linux: its start tick), so a pid
-    the OS reused for another process does not read as the same one. None when no such process runs; 0 where the OS
-    gives no start time, or refuses this reader one (Windows access denied: the process exists), so the pid alone then
-    names it."""
+    the OS reused for another process does not read as the same one. None when no process of this user runs under it:
+    none at all, or one this user may not query (Windows refuses PROCESS_QUERY_LIMITED_INFORMATION, which the owner of a
+    process is granted across integrity levels, only for another user's or a protected process: a system process given
+    a dead step's pid after a restart; elsewhere `kill(pid, 0)` refused). 0 where the OS gives no start time for a
+    process of this user (the pid alone then names it)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     if os.name == 'nt':
@@ -2167,8 +2169,8 @@ def process_started(pid):
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         handle = kernel.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            # Access denied (ERROR_ACCESS_DENIED): the process exists and refuses this reader, so the pid alone names it.
-            return 0 if ctypes.get_last_error() == 5 else None
+            # No such process, or access denied: another user's or a protected process, never a step of this user.
+            return None
         try:
             code = wintypes.DWORD()
             if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
@@ -2185,9 +2187,7 @@ def process_started(pid):
         pass
     try:
         os.kill(pid, 0)
-    except PermissionError:
-        return 0
-    except OSError:
+    except OSError:     # PermissionError included: another user's process, never a step of this user
         return None
     return 0
 
@@ -2199,8 +2199,8 @@ def process_identity():
 
 def step_binds(record, now):
     """A fallback step's claim or relaunch in progress still binds, decided by the fact where the record names one. A
-    record naming its step's process (`holder`) binds while that process runs (its pid and start time match) and has not
-    released it (`released_at`, dispatch_fallback.Chain.release), however long the step takes: its lease (`until`) does
+    record naming its step's process (`holder`) binds while that process runs (a process of this user with that pid
+    and that start time: process_started) and has not released it (`released_at`, dispatch_fallback.Chain.release), however long the step takes: its lease (`until`) does
     not end it. A live step is working, not hung, because every call it waits on outside its own process is bounded by
     that call's own timeout (dispatch_flow.host_call, scorer_client.run_scorer); meanwhile the parent reads
     FALLBACK_RUNNING_NEXT (dispatch_flow.with_fallback). A record naming no holder (written by older code) binds until
@@ -2211,8 +2211,7 @@ def step_binds(record, now):
     if not isinstance(holder, dict):
         return later(record.get('until'), now)
     started = process_started(holder.get('pid'))
-    # 0: the OS gives this reader no start time (access denied), so the pid alone names the process.
-    return started is not None and (started == 0 or holder.get('started') in (None, started))
+    return started is not None and holder.get('started') in (None, started)
 
 
 def claim_held(item, now):

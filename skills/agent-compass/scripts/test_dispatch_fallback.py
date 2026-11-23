@@ -957,22 +957,23 @@ class FallbackTests(unittest.TestCase):
         child.wait()
         return {'pid': child.pid, 'started': 1}
 
-    def killed_step(self, root, relaunching=False):
+    def killed_step(self, root, relaunching=False, holder=None):
         """The watcher's fallback step took the attempt's claim and its process was killed outright: nothing of it ran
-        past the claim (or, `relaunching`, past preparing the next attempt), and no handler of its own ran."""
+        past the claim (or, `relaunching`, past preparing the next attempt), and no handler of its own ran. `holder`:
+        the identity its claim names (default: a process that ran and exited)."""
         class Killed(BaseException):
             pass
 
         def die(*_, **__):
             raise Killed()
-        with patch.object(registry, 'process_identity', return_value=self.ended_process()), \
+        with patch.object(registry, 'process_identity', return_value=holder or self.ended_process()), \
                 patch.object(fallback.Chain, 'release', lambda *_: None), \
                 patch.object(*((flow, 'launch') if relaunching else (fallback.Chain, 'run')), die), \
                 self.assertRaises(Killed):
             self.handle(root['dispatch_id'])
 
-    def failed_root(self):
-        root = self.first()
+    def failed_root(self, task=None):
+        root = self.first(task=task)
         self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
         return root
 
@@ -1089,25 +1090,56 @@ class FallbackTests(unittest.TestCase):
         self.assertTrue(registry.claim_held(legacy, registry.utcnow()))
         self.assertFalse(registry.claim_held(legacy, registry.parse(item['until']) + timedelta(seconds=1)))
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows OpenProcess')
-    def test_a_holder_that_refuses_this_reader_is_alive(self):
-        """Round 2 review D: OpenProcess answering access denied (error 5) means the process exists: it is not dead."""
+    @staticmethod
+    def unopenable_pid():
+        """A live process this user may not query (Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) refused with
+        access denied), such as a system process; None when none is found."""
         import ctypes
+        import psutil
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        for proc in psutil.process_iter(['name']):
+            if (proc.info['name'] or '').lower() not in ('lsass.exe', 'csrss.exe', 'smss.exe', 'services.exe', 'wininit.exe'):
+                continue
+            if not kernel.OpenProcess(0x1000, False, proc.pid) and ctypes.get_last_error() == 5:
+                return proc.pid
+        return None
 
-        def kernel(*_, **__):
-            def open_process(*_):
-                ctypes.set_last_error(5)
-                return None
-            return type('Kernel', (), {'OpenProcess': staticmethod(open_process),
-                                       'GetProcessTimes': staticmethod(lambda *_: 0),
-                                       'GetExitCodeProcess': staticmethod(lambda *_: 0),
-                                       'CloseHandle': staticmethod(lambda *_: 0)})()
-        claim = {'action': 'pending', 'at': registry.stamp(registry.utcnow()),
-                 'until': registry.stamp(registry.utcnow() + timedelta(seconds=registry.RUN_LEASE)),
-                 'holder': {'pid': 4242, 'started': 133000000000000000}}
-        with patch.object(ctypes, 'WinDLL', side_effect=kernel):
-            self.assertEqual(registry.process_started(4242), 0)
-            self.assertTrue(registry.claim_held(claim, registry.utcnow()))
+    @unittest.skipUnless(os.name == 'nt', 'Windows OpenProcess')
+    def test_a_dead_holders_pid_given_to_a_process_this_user_cannot_open_does_not_hold_the_claim(self):
+        """Round 3 review R3-1: the holder is a process this same user started, so a claim is held only when a process
+        of that pid can be opened by this user and its start time is the recorded one. A dead step whose pid a system
+        process now carries (after a restart) holds nothing: its attempt is taken over, not promised forever."""
+        pid = self.unopenable_pid()
+        if pid is None:
+            self.skipTest('no process refuses this user here')
+        self.assertIsNone(registry.process_started(pid))
+        for delta in ({'hours': 1}, {'hours': 24}, {'days': 30}):
+            with self.subTest(**delta):
+                creates = len(self.host.creates)
+                root = self.failed_root(task=dict(self.task, task_id=f"r3-1-{'-'.join(map(str, delta.values()))}"))
+                self.killed_step(root, holder={'pid': pid, 'started': 1})
+                with self.at(**delta):
+                    item = registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]
+                    self.assertFalse(registry.claim_held(item, registry.utcnow()))
+                    self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
+                    self.assertEqual(self.handle(root['dispatch_id'])['action'], 'relaunched')
+                self.assertEqual(len(self.host.creates), creates + 2)
+
+    def test_a_live_holder_of_this_user_still_holds_and_another_users_pid_does_not(self):
+        """E's rule stays: this process, as a holder, reads alive with its own start time. Without /proc, a pid whose
+        `kill(pid, 0)` is refused (another user's process) is not a step of this user."""
+        me = registry.process_identity()
+        self.assertIsNotNone(me['started'])
+        self.assertEqual(registry.process_started(me['pid']), me['started'])
+        claim = {'action': 'pending', 'at': registry.stamp(registry.utcnow()), 'holder': me,
+                 'until': registry.stamp(registry.utcnow() - timedelta(days=30))}
+        self.assertTrue(registry.claim_held(claim, registry.utcnow()))
+
+        def refused(*_):
+            raise PermissionError(1, 'Operation not permitted')
+        no_proc = type('Os', (), {'name': 'posix', 'kill': staticmethod(refused), 'getpid': staticmethod(os.getpid)})
+        with patch.object(registry, 'os', no_proc):
+            self.assertIsNone(registry.process_started(987654))
 
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim
