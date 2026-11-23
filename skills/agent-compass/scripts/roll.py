@@ -539,15 +539,11 @@ def none_next(decision):
 
 
 def user_decision_next(decision):
-    """What a caller reads when the router leaves the choice to the user: the plan's own reason, and the ways out that fit
-    the fact (a blocked chain owner, or a wait longer than --can-wait-hours allows)."""
+    """What a caller reads when the router leaves the choice to the user: the plan's own reason, and the ways out of a
+    wait longer than --can-wait-hours allows."""
     plan = decision.get('decision') or {}
     reason = plan.get('reason') or 'no reason was recorded'
     wait = plan.get('wait_hours')
-    if plan.get('resume_blocked_by'):
-        wait_text = f'wait about {wait}h and roll again (keeps the one owner)' if wait is not None else 'wait and roll again (keeps the one owner)'
-        return (f'The router needs a user decision: {reason} Ask the user: {wait_text}, or roll with --new-worker to start a '
-                'fresh worker on another route now (handoff and drift risk).')
     if wait is not None:
         return (f'The router needs a user decision: {reason} Ask the user: wait {wait}h and roll again, allow a longer wait '
                 f'with --can-wait-hours {wait}, name a route (--provider --account --model --basis), or do the task yourself.')

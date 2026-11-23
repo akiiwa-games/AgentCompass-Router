@@ -134,11 +134,14 @@ class HostPolicyTests(unittest.TestCase):
                 host_policy.sync_discovered(self.registered(codex='ready', claude='ready', **{'codex-work': 'ready'}))
                 self.assertEqual(host_policy.load_policy()['judges'], judges)
 
-    def test_excluded_coupled_owner_is_blocked(self):
+    def test_excluded_coupled_owner_gives_way_without_a_question(self):
+        """Rule: host policy excludes the chain owner like any candidate, and the plan then takes the next route itself."""
         result = self.plan({'work_kind': 'code_implementation', 'difficulty': 'coupled',
                             'chain': {'id': 'a', 'coupling': 'high', 'worker': {'bundle': 'opus55_high'}}})
-        self.assertIn('excluded by host policy', result['decision']['resume_blocked_by'])
-        self.assertTrue(result['decision']['needs_user_decision'])
+        owner = next(c for c in result['ranking'] if c['id'] == 'opus55_high')
+        self.assertIn('excluded by host policy', owner['excluded'])
+        self.assertNotEqual(result['choice'], 'opus55_high')
+        self.assertFalse(result['decision']['needs_user_decision'])
 
     def record(self, constraint='user_override', model='claude-opus-5-5', usage=None):
         """record_constraint for a route on `claude`, an account outside LS (out of automatic routing)."""

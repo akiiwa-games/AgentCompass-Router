@@ -218,19 +218,6 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
                                     if top is resume and top['action'] == 'resume'
                                     else f"Nothing eligible can start within {can_wait:g}h; the best, {top['id']}, can start in {advised_hours(top['available_in_hours'])}h{after}")
                          + '. Wait, allow a longer wait, or mark it unavailable and replan.'})
-    # A worker held only by the old route gives way when the user names something else.
-    pin_moved = resume is not None and (
-        ('explicit model constraint' in resume['excluded'] or 'explicit effort constraint' in resume['excluded'])
-        or bool(task.get('pinned_bundle') and task['pinned_bundle'] != resume['id']))
-    if (task['worker'] and not worker_sessions.worker_worn(task['worker'], policy) and task['coupling'] == 'high'
-            and resume is not None and resume['excluded'] and not pin_moved):
-        decision.update({'needs_user_decision': True, 'drift_risk': 'high',
-                         'resume_blocked_by': resume['excluded'],
-                         'wait_hours': (advised_hours(resume['wait_until_hours']) if isinstance(resume.get('wait_until_hours'), (int, float))
-                                        and math.isfinite(resume['wait_until_hours']) else None),
-                         'reason': (f"The chain owner {resume['id']} cannot continue now ({'; '.join(candidate_eval.said_exclusions(resume))})"
-                                    + (f"; it can continue in {advised_hours(resume['wait_until_hours'])}h" if isinstance(resume.get('wait_until_hours'), (int, float)) and resume['wait_until_hours'] != float('inf') else '')
-                                    + '. Waiting keeps one owner; switching delivers sooner with handoff and drift risk.')})
     # The margin is to the best other model, not to another effort, harness or account of the same model.
     rival = next((c for c in pool if c is not top
                   and account_fleet.row_key(c['bundle']['model'], accounts) != account_fleet.row_key(top['bundle']['model'], accounts)), None)

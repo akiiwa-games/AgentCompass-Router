@@ -145,16 +145,6 @@ class BlockedHandBuilt(HandBuilt):
         self.assertEqual(code, 2)
         self.assertIn('route.reason', res['next_action'])
 
-    def test_ask_user_for_a_blocked_chain_owner_names_what_blocks_it_and_for_how_long(self):
-        plan = {'action': 'resume', 'needs_user_decision': True, 'resume_blocked_by': ['five_hour has 1% left'], 'wait_hours': 4.2,
-                'reason': 'The chain owner x cannot continue now (five_hour has 1% left); it can continue in 4.2h. Waiting keeps one owner.'}
-        decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision=plan)
-        (res, code), _ = HandBuilt.roll(self, decision, task='x')
-        self.assertEqual((code, res['status']), (2, 'blocked'))
-        for fact in ('five_hour has 1% left', '4.2h'):
-            self.assertIn(fact, res['next_action'])
-        self.assertIn('--new-worker', res['next_action'])       # the way to switch: the chain is not carried
-
     def test_ask_user_for_a_wait_longer_than_allowed_names_the_wait_and_the_flag(self):
         plan = {'action': 'start', 'needs_user_decision': True, 'wait_hours': 7.5,
                 'reason': 'Nothing eligible can start within 2h; the best, x, can start in 7.5h (claude-lab\'s five_hour window resets then).'}

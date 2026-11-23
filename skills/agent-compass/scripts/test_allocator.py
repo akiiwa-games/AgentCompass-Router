@@ -141,13 +141,14 @@ class AllocatorTests(unittest.TestCase):
         short = lambda result: [r for r in result['ranking'] if r['id'] == 'sol_xhigh'][0]['excluded']
         high = self.plan(task('high'), usage)
         self.assertTrue(short(high), 'a window that covers the step but not the whole chain excludes the owner of a high-coupling chain')
-        self.assertTrue(high['decision']['needs_user_decision'])
+        self.assertNotEqual(high['choice'], 'sol_xhigh', 'an excluded owner is not chosen')
+        self.assertFalse(high['decision']['needs_user_decision'], 'the ranking picks the next route; nothing is left to the user')
         medium = self.plan(task('medium'), usage)
         self.assertEqual(short(medium), [], 'the same window covers the step of a medium-coupling chain')
         self.assertEqual((medium['choice'], medium['decision']['action']), ('sol_xhigh', 'resume'))
 
     def test_chain_continuity_and_handoff_rotation(self):
-        # 1. Active high-coupling chain resumes owner; blocked owner asks user; low-coupling switches silently
+        # 1. Active high-coupling chain resumes owner; a blocked owner gives way to the next route at any coupling
         # Rule: the owner resumes while the whole chain fits its window with the margin left. The share the chain needs is
         # computed from the plan's own row (chain hours / step hours x the step's spend, over the window's capacity), so the
         # fixture follows the data: the window is left with that share plus 15 points (the margin is 5).
@@ -163,20 +164,19 @@ class AllocatorTests(unittest.TestCase):
         self.assertEqual((resumed['choice'], resumed['decision']['action'], resumed['decision']['needs_user_decision']),
                          ('sol_xhigh', 'resume', False))
         blocked_usage = self.usage(codex=[('usage', 1, 121)])
-        blocked = self.plan({'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 2, 'chain': self.chain()}, blocked_usage)
-        self.assertTrue(blocked['decision']['needs_user_decision'])
-        self.assertEqual(blocked['decision']['drift_risk'], 'high')
-        self.assertAlmostEqual(blocked['decision']['wait_hours'], 121, delta=0.1)
-        self.assertNotEqual(blocked['selected_bundle']['account'], 'codex')
-        low_c = self.plan({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 1,
-                           'chain': self.chain(coupling='low')}, blocked_usage)
-        self.assertFalse(low_c['decision']['needs_user_decision'])
-        self.assertNotEqual(low_c['selected_bundle']['account'], 'codex')
+        for coupling in ('high', 'medium', 'low'):
+            with self.subTest(coupling=coupling):
+                blocked = self.plan({'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 2,
+                                     'chain': self.chain(coupling=coupling)}, blocked_usage)
+                self.assertFalse(blocked['decision']['needs_user_decision'])
+                self.assertNotEqual(blocked['selected_bundle']['account'], 'codex')
 
         # 2. Whole chain must fit for high coupling, only current step for medium coupling
         tight_usage = self.usage(codex=[('usage', 8, 100)])
         task = {'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 1, 'chain': self.chain(total=20)}
-        self.assertTrue(self.plan(task, tight_usage)['decision']['needs_user_decision'])
+        tight = self.plan(task, tight_usage)
+        self.assertTrue(next(c for c in tight['ranking'] if c['id'] == 'sol_xhigh')['excluded'])
+        self.assertFalse(tight['decision']['needs_user_decision'])
 
         # 4. Carried context (>=2M historical tokens) rotates unconditionally and unlocks re-allocation; compactions alone (<2M) still resume
         base_task = {'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 1}
@@ -685,10 +685,9 @@ class AllocatorTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     worker_sessions.rotation_threshold({'rotate_after_carried_tokens': bad_val})
 
-    def test_a_wait_names_the_window_that_sets_it_and_a_blocked_owner_names_what_blocks_it(self):
+    def test_a_wait_names_the_window_that_sets_it(self):
         """Rule (`candidate_eval.evaluate_bundle`, `allocator.plan`): `available_in_hours` is the reset of the window that
-        holds the candidate back, and the decision names that window (`wait_for`); a chain owner that cannot continue is
-        described by the exclusions the plan holds for it (`resume_blocked_by`) and the wait it computed (`wait_hours`)."""
+        holds the candidate back, and the decision names that window (`wait_for`)."""
         usage = self.usage(claude=[('five_hour', 3, 1.0), ('seven_day', 60, 100), ('weekly_fable', 100, 100)], codex=[('usage', 1, 121)])
         task = {'work_kind': 'visual_analysis', 'difficulty': 'routine', 'expected_hours': 1, 'needs': {'visual': True}}
         no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))]
@@ -701,12 +700,6 @@ class AllocatorTests(unittest.TestCase):
         self.assertTrue(impatient['decision']['needs_user_decision'])
         self.assertIn(impatient['decision']['wait_for']['window'], impatient['decision']['reason'])
         self.assertIn(impatient['decision']['wait_for']['account'], impatient['decision']['reason'])
-        blocked = self.plan({'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 2, 'chain': self.chain()},
-                            self.usage(codex=[('usage', 1, 121)]))
-        decision = blocked['decision']
-        for exclusion in decision['resume_blocked_by']:
-            self.assertIn(exclusion, decision['reason'])
-        self.assertIn(f"{decision['wait_hours']:.1f}h", decision['reason'])
 
     def waiting_fixture(self, five_hours, seven_hours, can_wait, seven_left=3):
         usage = self.usage(claude=[('five_hour', 3, five_hours), ('seven_day', seven_left, seven_hours), ('weekly_fable', 100, 100)],

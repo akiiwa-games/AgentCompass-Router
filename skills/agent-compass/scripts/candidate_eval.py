@@ -513,7 +513,6 @@ def evaluate_bundle(bundle, task, ctx):
                 if state['known'] and state['remaining'] <= policy['safety_margin_pct']:
                     exclude(f'{wid} has {state["remaining"]:.0f}% left, inside the {policy["safety_margin_pct"]}% reserve '
                             '(capacity unknown, so the need cannot be priced)')
-                    result['wait_until_hours'] = max(result.get('wait_until_hours', 0), state['reset_hours'])
                     continue
                 err = f'{wid} capacity_unknown (quota unknown, spend unpriced)'
                 plan_suffix = f"; plan unknown ({spec['plan_unknown_reason']})" if spec.get('plan_unknown_reason') else ''
@@ -597,7 +596,6 @@ def evaluate_bundle(bundle, task, ctx):
                 else:
                     task_exclude(f'{wid} has {state["remaining"]:.0f}% left; the work needs ~{need:.1f}% plus a {policy["safety_margin_pct"]}% margin '
                                  f'and it resets in {state["reset_hours"] / 24:.1f} days')
-                    result['wait_until_hours'] = max(result.get('wait_until_hours', 0), state['reset_hours'])
             elif w_len is not None and req_hours > h_before:
                 rem_need = min(req_hours - h_before, float(w_len)) * unit * context_burn
                 if 100.0 - rem_need < policy['safety_margin_pct']:
@@ -672,7 +670,6 @@ def evaluate_bundle(bundle, task, ctx):
                 task_exclude(OVER_CADENCE)
                 result['notes'].append(f'cadence has 0 of {cap_count:g} dispatches left; one frees in '
                                        f'{state["reset_hours"]:.1f}h')
-                result['wait_until_hours'] = max(result.get('wait_until_hours', 0), state['reset_hours'])
         if spec.get('unmetered') and not spec.get('unlimited'):
             result.setdefault('_five_axis_windows', []).append('cadence')
             five_window_states['cadence'] = (wspec, state, cap_count, None)

@@ -294,12 +294,11 @@ class UserPinTests(RouterCase):
         self.assertEqual(cooled['choice'], 'none')
         self.assertTrue(any('cooling down' in w for w in cooled['decision']['warnings']))
 
-    def test_a_new_pin_breaks_the_hold_of_a_coupled_chain(self):
+    def test_a_named_model_is_obeyed_on_a_chain_another_model_owns(self):
         chain = {'id': 'c', 'coupling': 'high', 'worker': {'bundle': 'opus55_high', 'compacted_tokens': 0, 'compactions': 0}}
         plan = self.plan(self.task(chain=chain, constraints={'model': 'gpt-6-astra'}))
         self.assertEqual(plan['selected_bundle']['model'], 'gpt-6-astra')
         self.assertFalse(plan['decision']['needs_user_decision'])
-        self.assertIsNone(plan['decision'].get('drift_risk'))
         kept = self.plan(self.task(chain=chain, constraints={'model': 'claude-opus-5-5', 'effort': 'high'}))
         self.assertEqual(kept['choice'], 'opus55_high')
 
