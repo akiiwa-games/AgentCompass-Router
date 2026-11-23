@@ -1064,6 +1064,84 @@ class AllocatorTests(unittest.TestCase):
                 )
             self.assertEqual(p_defer['choice'], p_after['choice'])
 
+    def test_named_model_starts_now_only_ever_names_a_bundle_of_that_model(self):
+        """Rule (`allocator.plan`, `allocator.named_model_keys`, `roll.defer_next`): `decision.starts_now` is the offer
+        'this can start at once instead'; for every way a model is named (`constraints.model`, `constraints.bundle`,
+        `route={'pinned_bundle': ...}`), `starts_now` equals the best eligible ready-now bundle of that named model's
+        `row_key` when one exists and is absent otherwise—never another model's bundle."""
+        import roll
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        base_accounts = copy.deepcopy(account_fleet.load_accounts())
+        base_task = {'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.3,
+                     'needs': {'local_only': True}, 'can_wait_hours': 3.0}
+        ways = (
+            ('constraint_model', {'constraints': {'model': 'claude-opus-5-5'}}, None),
+            ('constraint_bundle', {'constraints': {'bundle': 'opus55_high'}}, None),
+            ('pinned_bundle', {}, {'pinned_bundle': 'opus55_high'}),
+            ('user_named_pinned_bundle', {}, {'pinned_bundle': 'opus55_high', 'user_named_bundle': 'opus55_high'}),
+        )
+
+        # 1. Only other models (`codex`) can start now while `claude-opus-5-5` waits 2.0h: `starts_now` is absent everywhere.
+        usage_none_same = self.usage(
+            claude=[('five_hour', 2, 2.0), ('seven_day', 90, 100.0), ('weekly_fable', 100, 100.0)],
+            codex=[('usage', 90, 100.0)],
+        )
+        for label, extra, route in ways:
+            with self.subTest(case='no_same_model_ready', way=label):
+                planned = allocator.plan(
+                    with_prof({**base_task, **extra}), copy.deepcopy(usage_none_same), self.now,
+                    accounts=copy.deepcopy(base_accounts), overrides=[],
+                    host_policy_config={'allowed_accounts': ['claude', 'codex']}, route=route,
+                )
+                decision = planned['decision']
+                self.assertEqual(decision['action'], 'defer')
+                self.assertTrue(decision['task'].get('named_model'))
+                self.assertNotIn('starts_now', decision)
+                nxt = roll.defer_next(planned, decision['start_after_hours'])
+                self.assertIn('do not substitute another model', nxt)
+                self.assertNotIn('without --can-wait-hours', nxt)
+
+        # 2. Both a higher-ranked other model (`codex`, boosted) and a ready-now bundle of `claude-opus-5-5` on `claude-lab`
+        #    can start now while `claude`'s `opus55_high` waits 2.0h: `starts_now` picks only the ready-now `claude-opus-5-5`
+        #    bundle when eligible (`constraint_model`, `pinned_bundle`) and stays absent on `constraint_bundle`.
+        two_acct = copy.deepcopy(base_accounts)
+        two_acct['accounts']['claude-lab']['bundles']['lab_opus55_low'] = dict(
+            two_acct['accounts']['claude']['bundles']['opus55_high'],
+            id='lab_opus55_low', effort='low', account='claude-lab', provider='claude-lab', disabled=False,
+        )
+        usage_both_ready = self.usage(
+            claude=[('five_hour', 2, 2.0), ('seven_day', 90, 100.0), ('weekly_fable', 100, 100.0)],
+            codex=[('usage', 95, 100.0)],
+            **{'claude-lab': [('five_hour', 95, 3.0), ('seven_day', 95, 100.0), ('weekly_fable', 100, 100.0)]},
+        )
+        codex_boost = [{'id': 'b-codex', 'account': 'codex', 'intent': 'priority', 'boost': 2.0,
+                        'until': (self.now + timedelta(hours=5)).isoformat()}]
+        for label, extra, route in ways:
+            with self.subTest(case='same_and_other_ready', way=label):
+                planned = allocator.plan(
+                    with_prof({**base_task, **extra}), copy.deepcopy(usage_both_ready), self.now,
+                    accounts=copy.deepcopy(two_acct), overrides=copy.deepcopy(codex_boost),
+                    host_policy_config={'allowed_accounts': ['claude', 'codex', 'claude-lab']}, route=route,
+                )
+                decision = planned['decision']
+                self.assertEqual(decision['action'], 'defer')
+                same_ready = [c['id'] for c in planned['ranking']
+                              if not c['excluded'] and not c['available_in_hours']
+                              and account_fleet.row_key(c['bundle']['model'], two_acct) == 'claude-opus-5-5']
+                if route:
+                    other_ready_ahead = [c['id'] for c in planned['ranking']
+                                         if not c['excluded'] and not c['available_in_hours']
+                                         and account_fleet.row_key(c['bundle']['model'], two_acct) != 'claude-opus-5-5'
+                                         and c['score'] > self.rows(planned)[same_ready[0]]['score']]
+                    self.assertTrue(other_ready_ahead)
+                expected_starts_now = same_ready[0] if same_ready else None
+                self.assertEqual(decision.get('starts_now'), expected_starts_now)
+                if expected_starts_now is not None:
+                    self.assertEqual(
+                        account_fleet.row_key(self.rows(planned)[decision['starts_now']]['bundle']['model'], two_acct),
+                        'claude-opus-5-5',
+                    )
+
 
 class OverrideContractTests(unittest.TestCase):
     """Contract tests for temporary priority overrides, reset confirmation, receipts, and atomic store."""

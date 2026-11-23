@@ -29,6 +29,7 @@ import account_fleet
 import axis_scores
 import candidate_eval
 import candidate_ranking
+import fast_modes
 import quota_economy
 import quota_overrides
 import quota_pools
@@ -64,6 +65,25 @@ def named_pin_block(task, candidates):
     if not rows:
         return [f'{named}: no configured bundle offers it']
     return [f"{named} via {c['id']}: {'; '.join(c['excluded'])}" for c in rows if c['excluded']]
+
+
+def named_model_keys(task, candidates, accounts):
+    """The `row_key`s of the model `task` names (`constraint_model`, `constraint_bundle`, or `pinned_bundle`), or None
+    when the task names no model."""
+    keys = None
+    for bundle_id in (task.get('pinned_bundle'), task.get('constraint_bundle')):
+        if bundle_id:
+            base_id = bundle_id[:-len(fast_modes.ID_SUFFIX)] if bundle_id.endswith(fast_modes.ID_SUFFIX) else bundle_id
+            cand = (candidate_ranking.candidate_for_bundle(candidates, bundle_id, task.get('force_fast'))
+                    or candidate_ranking.candidate_for_bundle(candidates, base_id))
+            found = {account_fleet.row_key(cand['bundle']['model'], accounts)} if cand is not None else set()
+            keys = found if keys is None else (keys & found)
+    pin = task.get('constraint_raw_model') or task.get('constraint_model')
+    if pin:
+        pool = account_fleet.pin_pool(accounts, extra=[c['bundle'] for c in candidates])
+        found = {account_fleet.row_key(b['model'], accounts) for b in account_fleet.pin_matching_bundles(pin, pool, accounts)}
+        keys = found if keys is None else (keys & found)
+    return keys
 
 
 def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None, capabilities=None, overrides=None,
@@ -248,8 +268,13 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
     result['decision']['alternatives'] = list(dict.fromkeys(c['id'] for c in pool if c['id'] != top['id']))[:3]
     if top['available_in_hours']:
         decision.update({'action': 'defer', 'start_after_hours': advised_hours(top['available_in_hours'])})
-        # What a caller that will not wait can have instead: the best candidate that starts now, when there is one.
-        ready_now = next((c for c in eligible if not c['available_in_hours']), None)
+        # What a caller that will not wait can have instead: the best candidate that starts now, when there is one;
+        # for a named model (`constraint_model`, `constraint_bundle`, `pinned_bundle`), only a bundle of that model.
+        allowed_models = named_model_keys(task, candidates, accounts)
+        ready_now = next((c for c in eligible if not c['available_in_hours']
+                          and (allowed_models is None
+                               or account_fleet.row_key(c['bundle']['model'], accounts) in allowed_models)),
+                         None)
         if ready_now is not None:
             decision['starts_now'] = ready_now['id']
     if task.get('wants_fast') and not top['bundle'].get('fast'):
