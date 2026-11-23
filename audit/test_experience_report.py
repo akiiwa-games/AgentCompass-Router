@@ -7,7 +7,7 @@ import experience_report as report
 
 def answer(chain, step=0, kind="roll", status="launched", **extra):
     return {"chain": chain, "step": step, "kind": kind, "status": status, "caller_action": extra.pop("caller_action", None),
-            "at": extra.pop("at", 0.0), "brief": extra.pop("brief", "b"), "difficulty": extra.pop("difficulty", "moderate"), **extra}
+            "at": extra.pop("at", 0.0), "brief": extra.pop("brief", "b"), "level": extra.pop("level", 2), **extra}
 
 
 def test_answer_counts_take_only_what_the_session_read():
@@ -19,9 +19,10 @@ def test_answer_counts_take_only_what_the_session_read():
     assert counts["observations"] == {"observe: failed": 1}
 
 
-def test_launches_are_the_last_answer_of_each_launched_chain():
-    answers = [answer("0", status="blocked"), answer("0", 1), answer("1", status="error")]
-    chains = [{"id": "0", "answers": [0, 1], "outcome": "launched"}, {"id": "1", "answers": [2], "outcome": "handed_to_session"}]
+def test_launches_are_the_answers_that_carried_the_launch_not_a_later_observation():
+    answers = [answer("0", status="blocked"), answer("0", 1, carried_launch=True), answer("0", 2, kind="observe", status="failed"),
+               answer("1", status="error")]
+    chains = [{"id": "0", "answers": [0, 1, 2], "outcome": "launched"}, {"id": "1", "answers": [3], "outcome": "handed_to_session"}]
     assert report.launches(answers, chains) == [answers[1]]
 
 
@@ -36,40 +37,98 @@ def test_dead_end_and_broken_promise_are_read_from_the_chain():
     assert not report.promise_broken(scenario, dict(chains[1], outcome="relaunched"))
 
 
-def test_questions_compare_the_chosen_candidate_with_the_other_eligible_ones():
-    ranking = [{"id": "a", "fit": 1.0, "usd": 4.0}, {"id": "b", "fit": 2.0, "usd": 1.0}]
-    hard = answer("0", difficulty="hard", bundle_id="a", ranking=ranking)
+def test_the_fit_question_reads_the_recorded_fit_of_hard_work_only():
+    ranking = [{"id": "a", "fit": 1.0}, {"id": "b", "fit": 2.0}]
+    hard = answer("0", level=report.limit("hard_level"), bundle_id="a", ranking=ranking)
     assert report.harder_on_weaker(hard)["stronger"]["id"] == "b"
     assert report.harder_on_weaker(dict(hard, bundle_id="b")) is None
-    assert report.harder_on_weaker(dict(hard, difficulty="moderate")) is None
-    trivial = answer("0", difficulty="trivial", bundle_id="a", ranking=ranking)
-    assert report.trivial_on_dearer(trivial)["ratio"] == 4.0
-    assert report.trivial_on_dearer(dict(trivial, bundle_id="b")) is None
+    assert report.harder_on_weaker(dict(hard, level=2)) is None
 
 
-def test_run_outs_are_charges_that_did_not_fit():
-    scenario = {"charges": [{"chain": "0", "pct": 10.0, "applied": 10.0}, {"chain": "1", "pct": 30.0, "applied": 5.0},
-                            {"chain": "2", "pct": None, "applied": None}]}
-    assert [c["chain"] for c in report.run_outs(scenario)] == ["1"]
+def test_the_cost_question_compares_the_routers_opportunity_cost_never_dollars():
+    """Cost is components.opportunity_cost as recorded; a dearer list price on a cheaper quota is not dearer."""
+    routine = report.limit("routine_level")
+    ranking = [{"id": "a", "account": "claude", "opportunity_cost": 0.004, "usd": 4.0},
+               {"id": "b", "account": "codex", "opportunity_cost": 0.02, "usd": 1.0}]
+    q = report.cost_check(answer("0", level=routine, bundle_id="a", ranking=ranking))
+    assert q["recorded"] and not q["dearer"] and q["cheaper"] is None
+    q = report.cost_check(answer("0", level=routine, bundle_id="b", ranking=ranking))
+    assert q["dearer"] and q["cheaper"]["id"] == "a" and q["ratio"] == 5.0
+    near = [dict(ranking[0], opportunity_cost=0.015), ranking[1]]
+    q = report.cost_check(answer("0", level=routine, bundle_id="b", ranking=near))
+    assert q["cheaper"]["id"] == "a" and not q["dearer"]                                     # under the declared ratio
+    free = [dict(ranking[0], opportunity_cost=0.0), ranking[1]]
+    assert report.cost_check(answer("0", level=routine, bundle_id="b", ranking=free))["dearer"]   # above a zero cost
+    unrecorded = [{"id": "b", "account": "codex", "fit": 1.0}, ranking[0]]
+    assert report.cost_check(answer("0", level=routine, bundle_id="b", ranking=unrecorded)) == {"recorded": False}
+    assert report.cost_check(answer("0", level=2, bundle_id="b", ranking=ranking)) is None
+
+
+def test_models_with_nothing_count_a_model_once_keep_the_users_switches_apart_and_say_only_what_was_recorded():
+    scenario = {"spec": {"switches": {"outside_allowed": ["codex-2"]}},
+                "bundles": {"sonnet_a": {"account": "claude", "provider": "claude", "model": "sonnet"},
+                            "sonnet_b": {"account": "claude-2", "provider": "claude-2", "model": "sonnet"},
+                            "astra": {"account": "codex", "provider": "codex", "model": "astra"},
+                            "pi_astra": {"account": "codex", "provider": "pi", "model": "astra"},
+                            "fable": {"account": "claude", "provider": "claude", "model": "fable"},
+                            "sol": {"account": "codex-2", "provider": "codex-2", "model": "sol"},
+                            "opus": {"account": "claude", "provider": "claude", "model": "opus", "disabled": True}},
+                "exclusions": {"astra": {"plans": 4, "eligible": 4, "won": 0, "gaps": [0.1, 0.3], "excluded": {}},
+                               "pi_astra": {"plans": 4, "eligible": 0, "won": 0, "gaps": [], "excluded": {"provider discovery: missing_client": 4}}}}
+    nothing = report.models_with_nothing(scenario, [answer("0", model="sonnet")])
+    assert [e["model"] for e in nothing["models"]] == ["astra", "fable"]
+    assert nothing["outside_allowed"] == ["sol"] and nothing["unchecked"] == ["opus"]
+    astra = {r["bundle"]: r["recorded"] for r in nothing["models"][0]["bundles"]}
+    assert astra["astra"] == "eligible in 4 plan(s), never the top score"           # pi's missing client is not codex's
+    assert astra["pi_astra"] == "provider discovery: missing_client ×4"
+    assert nothing["models"][1]["bundles"][0]["recorded"].startswith("not recorded")
+
+
+def test_one_headline_per_event_and_models_counted_once_per_scenario():
+    def scenario(name, share):
+        return {"name": name, "broken_promises": ["1"], "dead_ends": [], "error": None, "resets": [], "long_answers": [],
+                "roll_seconds": {}, "questions": {"hard_on_weaker": [], "routine_on_dearer": []}, "routine_cost": {},
+                "not_launched": [{"scenario": name, "chain": "1", "step": 0, "status": "error", "caller_action": "check_error", "brief": "b"},
+                                 {"scenario": name, "chain": "2", "step": 0, "status": "blocked", "caller_action": "tell_user", "brief": "b"}],
+                "models_with_nothing": {"models": [{"model": "astra", "bundles": [{"provider": "codex", "recorded": "x"}]},
+                                                   {"model": "astra-2", "bundles": [{"provider": "codex", "recorded": "x"}]}],
+                                        "outside_allowed": [], "unchecked": []},
+                "level_x_model": share}
+    folded = {"L1": {"sonnet:medium@claude": 3, "sol:high@codex": 1}, "L2": {"sonnet:high@claude": 3}, "L3": {"sonnet:high@claude-2": 2}}
+    items = report.look_first({}, {"scenarios": [scenario("one", folded), scenario("two", {})]})
+    titles = [i["title"] for i in items]
+    assert not any("error / check_error" in t for t in titles)          # the broken promise's answer is counted once
+    assert any("blocked / tell_user" in t for t in titles)
+    nothing = next(i for i in items if "got no work" in i["title"])
+    assert nothing["title"].startswith("2 signed-in model(s)") and {r["scenarios"] for r in nothing["rows"]} == {2}
+    concentrated = next(i for i in items if "one model" in i["title"])
+    assert concentrated["rows"] == [{"scenario": "one", "model": "sonnet", "share": 0.89, "workers": 9, "models_that_worked": 2}]
 
 
 def test_write_builds_report_and_summary_from_rows(tmp_path):
     rows = {"run": {"started": "t", "seconds": 1, "processes_at_end": [], "processes_after_end": []},
             "scenarios": [{"name": "s", "spec": {"accounts": [{"name": "codex", "family": "codex", "plan": "plus"}]}, "error": None, "seconds": 1,
                            "processes_ended": [], "answers": [answer("0", model="m", effort="high", account="codex", bundle_id="x", expected_usd=1.5,
-                                                                     seconds=2.0, stdout_chars=100)],
-                           "chains": [{"id": "0", "briefs": ["b"], "answers": [0], "outcome": "launched", "commands": 1}],
+                                                                     seconds=2.0, stdout_chars=100, carried_launch=True)],
+                           "chains": [{"id": "0", "briefs": ["b"], "answers": [0], "outcome": "launched", "commands": 1},
+                                      {"id": "1", "briefs": ["b"], "answers": [], "outcome": "batch", "commands": 1},
+                                      {"id": "1.0", "briefs": ["b"], "answers": [], "outcome": "launched", "commands": 0, "batch_of": "1"}],
                            "charges": [], "resets": [{"account": "codex", "window": "usage", "at": 168, "used_before": 10, "unused": 90}],
                            "timeline": [{"at": 0, "windows": {"codex": {"usage": {"used": 0, "resets_in": 168}}}}],
-                           "exclusions": {}, "bundles": {"x": {"account": "codex", "model": "m"}, "y": {"account": "codex", "model": "n"}}}]}
+                           "exclusions": {}, "bundles": {"x": {"account": "codex", "provider": "codex", "model": "m"},
+                                                         "y": {"account": "codex", "provider": "codex", "model": "n"}}}]}
     (tmp_path / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
     path = report.write(tmp_path)
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     scenario = summary["scenarios"][0]
     assert scenario["workers"] == 1 and scenario["unused_at_reset"] == 90
-    assert [m["model"] for m in scenario["models_with_nothing"]] == ["n@codex"]
-    assert scenario["usd_by_difficulty"]["moderate"]["sum"] == 1.5
-    assert "## s" in path.read_text(encoding="utf-8")
+    assert [m["model"] for m in scenario["models_with_nothing"]["models"]] == ["n"]
+    assert scenario["usd_by_level"]["L2"]["sum"] == 1.5
+    assert scenario["batch_workers"] == {"workers": 1, "batch_rolls": 1, "follow_up_commands": 0}
+    text = path.read_text(encoding="utf-8")
+    assert "## s" in text
+    for name in report.THRESHOLDS:
+        assert name in text                                              # every threshold is declared in the report
 
 
 def test_a_reset_after_the_days_last_act_is_overnight():

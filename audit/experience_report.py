@@ -4,9 +4,11 @@
 
 Writes `report.md` (for reading) and `summary.json` (every table of the report as data) next to `rows.json`. It gives no
 verdicts: it counts what the main session met, where the work went, what it cost on the simulated clock and how the answers
-felt, and lists rows a person should look at. The "questions" it lists (hard work on a weaker candidate, trivial work on a
-dearer one, a model that got nothing) are read from the plan's own ranking and reason; whether they are wrong is the
-reader's call.
+felt, and lists rows a person should look at. Every number is read from the router's own fields as the run recorded them
+(the plan's ranking snapshot, its reason, its profile, its expected_usd); where the router recorded nothing, the report says
+"not recorded" instead of computing a stand-in. The "questions" it lists (hard work on a weaker candidate, routine work on
+a dearer one, a model that got nothing) are read from the plan's own ranking and reason; whether they are wrong is the
+reader's call. Every threshold is in THRESHOLDS and printed at the top of the report.
 """
 from __future__ import annotations
 
@@ -17,9 +19,28 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-LONG_ANSWER_CHARS = 2500          # a short result longer than this is more than a session reads at a glance
-SLOW_ROLL_SECONDS = 10.0
-DIFFICULTIES = ("trivial", "simple", "moderate", "hard")
+# Every threshold the report uses, with what it means; render prints them all at the top.
+THRESHOLDS = {
+    "hard_level": (3, "the primary_level of the router's profile that counts as hard work in the higher-fit question"),
+    "hard_fit_margin": (0.25, "a candidate's fit (the router's components.fit) above the chosen one's by more than this is clearly higher"),
+    "routine_level": (1, "the primary_level that counts as routine work in the dearer-candidate question"),
+    "dearer_cost_ratio": (2.0, "the chosen candidate's opportunity_cost at least this many times another eligible candidate's "
+                               "(or any cost above a zero one) is dearer"),
+    "concentration_min_workers": (8, "a scenario needs at least this many workers before one model's share is listed"),
+    "concentration_share": (0.6, "one model's share of a scenario's workers (accounts and efforts folded) from which it is listed"),
+    "unused_at_reset_pp": (80, "a long window that resets during the day with at least this many percentage points unused is listed"),
+    "long_answer_chars": (2500, "a short result longer than this is more than a session reads at a glance"),
+    "slow_roll_seconds": (10.0, "a roll that took longer than this is listed"),
+    "not_launched_kinds": (3, "how many kinds of answer that did not launch (status / caller_action) the first look lists"),
+    "rows_per_item": (8, "rows shown under each item of the first look"),
+}
+
+
+def limit(name: str):
+    return THRESHOLDS[name][0]
+
+
+LEVELS = ("L1", "L2", "L3")
 NOT_A_WAY_OUT = ("", None)
 
 
@@ -38,13 +59,21 @@ def answer_counts(answers: list[dict]) -> dict:
 
 
 def launches(answers: list[dict], chains: list[dict]) -> list[dict]:
-    """The answer that carried each launched worker: the last answer of every chain whose outcome is a launch."""
-    by_index = {i: a for i, a in enumerate(answers)}
+    """The answer that carried each launched worker: the one the run marked `carried_launch` in a chain whose outcome is a
+    launch (an observation the run made after it is not that answer)."""
     out = []
     for chain in chains:
-        if chain.get("outcome") in ("launched", "relaunched") and chain.get("answers"):
-            out.append(by_index[chain["answers"][-1]])
+        if chain.get("outcome") not in ("launched", "relaunched"):
+            continue
+        carried = [answers[i] for i in chain.get("answers") or [] if answers[i].get("carried_launch")]
+        if carried:
+            out.append(carried[-1])
     return out
+
+
+def level_label(answer: dict) -> str:
+    """The router's primary_level of the brief's profile, as L1..L3."""
+    return f"L{answer['level']}" if answer.get("level") else "(none)"
 
 
 def share_table(rows: list[dict], row_key, col_key) -> dict:
@@ -97,30 +126,40 @@ def promise_broken(scenario: dict, chain: dict) -> bool:
 # questions for the reader (from the plan's own ranking)
 
 
-def harder_on_weaker(answer: dict, margin: float = 0.25) -> dict | None:
-    """Hard work launched on a candidate whose fit is below another eligible candidate's by more than `margin`."""
+def harder_on_weaker(answer: dict) -> dict | None:
+    """Hard work (THRESHOLDS hard_level) launched on a candidate whose recorded fit is below another eligible candidate's by
+    more than hard_fit_margin."""
     ranking = answer.get("ranking") or []
     chosen = next((c for c in ranking if c.get("id") == answer.get("bundle_id")), None)
-    if answer.get("difficulty") != "hard" or chosen is None or chosen.get("fit") is None:
+    if answer.get("level") != limit("hard_level") or chosen is None or chosen.get("fit") is None:
         return None
-    better = [c for c in ranking if c.get("fit") is not None and c["fit"] > chosen["fit"] + margin]
+    better = [c for c in ranking if c.get("fit") is not None and c["fit"] > chosen["fit"] + limit("hard_fit_margin")]
     if not better:
         return None
     best = max(better, key=lambda c: c["fit"])
     return {"chosen": chosen, "stronger": best, "gap": round(best["fit"] - chosen["fit"], 3)}
 
 
-def trivial_on_dearer(answer: dict, ratio: float = 2.0) -> dict | None:
-    """Trivial or simple work launched on a candidate at least `ratio` times the cost of another eligible candidate."""
+def cost_check(answer: dict) -> dict | None:
+    """For routine work (THRESHOLDS routine_level): the chosen candidate's cost against the other eligible candidates', where
+    cost is the router's own ranking cost, `components.opportunity_cost` (what the score N subtracts for the quota the work
+    would use on that account's windows at that moment; not dollars). None for other work; `{"recorded": False}` when the
+    snapshot did not record the chosen candidate's cost; else the cheapest other candidate with a recorded cost when it is
+    below the chosen one's, and whether the chosen one is dearer by dearer_cost_ratio (any cost above a zero one is)."""
+    if answer.get("level") != limit("routine_level"):
+        return None
     ranking = answer.get("ranking") or []
     chosen = next((c for c in ranking if c.get("id") == answer.get("bundle_id")), None)
-    if answer.get("difficulty") not in ("trivial", "simple") or chosen is None or not chosen.get("usd"):
-        return None
-    cheaper = [c for c in ranking if c.get("usd") and c["usd"] * ratio <= chosen["usd"]]
-    if not cheaper:
-        return None
-    cheapest = min(cheaper, key=lambda c: c["usd"])
-    return {"chosen": chosen, "cheaper": cheapest, "ratio": round(chosen["usd"] / cheapest["usd"], 2)}
+    if chosen is None or chosen.get("opportunity_cost") is None:
+        return {"recorded": False}
+    others = [c for c in ranking if c is not chosen and c.get("opportunity_cost") is not None]
+    cheapest = min(others, key=lambda c: c["opportunity_cost"]) if others else None
+    if cheapest is None or chosen["opportunity_cost"] <= cheapest["opportunity_cost"]:
+        return {"recorded": True, "chosen": chosen, "cheaper": None, "dearer": False, "ratio": None}
+    mine, low = chosen["opportunity_cost"], cheapest["opportunity_cost"]
+    ratio = round(mine / low, 2) if low > 0 else None
+    return {"recorded": True, "chosen": chosen, "cheaper": cheapest, "ratio": ratio,
+            "dearer": low <= 0 or ratio >= limit("dearer_cost_ratio")}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -147,22 +186,16 @@ def overnight(scenario: dict) -> list[dict]:
     return [dict(r, overnight=r["at"] > ends.get(int(r["at"] // 24), float("inf"))) for r in scenario.get("resets") or ()]
 
 
-def run_outs(scenario: dict) -> list[dict]:
-    """Charges that did not fit under 100 % (the window ran out with this launch), in time order."""
-    return [c for c in scenario.get("charges") or [] if c.get("pct") is not None and c.get("applied") is not None and c["applied"] + 1e-9 < c["pct"]]
+# A window running out is not counted. The run charges a launch's expected_usd in one lump at launch, and the router keeps
+# no draw of its own to compare it with: a reservation holds the full expected_usd, and the feasibility check
+# (candidate_eval) prorates a short window's share before its reset inline. A count from the run's own charge would be a
+# formula of the tool's, so the report shows the window readings only.
 
 
-def after_run_out(scenario: dict, charge: dict, limit: int = 4) -> list[dict]:
-    """The next answers after a window ran out: what happened to the work then."""
-    later = [a for a in scenario["answers"] if a["at"] >= charge["at"] and a.get("kind") in ("roll", "next_argv")]
-    started = next((i for i, a in enumerate(later) if a["chain"] == charge["chain"]), 0)
-    return later[started + 1:started + 1 + limit]
-
-
-def usd_by_difficulty(launched: list[dict]) -> dict:
+def usd_by_level(launched: list[dict]) -> dict:
     out = {}
-    for level in DIFFICULTIES:
-        values = [a["expected_usd"] for a in launched if a.get("difficulty") == level and isinstance(a.get("expected_usd"), (int, float))]
+    for level in LEVELS:
+        values = [a["expected_usd"] for a in launched if level_label(a) == level and isinstance(a.get("expected_usd"), (int, float))]
         if values:
             out[level] = {"n": len(values), "median": round(statistics.median(values), 2), "mean": round(statistics.mean(values), 2),
                           "max": round(max(values), 2), "sum": round(sum(values), 2)}
@@ -181,33 +214,22 @@ def summarize(rows: dict) -> dict:
         read = [a for a in answers if a.get("kind") in ("roll", "next_argv")]
         top_level = [c for c in chains if "batch_of" not in c]
         worker_chains = [c for c in chains if c.get("outcome") in ("launched", "relaunched")]
-        bundles = scenario.get("bundles") or {}
         got = Counter(a.get("bundle_id") for a in launched)
-        available = sorted({f"{b['model']}@{b['account']}" for b in bundles.values() if not b.get("disabled")})
-        models_got = Counter(f"{a.get('model')}@{a.get('account')}" for a in launched)
-        nothing = []
-        for label in available:
-            if models_got.get(label):
-                continue
-            ids = [bid for bid, b in bundles.items() if f"{b['model']}@{b['account']}" == label]
-            reasons, eligible, gaps = Counter(), 0, []
-            for bid in ids:
-                entry = (scenario.get("exclusions") or {}).get(bid) or {}
-                reasons.update(entry.get("excluded") or {})
-                eligible += entry.get("eligible", 0)
-                gaps += entry.get("gaps") or []
-            nothing.append({"model": label, "bundles": ids, "eligible_in_plans": eligible,
-                            "median_gap_to_top": round(statistics.median(gaps), 4) if gaps else None,
-                            "top_exclusions": reasons.most_common(3)})
-        questions = {"hard_on_weaker": [], "trivial_on_dearer": []}
+        questions = {"hard_on_weaker": [], "routine_on_dearer": []}
+        costs = Counter()
         for a in launched:
             q = harder_on_weaker(a)
             if q:
                 questions["hard_on_weaker"].append({"answer": ref(scenario, a), "brief": a["brief"], "chosen": q["chosen"], "stronger": q["stronger"],
                                                     "gap": q["gap"], "reason": a.get("decision_reason")})
-            q = trivial_on_dearer(a)
-            if q:
-                questions["trivial_on_dearer"].append({"answer": ref(scenario, a), "brief": a["brief"], "chosen": q["chosen"], "cheaper": q["cheaper"],
+            q = cost_check(a)
+            if q is None:
+                continue
+            costs["routine launches"] += 1
+            costs["chosen cost not recorded" if not q["recorded"] else "dearer" if q["dearer"]
+                  else "lowest recorded cost" if q["cheaper"] is None else "dearer, under the ratio"] += 1
+            if q.get("dearer"):
+                questions["routine_on_dearer"].append({"answer": ref(scenario, a), "brief": a["brief"], "chosen": q["chosen"], "cheaper": q["cheaper"],
                                                        "ratio": q["ratio"], "reason": a.get("decision_reason")})
         roll_seconds = [a["seconds"] for a in read if isinstance(a.get("seconds"), (int, float))]
         resets = overnight(scenario)
@@ -221,27 +243,63 @@ def summarize(rows: dict) -> dict:
                              for a in read if a.get("status") not in ("launched", "batch")],
             "dead_ends": [c["id"] for c in chains if is_dead_end(scenario, c)],
             "broken_promises": [c["id"] for c in chains if promise_broken(scenario, c)],
-            "difficulty_x_model": share_table(launched, lambda a: a.get("difficulty"), model_label),
+            "level_x_model": share_table(launched, level_label, model_label),
             "kind_x_model": share_table(launched, lambda a: a.get("work_kind"), model_label),
             "model_share": dict(Counter(model_label(a) for a in launched).most_common()),
             "bundles_won": dict(got.most_common()),
-            "models_with_nothing": nothing, "questions": questions,
-            "usd_by_difficulty": usd_by_difficulty(launched),
+            "models_with_nothing": models_with_nothing(scenario, launched), "questions": questions, "routine_cost": dict(costs),
+            "usd_by_level": usd_by_level(launched),
             "windows": {k: {"start": v[0][1] if v else None, "peak": max((u for _, u in v), default=None), "end": v[-1][1] if v else None}
                         for k, v in window_timelines(scenario).items()},
             "resets": resets, "unused_at_reset": round(sum(r["unused"] for r in resets if not r["overnight"]), 1),
             "unused_overnight": round(sum(r["unused"] for r in resets if r["overnight"]), 1),
-            "run_outs": [{"charge": c, "next": [ref(scenario, a) | {"status": a.get("status"), "model": a.get("model")} for a in after_run_out(scenario, c)]}
-                         for c in run_outs(scenario)],
             "deferrals": [{"chain": c["id"], "brief": c["briefs"], "waits": c.get("waits")} for c in chains if c.get("waits")],
             "roll_seconds": {"n": len(roll_seconds), "median": percentile(roll_seconds, 0.5), "p90": percentile(roll_seconds, 0.9),
                              "max": max(roll_seconds, default=None)},
             "commands_per_worker": dict(Counter(c.get("commands") for c in worker_chains if "batch_of" not in c).most_common()),
-            "long_answers": [ref(scenario, a) | {"chars": a["stdout_chars"]} for a in read if (a.get("stdout_chars") or 0) > LONG_ANSWER_CHARS],
+            "batch_workers": {"workers": len([c for c in worker_chains if "batch_of" in c]),
+                              "batch_rolls": len({c["batch_of"] for c in worker_chains if "batch_of" in c}),
+                              "follow_up_commands": sum(c.get("commands") or 0 for c in worker_chains if "batch_of" in c)},
+            "long_answers": [ref(scenario, a) | {"chars": a["stdout_chars"]} for a in read if (a.get("stdout_chars") or 0) > limit("long_answer_chars")],
             "no_way_out": [ref(scenario, a) | {"status": a.get("status")} for a in read
                            if a.get("status") not in ("launched", "batch") and a.get("next_action") in NOT_A_WAY_OUT],
         })
     return {"run": rows.get("run") or {}, "scenarios": scenarios}
+
+
+def models_with_nothing(scenario: dict, launched: list[dict]) -> dict:
+    """The signed-in models (accounts, efforts and harnesses folded) no worker of this scenario ran, once each. Models only on
+    accounts the user left outside allowed_accounts, or only in bundles the user unchecked, are kept apart. For the others
+    each bundle (its own harness) carries what its plans recorded about it: its exclusions in the plans' rankings, or how
+    often it was eligible and never the top score; a bundle in no recorded ranking is "not recorded"."""
+    bundles = scenario.get("bundles") or {}
+    outside = set(((scenario.get("spec") or {}).get("switches") or {}).get("outside_allowed") or ())
+    got = {a.get("model") for a in launched}
+    by_model = defaultdict(list)
+    for bid, bundle in bundles.items():
+        by_model[bundle["model"]].append((bid, bundle))
+    out = {"models": [], "outside_allowed": [], "unchecked": []}
+    for model, members in sorted(by_model.items()):
+        if model in got:
+            continue
+        open_ = [(bid, b) for bid, b in members if b["account"] not in outside and not b.get("disabled")]
+        if not open_:
+            kind = "outside_allowed" if all(b["account"] in outside for _, b in members) else "unchecked"
+            out[kind].append(model)
+            continue
+        rows = []
+        for bid, bundle in open_:
+            entry = (scenario.get("exclusions") or {}).get(bid) or {}
+            gaps = entry.get("gaps") or []
+            reasons = Counter(entry.get("excluded") or {}).most_common(2)
+            said = ("; ".join(f"{r} ×{n}" for r, n in reasons) if reasons
+                    else f"eligible in {entry['eligible']} plan(s), never the top score" if entry.get("eligible")
+                    else "not recorded (in no plan's recorded ranking)")
+            rows.append({"bundle": bid, "provider": bundle.get("provider"), "account": bundle["account"], "plans": entry.get("plans", 0),
+                         "eligible": entry.get("eligible", 0), "median_gap_to_top": round(statistics.median(gaps), 4) if gaps else None,
+                         "recorded": said})
+        out["models"].append({"model": model, "bundles": rows})
+    return out
 
 
 def masked(text, n=110) -> str:
@@ -257,10 +315,11 @@ def ref(scenario: dict, answer: dict) -> dict:
 # the things most worth a look
 
 
-def look_first(rows: dict, summary: dict, limit: int = 10) -> list[dict]:
+def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
     """Candidates for a person's first look, each with the rows that show it, most widespread first. Counting only:
     which are problems is the reader's call."""
     items = []
+    shown = limit("rows_per_item")
     broken = [(s["name"], c) for s in summary["scenarios"] for c in s["broken_promises"]]
     if broken:
         items.append({"weight": 100 + len(broken), "title": f"{len(broken)} answer(s) told the session the router would go on by itself "
@@ -275,64 +334,83 @@ def look_first(rows: dict, summary: dict, limit: int = 10) -> list[dict]:
         items.append({"weight": 95, "title": f"the run could not finish {len(errors)} scenario(s): " + ", ".join(errors), "rows": [{"scenario": n} for n in errors]})
     handed = Counter()
     handed_rows = defaultdict(list)
+    told = {(n, c) for n, c in broken}
     for s in summary["scenarios"]:
         for row in s["not_launched"]:
-            if row["status"] == "split":
+            # One headline per kind of event: an answer of a broken promise is counted there, not again here.
+            if row["status"] == "split" or (s["name"], row["chain"]) in told:
                 continue
             key = f"{row['status']} / {row['caller_action']}"
             handed[key] += 1
             handed_rows[key].append(row)
-    for key, n in handed.most_common(3):
+    for key, n in handed.most_common(limit("not_launched_kinds")):
         why = Counter(masked(r.get("reason") or r.get("cause")) for r in handed_rows[key]).most_common(2)
         items.append({"weight": 40 + n, "title": f"{n} answer(s) did not launch: {key}; most common reason: " + " | ".join(f"{w} ×{c}" for w, c in why),
-                      "rows": [{k: v for k, v in r.items() if k not in ("reason", "cause")} for r in handed_rows[key][:8]]})
-    nothing = Counter()
-    nothing_rows = defaultdict(list)
+                      "rows": [{k: v for k, v in r.items() if k not in ("reason", "cause")} for r in handed_rows[key][:shown]]})
+    nothing = defaultdict(set)
+    nothing_said = defaultdict(Counter)
+    apart = Counter()
     for s in summary["scenarios"]:
-        for entry in s["models_with_nothing"]:
-            model = entry["model"].split("@")[0]
-            nothing[model] += 1
-            nothing_rows[model].append(entry["top_exclusions"][0][0] if entry["top_exclusions"] else f"outranked (eligible in {entry['eligible_in_plans']} plans)")
+        for entry in s["models_with_nothing"]["models"]:
+            nothing[entry["model"]].add(s["name"])
+            for row in entry["bundles"]:
+                nothing_said[entry["model"]][f"{row['provider']}: {masked(row['recorded'], 140)}"] += 1
+        for kind in ("outside_allowed", "unchecked"):
+            apart[kind] += len(s["models_with_nothing"][kind])
     if nothing:
-        items.append({"weight": 30 + len(nothing), "title": f"{len(nothing)} signed-in model(s) got no work in at least one scenario",
-                      "rows": [{"model": m, "scenarios": n, "most common reason": Counter(nothing_rows[m]).most_common(1)[0][0]} for m, n in nothing.most_common(8)]})
+        items.append({"weight": 30 + len(nothing), "title": f"{len(nothing)} signed-in model(s) got no work in at least one scenario "
+                      f"(not counted: {apart['outside_allowed']} model(s) only on accounts outside allowed_accounts, {apart['unchecked']} unchecked by the user)",
+                      "rows": [{"model": m, "scenarios": len(names), "recorded, per harness": nothing_said[m].most_common(2)}
+                               for m, names in sorted(nothing.items(), key=lambda kv: -len(kv[1]))[:shown]]})
     concentrated = []
     for s in summary["scenarios"]:
-        total = sum(s["model_share"].values())
-        if total >= 8:
-            label, n = next(iter(s["model_share"].items()))
-            levels = [d for d, cols in s["difficulty_x_model"].items() if cols.get(label)]
-            if n / total >= 0.6 and len(levels) >= 3:
-                concentrated.append({"scenario": s["name"], "model": label, "share": round(n / total, 2), "difficulties": sorted(levels)})
+        by_model = Counter()
+        levels = defaultdict(set)
+        for level, cols in s["level_x_model"].items():
+            for label, n in cols.items():
+                model = label.split(":")[0]
+                by_model[model] += n
+                levels[model].add(level)
+        total = sum(by_model.values())
+        if total >= limit("concentration_min_workers") and by_model:
+            model, n = by_model.most_common(1)[0]
+            if n / total >= limit("concentration_share") and set(LEVELS) <= levels[model]:
+                concentrated.append({"scenario": s["name"], "model": model, "share": round(n / total, 2), "workers": total,
+                                     "models_that_worked": len(by_model)})
     if concentrated:
-        items.append({"weight": 35 + len(concentrated), "title": f"in {len(concentrated)} scenario(s) one model took 60 % or more of the workers "
-                      "across trivial to hard work", "rows": concentrated})
+        items.append({"weight": 35 + len(concentrated), "title": f"in {len(concentrated)} scenario(s) one model (accounts and efforts folded) took "
+                      f"{limit('concentration_share'):.0%} or more of the workers, on L1, L2 and L3 work alike", "rows": concentrated})
     weaker = [q | {"scenario": s["name"]} for s in summary["scenarios"] for q in s["questions"]["hard_on_weaker"]]
     if weaker:
         items.append({"weight": 25 + len(weaker), "title": f"{len(weaker)} hard brief(s) launched while an eligible candidate had a clearly higher fit",
-                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": q["chosen"]["id"], "stronger": q["stronger"]["id"], "gap": q["gap"]} for q in weaker[:8]]})
-    dearer = [q | {"scenario": s["name"]} for s in summary["scenarios"] for q in s["questions"]["trivial_on_dearer"]]
+                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": q["chosen"]["id"], "stronger": q["stronger"]["id"], "gap": q["gap"]}
+                               for q in weaker[:shown]]})
+    dearer = [q | {"scenario": s["name"]} for s in summary["scenarios"] for q in s["questions"]["routine_on_dearer"]]
+    costs = Counter()
+    for s in summary["scenarios"]:
+        costs.update(s["routine_cost"])
     if dearer:
-        items.append({"weight": 20 + len(dearer), "title": f"{len(dearer)} trivial/simple brief(s) launched at twice or more the cost of an eligible candidate",
-                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": q["chosen"]["id"], "cheaper": q["cheaper"]["id"], "ratio": q["ratio"]} for q in dearer[:8]]})
-    outs = [(s["name"], r) for s in summary["scenarios"] for r in s["run_outs"]]
-    if outs:
-        items.append({"weight": 30 + len(outs), "title": f"{len(outs)} launch(es) charged more than the window had left (the window ran out)",
-                      "rows": [{"scenario": n, "chain": r["charge"]["chain"], "window": f"{r['charge']['account']}/{r['charge']['window']}",
-                                "pct": r["charge"]["pct"], "applied": r["charge"]["applied"]} for n, r in outs[:8]]})
-    unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"] if r["unused"] >= 80 and r["window"] not in ("five_hour",) and not r["overnight"]]
+        items.append({"weight": 20 + len(dearer), "title": f"{len(dearer)} of {costs['routine launches']} routine (L1) launch(es) went to a candidate whose "
+                      f"opportunity_cost (the router's ranking cost) was {limit('dearer_cost_ratio'):g}x or more another eligible candidate's; "
+                      f"{costs['lowest recorded cost']} went to the lowest recorded cost, {costs['chosen cost not recorded']} not recorded",
+                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": f"{q['chosen']['id']}@{q['chosen']['account']} ({q['chosen']['opportunity_cost']})",
+                                "cheaper": f"{q['cheaper']['id']}@{q['cheaper']['account']} ({q['cheaper']['opportunity_cost']})", "ratio": q["ratio"]}
+                               for q in dearer[:shown]]})
+    unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"]
+              if r["unused"] >= limit("unused_at_reset_pp") and r["window"] not in ("five_hour",) and not r["overnight"]]
     if unused:
-        items.append({"weight": 15 + len(unused), "title": f"{len(unused)} long window(s) reset with 80 % or more unused", "rows": [{"scenario": n, **r} for n, r in unused[:8]]})
-    slow = [(s["name"], s["roll_seconds"]) for s in summary["scenarios"] if (s["roll_seconds"].get("max") or 0) > SLOW_ROLL_SECONDS]
+        items.append({"weight": 15 + len(unused), "title": f"{len(unused)} long window(s) reset during the day with {limit('unused_at_reset_pp')} pp or more unused",
+                      "rows": [{"scenario": n, **r} for n, r in unused[:shown]]})
+    slow = [(s["name"], s["roll_seconds"]) for s in summary["scenarios"] if (s["roll_seconds"].get("max") or 0) > limit("slow_roll_seconds")]
     if slow:
-        items.append({"weight": 10 + len(slow), "title": f"a roll took over {SLOW_ROLL_SECONDS:.0f} s in {len(slow)} scenario(s)",
+        items.append({"weight": 10 + len(slow), "title": f"a roll took over {limit('slow_roll_seconds'):.0f} s in {len(slow)} scenario(s)",
                       "rows": [{"scenario": n, **v} for n, v in slow]})
     long_answers = [row for s in summary["scenarios"] for row in s["long_answers"]]
     if long_answers:
-        items.append({"weight": 10 + len(long_answers) / 10, "title": f"{len(long_answers)} short result(s) longer than {LONG_ANSWER_CHARS} characters",
-                      "rows": long_answers[:6]})
+        items.append({"weight": 10 + len(long_answers) / 10, "title": f"{len(long_answers)} short result(s) longer than {limit('long_answer_chars')} characters",
+                      "rows": long_answers[:shown]})
     items.sort(key=lambda i: -i["weight"])
-    return items[:limit]
+    return items[:most]
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -377,14 +455,17 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
     by_name = {s["name"]: s for s in rows.get("scenarios") or []}
     out = ["# Experience run report", "",
            f"Run {run.get('started')} · {len(summary['scenarios'])} scenario(s) · {run.get('seconds')} s · wheel {run.get('wheel')} · classifier: {run.get('classifier')}.",
-           "No verdicts: counts, tables and the rows behind them. The clock is simulated (packaging/experience_run.py says what it covers);"
-           " usage is charged at launch with the router's own expected_usd over each drawn window's capacity.", "",
+           "No verdicts: counts, tables and the rows behind them, read from the router's own recorded fields (\"not recorded\" where it recorded"
+           " nothing). The clock is simulated (packaging/experience_run.py says what it covers); usage is charged at launch, in one lump, with the"
+           " router's own expected_usd over each drawn window's capacity. The router prorates a short window's share before its reset and keeps no"
+           " draw of its own, so a window running out is not counted: the window readings are shown as the run's charge left them.", "",
+           "Thresholds: " + "; ".join(f"{name} = {value} ({meaning})" for name, (value, meaning) in THRESHOLDS.items()) + ".", "",
            f"Processes: {len(run.get('processes_at_end') or [])} found by command line at the end and ended, {len(run.get('processes_after_end') or [])} left after that; "
            f"per scenario {sum(len(s['processes_ended']) for s in summary['scenarios'])} ended when the scenario finished.", ""]
     out += ["## Ten things most worth a look", ""]
     for n, item in enumerate(items, 1):
         out.append(f"{n}. **{item['title']}**")
-        for row in item["rows"][:8]:
+        for row in item["rows"][:limit("rows_per_item")]:
             out.append(f"   - `{json.dumps(row, ensure_ascii=False, default=str)[:400]}`")
     out += ["", "## Across scenarios", ""]
     head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets in the day / overnight (pp)", "roll s median/p90/max", "error"]
@@ -398,11 +479,11 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
     out += md_table(["status / caller_action", "n"], [[k, v] for k, v in total.most_common()])
     shares = defaultdict(Counter)
     for s in summary["scenarios"]:
-        for level, cols in s["difficulty_x_model"].items():
+        for level, cols in s["level_x_model"].items():
             for label, n in cols.items():
                 shares[level][label.split("@")[0]] += n
-    out += ["", "Difficulty against model:effort (all scenarios, accounts folded):", ""]
-    out += matrix({k: dict(v) for k, v in shares.items()}, DIFFICULTIES)
+    out += ["", "The router's primary_level against model:effort (all scenarios, accounts folded):", ""]
+    out += matrix({k: dict(v) for k, v in shares.items()}, LEVELS)
     for s in summary["scenarios"]:
         out += render_scenario(by_name[s["name"]], s)
     return "\n".join(out) + "\n"
@@ -444,27 +525,37 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
                            + (f" · observed {json.dumps(a.get('observed'), ensure_ascii=False)[:500]}" if a.get("observed") else "")
                            + (f" · mail {len(a.get('mail') or [])}" if "mail" in a else ""))
     out += ["", "### Where work went", ""]
-    if s["difficulty_x_model"]:
-        out += matrix(s["difficulty_x_model"], DIFFICULTIES)
+    if s["level_x_model"]:
+        out += ["The router's primary_level against model:effort@account:", ""]
+        out += matrix(s["level_x_model"], LEVELS)
         out += ["", "Work kind against model:", ""]
         out += matrix(s["kind_x_model"])
     else:
         out.append("No worker was launched.")
-    if s["models_with_nothing"]:
-        out += ["", "Signed-in models that got nothing, with what excluded or outranked them (from the plans' rankings):", ""]
-        out += md_table(["model@account", "eligible in plans", "median score gap to the top", "top exclusions"],
-                        [[e["model"], e["eligible_in_plans"], e["median_gap_to_top"], "; ".join(f"{clip(r, 140)} ×{n}" for r, n in e["top_exclusions"])]
-                         for e in s["models_with_nothing"]])
+    nothing = s["models_with_nothing"]
+    if nothing["models"]:
+        out += ["", "Signed-in models that got nothing, each bundle with what the plans' recorded rankings say about it:", ""]
+        out += md_table(["model", "bundle", "harness", "account", "plans", "eligible", "median score gap to the top", "recorded"],
+                        [[e["model"], r["bundle"], r["provider"], r["account"], r["plans"], r["eligible"], r["median_gap_to_top"], clip(r["recorded"], 240)]
+                         for e in nothing["models"] for r in e["bundles"]])
+    for kind, what in (("outside_allowed", "only on accounts outside allowed_accounts"), ("unchecked", "unchecked by the user")):
+        if nothing[kind]:
+            out.append(f"Models {what} (not counted above): {', '.join(nothing[kind])}.")
     if s["questions"]["hard_on_weaker"]:
         out += ["", "Questions: hard work launched while an eligible candidate had a clearly higher fit (the plan's reason given):", ""]
         out += md_table(["chain", "brief", "chosen (fit)", "higher fit", "plan's reason"],
                         [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['fit']})", f"{q['stronger']['id']} ({q['stronger']['fit']})", clip(q["reason"], 220)]
                          for q in s["questions"]["hard_on_weaker"]])
-    if s["questions"]["trivial_on_dearer"]:
-        out += ["", "Questions: trivial or simple work launched at twice or more the cost of an eligible candidate:", ""]
-        out += md_table(["chain", "brief", "chosen ($)", "cheaper ($)", "plan's reason"],
-                        [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['usd']})", f"{q['cheaper']['id']} ({q['cheaper']['usd']})", clip(q["reason"], 220)]
-                         for q in s["questions"]["trivial_on_dearer"]])
+    if s["routine_cost"]:
+        out += ["", "Routine (L1) launches by the router's ranking cost (components.opportunity_cost) of the chosen candidate against the other "
+                "eligible ones: " + ", ".join(f"{k} {v}" for k, v in s["routine_cost"].items()) + "."]
+    if s["questions"]["routine_on_dearer"]:
+        out += ["", f"Questions: routine work launched on a candidate whose opportunity_cost was {limit('dearer_cost_ratio'):g}x or more another eligible one's:", ""]
+        out += md_table(["chain", "brief", "chosen (account, opportunity_cost, score)", "cheaper (account, opportunity_cost, score)", "ratio", "plan's reason"],
+                        [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['account']}, {q['chosen']['opportunity_cost']}, {q['chosen']['score']})",
+                          f"{q['cheaper']['id']} ({q['cheaper']['account']}, {q['cheaper']['opportunity_cost']}, {q['cheaper']['score']})",
+                          q["ratio"] if q["ratio"] is not None else "above zero", clip(q["reason"], 220)]
+                         for q in s["questions"]["routine_on_dearer"]])
     out += ["", "### What it cost", ""]
     timelines = window_timelines(scenario)
     if timelines:
@@ -474,23 +565,19 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
         out += ["", "Resets (quota left unused at each):", ""]
         out += md_table(["hour", "window", "used before", "unused", "overnight"],
                         [[r["at"], f"{r['account']}/{r['window']}", r["used_before"], r["unused"], "yes" if r["overnight"] else ""] for r in s["resets"]])
-    if s["run_outs"]:
-        out += ["", "Moments a window ran out and the answers right after:", ""]
-        for item in s["run_outs"]:
-            c = item["charge"]
-            nxt = "; ".join(f"chain {n['chain']} {n['status']} {n.get('model') or ''}" for n in item["next"]) or "nothing after"
-            out.append(f"- h{c['at']} {c['account']}/{c['window']}: chain {c['chain']} ({c['brief']}, {c['model']}) needed {c['pct']}% with {c['applied']}% left → {nxt}")
     if s["deferrals"]:
         out += ["", "Deferrals and waits:", ""]
         out += md_table(["chain", "brief", "waits (hours, or writer)"], [[d["chain"], ", ".join(d["brief"]), d["waits"]] for d in s["deferrals"]])
-    if s["usd_by_difficulty"]:
-        out += ["", "Expected USD per dispatch by declared difficulty (the router's expected_usd):", ""]
-        out += md_table(["difficulty", "n", "median", "mean", "max", "sum"], [[k, v["n"], v["median"], v["mean"], v["max"], v["sum"]] for k, v in s["usd_by_difficulty"].items()])
+    if s["usd_by_level"]:
+        out += ["", "Expected USD per dispatch by the router's primary_level (the router's expected_usd: list price over the expected hours):", ""]
+        out += md_table(["level", "n", "median", "mean", "max", "sum"], [[k, v["n"], v["median"], v["mean"], v["max"], v["sum"]] for k, v in s["usd_by_level"].items()])
     out += ["", "### How it felt", "",
             f"Roll time (s): median {s['roll_seconds']['median']}, p90 {s['roll_seconds']['p90']}, max {s['roll_seconds']['max']} over {s['roll_seconds']['n']} answers. "
-            f"Commands a session ran per worker: {s['commands_per_worker']}."]
+            f"Commands a session ran per worker launched alone: {s['commands_per_worker']}; "
+            f"{s['batch_workers']['workers']} worker(s) came from {s['batch_workers']['batch_rolls']} batch roll(s) (one command each), "
+            f"with {s['batch_workers']['follow_up_commands']} follow-up command(s)."]
     if s["long_answers"]:
-        out.append(f"Short results over {LONG_ANSWER_CHARS} characters: " + ", ".join(f"chain {r['chain']} ({r['chars']})" for r in s["long_answers"][:12]))
+        out.append(f"Short results over {limit('long_answer_chars')} characters: " + ", ".join(f"chain {r['chain']} ({r['chars']})" for r in s["long_answers"][:12]))
     if s["no_way_out"]:
         out.append("Answers that did not launch and give no next_action: " + ", ".join(f"chain {r['chain']} step {r['step']} ({r['status']})" for r in s["no_way_out"]))
     return out
