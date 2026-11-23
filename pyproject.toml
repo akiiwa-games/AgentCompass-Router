@@ -68,7 +68,8 @@ path = "packaging/hatch_build.py"
 
 [tool.pytest.ini_options]
 addopts = "--capture=sys"
-testpaths = ["agentcompass", "skills/agent-compass", "setup", "tray", "audit", "skills/chatgpt-pro-consult", "skills/dot-subagent"]
+testpaths = ["agentcompass", "skills/agent-compass", "setup", "tray", "audit", "skills/chatgpt-pro-consult", "skills/dot-subagent",
+             "packaging/test_experience_clock.py", "packaging/test_experience_run.py"]
 norecursedirs = ["node_modules", ".staged", ".build", "verify-release", ".git", "__pycache__", ".*", "dist", "build", "scratch"]
 markers = [
   "slow: tests that start real subprocesses, packaging, sandbox checks or real Tk main loops",

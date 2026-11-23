@@ -2,7 +2,7 @@
 
     python packaging/experience_run.py [--scenario NAME ...] [--out DIR] [--parallel N] [--days N] [--keep]
     python packaging/experience_run.py --list
-    python packaging/experience_run.py classify --out DIR          # spends the configured classifier's quota: ask first
+    python packaging/experience_run.py classify --out DIR [--spend-classifier-quota]   # without the flag: the plan only
 
 There is no pass or fail. Every scenario (packaging/experience/scenarios.json) is an account situation: the accounts a user
 has, how much of each quota window is left when the day starts, and the user's own switches (an account outside
@@ -37,9 +37,13 @@ worker's simulated hours (the launch charge stands in for it). Fixture workers d
 slowly as the stream declares.
 
 Classifier. The default run spends no model tokens. `classify` asks the real configured classifier once per brief of the
-corpus (through `agentcompass plan --dry-run --score` of the installed product, on this machine's real home) and writes
-the answers to `<out>/classifications.json`; `--classifications FILE` replays them instead of the declared profiles. It
-spends the owner's classifier quota: run it only with their consent, each time.
+corpus (`agentcompass score --input` of the installed product, on this machine's real home) and writes each answer whole
+to `<out>/classifications.json` as it arrives (a stopped run resumes); `--classifications FILE` replays them instead of
+the declared profiles. It spends the owner's classifier quota: without `--spend-classifier-quota` it prints the briefs
+and the scorer it would ask and stops; pass the flag only with their consent, each time.
+The same fixture answers the router's reading of a worker's error (provider_retry's scope question) from the scopes
+declared for the fixture workers' error texts (briefs.json `error_scopes`); any other error text gets no answer, which
+the router reads as `unknown`.
 
 Processes. Every process the run starts is ended by the run: workers and watchers of a scenario when the scenario ends,
 and at the end (also after Ctrl+C) every process whose command line names the run's sandbox directory. The report says
@@ -78,6 +82,12 @@ MAX_PARALLEL = 4
 FOLLOW_LIMIT = 6                     # answers one roll may lead to before the chain counts as not settling
 WAIT_LIMIT_HOURS = 30.0              # a deferral longer than this is not waited for (recorded, the session moves on)
 NIGHT_HOURS = 14.0
+# How long one command of the session may take before the run stops waiting for it. A roll is synchronous while
+# AgentCompass relaunches a brief whose worker fails at once on candidate after candidate (dispatch_fallback goes on until
+# no startable candidate is left): on the large fleet one such roll took 822 s (2026-11-24), so a few minutes would cut the
+# scenario in the middle of the product's own behaviour. The limit only stops a command that hangs; a command that reaches
+# it is recorded as an answer with status `timed_out` (its process tree ended) and the scenario goes on.
+COMMAND_TIMEOUT_SECONDS = 3600
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -112,17 +122,6 @@ def brief_corpus(briefs_doc: dict) -> dict:
             if part not in corpus:
                 raise ValueError(f"brief {key} splits into {part}, which is not a brief")
     return corpus
-
-
-def difficulty(profile: dict) -> str:
-    """The declared difficulty band of a brief, from its profile: trivial (level 1 and under 0.25 h), simple (level 1),
-    moderate (level 2), hard (level 3). Read by the report only; the router reads the profile itself."""
-    level = int(profile.get("primary_level") or 1)
-    if level >= 3:
-        return "hard"
-    if level == 2:
-        return "moderate"
-    return "trivial" if float(profile.get("expected_hours") or 1) < 0.25 else "simple"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -227,14 +226,17 @@ class UsageServer:
 
 class ReplayScorer:
     """The model behind the classifier: answers the OpenAI-compatible request the router sends with the profile declared for
-    the brief (found by its `EXPERIENCE-BRIEF: <id>` line), or with the real classifier's stored answer for it."""
+    the brief (found by its `EXPERIENCE-BRIEF: <id>` line), or with the real classifier's stored answer for it. A request
+    about a worker's error (provider_retry's scope question, whose input carries `provider_message`) is answered with the
+    scope declared for that exact error text (`error_scopes`); any other gets no answer."""
 
     MARK = re.compile(r"EXPERIENCE-BRIEF:\s*([\w.-]+)")
 
-    def __init__(self, corpus: dict, replay: dict | None = None):
-        self.corpus, self.replay = corpus, replay or {}
+    def __init__(self, corpus: dict, replay: dict | None = None, error_scopes: dict | None = None):
+        self.corpus, self.replay, self.error_scopes = corpus, replay or {}, error_scopes or {}
         self.requests = 0
         self.unknown: list[str] = []
+        self.scopes_answered: dict[str, int] = {}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -248,6 +250,11 @@ class ReplayScorer:
                 user = next((m["content"] for m in body.get("messages", []) if m.get("role") == "user"), "")
                 found = outer.MARK.search(user or "")
                 key = found.group(1) if found else None
+                scope = None if found else outer.scope_of(user)
+                if scope is not None:
+                    outer.scopes_answered[scope] = outer.scopes_answered.get(scope, 0) + 1
+                    return self._send(200, {"choices": [{"message": {"content": json.dumps(
+                        {"scope": scope, "reason": "experience-run fixture: the scope declared for this error text"})}}]})
                 profile = outer.replay.get(key) or (outer.corpus.get(key) or {}).get("profile")
                 if profile is None:
                     outer.unknown.append((user or "")[:200])
@@ -264,6 +271,15 @@ class ReplayScorer:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def scope_of(self, text: str) -> str | None:
+        """The declared scope of the error a scope question carries, or None (not a scope question, or an undeclared text)."""
+        try:
+            message = json.loads(text).get("provider_message")
+        except (ValueError, AttributeError):
+            return None
+        entry = self.error_scopes.get(message.strip()) if isinstance(message, str) else None
+        return entry.get("scope") if isinstance(entry, dict) else None
 
     @property
     def port(self) -> int:
@@ -373,8 +389,19 @@ class Scenario:
         return {"PATH": self.path(), "FIXTURE_STATE": str(self.state), "FIXTURE_BIN": str(self.bin), "ROUTER_SCORE_CACHE": "off",
                 "PASEO_AGENT_ID": PARENT, "ROUTER_PASEO_BRIDGE": str(BRIDGE), **extra}
 
-    def call(self, op, *args, stdin=None, timeout=300, **env):
-        return self.box.run_command(op, [self.box.agentcompass, *map(str, args)], cwd=self.work, stdin=stdin, timeout=timeout, **self.env(**env))
+    def call(self, op, *args, stdin=None, timeout=COMMAND_TIMEOUT_SECONDS, **env):
+        argv = [self.box.agentcompass, *map(str, args)]
+        return self.command(op, argv, stdin=stdin, timeout=timeout, **env)
+
+    def command(self, op, argv, stdin=None, timeout=COMMAND_TIMEOUT_SECONDS, **env):
+        """Run one command of the session; one that does not answer within `timeout` is ended with its children and comes
+        back as a `TimedOut` result instead of an exception (COMMAND_TIMEOUT_SECONDS)."""
+        try:
+            return self.box.run_command(op, argv, cwd=self.work, stdin=stdin, timeout=timeout, **self.env(**env))
+        except subprocess.TimeoutExpired:
+            marker = command_marker(argv)
+            ended = self.end_processes(marker) if marker else []
+            return TimedOut(timeout, ended)
 
     # ---- accounts
     def sign_in(self, states: dict):
@@ -491,12 +518,47 @@ class Scenario:
         return next((a for a in self.accounts if a.name == name), None)
 
     # ---- processes
-    def end_processes(self) -> list[str]:
-        """End every process whose command line names this scenario's sandbox (workers, watchers); returns what was found."""
-        found = sc.sandbox_processes(self.box.root)
+    def end_processes(self, marker: str | None = None) -> list[str]:
+        """End every process whose command line names this scenario's sandbox (workers, watchers), or only those whose
+        command line also holds `marker`; returns what was found."""
+        found = sc.sandbox_processes(self.box.root) if marker is None else processes_with(self.box.root, marker)
         for entry in found:
             subprocess.run(["taskkill", "/F", "/T", "/PID", entry.split(":")[0]], capture_output=True)
         return found
+
+
+class TimedOut:
+    """The result of a command that did not answer within its limit (Scenario.command)."""
+
+    def __init__(self, seconds: int, ended: list[str]):
+        self.returncode, self.stdout, self.timed_out, self.ended = None, "", True, ended
+        self.stderr = f"the command did not answer within {seconds} s; ended: {', '.join(ended) or 'nothing left'}"
+
+
+def command_marker(argv) -> str | None:
+    """A piece of a command's own arguments no other command of the run carries: a brief's `[experience day ...]` line, or
+    a brief file's name."""
+    for value in map(str, argv):
+        found = re.search(r"\[experience day [^\]]+\]", value)
+        if found:
+            return found.group(0)
+        if value.endswith(".md"):
+            return Path(value).name
+    return None
+
+
+def processes_with(base: Path, marker: str) -> list[str]:
+    """`pid:name` of the processes whose command line names the sandbox and holds `marker` (Windows; empty elsewhere)."""
+    if os.name != "nt":
+        return []
+    root, mark = (str(v).replace("'", "''").replace("[", "`[").replace("]", "`]") for v in (base, marker))
+    command = (f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{root}*' -and $_.CommandLine -like '*{mark}*' "
+               f"-and $_.ProcessId -ne {os.getpid()} -and $_.ProcessId -ne $PID }} | ForEach-Object {{ \"$($_.ProcessId):$($_.Name)\" }}")
+    try:
+        done = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return done.stdout.split()
 
 
 def find_key(document, key):
@@ -517,15 +579,20 @@ def find_key(document, key):
 
 
 def compact_ranking(ranking: list) -> list:
-    """The eligible candidates of a plan (score not None), best first: id, model, account, effort, score, fit, usd, level."""
+    """The eligible candidates of a plan's recorded snapshot (score not None), best first, with the router's own numbers
+    copied as recorded: score N, fit, opportunity_cost (the quota cost N subtracts), quota_price, decided_by, the
+    candidate's expected_usd and expected_pct. A field the snapshot did not record stays None (ledger_snapshot keeps every
+    component for the best 6 eligible candidates and fewer for the next 8)."""
     out = []
     for candidate in ranking:
         if candidate.get("score") is None:
             continue
         bundle = candidate.get("bundle") or {}
         components = candidate.get("components") or {}
-        out.append({"id": candidate.get("id"), "model": bundle.get("model"), "account": bundle.get("account"), "effort": bundle.get("effort"),
-                    "score": candidate.get("score"), "fit": components.get("fit"), "level": components.get("five_axis_level"),
+        out.append({"id": candidate.get("id"), "model": bundle.get("model"), "account": bundle.get("account"), "provider": bundle.get("provider"),
+                    "effort": bundle.get("effort"), "score": candidate.get("score"), "fit": components.get("fit"),
+                    "opportunity_cost": components.get("opportunity_cost"), "quota_price": components.get("quota_price"),
+                    "decided_by": components.get("decided_by"), "level": components.get("five_axis_level"),
                     "usd": candidate.get("expected_usd"), "pct": candidate.get("expected_pct")})
     return out
 
@@ -711,14 +778,16 @@ class Play:
         decision = snap.get("decision") or {}
         bundle = snap.get("selected_bundle") or {}
         route_bundle = (full.get("route") or {}).get("bundle") or {}
-        profile = self.corpus[key]["profile"]
+        # The profile the router planned with, as its snapshot recorded it; else the one the fixture classifier answered.
+        served = self.s.world.scorer.replay.get(key) or self.corpus[key]["profile"]
+        profile = (snap.get("task") or {}).get("profile") or (decision.get("task") or {}).get("profile") or served
         record = {
             "scenario": self.s.name, "chain": chain["id"], "step": len(chain["answers"]), "kind": kind, "day": chain["day"], "index": chain["index"],
-            "at": round(self.s.clock.now, 3), "brief": key, "work_kind": profile["work_kind"], "level": profile["primary_level"],
-            "difficulty": difficulty(profile), "declared_hours": profile["expected_hours"], "flags": chain["flags"],
+            "at": round(self.s.clock.now, 3), "brief": key, "work_kind": profile.get("work_kind"), "level": profile.get("primary_level"),
+            "declared_hours": profile.get("expected_hours"), "flags": chain["flags"],
             "argv": [shown_arg(a) for a in argv], "exit": result.returncode if result is not None else None, "seconds": seconds,
             "stdout_chars": len(result.stdout) if result is not None else None,
-            "status": doc.get("status") or doc.get("state"), "caller_action": full.get("caller_action") or doc.get("caller_action"),
+            "status": "timed_out" if getattr(result, "timed_out", False) else doc.get("status") or doc.get("state"), "caller_action": full.get("caller_action") or doc.get("caller_action"),
             "dispatch_mode": full.get("dispatch_mode") or doc.get("dispatch_mode"), "launched": full.get("launched", doc.get("launched")),
             "reason": doc.get("reason") or (full.get("route") or {}).get("reason"), "cause": doc.get("cause") or full.get("cause"),
             "next_action": doc.get("next_action"), "next_argv": doc.get("next_argv"), "warnings": doc.get("warnings"),
@@ -735,7 +804,7 @@ class Play:
             "expected_hours": bundle.get("expected_hours"), "router_difficulty": (decision.get("task") or {}).get("difficulty"),
             "decision_reason": decision.get("reason"), "decision_action": decision.get("action"), "ledger_stage": row.get("stage"),
             "ledger_constraint": row.get("constraint"), "ranking": compact_ranking(snap.get("ranking") or []),
-            "part_of_batch": part_of_batch, "batch": batch,
+            "part_of_batch": part_of_batch, "batch": batch, "carried_launch": False,
         }
         if snap.get("ranking"):
             self.note_ranking(snap["ranking"], snap.get("choice"))
@@ -771,7 +840,7 @@ class Play:
             if chain["commands"] >= FOLLOW_LIMIT:
                 chain["outcome"], chain["note"] = "dead_end", f"still pending after {chain['commands']} commands"
                 return
-            result = s.box.run_command(op, [str(a) for a in doc["next_argv"]], cwd=s.work, timeout=300, **s.env())
+            result = s.command(op, [str(a) for a in doc["next_argv"]])
             chain["commands"] += 1
             got = parse(result.stdout) or {}
             follow = self.answer(chain, got, doc["next_argv"], result, None, key, kind="next_argv")
@@ -879,6 +948,7 @@ class Play:
 
     def launched(self, op, chain, record, act):
         chain["outcome"] = "launched"
+        record["carried_launch"] = True        # the answer that carried this worker (the report's launch tables read it)
         if act.get("label") and record.get("agent_id") and not chain.get("batch_of"):
             self.labels[act["label"]] = record["agent_id"]
         self.charge(chain, record)
@@ -899,7 +969,7 @@ class Play:
             pct = clock.cost_pct(1.0, usd, capacity)
             with self.s.clock.lock:
                 done = clock.charge(usage, wid, pct, self.s.clock.now) if pct is not None else None
-            self.charges.append({"chain": chain["id"], "brief": record["brief"], "difficulty": record["difficulty"], "account": account,
+            self.charges.append({"chain": chain["id"], "brief": record["brief"], "level": record["level"], "account": account,
                                  "model": record.get("model"), "effort": record.get("effort"), "at": round(self.s.clock.now, 3), "window": wid,
                                  "usd": usd, "capacity_usd": capacity, "pct": None if pct is None else round(pct, 4),
                                  "applied": None if done is None else round(done.applied, 4), "used_after": None if done is None else round(done.used_after, 3),
@@ -981,6 +1051,8 @@ def main(argv=None) -> int:
     parser.add_argument("--classifications", type=Path, help="Replay these real classifier answers (from `classify`) instead of the declared profiles.")
     parser.add_argument("--keep", action="store_true", help="Keep the sandbox directory for inspection.")
     parser.add_argument("--list", action="store_true", help="List the scenarios and the day's stream, then exit.")
+    parser.add_argument("--spend-classifier-quota", action="store_true",
+                        help="classify: ask the real classifier (it spends the owner's quota). Without it, classify prints its plan only.")
     args = parser.parse_args(argv)
     scenarios_doc, briefs_doc = load_json(DATA / "scenarios.json"), load_json(DATA / "briefs.json")
     corpus = brief_corpus(briefs_doc)
@@ -991,10 +1063,10 @@ def main(argv=None) -> int:
         print(f"\nday: {len(briefs_doc['day'])} entries, corpus {len(corpus)} briefs")
         return 0
     out = (args.out or default_out()).resolve()
-    if str(out).lower().startswith(str(ROOT).lower()):
+    if inside(out, ROOT):
         parser.error("the run directory must be outside the repository")
     if args.command == "classify":
-        return classify(corpus, out)
+        return classify(corpus, out, spend=args.spend_classifier_quota)
     names = sc.registry_clean()
     if names:
         print("refusing to run: Windows user variables the router reads exist in HKCU\\Environment: " + ", ".join(names), file=sys.stderr)
@@ -1013,6 +1085,7 @@ def main(argv=None) -> int:
             "classifier": "replayed real answers " + str(args.classifications) if replay else "declared profiles (no model tokens)",
             "scenarios": [s["name"] for s in selected], "day_entries": len(briefs_doc["day"]), "days_override": args.days}
     print(f"experience run -> {out}", flush=True)
+    interrupt_on_break()
     try:
         sc.NETGUARD = base / "netguard"
         sc.NETGUARD.mkdir()
@@ -1021,7 +1094,7 @@ def main(argv=None) -> int:
         venv, wheel = install_world(base, args.wheel.resolve() if args.wheel else None)
         meta["wheel"] = wheel.name
         sites = venv / ("Lib/site-packages" if os.name == "nt" else next((venv / "lib").glob("python*/site-packages")))
-        with UsageServer() as usage, ReplayScorer(corpus, replay) as scorer:
+        with UsageServer() as usage, ReplayScorer(corpus, replay, briefs_doc.get("error_scopes")) as scorer:
             sc.write_netguard([sites, sc.NETGUARD], usage.url, [usage.server.server_address[1], scorer.port], base / "net-default.jsonl")
             world = World(base, venv, fakecli, usage, scorer, out)
             workers = max(1, min(MAX_PARALLEL, args.parallel))
@@ -1036,31 +1109,66 @@ def main(argv=None) -> int:
                     meta["interrupted"] = True
                     for future in futures:
                         future.cancel()
+                    # A scenario thread waits on its command; ending the sandbox's processes lets the pool close now.
+                    for entry in sc.sandbox_processes(base):
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", entry.split(":")[0]], capture_output=True)
                     raise
             meta["scorer_requests"], meta["scorer_unknown"] = scorer.requests, scorer.unknown[:20]
+            meta["scopes_answered"] = scorer.scopes_answered
             meta["usage_requests"] = usage.requests
     except KeyboardInterrupt:
+        meta["interrupted"] = True
+        stop.set()
         print("interrupted: ending every process of the sandbox", flush=True)
     finally:
+        # Ending, removing and recording happen before rows.json is written, so the file says what was left behind;
+        # a second interrupt meanwhile is ignored (signal handlers off), or the sandbox would stay without a word.
+        signals_off()
         left = sc.sandbox_processes(base)
         for entry in left:
             subprocess.run(["taskkill", "/F", "/T", "/PID", entry.split(":")[0]], capture_output=True)
         meta["processes_at_end"] = left
         meta["processes_after_end"] = sc.sandbox_processes(base)
+        if not args.keep:
+            remove_tree(base)
+        meta["sandbox_left"] = str(base) if base.exists() else None
         meta["seconds"] = round(time.time() - started, 1)
         order = {s["name"]: i for i, s in enumerate(selected)}
         results.sort(key=lambda r: order.get(r["name"], 0))
-        rows = {"run": meta, "corpus": {k: {"profile": v["profile"], "source": v["source"], "difficulty": difficulty(v["profile"])} for k, v in corpus.items()},
+        rows = {"run": meta, "corpus": {k: {"profile": v["profile"], "source": v["source"]} for k, v in corpus.items()},
                 "scenarios": results}
         (out / "rows.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8", newline="\n")
-        if not args.keep:
-            remove_tree(base)
-        meta["sandbox_left"] = base.exists()
+        if meta["sandbox_left"]:
+            print(f"the sandbox is left at {base}" + (" (--keep)" if args.keep else ": delete it by hand"), flush=True)
     sys.path.insert(0, str(ROOT / "audit"))
     import experience_report
     report = experience_report.write(out)
     print(f"report: {report}")
-    return 0
+    return 130 if meta.get("interrupted") else 0
+
+
+def inside(path: Path, root: Path) -> bool:
+    """`path` is `root` or under it, both resolved (a prefix test would take E:/repo-runs for E:/repo)."""
+    return path.resolve().is_relative_to(root.resolve())
+
+
+def interrupt_on_break() -> None:
+    """Ctrl+Break and a termination request end the run like Ctrl+C: its `finally` ends the sandbox's processes, removes the
+    sandbox and writes rows.json saying so."""
+    import signal
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    for name in ("SIGBREAK", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupt)
+
+
+def signals_off() -> None:
+    import signal
+    for name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
 
 
 def remove_tree(base: Path) -> None:
@@ -1078,34 +1186,65 @@ def remove_tree(base: Path) -> None:
         time.sleep(2)
 
 
-def classify(corpus: dict, out: Path) -> int:
-    """Ask the real configured classifier once per brief (through the installed product on this machine's real home) and keep
-    the answers for `--classifications`. It spends classifier quota: run only with the owner's consent."""
+def product_command() -> list[str]:
+    """The installed `agentcompass` on PATH, else this checkout's entry."""
     entry = shutil.which("agentcompass")
-    command = [entry] if entry else [sys.executable, "-X", "utf8", str(ROOT / "agentcompass")]
+    return [entry] if entry else [sys.executable, "-X", "utf8", str(ROOT / "agentcompass")]
+
+
+def classify(corpus: dict, out: Path, spend: bool = False, command: list[str] | None = None) -> int:
+    """Ask the real configured classifier once per brief (`agentcompass score --input`, the installed product on this
+    machine's real home) and keep each answer whole, a split's `multi_task`/`task_count` included, for `--classifications`.
+
+    It spends the owner's classifier quota, so it first prints what it would ask (how many briefs, which scorer, never a
+    key) and asks nothing without `--spend-classifier-quota`. Every answer is written as it arrives; a run that stopped
+    resumes with the briefs that have no answer yet."""
+    command = command or product_command()
+    target, failed_path = out / "classifications.json", out / "classifications-failed.json"
+    answers = load_json(target) if target.is_file() else {}
+    todo = [key for key in corpus if key not in answers]
+    shown = subprocess.run([*command, "scorer", "--action", "show"], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+    view = parse(shown.stdout) or {}
+    chosen = view.get(view.get("scorer_type")) if isinstance(view.get(view.get("scorer_type")), dict) else {}
+    scorer = (f"{view.get('scorer_type')} ({view.get('label')}): model {chosen.get('model')} at {chosen.get('base_url')}"
+              if view.get("scorer_type") else f"unreadable (scorer --action show exited {shown.returncode})")
+    print(f"classify: {len(todo)} of {len(corpus)} briefs to ask ({len(answers)} answered already in {target})\n"
+          f"scorer: {scorer}")
+    if not spend:
+        print("nothing asked: this spends the owner's classifier quota; with their consent, run again with --spend-classifier-quota")
+        return 0
     folder = out / "classify-input"
     folder.mkdir(parents=True, exist_ok=True)
-    answers, failures = {}, {}
-    fields = ("work_kind", "primary_level", "secondary_kind", "secondary_level", "access", "local_only", "needs_visual", "wants_fast",
-              "expected_hours", "task_count")
-    for key, item in corpus.items():
+    failures = {}
+    for key in todo:
         path = folder / f"{key}.json"
-        path.write_text(json.dumps({"task": {"objective": item["text"]}}, ensure_ascii=False), encoding="utf-8", newline="\n")
-        done = subprocess.run([*command, "plan", "--dry-run", "--score", "--input", str(path)], capture_output=True, text=True,
+        path.write_text(json.dumps({"task": {"objective": corpus[key]["text"]}}, ensure_ascii=False), encoding="utf-8", newline="\n")
+        done = subprocess.run([*command, "score", "--input", str(path)], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=600)
-        plan = parse(done.stdout) or {}
-        profile = (((plan.get("decision") or {}).get("task") or {}).get("profile")) or ((plan.get("task") or {}).get("profile"))
-        if isinstance(profile, dict) and all(f in profile for f in fields):
-            answers[key] = {**{f: profile[f] for f in fields}, "reason": "real classifier answer, replayed by the experience run"}
-            print(f"  {key}: {profile['work_kind']} L{profile['primary_level']}")
+        result = parse(done.stdout) or {}
+        profile = result.get("task_profile")
+        if isinstance(profile, dict) and profile.get("work_kind") and result.get("source") == "system_one":
+            answers[key] = {**profile, "reason": "real classifier answer, replayed by the experience run"}
+            write_json(target, answers)
+            print(f"  {key}: {profile['work_kind']} L{profile.get('primary_level')}"
+                  + (f" multi_task x{profile.get('task_count')}" if profile.get("multi_task") else ""), flush=True)
         else:
-            failures[key] = (done.stdout + done.stderr)[-400:]
-            print(f"  {key}: no profile (exit {done.returncode})")
-    (out / "classifications.json").write_text(json.dumps(answers, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
-    if failures:
-        (out / "classifications-failed.json").write_text(json.dumps(failures, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
-    print(f"{len(answers)} answers -> {out / 'classifications.json'}; {len(failures)} without a profile")
+            failures[key] = {"exit": done.returncode, "source": result.get("source"), "error": result.get("error"),
+                             "tail": (done.stdout + done.stderr)[-400:]}
+            write_json(failed_path, failures)
+            print(f"  {key}: no answer of the configured classifier (exit {done.returncode}, source {result.get('source')})", flush=True)
+    if not failures and failed_path.is_file():
+        failed_path.unlink()
+    print(f"{len(answers)} answers -> {target}; {len(failures)} without one")
     return 0 if not failures else 1
+
+
+def write_json(path: Path, document) -> None:
+    """Replace `path` with `document` in one step, so an interrupted run keeps the previous complete file."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
+    temporary.replace(path)
 
 
 if __name__ == "__main__":
