@@ -50,16 +50,22 @@ LABELS = ('router.decision_id', 'router.dispatch_id', 'router.parent_id',
 BOUND = ('provider', 'settings')
 
 
-class NotBound(ValueError):
+class Refused(ValueError):
+    """A rule of the dispatch registry or its flow refused the request on purpose; its text is the rule's own. A plain
+    ValueError is not one, since Python raises those too (an unpacking, a conversion): a reader that tells a refusal from a
+    defect of AgentCompass (dispatch_fallback.Chain.cause_of) reads this type."""
+
+
+class NotBound(Refused):
     """Paseo answered, and this worker does not carry this dispatch's labels."""
 
 
-class CapacityChanged(ValueError):
+class CapacityChanged(Refused):
     """The decision's bundle can no longer start (an exclusion, a launch floor, a disabled account or model, a live
     model list that dropped it): the attempt failed before anything was sent, so the brief may go to the next candidate."""
 
 
-class WorkspaceBusy(ValueError):
+class WorkspaceBusy(Refused):
     """The workspace already has a writer; `holders` names each one."""
 
     def __init__(self, workspace, holders):
@@ -67,7 +73,7 @@ class WorkspaceBusy(ValueError):
         self.workspace, self.holders = workspace, holders
 
 
-class ResumedWorkerBusy(ValueError):
+class ResumedWorkerBusy(Refused):
     """The explicitly resumed worker already has an active dispatch."""
 
     def __init__(self, agent_id):
@@ -129,7 +135,7 @@ def rows(connection, table):
 def get(connection, table, key):
     row = connection.execute('SELECT data FROM ' + table + ' WHERE id=?', (key,)).fetchone()
     if row is None:
-        raise ValueError('Unknown ' + {'dispatches': 'dispatch'}.get(table, table.rstrip('s')) + ' id')
+        raise Refused('Unknown ' + {'dispatches': 'dispatch'}.get(table, table.rstrip('s')) + ' id')
     return json.loads(row[0])
 
 
@@ -196,10 +202,10 @@ def resolve_bundle(bundle, accounts, explicit_override=False):
     if exact:
         return dict(exact, bundle_id=exact['id'], **({'fast': True} if bundle.get('fast') else {}))
     if not siblings:
-        raise ValueError(f"named_model_unavailable: {bundle.get('model')} has no row on "
+        raise Refused(f"named_model_unavailable: {bundle.get('model')} has no row on "
                          f"{bundle.get('account')}/{bundle.get('provider')}. Tell the user; do not substitute another model.")
     if bundle.get('effort') not in contract:
-        raise ValueError(account_fleet.unaccepted_effort(
+        raise Refused(account_fleet.unaccepted_effort(
             account_fleet.bundle_harness(siblings[0], bundle.get('account')), bundle.get('model'), bundle.get('effort'),
             contract | {s.get('effort') for s in siblings}))
     base = next((b for b in siblings if not b.get('disabled')), siblings[0])
@@ -223,9 +229,9 @@ def check_launch_quota(bundle, accounts, usage, now):
     import quota_pools
     reason = provider_inventory.unavailable_reason(accounts.get('_discovery') or {}, bundle['account'], bundle['provider'])
     if reason:
-        raise ValueError(reason)
+        raise Refused(reason)
     if bundle['account'] not in accounts['accounts']:
-        raise ValueError('Account is no longer configured; reroute using the current provider inventory')
+        raise Refused('Account is no longer configured; reroute using the current provider inventory')
     if bundle.get('fast'):
         model = account_fleet.canonical(bundle['model'], accounts)
         fast_modes.validate(account_fleet.bundle_harness(bundle, bundle['account']), model,
@@ -236,7 +242,7 @@ def check_launch_quota(bundle, accounts, usage, now):
     for wid, window, observed in quota_pools.applicable_windows(spec, bundle.get('model'), row, bundle, accounts):
         if quota_pools.below_launch_floor(window, observed, row, now):
             floor = window.get('launch_min_remaining_pct', 0)
-            raise ValueError(f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor); refresh quota or replan")
+            raise Refused(f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor); refresh quota or replan")
 
 
 EARLIER_VERSION = ('decision {decision_id} was recorded by an earlier version of AgentCompass ({detail}); roll or '
@@ -306,7 +312,7 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
 def canonical_request(request):
     allowed = {'title', 'provider', 'initialPrompt', 'workspaceId', 'cwd', 'settings', 'labels', 'notifyOnFinish'}
     if set(request) - allowed:
-        raise ValueError('Unsupported create_agent fields; put dispatch metadata in labels')
+        raise Refused('Unsupported create_agent fields; put dispatch metadata in labels')
     value = {k: v for k, v in request.items() if k != 'labels' and v is not None}
     value.setdefault('settings', {})
     value.setdefault('notifyOnFinish', True)
@@ -328,19 +334,19 @@ PASEO_LAUNCHER_MODES = {'codex': 'full-access', 'claude': 'bypassPermissions', '
 
 def launch_request(bundle, launch):
     if not isinstance(launch, dict) or not isinstance(launch.get('initialPrompt'), str) or not launch['initialPrompt'].strip():
-        raise ValueError('launch.initialPrompt must contain the reviewed assignment')
+        raise Refused('launch.initialPrompt must contain the reviewed assignment')
     if not isinstance(launch.get('title'), str) or not 0 < len(launch['title']) <= 60:
-        raise ValueError('launch.title must contain 1..60 characters')
+        raise Refused('launch.title must contain 1..60 characters')
     if set(launch) - {'title', 'initialPrompt', 'cwd', 'labels', 'notifyOnFinish'}:
-        raise ValueError('Launch configuration comes from the decision; only title/prompt/cwd/labels/notify are inputs')
+        raise Refused('Launch configuration comes from the decision; only title/prompt/cwd/labels/notify are inputs')
     if 'cwd' in launch and not (isinstance(launch['cwd'], str) and os.path.isabs(launch['cwd'])):
-        raise ValueError('launch.cwd must be an absolute directory')
+        raise Refused('launch.cwd must be an absolute directory')
     if any(k.startswith('router.') for k in launch.get('labels', {})):
-        raise ValueError('router.* labels are generated, not caller supplied')
+        raise Refused('router.* labels are generated, not caller supplied')
     provider = bundle['provider']
     family = provider_inventory.launcher_family(provider)
     if family not in PASEO_LAUNCHER_MODES:
-        raise ValueError('This dispatch adapter supports verified Paseo providers only; use the provider-specific runner otherwise')
+        raise Refused('This dispatch adapter supports verified Paseo providers only; use the provider-specific runner otherwise')
     model = bundle.get('launch_model') or bundle['model']
     settings = {}
     # Pi has fixed tool permissions and advertises no selectable modes. Ignore
@@ -919,8 +925,8 @@ def _plus(value, seconds):
 
 def _unhandled_covered(by_id, row, now):
     """A failed attempt whose failure the fallback covers and that no fallback step holds or decided: no `handled`
-    entry in its chain, or a claim no longer held (`claim_held`: its holder ended or its lease lapsed). The fallback is
-    on."""
+    entry in its chain, or a claim no longer held (`claim_held`: its holder ended, or a claim naming no holder outlived
+    its lease). The fallback is on."""
     import dispatch_fallback
     if row.get('state') not in ('failed', 'create_failed') or not dispatch_fallback.enabled():
         return False
@@ -931,6 +937,21 @@ def _unhandled_covered(by_id, row, now):
     if claim_held(handled, now):
         return False
     return bool(dispatch_fallback.failure_of(row)['covered'])
+
+
+def unclosable(row):
+    """Why a fallback step may not close this attempt as not relaunched (dispatch_fallback.abandon), or None when it
+    may: only an attempt that ended in a failure (`failed`, `create_failed`) the fallback covers is one a fallback step
+    owes a relaunch, so only its step's watcher closes it when that step ended twice without an answer. Read in the
+    transaction that takes the claim (`update_fallback` `attempt`), so a dispatch still running, ended otherwise, or a
+    failure the fallback does not relaunch is never closed by it."""
+    import dispatch_fallback
+    if row.get('state') not in ('failed', 'create_failed'):
+        return f"it has not ended in a failure (state {row.get('state')})"
+    failure = dispatch_fallback.failure_of(row)
+    if not failure['covered']:
+        return f"its failure is not one the fallback relaunches ({failure['label']})"
+    return None
 
 
 def _hold_end(row):
@@ -975,7 +996,7 @@ def _chain_hold(by_id, row, now):
 
     What ends `open`: a fallback step's outcome (relaunched, final, scheduled); a scheduled retry's guard lapsing (its
     claim then retires the retry, `dispatch_fallback.Chain.claim`, so it never starts); a claim no longer held
-    (`claim_held`: its holder ended, or its own `until` lapsed);
+    (`claim_held`: its holder ended, or a claim naming no holder outlived its own `until`);
     the fallback switched off (`AGENTCOMPASS_ROLL_FALLBACK=off`: nothing more is relaunched); and, for a failure no
     observer took, the end of its hold (`_hold_end`). `reconcile` observes such a failure meanwhile (`_awaits_fallback`)
     so its watcher is restarted and the fallback runs. A live watcher's open fallback is one of these: its step holds a
@@ -992,7 +1013,9 @@ def _chain_hold(by_id, row, now):
     if action == 'scheduled':
         return ('open', fallback.get('until')) if fallback_guard(root, now) else (None, None)
     if claim_held(handled, now):
-        return 'open', handled['until']
+        # A live step past its lease still holds it (step_binds): its own end writes the chain's record, or its watcher
+        # runs the step again, so no time moves it.
+        return 'open', handled['until'] if later(handled.get('until'), now) else None
     if not _unhandled_covered(by_id, row, now):
         return None, None
     end = _hold_end(row)
@@ -1667,7 +1690,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
     attempt failed (dispatch_fallback): that chain's own rows do not block it, its own live rows still do."""
     require_parent_id(task.get('parent_agent_id'))
     if isinstance(launch, dict) and 'workspaceId' in launch:
-        raise ValueError('launch cannot carry a host workspaceId; pass canonical directory workspace instead')
+        raise Refused('launch cannot carry a host workspaceId; pass canonical directory workspace instead')
     exempt = (attempt or {}).get('attempt_of')
     canon_ws = canonical_dir(workspace)
     cwd = canon_ws or cwd
@@ -1686,11 +1709,11 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
         expire(connection, now)
         decision = get(connection, 'decisions', decision_id)
         if not decision['bound'] or decision['task_hash'] != digest(task):
-            raise ValueError('Decision is unbound or belongs to another task/parent/input')
+            raise Refused('Decision is unbound or belongs to another task/parent/input')
         detail = earlier_version(decision.get('allocation_task'))
         if detail:
             # Neither a new launch nor a resume of its prepared row proceeds under it; other decisions are not affected.
-            raise ValueError(EARLIER_VERSION.format(decision_id=decision_id, detail=detail))
+            raise Refused(EARLIER_VERSION.format(decision_id=decision_id, detail=detail))
         if isinstance(resume_bundle, dict):
             bundle = dict(resume_bundle)
             resolved_resume = resolve_bundle(bundle, accounts, False)
@@ -1717,7 +1740,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                 save(connection, row)
             return row
         if parse(decision['valid_until']) <= now or not decision['dispatchable']:
-            raise ValueError('Decision expired, deferred or requires a new route; run plan or record again')
+            raise Refused('Decision expired, deferred or requires a new route; run plan or record again')
         if canon_ws and access != 'read_only':
             # Same transaction as the insert: of two concurrent rolls only the first becomes the writer.
             holders = writers_in(connection, canon_ws, now, task['parent_agent_id'], exempt)
@@ -1728,7 +1751,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             if not unresolved(old, now, exempt):
                 continue
             if not new_worker and (old['parent_id'], old['task_id']) == (decision['parent_id'], decision['task_id']):
-                raise ValueError('This parent/task already has an active dispatch; reconcile it first')
+                raise Refused('This parent/task already has an active dispatch; reconcile it first')
             if old.get('agent_id'):
                 busy_agents.add(old['agent_id'])
         try:
@@ -1741,7 +1764,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             resolved = resolve_bundle(bundle, accounts, decision.get('constraint') == 'user_override')
             if resolved is None or any(resolved.get(k) != bundle.get(k)
                     for k in ('id', 'provider', 'account', 'model', 'effort', 'modeId', 'launch_model')):
-                raise ValueError('Explicit override contract changed; record a new decision')
+                raise Refused('Explicit override contract changed; record a new decision')
             # Add only to this calculation, never to defaults or persistent account settings.
             accounts = deepcopy(accounts)
             accounts['accounts'][bundle['account']]['bundles'][bundle['bundle_id']] = resolved
@@ -1899,13 +1922,18 @@ def current_attempt(dispatch_id, path=None):
     return (root.get('fallback') or {}).get('current') or root['dispatch_id']
 
 
-def update_fallback(root_id, change, now=None, path=None):
-    """Apply change(fallback dict) to the first dispatch's attempt record in one transaction; returns the row."""
+def update_fallback(root_id, change, now=None, path=None, attempt=None):
+    """Apply change(fallback dict) to the first dispatch's attempt record in one transaction; returns the row. With
+    `attempt` (a dispatch id of the chain), that row as this transaction reads it is change's second argument, so a
+    decision about it is taken on the state it has when the change is written."""
     now = now or utcnow()
     with transaction(path) as connection:
         row = get(connection, 'dispatches', root_id)
         fallback = dict(row.get('fallback') or {})
-        change(fallback)
+        if attempt is None:
+            change(fallback)
+        else:
+            change(fallback, row if attempt == root_id else get(connection, 'dispatches', attempt))
         fallback['updated_at'] = stamp(now)
         row['fallback'] = fallback
         save(connection, row)
@@ -1973,7 +2001,7 @@ def missing_agent(dispatch_id, agent_id, now=None, path=None):
     with transaction(path, upkeep=True) as connection:
         row = get(connection, 'dispatches', dispatch_id)
         if not agent_id or row.get('agent_id') != agent_id:
-            raise ValueError('Missing-agent observation does not match an acknowledged agent')
+            raise Refused('Missing-agent observation does not match an acknowledged agent')
         if _in_flight_claim(row, now):
             return row
         if row['state'] in ACTIVE or row['state'] == 'expired':
@@ -1991,16 +2019,16 @@ def claim(request, parent_id=None, call_id=None, now=None, path=None):
         row = get(connection, 'dispatches', labels.get('router.dispatch_id'))
         require_parent_id(row['parent_id'])
         if any(labels.get(k) != row['request']['labels'][k] for k in LABELS):
-            raise ValueError('Dispatch labels do not match decision/account/task/parent')
+            raise Refused('Dispatch labels do not match decision/account/task/parent')
         if parent_id is not None and parent_id != row['parent_id']:
-            raise ValueError('Dispatch belongs to another parent')
+            raise Refused('Dispatch belongs to another parent')
         if bound_hash(request) != row['request_hash']:
-            raise ValueError('Dispatch launch configuration changed (provider/model/mode/effort); '
+            raise Refused('Dispatch launch configuration changed (provider/model/mode/effort); '
                              'title/initialPrompt/workspaceId may be edited, these may not')
         if row['state'] == 'launching' and call_id and row.get('claim_id') == call_id and parse(row['lease_until']) > now:
             return row
         if row['state'] != 'prepared' or parse(row['lease_until']) <= now:
-            raise ValueError('Dispatch already claimed, terminal or expired; reconcile instead of replaying create_agent')
+            raise Refused('Dispatch already claimed, terminal or expired; reconcile instead of replaying create_agent')
         import account_fleet
         import usage_reading
         try:
@@ -2050,9 +2078,6 @@ def provider_replied(terminal, launched_at):
         return False
 
 
-# The worker's error a failed turn the classifier read as not the provider's doing carries in its answer, bounded.
-WORKER_ERROR_LIMIT = 600
-
 
 def snapshot_turn_failure(dispatch_id, snapshot, terminal, path=None):
     """`terminal` as the notifier would have written it when this observation, not the notifier, is the first to see the
@@ -2063,7 +2088,7 @@ def snapshot_turn_failure(dispatch_id, snapshot, terminal, path=None):
     if not isinstance(snapshot, dict) or (isinstance(terminal, dict)
                                           and terminal.get('failure_code') in provider_retry.FAILURE_CODES):
         return terminal
-    message = snapshot.get('lastError').strip() if isinstance(snapshot.get('lastError'), str) else ''
+    message = provider_retry.turn_error_text(snapshot.get('lastError'))
     updated = snapshot.get('updatedAt')
     if not message or not isinstance(updated, str) or not (
             snapshot.get('status') == 'error' or snapshot.get('attentionReason') == 'error'):
@@ -2088,7 +2113,7 @@ def snapshot_turn_failure(dispatch_id, snapshot, terminal, path=None):
     except ValueError:
         return terminal
     return {**(terminal if isinstance(terminal, dict) else {}), 'reason': 'error', 'at': updated,
-            'failure_code': provider_retry.TURN_FAILED_CODE, 'provider_message': message[:provider_retry.MESSAGE_LIMIT]}
+            'failure_code': provider_retry.TURN_FAILED_CODE, 'provider_message': message}
 
 
 def classify_provider_failure(dispatch_id, terminal, path=None):
@@ -2127,7 +2152,8 @@ def later(first, second):
 def process_started(pid):
     """When process `pid` started, as the OS counts it (Windows: its creation FILETIME; Linux: its start tick), so a pid
     the OS reused for another process does not read as the same one. None when no such process runs; 0 where the OS
-    gives no start time (the pid alone then names it)."""
+    gives no start time, or refuses this reader one (Windows access denied: the process exists), so the pid alone then
+    names it."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     if os.name == 'nt':
@@ -2141,7 +2167,8 @@ def process_started(pid):
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         handle = kernel.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            return None
+            # Access denied (ERROR_ACCESS_DENIED): the process exists and refuses this reader, so the pid alone names it.
+            return 0 if ctypes.get_last_error() == 5 else None
         try:
             code = wintypes.DWORD()
             if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
@@ -2166,45 +2193,49 @@ def process_started(pid):
 
 
 def process_identity():
-    """This process, as a fallback step's claim names its holder (`claim_held`)."""
+    """This process, as a fallback step's claim names its holder (`step_binds`)."""
     return {'pid': os.getpid(), 'started': process_started(os.getpid())}
 
 
-def step_running(record):
-    """The step a claim or a relaunch in progress names (`holder`) is still at it: it did not release it
-    (`released_at`, dispatch_fallback.Chain.release) and its process still runs. A record that names no holder (written
-    before records named one) is taken at its word until its lease ends."""
+def step_binds(record, now):
+    """A fallback step's claim or relaunch in progress still binds, decided by the fact where the record names one. A
+    record naming its step's process (`holder`) binds while that process runs (its pid and start time match) and has not
+    released it (`released_at`, dispatch_fallback.Chain.release), however long the step takes: its lease (`until`) does
+    not end it. A live step is working, not hung, because every call it waits on outside its own process is bounded by
+    that call's own timeout (dispatch_flow.host_call, scorer_client.run_scorer); meanwhile the parent reads
+    FALLBACK_RUNNING_NEXT (dispatch_flow.with_fallback). A record naming no holder (written by older code) binds until
+    its lease ends."""
     if not isinstance(record, dict) or record.get('released_at'):
         return False
     holder = record.get('holder')
     if not isinstance(holder, dict):
-        return True
+        return later(record.get('until'), now)
     started = process_started(holder.get('pid'))
-    return started is not None and holder.get('started') in (None, started)
+    # 0: the OS gives this reader no start time (access denied), so the pid alone names the process.
+    return started is not None and (started == 0 or holder.get('started') in (None, started))
 
 
 def claim_held(item, now):
-    """A fallback step's claim on a failed attempt (`pending`, dispatch_fallback.Chain.claim) that still binds: its lease
-    runs and its step is still at it (`step_running`). The step's process ending (it exited or was killed, the machine
-    restarted) releases it at once for whoever reads it next; so does the step itself when it stops by an exception
-    (dispatch_fallback.handle). Only a held claim keeps others from taking the attempt over or keeps the brief counted
-    as being relaunched."""
-    return isinstance(item, dict) and item.get('action') == 'pending' and later(item.get('until'), now) \
-        and step_running(item)
+    """A fallback step's claim on a failed attempt (`pending`, dispatch_fallback.Chain.claim) that still binds
+    (`step_binds`). The step's process ending (it exited or was killed, the machine restarted) releases it at once for
+    whoever reads it next; so does the step itself when it stops by an exception (dispatch_fallback.handle). Only a held
+    claim keeps others from taking the attempt over or keeps the brief counted as being relaunched."""
+    return isinstance(item, dict) and item.get('action') == 'pending' and step_binds(item, now)
 
 
 def relaunch_held(fallback, now):
-    """A step is launching the brief's next attempt (`relaunching`) inside its lease, and is still at it."""
-    return fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and step_running(fallback)
+    """A step is launching the brief's next attempt (`relaunching`) and still binds (`step_binds`)."""
+    return fallback.get('state') == 'relaunching' and step_binds(fallback, now)
 
 
 def claim_stopped(fallback, now):
     """A step took this brief's failed attempt and stopped before it finished: inside its lease, a claim (or a relaunch
-    in progress) whose step is no longer at it. Nothing runs the brief until the next step takes the claim over."""
-    if fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and not step_running(fallback):
+    in progress) that no longer binds (`step_binds`: its step ended or released it). Nothing runs the brief until the
+    next step takes the claim over."""
+    if fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and not step_binds(fallback, now):
         return True
     return any(isinstance(item, dict) and item.get('action') == 'pending' and later(item.get('until'), now)
-               and not step_running(item) for item in (fallback.get('handled') or {}).values())
+               and not step_binds(item, now) for item in (fallback.get('handled') or {}).values())
 
 
 def agent_resumed(snapshot, row, terminal=None):
@@ -2273,17 +2304,17 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
         if any(labels.get(k) != row['request']['labels'][k] for k in LABELS):
             raise NotBound('Host snapshot belongs to another dispatch/parent/task')
         if not isinstance(agent_id, str) or not agent_id or row.get('agent_id') not in (None, agent_id):
-            raise ValueError('Host agent ID mismatch')
+            raise Refused('Host agent ID mismatch')
         provider, _, model = row['request']['provider'].partition('/')
         if snapshot.get('provider') != provider or snapshot.get('model') != model:
-            raise ValueError('Host provider/model differs from dispatched bundle')
+            raise Refused('Host provider/model differs from dispatched bundle')
         if snapshot.get('status') == 'running':
             settings = row['request']['settings']
             if settings.get('modeId') and snapshot.get('currentModeId') != settings['modeId']:
-                raise ValueError('Host permission mode differs from dispatched settings')
+                raise Refused('Host permission mode differs from dispatched settings')
             effort = snapshot.get('effectiveThinkingOptionId') or snapshot.get('thinkingOptionId')
             if settings.get('thinkingOptionId') and effort != settings['thinkingOptionId']:
-                raise ValueError('Host thinking option differs from dispatched settings')
+                raise Refused('Host thinking option differs from dispatched settings')
         # A completed worker can be resumed; its later quota failure still matters.
         if snapshot.get('status') == 'error':
             updated_error = snapshot.get('updatedAt')
@@ -2310,10 +2341,10 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
         if row['state'] in TERMINAL and row['state'] != 'expired' and not followup:
             return row
         if row['state'] == 'prepared':
-            raise ValueError('Agent observed without a launch claim')
+            raise Refused('Agent observed without a launch claim')
         updated = snapshot.get('updatedAt')
         if not isinstance(updated, str) or parse(updated) < parse(row['launched_at']):
-            raise ValueError('Host snapshot predates this launch')
+            raise Refused('Host snapshot predates this launch')
         row['agent_id'] = agent_id
         row['observed_at'] = stamp(now)
         if isinstance(snapshot.get('cwd'), str):
@@ -2344,7 +2375,7 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             row['failure_detail'] = {k: terminal[k] for k in ('partial_work', 'cancelled') if k in terminal}
             if row['failure_code'] in provider_retry.WORKER_CODES and isinstance(terminal.get('provider_message'), str):
                 # The worker's own error ends the chain: its answer carries the text, as the watcher's notice does.
-                row['failure_detail']['worker_error'] = terminal['provider_message'][:WORKER_ERROR_LIMIT]
+                row['failure_detail']['worker_error'] = provider_retry.turn_error_text(terminal['provider_message'])
         elif finished_before(terminal, row['launched_at']) and status != 'running':
             target = 'completed'
         elif status == 'error' or reason == 'error' or snapshot.get('providerUnavailable'):
@@ -2362,7 +2393,7 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
         elif status in ('initializing', 'idle'):
             target = 'launched'
         if target is None:
-            raise ValueError('Unrecognized host status; reservation retained until lease expiry')
+            raise Refused('Unrecognized host status; reservation retained until lease expiry')
         # A resume's prompt after its launch is its turn landing on a worker an earlier round used: kept so the end
         # notice of that earlier round knows it (`_own_turn_landed`). A create's states are as before: its own turn is
         # the worker's first, and `started_at` there means a seen run.
@@ -2460,11 +2491,11 @@ def release(dispatch_id, parent_id, reason, now=None, path=None, failed=False):
     with transaction(path) as connection:
         row = get(connection, 'dispatches', dispatch_id)
         if parent_id != row['parent_id']:
-            raise ValueError('Dispatch belongs to another parent')
+            raise Refused('Dispatch belongs to another parent')
         if row['state'] in ('launching', 'launched', 'started') and not failed:
-            raise ValueError('Observe terminal status before releasing a launched dispatch; release does not cancel an agent')
+            raise Refused('Observe terminal status before releasing a launched dispatch; release does not cancel an agent')
         if row['state'] == 'expired' and (row.get('creation') or {}).get('in_flight') and not failed:
-            raise ValueError('Paseo is still creating this worker and cannot cancel a create; release does not stop it')
+            raise Refused('Paseo is still creating this worker and cannot cancel a create; release does not stop it')
         canceled = None
         if not failed:
             root = row if chain_root(row) == dispatch_id else get(connection, 'dispatches', chain_root(row))
@@ -2490,7 +2521,7 @@ def finalize_dispatch(dispatch_id, now=None, path=None, receipt_only=False):
     `receipt_only` ignores the agent JSON. An ending the receipt does not carry leaves the row unchanged.
     Safe to call again: a stored terminal is kept, and effects that already ran are not repeated."""
     if not _safe_dispatch_id(dispatch_id) or not Path(path or db_path()).exists():
-        raise ValueError('invalid dispatch id')
+        raise Refused('invalid dispatch id')
     now = now or utcnow()
     with transaction(path) as connection:
         apply_ending(connection, get(connection, 'dispatches', dispatch_id), now, receipt_only=receipt_only)

@@ -46,7 +46,8 @@ Contract:
   error (no profile to plan with, for one) ends there too, saying so, never `blocked`. A launch that fails after the
   create may have been sent keeps that attempt as `current`: observing the dispatch settles it, and nothing else starts.
   The failure's text is the one `route_judge.failure_cause` allows; the ledger line keeps its kind (`error_kind`:
-  `internal` for a defect of AgentCompass, told apart in the parent's text too) and its traceback. Every final result
+  `internal` for a defect of AgentCompass, told apart in the parent's text too), its class and its stack frames, never
+  its message (`frames`). Every final result
   after which nothing runs the brief (NOTHING_RUNS) carries its own text, and that text is what the parent reads: roll's
   answer when roll ran the step, the watcher's one notice when the watcher did, and any later observation of the
   dispatch.
@@ -92,6 +93,9 @@ class NotReplanned(Exception):
 # alone and the bridge keeps no other key of these two.
 DISABLED_MEANING = ('Automatic retry and relaunch of a failed attempt is off on this machine (AGENTCOMPASS_ROLL_FALLBACK=off), '
                     'so nothing was retried or relaunched; the parent is told of the failure as it is.')
+UNCLOSED_MEANING = ('Nothing was changed: the attempt was not closed, because {why}. Only the watcher of an attempt whose '
+                    'covered failure its fallback step could not finish closes it this way. Observe the dispatch with '
+                    '--dispatch-action reconcile.')
 UNSETTLED_MEANING = ('This dispatch has not ended (state {state}), and only an attempt that ended in a failure is retried or '
                      'relaunched, so nothing was done. Observe it with --dispatch-action reconcile.')
 
@@ -137,8 +141,28 @@ def failure_of(row):
 
 
 def refused(exc):
+    import route_judge
     return {'covered': True, 'kind': 'switch', 'scope': None, 'label': 'refused_before_launch',
-            'detail': str(exc)[:300]}
+            'detail': route_judge.failure_cause(exc)}
+
+
+def refusals():
+    """The exception types this repository raises on purpose to refuse a request (their text is a rule's own): a
+    next attempt stopped by one is `refused`; any other ValueError is a defect (`internal`)."""
+    import host_placement
+    import host_policy
+    import launch_values
+    import task_intake
+    return (registry.Refused, host_placement.InvalidWorkspace, host_policy.HostPolicyError, launch_values.LaunchValueError,
+            task_intake.InvalidCallerProfile)
+
+
+def frames(exc):
+    """What the ledger keeps of an exception that stopped a step: its class and its stack frames (file, line and function
+    of each, innermost last), never its message, which may carry a host's reply, a token or transcript text, nor a
+    source line. The text the owner allows out (route_judge.failure_cause) is the line's `error`."""
+    lines = [f'{frame.filename}:{frame.lineno} in {frame.name}' for frame in traceback.extract_tb(exc.__traceback__)]
+    return {'error_type': type(exc).__name__, 'traceback': '\n'.join(lines)[-4000:]}
 
 
 def bundle_view(bundle):
@@ -202,6 +226,13 @@ class AlreadyHandled(Exception):
     def __init__(self, outcome):
         super().__init__('already handled')
         self.outcome = outcome
+
+
+class Unclosable(Exception):
+    """The attempt a closing claim names is not one a fallback step may close (dispatch_registry.unclosable)."""
+    def __init__(self, why, state):
+        super().__init__(why)
+        self.why, self.state = why, state
 
 
 class Chain:
@@ -325,22 +356,26 @@ class Chain:
         self.root = registry.update_fallback(self.root['dispatch_id'], change)
         return self.root
 
-    def claim(self, failed_id):
+    def claim(self, failed_id, closing=False):
         """Only one observer handles a failed attempt; a second gets the first one's outcome. Returns True when the
         claim is the scheduled same-bundle retry falling due (run it with resume=True), False for a fresh failure.
 
-        A step in progress holds its claim for RUN_LEASE while its own process runs (the claim names it:
-        registry.claim_held); a scheduled retry holds until its retry time (no observer may take a failure over while
-        its backoff is still being waited out). Only a claim no longer held (its holder ended, released it, or outlived
-        its lease) or a scheduled retry that is due may be taken.
+        A step in progress holds its claim while its own process runs, however long (the claim names it:
+        registry.step_binds); a scheduled retry holds until its retry time (no observer may take a failure over while
+        its backoff is still being waited out). Only a claim no longer held (its holder ended or released it; a claim
+        naming no holder, written by older code, that outlived its lease) or a scheduled retry that is due may be taken.
 
         A scheduled retry only runs while the first dispatch's guard holds (fallback `until`, see `schedule`): the
         guard is what keeps the brief from being dispatched again, so a retry found due after it lapsed is retired
         (`retry_expired`) in this same transaction instead, and a fresh dispatch of the brief and this retry never both
-        run. Taking a due retry renews the guard, so it cannot lapse between the claim and the relaunch's own guard."""
+        run. Taking a due retry renews the guard, so it cannot lapse between the claim and the relaunch's own guard.
+
+        `closing` (abandon): the claim is taken only on an attempt a fallback step may close, decided on the attempt's
+        row as this same transaction reads it (dispatch_registry.unclosable); otherwise nothing is written and
+        Unclosable is raised."""
         claimed = {}
 
-        def change(fallback):
+        def change(fallback, attempt=None):
             now = registry.utcnow()
             handled = dict(fallback.get('handled') or {})
             before = claimed['before'] = handled.get(failed_id)
@@ -355,6 +390,11 @@ class Chain:
                 claimed['take'] = False
                 return
             claimed['take'] = before is None or due or stale
+            if claimed['take'] and closing:
+                why = registry.unclosable(attempt)
+                if why:
+                    claimed.update(take=False, unclosable=(why, attempt.get('state')))
+                    return
             if claimed['take']:
                 handled[failed_id] = {'action': 'pending', 'at': registry.stamp(now), 'until': registry.stamp(
                     now + timedelta(seconds=registry.RUN_LEASE)), 'holder': registry.process_identity(),
@@ -364,7 +404,9 @@ class Chain:
                 if resume:
                     lease = registry.stamp(now + timedelta(seconds=registry.RUN_LEASE))
                     fallback['until'] = max(fallback['until'], lease, key=registry.parse)
-        self.root = registry.update_fallback(self.root['dispatch_id'], change)
+        self.root = registry.update_fallback(self.root['dispatch_id'], change, attempt=failed_id if closing else None)
+        if claimed.get('unclosable'):
+            raise Unclosable(*claimed['unclosable'])
         before = claimed['before']
         if claimed['take']:
             return claimed['resume']
@@ -562,7 +604,7 @@ class Chain:
             return self.not_relaunched(attempt, new_bundle, 'not_launched', exc, failed_id)
         cause = self.cause_of(exc)
         self.ledger('launch_unconfirmed', attempt, next={'dispatch_id': new['dispatch_id'], **bundle_view(new_bundle)},
-                    error_kind=cause['kind'], error=cause['text'], traceback=traceback.format_exc()[-4000:])
+                    error_kind=cause['kind'], error=cause['text'], **frames(exc))
         try:
             self.save('relaunched', current=new['dispatch_id'])
         except Exception:   # noqa: BLE001 - the root still names it from `relaunching`
@@ -725,7 +767,7 @@ class Chain:
         (the owner of what a failure may say). The kind tells a refusal of this repository's rules or of the local state
         (`refused`, `environment`, `data`) from a defect of AgentCompass (`internal`: any other exception type, such as an
         AttributeError or a TypeError, raised by its code or by data in a shape it does not read), which the
-        parent's text names as such and the ledger line keeps with its traceback."""
+        parent's text names as such and the ledger line keeps with its stack frames (`frames`)."""
         import sqlite3
         import route_judge
         import public_data
@@ -733,15 +775,15 @@ class Chain:
             return {'kind': 'not_replanned', 'text': str(exc)[:400]}
         if isinstance(exc, public_data.ReferenceDataError):
             kind = 'data'
-        elif isinstance(exc, ValueError):
+        elif isinstance(exc, refusals()):
             kind = 'refused'
         elif isinstance(exc, (OSError, sqlite3.Error, TimeoutError, RuntimeError)):
             kind = 'environment'    # the local state, the host or its reply (a RuntimeError carries a host's answer)
         else:
-            # A KeyError, TypeError or AttributeError: a defect of the code, or data in a shape the code does not read;
-            # the type cannot tell which, the traceback can.
+            # A KeyError, TypeError, AttributeError or a ValueError no rule raised: a defect of the code, or data in a
+            # shape the code does not read; the type cannot tell which, the stack frames can.
             kind = 'internal'
-        return {'kind': kind, 'text': route_judge.failure_cause(exc)}
+        return {'kind': kind, 'text': route_judge.failure_cause(exc) if kind != 'internal' else route_judge.withheld_cause(exc)}
 
     def not_relaunched(self, attempt, bundle, label, exc, failed_id):
         """The failed attempt was one AgentCompass promised to relaunch, and the next attempt could not be made before
@@ -757,8 +799,7 @@ class Chain:
             self.failed(failed, {'covered': False, 'kind': None, 'scope': None, 'label': label, 'detail': cause['text']})
             step = None
         self.ledger('not_relaunched', self.attempts[-1] if bundle else attempt,
-                    **({'next_step': step} if step else {}), error_kind=cause['kind'],
-                    traceback=traceback.format_exc()[-4000:])
+                    **({'next_step': step} if step else {}), error_kind=cause['kind'], error=cause['text'], **frames(exc))
         return self.finish('not_relaunched', {'label': label}, failed_id, step=step, internal=cause['kind'] == 'internal')
 
     def finish(self, kind, failure, failed_id, step=None, internal=False, forced=False):
@@ -797,7 +838,7 @@ def final_text(kind, attempts, task, step=None, internal=False, forced_by=None, 
         if internal:
             return ('AgentCompass hit an internal error of its own while starting the next attempt of this brief after its '
                     f'failure, so nothing is running it:\n{listed}\nThis is a defect of AgentCompass (its code, or local '
-                    'or reference data in a shape it does not read), not of the brief or the accounts; its traceback is in the local ledger (stage fallback, action not_relaunched). Tell the '
+                    'or reference data in a shape it does not read), not of the brief or the accounts; its stack frames are in the local ledger (stage fallback, action not_relaunched). Tell the '
                     'user; rolling the brief again routes it afresh (nothing holds it now).')
         return ('AgentCompass could not start the next attempt of this brief after its failure, so nothing is running '
                 f'it:\n{listed}\nThe brief did not start. Roll it again to route it afresh (nothing holds it now), or '
@@ -865,22 +906,37 @@ def abandon(dispatch_id, *, judge=None, host=None):
     the process ran and exited, or could not be read). Whatever it claimed ended with it, so this closes the attempt
     in the registry (`not_relaunched`, nothing runs the brief) before the watcher tells the parent: the notice and every
     later observation then say the same, and no later step relaunches a brief the parent was told to roll again.
-    Another live step's claim, or an outcome already decided, is returned as it stands."""
+    Another live step's claim, or an outcome already decided, is returned as it stands.
+
+    It exists for that one caller in that one state, a step between the router's own processes: whether the attempt
+    may be closed (it ended in a failure the fallback covers: dispatch_registry.unclosable) is decided in the
+    transaction that takes the claim, and any other attempt (a dispatch running fine included) is returned unchanged
+    with why (`action: unchanged`). The watcher's ending is first written from its receipt (dispatch_flow.settle, no
+    host call), since the step that would have settled it is the one that stopped."""
+    if not enabled():
+        return {'action': 'disabled', 'meaning': DISABLED_MEANING}
+    import dispatch_flow
     row = registry.inspect(dispatch_id)
+    if row['state'] not in registry.TERMINAL:
+        dispatch_flow.settle(dispatch_id)
+        row = registry.inspect(dispatch_id)
     root_id = registry.chain_root(row)
     chain = Chain.of(row if root_id == dispatch_id else registry.inspect(root_id), judge=judge, host=host)
     try:
-        chain.claim(dispatch_id)
+        chain.claim(dispatch_id, closing=True)
     except AlreadyHandled as done:
         return done.outcome
+    except Unclosable as refused:
+        return {'action': 'unchanged', 'dispatch_id': dispatch_id, 'state': refused.state,
+                'meaning': UNCLOSED_MEANING.format(why=refused.why)}
     try:
+        row = registry.inspect(dispatch_id)
         chain.drop_unsent()
         attempt = next((a for a in chain.attempts if a.get('dispatch_id') == dispatch_id), None)
         if attempt is None:
             attempt = chain.entry(row['bundle'], row)
             chain.attempts.append(attempt)
-        if row['state'] in registry.TERMINAL:
-            chain.failed(attempt, failure_of(row), row)
+        chain.failed(attempt, failure_of(row), row)
         step = {'failure': 'step_stopped', 'detail': STEP_STOPPED_DETAIL, 'error_kind': 'internal'}
         chain.ledger('not_relaunched', attempt, next_step=step, error_kind='internal')
         return chain.finish('not_relaunched', {'label': 'step_stopped'}, dispatch_id, step=step, internal=True)

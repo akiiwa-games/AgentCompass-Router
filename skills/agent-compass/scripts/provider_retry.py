@@ -272,6 +272,14 @@ def validate_scope(answer):
     return {'scope': scope, **({'reason': reason[:300]} if isinstance(reason, str) and reason else {})}
 
 
+def turn_error_text(message):
+    """A worker turn's own error text as AgentCompass keeps and forwards it (the classifier's scope question, the
+    registry's failure_detail, the parent's answer): the watcher's rule (paseo_dispatch_bridge.mjs turnFailure), stripped
+    of surrounding whitespace and cut at MESSAGE_LIMIT. None when there is none."""
+    text = message.strip() if isinstance(message, str) else ''
+    return text[:MESSAGE_LIMIT] or None
+
+
 def classify_scope(account, provider, model, message, failure=FAILURE_CODE):
     """(scope, metadata) from the configured System-One classifier; `unknown` when it cannot answer."""
     if not isinstance(message, str) or not message:
@@ -343,8 +351,7 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
     if dispatch_id in _read(path)['dispatches']:
         return None
     provider = bundle.get('provider') or account
-    message = failure.get('provider_message') if isinstance(failure.get('provider_message'), str) else None
-    message = message[:MESSAGE_LIMIT] if message else None
+    message = turn_error_text(failure.get('provider_message'))
     # The classifier can take seconds: ask it before taking the lock.
     scope, meta = (classify or classify_scope)(account, provider, model, message, code)
     scope = scope if scope in SCOPES else 'unknown'

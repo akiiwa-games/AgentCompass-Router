@@ -509,6 +509,16 @@ class FallbackTests(unittest.TestCase):
         self.assertIn('the test suite failed in tests/test_parser.py', public['next_action'])
         self.assertEqual(public['worker_error'], 'Error: the test suite failed in tests/test_parser.py')
 
+    def test_the_workers_error_is_kept_by_the_watchers_rule_on_the_snapshot_path(self):
+        """Round 2 review A: the worker's own error text an observation reads is kept and forwarded by the one rule the
+        watcher applies (provider_retry.turn_error_text: stripped, cut at MESSAGE_LIMIT), not a second limit."""
+        self.scopes = ['none']
+        message = '  Error: ' + 'x' * 900 + '  '
+        root, out = self.observed_error(message)
+        public = flow.public_chain(registry.inspect(root['dispatch_id']))
+        self.assertEqual(public['worker_error'], provider_retry.turn_error_text(message))
+        self.assertEqual(len(public['worker_error']), len(message.strip()))
+
     def test_a_worker_error_the_classifier_reads_as_the_providers_moves_to_the_next_candidate(self):
         self.scopes = ['model']
         root, out = self.observed_error('429 model overloaded, try again later')
@@ -645,10 +655,11 @@ class FallbackTests(unittest.TestCase):
         self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
         return root
 
-    def test_a_defect_in_the_replan_is_named_as_one_with_its_traceback_and_keeps_the_attempts_cause(self):
+    def test_a_defect_in_the_replan_is_named_as_one_with_its_stack_frames_and_keeps_the_attempts_cause(self):
         """Rule: the parent's text is the one route_judge.failure_cause allows, a defect of AgentCompass (an exception
-        type outside its refusals, the local state and the host) is said to be one, the ledger line keeps its kind and
-        traceback, and the failed attempt keeps its own cause."""
+        type outside its refusals, the local state and the host) is said to be one, the ledger line keeps its kind, its
+        class and its stack frames (never its message: dispatch_fallback.frames), and the failed attempt keeps its own
+        cause."""
         root = self.worker_error_root()
 
         class Broken:
@@ -662,9 +673,53 @@ class FallbackTests(unittest.TestCase):
         self.assertNotIn("'NoneType' object", out['text'])          # failure_cause names the type only
         line = self.fallback_lines()[-1]
         self.assertEqual((line['action'], line['error_kind']), ('not_relaunched', 'internal'))
-        self.assertIn('AttributeError', line['traceback'])
+        self.assertEqual(line['error_type'], 'AttributeError')
+        self.assertIn('plan_task', line['traceback'])                  # the frame that raised
+        self.assertNotIn("'NoneType' object", json.dumps(line))
         self.assertEqual(line['failed']['failure'], 'worker_error')
         self.assertEqual(line['next_step']['failure'], 'replan_failed')
+
+    def test_an_exceptions_message_reaches_neither_the_parent_nor_the_ledger(self):
+        """Round 2 review A: one rule for what is written down about a failure, wherever it goes: the stack frames, the
+        exception class and only the text route_judge.failure_cause allows out. A message carrying a token or a user's
+        words (here a re-plan whose exception quotes them) is in no answer and no ledger line."""
+        root = self.worker_error_root()
+
+        class Leaky:
+            @staticmethod
+            def plan_task(task, args, unavailable=None):
+                raise RuntimeError('host replied: key FIXTURE-TOKEN-VALUE, user said: private words')
+        out = fallback.handle(root['dispatch_id'], judge=Leaky, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        written = json.dumps([out, flow.public_chain(registry.inspect(root['dispatch_id'])), self.fallback_lines()])
+        for secret in ('FIXTURE-TOKEN-VALUE', 'private words'):
+            self.assertNotIn(secret, written)
+        line = self.fallback_lines()[-1]
+        # A RuntimeError carries a host's answer: the environment's, its text withheld by failure_cause.
+        self.assertEqual((line['error_kind'], line['error_type']), ('environment', 'RuntimeError'))
+        self.assertIn('in plan_task', line['traceback'])
+        self.assertEqual(line['error'], route_judge.withheld_cause(RuntimeError()))
+
+    def test_a_value_error_no_rule_raised_is_a_defect_not_a_refusal(self):
+        """Round 2 review C: a refusal is raised on purpose (dispatch_registry.Refused and the owners' refusal types);
+        a ValueError Python raises (an unpacking) is a defect of AgentCompass (`internal`), its text withheld."""
+        root = self.worker_error_root()
+
+        class Unpacking:
+            @staticmethod
+            def plan_task(task, args, unavailable=None):
+                planned, = (1, 2)
+                return planned
+        out = fallback.handle(root['dispatch_id'], judge=Unpacking, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn('internal error of its own', out['text'])
+        self.assertNotIn('too many values to unpack', out['text'])
+        line = self.fallback_lines()[-1]
+        self.assertEqual((line['error_kind'], line['error_type']), ('internal', 'ValueError'))
+        # A registry refusal is still one, in the rule's own words.
+        self.assertIsInstance(registry.CapacityChanged('x'), registry.Refused)
+        cause = fallback.Chain.cause_of(registry.Refused('the workspace has a writer'))
+        self.assertEqual(cause, {'kind': 'refused', 'text': route_judge.failure_cause(registry.Refused('the workspace has a writer'))})
 
     def test_a_refusal_of_the_local_state_reads_as_one_in_the_owners_words(self):
         root = self.worker_error_root()
@@ -998,6 +1053,62 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]['action'],
                          'pending')
 
+    def test_abandon_leaves_a_dispatch_that_has_not_failed_unchanged(self):
+        """Round 2 review B: abandon closes only an attempt that ended in a failure the fallback covers, decided in the
+        transaction that takes the claim (dispatch_registry.unclosable). A dispatch running fine is returned unchanged
+        with why, and keeps running: nothing is closed, nothing tells the parent to roll it again."""
+        root = self.first()
+        out = fallback.abandon(root['dispatch_id'], judge=self.judge, host=self.host)
+        self.assertEqual((out['action'], out['state']), ('unchanged', root['state']))
+        self.assertIn('has not ended in a failure', out['meaning'])
+        row = registry.inspect(root['dispatch_id'])
+        self.assertEqual(row['state'], root['state'])
+        self.assertNotIn(root['dispatch_id'], (row.get('fallback') or {}).get('handled') or {})
+        self.assertNotIn(fallback.STEP_STOPPED_DETAIL, json.dumps(flow.public_chain(row)))
+        self.assertEqual(len(self.host.creates), 1)
+        # Its own failure later is relaunched as any other: the fallback was not closed by the stray call.
+        self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
+        self.assertEqual(self.handle(root['dispatch_id'])['action'], 'relaunched')
+
+    def test_a_live_step_holds_its_claim_past_its_lease(self):
+        """Round 2 review E: a claim naming a live holder (pid and start time match) is held however long its step runs;
+        no observer takes it over when RUN_LEASE passes. Only a claim naming no holder (older code) ends by time."""
+        root = self.failed_root()
+        fallback.Chain.of(root, judge=self.judge, host=self.host).claim(root['dispatch_id'])   # held by this process
+        with self.at(seconds=registry.RUN_LEASE + 60):
+            now = registry.utcnow()
+            self.assertEqual(self.handle(root['dispatch_id'])['action'], 'pending')
+            self.assertIsNone(fallback.resume_due(root['dispatch_id'], host=self.host))
+            row = registry.inspect(root['dispatch_id'])
+            self.assertTrue(registry.fallback_guard(row, now))
+            self.assertEqual(flow.public_chain(row)['next_action'],
+                             flow.FALLBACK_RUNNING_NEXT.format(where=(row['fallback'].get('lines') or ['attempt 1'])[-1]))
+        self.assertEqual(len(self.host.creates), 1)
+        item = registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]
+        legacy = {k: v for k, v in item.items() if k != 'holder'}
+        self.assertTrue(registry.claim_held(legacy, registry.utcnow()))
+        self.assertFalse(registry.claim_held(legacy, registry.parse(item['until']) + timedelta(seconds=1)))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows OpenProcess')
+    def test_a_holder_that_refuses_this_reader_is_alive(self):
+        """Round 2 review D: OpenProcess answering access denied (error 5) means the process exists: it is not dead."""
+        import ctypes
+
+        def kernel(*_, **__):
+            def open_process(*_):
+                ctypes.set_last_error(5)
+                return None
+            return type('Kernel', (), {'OpenProcess': staticmethod(open_process),
+                                       'GetProcessTimes': staticmethod(lambda *_: 0),
+                                       'GetExitCodeProcess': staticmethod(lambda *_: 0),
+                                       'CloseHandle': staticmethod(lambda *_: 0)})()
+        claim = {'action': 'pending', 'at': registry.stamp(registry.utcnow()),
+                 'until': registry.stamp(registry.utcnow() + timedelta(seconds=registry.RUN_LEASE)),
+                 'holder': {'pid': 4242, 'started': 133000000000000000}}
+        with patch.object(ctypes, 'WinDLL', side_effect=kernel):
+            self.assertEqual(registry.process_started(4242), 0)
+            self.assertTrue(registry.claim_held(claim, registry.utcnow()))
+
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim
         on the real SQLite file at once, exactly one takes it and the others read it as being relaunched. Each stays
@@ -1304,7 +1415,7 @@ class StoredTaskRelaunchTests(unittest.TestCase):
         def claim(*a, **kw):
             calls.append(1)
             if len(calls) == 2:      # the relaunch's claim
-                raise ValueError('fixture: account_disabled_in_magpie at claim')
+                raise registry.Refused('fixture: account_disabled_in_magpie at claim')
             return real_claim(*a, **kw)
         result, code, creates = self.roll_refused_first('claim-raises', patch.object(registry, 'claim', side_effect=claim))
         self.assertEqual((result['caller_action'], result['error']), ('tell_user', 'relaunch_not_started'), result.get('next'))

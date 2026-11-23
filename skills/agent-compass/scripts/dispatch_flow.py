@@ -452,7 +452,7 @@ def require_actual_parent(parent_id):
     require_parent_id(parent_id)
     actual = os.environ.get('PASEO_AGENT_ID')
     if actual and actual != parent_id:
-        raise ValueError('Dispatch parent differs from actual PASEO_AGENT_ID; another agent cannot claim this assignment')
+        raise registry.Refused('Dispatch parent differs from actual PASEO_AGENT_ID; another agent cannot claim this assignment')
 
 
 def settle_create(row, creation, now, path):
@@ -698,7 +698,7 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
         return min(HOST_TIMEOUT, left()) if left() >= 1 else OBSERVE_FLOOR
 
     if row['parent_id'] != parent_id:
-        raise ValueError('Dispatch belongs to another parent')
+        raise registry.Refused('Dispatch belongs to another parent')
     if row['state'] in registry.TERMINAL and row['state'] != 'expired':
         now = registry.utcnow()
         root_row = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path)
@@ -845,7 +845,7 @@ _DISPATCH_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')
 def notification_file(dispatch_id):
     """The watcher's receipt. The id is checked before it becomes a path, so it cannot leave the notifications directory."""
     if not isinstance(dispatch_id, str) or _DISPATCH_ID.fullmatch(dispatch_id) is None:
-        raise ValueError('invalid dispatch id')
+        raise registry.Refused('invalid dispatch id')
     root = Path(os.environ.get('ROUTER_STATE_DIR') or Path.home() / '.agent-compass')
     return root / 'paseo-notifications' / f'{dispatch_id}.json'
 
@@ -952,26 +952,26 @@ def stop_watcher(dispatch_id):
 def cli(args):
     if args.stage == 'launch':
         if not args.dispatch_id or not args.parent_id:
-            raise ValueError('launch requires --dispatch-id and --parent-id')
+            raise registry.Refused('launch requires --dispatch-id and --parent-id')
         if not 0 <= args.watch_seconds <= 86400 or not 1 <= args.poll_seconds <= 60:
-            raise ValueError('watch-seconds must be 0..86400 and poll-seconds 1..60')
+            raise registry.Refused('watch-seconds must be 0..86400 and poll-seconds 1..60')
         return launch(args.dispatch_id, args.parent_id, watch_seconds=args.watch_seconds, poll_seconds=args.poll_seconds)
     action = args.dispatch_action
     if action == 'fallback':
         if not args.dispatch_id:
-            raise ValueError('fallback requires --dispatch-id')
+            raise registry.Refused('fallback requires --dispatch-id')
         return dispatch_fallback.handle(args.dispatch_id)
     if action == 'abandon':
         if not args.dispatch_id:
-            raise ValueError('abandon requires --dispatch-id')
+            raise registry.Refused('abandon requires --dispatch-id')
         return dispatch_fallback.abandon(args.dispatch_id)
     if action == 'settle':
         if not args.dispatch_id:
-            raise ValueError('settle requires --dispatch-id')
+            raise registry.Refused('settle requires --dispatch-id')
         return settle(args.dispatch_id)
     if action == 'prepare':
         if not args.input:
-            raise ValueError('dispatch prepare requires --input {decision_id, task, launch}')
+            raise registry.Refused('dispatch prepare requires --input {decision_id, task, launch}')
         document = json.loads(caller_input.read_text(args, args.input))
         require_actual_parent(document['task'].get('parent_agent_id'))
         import usage_reading
@@ -980,7 +980,7 @@ def cli(args):
                                usage_reading.usage_snapshot(args.usage_cache))
         return {**public(row), 'create_agent': row['request']}
     if action == 'start' and not args.dispatch_id:
-        raise ValueError('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
+        raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
     if action in ('reconcile', 'start'):
         not_observed = []
         observations = reconcile(args.dispatch_id, not_observed=not_observed)
@@ -990,10 +990,10 @@ def cli(args):
             answer['note'] = NOTHING_OPEN + (' ' + OPEN_ELSEWHERE.format(claims=elsewhere) if elsewhere else '')
         return end_notices(answer)
     if not args.dispatch_id:
-        raise ValueError('status/release requires --dispatch-id')
+        raise registry.Refused('status/release requires --dispatch-id')
     if action == 'release':
         if not args.parent_id or not args.basis:
-            raise ValueError('release requires --parent-id and --basis explaining cancellation')
+            raise registry.Refused('release requires --parent-id and --basis explaining cancellation')
         require_actual_parent(args.parent_id)
         before = registry.inspect(args.dispatch_id)['state']
         # A create that is already over can be settled now, then released; one still running stays refused.
@@ -1001,10 +1001,10 @@ def cli(args):
         error = next((item['error'] for item in observations if item.get('error') and not item.get('not_bound')), None)
         row = registry.inspect(args.dispatch_id)
         if error and row.get('launched_at') and registry.unresolved(row, registry.utcnow()):
-            raise ValueError(f'Paseo could not be read ({error}), so this worker or create may still be alive and '
+            raise registry.Refused(f'Paseo could not be read ({error}), so this worker or create may still be alive and '
                              'release cannot confirm it is over. Try again when Paseo answers.')
         if row['state'] in registry.ACTIVE and any(item.get('not_bound') for item in observations):
-            raise ValueError("Paseo answers that this worker does not carry this dispatch's labels, so its turn may still "
+            raise registry.Refused("Paseo answers that this worker does not carry this dispatch's labels, so its turn may still "
                              f"be on its way. Release works once the lease lapses at {row['lease_until']}.")
         released = registry.release(args.dispatch_id, args.parent_id, args.basis[:400])
         if released['state'] == 'canceled' and row['state'] != 'canceled':

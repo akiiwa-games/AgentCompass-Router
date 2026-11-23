@@ -1172,8 +1172,13 @@ def failure_cause(exc):
         return f'{kind}: {exc}'[:400]
     if isinstance(exc, KeyError) and exc.args and isinstance(exc.args[0], str):
         return f'{kind}: the field {exc.args[0][:80]!r} is missing from reference or local data'
-    return (f'{kind}: its text is not printed here (it may carry the reply of a host); run `agentcompass doctor` to check '
-            'the installation and local state')
+    return withheld_cause(exc)
+
+
+def withheld_cause(exc):
+    """What a failure says when its text may not be printed: its type, and where to look."""
+    return (f'{type(exc).__name__}: its text is not printed here (it may carry the reply of a host); run `agentcompass '
+            'doctor` to check the installation and local state')
 
 
 def failure_answer(exc, stage):
