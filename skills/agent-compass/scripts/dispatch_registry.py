@@ -2606,7 +2606,7 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
                       workspace=None, cwd=None, native_handover=False, new_worker=False, now=None, path=None):
     """Record a non-Paseo host dispatch (`orca`, `t3`, `native`, `herdr`, `cli`) in `dispatches` under the same
     canonical-directory writer rule and SQLite BEGIN IMMEDIATE transaction as Paseo. The claim is `prepared`: it holds the
-    workspace before the worker starts, and carries a launch time only once host_claim_launched (or claim_native_handover
+    workspace before the worker starts, and carries a launch time only once host_claim_launched (or claim_native_handovers
     when `native_handover` is True) says it started."""
     parent_id = task.get('parent_agent_id')
     require_parent_id(parent_id)
@@ -2782,15 +2782,6 @@ def claim_native_handovers(requests, *, now=None, path=None, timeout=0.5):
         for row in to_save:
             save(connection, row)
         return claimed_rows
-
-
-def claim_native_handover(dispatch_ids, *, call_id=None, now=None, path=None, timeout=0.5):
-    """Consume one native hand-over atomically on the launch it authorizes; retries of `call_id` are idempotent."""
-    ids = [str(d) for d in (dispatch_ids or ()) if d]
-    if not ids:
-        return None
-    claimed = claim_native_handovers([(ids, call_id)], now=now, path=path, timeout=timeout)
-    return claimed[0] if claimed else None
 
 
 def roll_decision_ids(path=None, *, timeout=0.5):

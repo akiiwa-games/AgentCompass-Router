@@ -157,6 +157,47 @@ def _hook_paths(home: Path) -> list[Path]:
     return paths
 
 
+def _generated_hook_status(path: Path, text: str) -> str | None:
+    """Compare an installed generated hook against what `sync_host_globals` currently generates; None when current."""
+    try:
+        sync_script = locations.setup_script("sync_host_globals.py")
+        if sync_script is None:
+            return None
+        setup_dir = sync_script.parent
+        if str(setup_dir) not in sys.path:
+            sys.path.insert(0, str(setup_dir))
+        import router_gate_hook
+        import sync_host_globals
+    except Exception:
+        return None
+    if path.name == "router-gate.ts":
+        expected = sync_host_globals.render_pi_router_gate_ts(
+            install.gate_hook_argv(sync_host_globals.ROUTER_HOOK_SCRIPT)
+        )
+        if text.replace("\r\n", "\n") != expected:
+            return "outdated (run `agentcompass setup`, then restart Pi)"
+        return None
+    if path.suffix.lower() == ".json":
+        import json
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        expected_matcher = router_gate_hook.hook_matcher()
+        groups = []
+        for container in (doc.get("hooks"), doc.get("router-gate")):
+            if isinstance(container, dict) and isinstance(container.get("PreToolUse"), list):
+                groups.extend(g for g in container["PreToolUse"] if isinstance(g, dict))
+        for group in groups:
+            hooks = group.get("hooks") if isinstance(group.get("hooks"), list) else ()
+            if any(isinstance(h, dict) and install.is_gate_hook_command(h.get("command", "")) for h in hooks):
+                if "matcher" in group and group.get("matcher") != expected_matcher:
+                    return "outdated (run `agentcompass setup`, then restart the host session)"
+    return None
+
+
 def _hook_installed(path: Path) -> str:
     try:
         if not path.is_file():
@@ -171,6 +212,9 @@ def _hook_installed(path: Path) -> str:
     bundled = install.bundled_cli()
     if bundled is not None and str(bundled).replace("\\", "/").lower() not in text.replace("\\\\", "/").replace("\\", "/").lower():
         return "installed (not the installer's agentcompass.exe; run `agentcompass setup` to switch it)"
+    outdated = _generated_hook_status(path, text)
+    if outdated:
+        return outdated
     return "installed"
 
 

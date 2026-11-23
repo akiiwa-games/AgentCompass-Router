@@ -195,10 +195,14 @@ class FindingTests(unittest.TestCase):
                       bundle={"provider": "codex", "account": "codex", "model": "gpt-6.1-sol"})]
         self.assertNotIn("unrouted", self.keys(context(routed, spawns=spawns)))
 
-    def test_find_unrouted_spawns_reads_gate_authority_from_single_owner(self):
-        """F5: native sub-agent spawns require a claimed native hand-over (even >15m after roll) or a standalone
-        `record` row within 15m from the same owner (`decision_ledger.spawn_is_authorized`); Paseo-launched rolls,
-        unconsumed hand-overs, `plan` rows, and `host_policy_violation` records never authorize native spawns."""
+    def test_find_unrouted_spawns_matches_recorded_handovers_and_records_by_fact(self):
+        """F5 & N2: post-hoc audit matches native sub-agent spawns against (1) one-use consumed `native_handover` rows
+        (`launched_at` within seconds of spawn `at`, `claim_id` == `tool_use_id` when present, matching session and
+        bundle model/effort, 1-to-1) and (2) standalone `record` rows within 15m matching session and route."""
+        import json
+        import tempfile
+        from pathlib import Path
+
         codex_bundle = {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}
         claude_bundle = {"provider": "claude", "account": "claude", "model": "claude-sonnet-5-5", "effort": "high"}
         native_spawn_20m = [{
@@ -206,25 +210,45 @@ class FindingTests(unittest.TestCase):
             "kind": "codex-subagent",
             "label": "codex-subagent/gpt-6.1-sol/high",
             "cwd": "/workspace/demo",
+            "session_id": "sess-A",
         }]
         plan_at_t0 = [row(0, "plan", choice="sol_high", source="deterministic_allocator",
                           decision_id="dec-native-1", bundle=codex_bundle)]
         # 1. Unconsumed native hand-over (`launched_at` absent) does not count as routed:
         unconsumed = [{"dispatch_id": "nh-1", "decision_id": "native:dec-native-1:aaaa1111",
-                       "native_handover": True, "state": "prepared", "bundle": codex_bundle}]
+                       "native_handover": True, "state": "prepared", "parent_id": "sess-A",
+                       "session_ids": ["sess-A"], "bundle": codex_bundle}]
         self.assertEqual(
             len(audit.find_unrouted_spawns(native_spawn_20m, plan_at_t0,
                                            dispatches=unconsumed, roll_ids={"dec-native-1"})),
             1,
         )
-        # 2. Claimed native hand-over at T0 + 20m authorizes the spawn at T0 + 20m + 3s (past the 15-min ledger window):
-        claimed = [dict(unconsumed[0], state="launched",
+        # 2. Claimed native hand-over at T0 + 20m authorizes sess-A's matching spawn at T0 + 20m + 3s (1-to-1):
+        claimed = [dict(unconsumed[0], state="launched", claim_id="tu-a1",
                         launched_at=(T0 + dt.timedelta(minutes=20)).isoformat())]
         self.assertEqual(
             audit.find_unrouted_spawns(native_spawn_20m, plan_at_t0,
                                        dispatches=claimed, roll_ids={"dec-native-1"}),
             [],
         )
+        # N2(a): session B spawning at +22m (or +20m+3s), a second spawn on the same one-use hand-over, or wrong model
+        # are all reported unrouted:
+        spawn_b_22m = [{
+            "at": T0 + dt.timedelta(minutes=22),
+            "kind": "codex-subagent",
+            "label": "codex-subagent/gpt-6.1-sol/high",
+            "cwd": "/workspace/demo",
+            "session_id": "sess-B",
+        }]
+        self.assertEqual(len(audit.find_unrouted_spawns(spawn_b_22m, plan_at_t0, dispatches=claimed, roll_ids={"dec-native-1"})), 1)
+        second_spawn_same_session = [
+            native_spawn_20m[0],
+            dict(native_spawn_20m[0], at=T0 + dt.timedelta(minutes=20, seconds=10)),
+        ]
+        self.assertEqual(len(audit.find_unrouted_spawns(second_spawn_same_session, plan_at_t0, dispatches=claimed, roll_ids={"dec-native-1"})), 1)
+        wrong_model_on_handover = [dict(native_spawn_20m[0], label="codex-subagent/gpt-6-astra/high")]
+        self.assertEqual(len(audit.find_unrouted_spawns(wrong_model_on_handover, plan_at_t0, dispatches=claimed, roll_ids={"dec-native-1"})), 1)
+
         # 3. Native spawn 2m after a `plan` row or a Paseo-launched `roll` (`record` in `roll_ids`) IS unrouted:
         native_spawn_2m = [{
             "at": T0 + dt.timedelta(minutes=2),
@@ -239,17 +263,43 @@ class FindingTests(unittest.TestCase):
             len(audit.find_unrouted_spawns(native_spawn_2m, paseo_roll_record, roll_ids={"dec-paseo-pin"})),
             1,
         )
-        # 4. Standalone `record` row (not in `roll_ids`, no `host_policy_violation`) within 15m IS routed;
-        #    `host_policy_violation`, `workflow`, and `explicit_resume` records are NOT:
+        # 4. Bare-shell standalone `record` row (no session_ids) matches same-route spawns; session-bound `record` of s1
+        #    matches s1 only and rejects s2, session-less spawns, wrong models, `host_policy_violation`, `workflow`, and `explicit_resume`:
         standalone = [row(0, "record", choice="constraint", source="constraint_record",
                           constraint="hard_constraint", decision_id="dec-standalone", bundle=claude_bundle)]
         self.assertEqual(audit.find_unrouted_spawns(native_spawn_2m, standalone, roll_ids={"dec-paseo-pin"}), [])
+        s1_record = [dict(standalone[0], session_ids=["s1"], parent_id="s1")]
+        self.assertEqual(audit.find_unrouted_spawns([dict(native_spawn_2m[0], session_id="s1")], s1_record), [])
+        self.assertEqual(len(audit.find_unrouted_spawns([dict(native_spawn_2m[0], session_id="s2")], s1_record)), 1)
+        self.assertEqual(len(audit.find_unrouted_spawns(native_spawn_2m, s1_record)), 1)
+        self.assertEqual(
+            len(audit.find_unrouted_spawns([dict(native_spawn_2m[0], session_id="s1", label="claude-subagent/claude-opus-5-5")], s1_record)),
+            1,
+        )
         for rejected in (
             dict(standalone[0], host_policy_violation={"reason": "blocked"}),
             dict(standalone[0], trigger="workflow"),
             dict(standalone[0], constraint="explicit_resume"),
         ):
             self.assertEqual(len(audit.find_unrouted_spawns(native_spawn_2m, [rejected])), 1)
+
+        # 5. `scan_subagent_spawns` extracts parent `sessionId` from Claude subagent JSONL so session mismatches are caught end-to-end:
+        scan_base = max(T0, audit.ROUTER_RULE_SINCE)
+        s1_scan_record = [row(0, "record", choice="constraint", source="constraint_record",
+                              constraint="hard_constraint", decision_id="dec-s1-scan", bundle=claude_bundle,
+                              at=scan_base.isoformat(), session_ids=["s1"], parent_id="s1")]
+        with tempfile.TemporaryDirectory() as tmp:
+            sub_file = Path(tmp) / "proj" / "s2" / "subagents" / "agent-1.jsonl"
+            sub_file.parent.mkdir(parents=True)
+            sub_file.write_text(json.dumps({
+                "timestamp": (scan_base + dt.timedelta(minutes=5)).isoformat(),
+                "sessionId": "s2",
+                "message": {"model": "claude-sonnet-5-5"},
+            }) + "\n", encoding="utf-8")
+            scanned = audit.scan_subagent_spawns((), [str(sub_file)], (), scan_base)
+        self.assertEqual(len(scanned), 1)
+        self.assertEqual(scanned[0].get("session_id"), "s2")
+        self.assertEqual(len(audit.find_unrouted_spawns(scanned, s1_scan_record)), 1)
 
     def test_old_shape_ledger_rows_are_skipped_with_count_in_report(self):
         import json

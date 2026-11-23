@@ -192,6 +192,52 @@ class DoctorTests(unittest.TestCase):
                 settings.write_text('{"command": "%s gate-hook"}' % exe.as_posix(), encoding="utf-8")
                 self.assertEqual(doctor._hook_installed(settings), "installed")
 
+    def test_outdated_generated_pi_extension_and_hook_matcher_are_flagged_against_current_generator(self):
+        """N4: doctor compares installed generated hooks against what `sync_host_globals` currently generates (never a
+        version string), flagging the v0.7.6 session-less Pi extension and stale matchers while marking current output installed."""
+        import json
+        from unittest import mock
+        from agentcompass import install, locations
+        setup_dir = locations.setup_script("sync_host_globals.py").parent
+        if str(setup_dir) not in sys.path:
+            sys.path.insert(0, str(setup_dir))
+        import router_gate_hook
+        import sync_host_globals
+
+        argv = [Path(sys.executable).resolve().as_posix(), "-X", "utf8", sync_host_globals.ROUTER_HOOK_SCRIPT]
+        v076_pi_ts = (
+            'import { spawnSync } from "node:child_process";\n'
+            f'const HOOK_ARGV = {json.dumps(argv)};\n'
+            'export default function (pi: any) {\n'
+            '  pi.on("tool_call", async (event: any) => {\n'
+            '    const payload = JSON.stringify({ toolName: event?.toolName, input: event?.input || {}, cwd: process.cwd() });\n'
+            '    spawnSync(HOOK_ARGV[0], HOOK_ARGV.slice(1), { input: payload, encoding: "utf-8" });\n'
+            '  });\n'
+            '}\n'
+        )
+        current_pi_ts = sync_host_globals.render_pi_router_gate_ts(argv)
+        with TemporaryDirectory() as tmp, mock.patch.object(install, "bundled_cli", return_value=None):
+            pi_ext = Path(tmp) / "router-gate.ts"
+            pi_ext.write_text(v076_pi_ts, encoding="utf-8", newline="\n")
+            old_status = doctor._hook_installed(pi_ext)
+            self.assertIn("outdated", old_status)
+            self.assertIn("agentcompass setup", old_status)
+            self.assertIn("restart Pi", old_status)
+
+            pi_ext.write_text(current_pi_ts, encoding="utf-8", newline="\n")
+            self.assertEqual(doctor._hook_installed(pi_ext), "installed")
+
+            claude_cfg = Path(tmp) / "settings.json"
+            cmd = " ".join(argv)
+            claude_cfg.write_text(json.dumps({
+                "hooks": {"PreToolUse": [{"matcher": "^Agent$", "hooks": [{"type": "command", "command": cmd}]}]}
+            }), encoding="utf-8")
+            self.assertIn("outdated", doctor._hook_installed(claude_cfg))
+            claude_cfg.write_text(json.dumps({
+                "hooks": {"PreToolUse": [{"matcher": router_gate_hook.hook_matcher(), "hooks": [{"type": "command", "command": cmd}]}]}
+            }), encoding="utf-8")
+            self.assertEqual(doctor._hook_installed(claude_cfg), "installed")
+
     def test_without_a_checkout_a_tool_in_its_installers_own_location_is_found_off_path(self):
         # Bun's installer puts bun.exe in ~/.bun/bin; the tray finds it there, so doctor must not call it missing.
         from unittest import mock

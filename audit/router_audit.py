@@ -206,12 +206,19 @@ def scan_codex(files):
                         calls_by_day[local(ts).date().isoformat()] += 1
                         peak = max(peak, step.get("input_tokens", 0))
         if total and calls:
-            subagent = isinstance(meta.get("source"), dict) and "subagent" in meta["source"]
+            source = meta.get("source") if isinstance(meta.get("source"), dict) else {}
+            sub_info = source.get("subagent") if "subagent" in source else None
+            parent_sid = None
+            if isinstance(sub_info, dict):
+                ts_info = sub_info.get("thread_spawn") if isinstance(sub_info.get("thread_spawn"), dict) else {}
+                parent_sid = (ts_info.get("parent_thread_id") or sub_info.get("parent_thread_id")
+                              or sub_info.get("parent_id"))
             sessions[name] = {"name": name, "model": model, "effort": effort, "calls": calls, "total": total["total_tokens"],
                               "cached": total.get("cached_input_tokens", 0), "input": total.get("input_tokens", 0),
                               "output": total.get("output_tokens", 0), "reasoning": total.get("reasoning_output_tokens", 0),
                               "peak_ctx": peak, "first": first_ts, "last": last_ts, "calls_by_day": calls_by_day,
-                              "cwd": meta.get("cwd") or "", "subagent": subagent}
+                              "cwd": meta.get("cwd") or "", "subagent": "subagent" in source,
+                              **({"session_id": str(parent_sid)} if parent_sid else {})}
     return list(sessions.values()), per_day
 
 
@@ -294,6 +301,10 @@ def dot_summary():
             "first_created": min((t[2] for t in tasks), default=None), "audit_actions": collections.Counter(a[0] for a in audit)}
 
 
+HANDOVER_LAUNCH_LAG_SECONDS = 60
+PASEO_SPAWN_KINDS = ("paseo", "pi->paseo", None)
+
+
 def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, since_dt: dt.datetime, pi_files=()) -> list[dict]:
     """Collect child-agent spawn events across Paseo creations, Pi sessions, Claude subagents, and Codex subagents."""
     spawns = []
@@ -307,12 +318,10 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
             continue
         snap = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
         agent = snap.get("agent") if isinstance(snap.get("agent"), dict) else data
+        labels = agent.get("labels") if isinstance(agent.get("labels"), dict) else {}
         idem = str(snap.get("idempotencyKey") or data.get("idempotencyKey") or "")
-        is_child = bool(
-            data.get("parentAgentId")
-            or agent.get("parentAgentId")
-            or (idem and not idem.startswith("draft_msg_"))
-        )
+        parent_id = data.get("parentAgentId") or agent.get("parentAgentId") or labels.get("router.parent_id")
+        is_child = bool(parent_id or (idem and not idem.startswith("draft_msg_")))
         if not is_child:
             continue
         at = parse_ts(agent.get("createdAt") or agent.get("updatedAt") or data.get("createdAt"))
@@ -323,11 +332,21 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
             "kind": "paseo",
             "label": f"paseo:{agent.get('provider') or '?'}/{agent.get('model') or '?'}",
             "cwd": agent.get("cwd") or "",
+            **({"dispatch_id": str(labels["router.dispatch_id"])} if labels.get("router.dispatch_id") else {}),
+            **({"session_id": str(parent_id)} if parent_id else {}),
         })
     for path in pi_files:
+        pi_session_id = None
         try:
             with open(path, encoding="utf-8", errors="replace") as stream:
                 for line in stream:
+                    if '"session"' in line and pi_session_id is None:
+                        try:
+                            hdr = json.loads(line)
+                            if hdr.get("type") == "session" and hdr.get("id"):
+                                pi_session_id = str(hdr["id"])
+                        except ValueError:
+                            pass
                     if "create_agent" not in line:
                         continue
                     try:
@@ -349,16 +368,20 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
                         if "create_agent(" in code:
                             m_prov = re.search(r'provider\s*:\s*["\']([^"\']+)["\']', code)
                             m_mod = re.search(r'model\s*:\s*["\']([^"\']+)["\']', code)
+                            m_disp = re.search(r'router\.dispatch_id["\']?\s*:\s*["\']([^"\']+)["\']', code)
                             spawns.append({
                                 "at": ts,
                                 "kind": "pi->paseo",
                                 "label": f"pi->paseo:{m_prov.group(1) if m_prov else '?'}/{m_mod.group(1) if m_mod else '?'}",
                                 "cwd": Path(path).parent.name,
+                                **({"dispatch_id": m_disp.group(1)} if m_disp else {}),
+                                **({"session_id": pi_session_id} if pi_session_id else {}),
+                                **({"tool_use_id": str(part["id"])} if part.get("id") else {}),
                             })
         except OSError:
             continue
     for path in claude_subagent_files:
-        first_ts, model = None, None
+        first_ts, model, session_id = None, None, None
         try:
             with open(path, encoding="utf-8", errors="replace") as stream:
                 for line in stream:
@@ -369,19 +392,23 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
                     ts = parse_ts(obj.get("timestamp"))
                     if ts and (first_ts is None or ts < first_ts):
                         first_ts = ts
+                    if not session_id and isinstance(obj.get("sessionId"), str) and obj.get("sessionId"):
+                        session_id = obj["sessionId"]
                     msg = obj.get("message") or {}
                     if isinstance(msg, dict) and msg.get("model"):
                         model = msg.get("model")
-                    if first_ts and model:
+                    if first_ts and model and session_id:
                         break
         except OSError:
             continue
         if first_ts and first_ts >= cutoff:
+            parent_dir = Path(path).parent.parent.name if Path(path).parent.name == "subagents" else ""
             spawns.append({
                 "at": first_ts,
                 "kind": "claude-subagent",
                 "label": f"claude-subagent/{model or '?'}",
-                "cwd": Path(path).parent.parent.name,
+                "cwd": parent_dir,
+                **({"session_id": session_id} if session_id else {}),
             })
     for s in codex_sessions:
         if s.get("subagent") and s.get("first") and s["first"] >= cutoff:
@@ -390,8 +417,85 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
                 "kind": "codex-subagent",
                 "label": f"codex-subagent/{s.get('model') or '?'}/{s.get('effort') or '?'}",
                 "cwd": s.get("cwd") or "",
+                **({"session_id": str(s["session_id"])} if s.get("session_id") else {}),
             })
     return sorted(spawns, key=lambda x: x["at"])
+
+
+def _clean_token(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text if text and text != "?" else None
+
+
+def _spawn_route_facts(spawn: dict) -> tuple[str | None, str | None, str | None]:
+    """`(family_or_provider, model, effort)` recorded on a post-hoc spawn dict."""
+    kind = spawn.get("kind")
+    label = str(spawn.get("label") or "")
+    if kind in PASEO_SPAWN_KINDS:
+        after = label.partition(":")[2] if ":" in label else ""
+        prov, _, mod = after.partition("/")
+        return _clean_token(prov), _clean_token(mod), None
+    if kind == "claude-subagent":
+        _, _, mod = label.partition("/")
+        return "claude", _clean_token(mod), None
+    if kind == "codex-subagent":
+        parts = label.split("/")
+        mod = parts[1] if len(parts) > 1 else None
+        eff = parts[2] if len(parts) > 2 else None
+        return "codex", _clean_token(mod), _clean_token(eff)
+    return _clean_token(kind), None, None
+
+
+def _audit_model_key(model: str | None, accounts: dict | None) -> str | None:
+    if not model:
+        return None
+    if isinstance(accounts, dict):
+        try:
+            import account_fleet
+            return str(account_fleet.canonical(model, accounts)).lower()
+        except Exception:
+            pass
+    return model.lower()
+
+
+def _record_sessions(row: dict) -> set[str]:
+    task = row.get("task") if isinstance(row.get("task"), dict) else {}
+    sids = row.get("session_ids") if isinstance(row.get("session_ids"), list) else ()
+    return {
+        str(v) for v in (
+            row.get("parent_id"), row.get("host_session_id"), task.get("host_session_id"), *sids,
+        ) if isinstance(v, str) and v
+    }
+
+
+def _bundle_family(bundle: dict, accounts: dict | None) -> str | None:
+    prov, acct = str(bundle.get("provider") or "").strip(), str(bundle.get("account") or "").strip()
+    try:
+        import provider_inventory
+        raw = ((provider_inventory.launcher_family(prov) if prov else None)
+               or (provider_inventory.account_family(acct, accounts) if acct else None)
+               or prov or acct or None)
+    except Exception:
+        raw = prov or acct or None
+    return raw.removesuffix("-resilient") if isinstance(raw, str) else None
+
+
+def _native_route_matches(bundle: dict, sp_family: str | None, sp_model: str | None, sp_effort: str | None,
+                          accounts: dict | None) -> bool:
+    if not isinstance(bundle, dict):
+        return False
+    b_family = _bundle_family(bundle, accounts)
+    if sp_family and b_family != sp_family:
+        return False
+    b_model = _clean_token(bundle.get("launch_model") or bundle.get("model"))
+    if not sp_model or not b_model:
+        return False
+    if _audit_model_key(sp_model, accounts) != _audit_model_key(b_model, accounts):
+        return False
+    b_effort = _clean_token(bundle.get("effort"))
+    if sp_effort and b_effort and sp_effort.lower() != b_effort.lower():
+        return False
+    return True
 
 
 def find_unrouted_spawns(
@@ -402,12 +506,102 @@ def find_unrouted_spawns(
     dispatches=(),
     roll_ids=(),
 ) -> list[dict]:
-    """Return child-agent spawns without gate-equivalent launch authority (`decision_ledger.spawn_is_authorized`)."""
-    spawn_is_authorized = load_decision_ledger().spawn_is_authorized
-    return [
-        sp for sp in spawns
-        if not spawn_is_authorized(sp, rows, dispatches=dispatches, roll_ids=roll_ids, window_seconds=window_seconds)
+    """Post-hoc audit check: match recorded child-agent spawns against consumed dispatches (`claim_id`, `launched_at`,
+    session, and bundle) and standalone `record` rows (route, session, and 15-minute window). Unlike the live PreToolUse
+    gate, this reads completed log artifacts rather than live hook payloads."""
+    dl = load_decision_ledger()
+    carries_route, standalone_record_rows = dl.carries_route, dl.standalone_record_rows
+    try:
+        import account_fleet
+        accounts = account_fleet.load_accounts()
+    except Exception:
+        accounts = None
+
+    standalone = [r for r in standalone_record_rows(rows, roll_ids)
+                  if not isinstance(r.get("host_policy_violation"), dict)]
+    paseo_dispatches = [
+        d for d in (dispatches or ())
+        if isinstance(d, dict) and d.get("dispatch_mode", "paseo") == "paseo"
+        and d.get("launched_at") and d.get("state") != "create_failed"
     ]
+    claimed_handovers = [
+        d for d in (dispatches or ())
+        if isinstance(d, dict) and d.get("native_handover") is True
+        and d.get("launched_at") and d.get("state") not in ("canceled", "create_failed")
+    ]
+    used_handovers: set[int] = set()
+    used_paseo: set[int] = set()
+    unrouted: list[dict] = []
+
+    for sp in spawns:
+        t = parse_ts(sp.get("at")) if isinstance(sp, dict) else None
+        if t is None:
+            unrouted.append(sp)
+            continue
+        sp_family, sp_model, sp_effort = _spawn_route_facts(sp)
+        sp_session = _clean_token(sp.get("session_id"))
+        sp_tool_id = _clean_token(sp.get("tool_use_id"))
+        sp_dispatch_id = _clean_token(sp.get("dispatch_id"))
+
+        if sp.get("kind") in PASEO_SPAWN_KINDS:
+            paseo_hit = next(
+                (idx for idx, d in enumerate(paseo_dispatches)
+                 if idx not in used_paseo
+                 and (sp_dispatch_id == d.get("dispatch_id") if sp_dispatch_id else (
+                     (ts := parse_ts(d.get("launched_at"))) is not None
+                     and -60 <= (t - ts).total_seconds() <= window_seconds
+                     and (not sp_family or _clean_token((d.get("bundle") or {}).get("provider")) in (None, sp_family))
+                 ))),
+                None,
+            )
+            if paseo_hit is not None:
+                used_paseo.add(paseo_hit)
+                continue
+            if any(
+                carries_route(r) and r.get("action") != "defer"
+                and not isinstance(r.get("host_policy_violation"), dict)
+                and (ts := parse_ts(r.get("at"))) is not None
+                and -60 <= (t - ts).total_seconds() <= window_seconds
+                and (not sp_family or _clean_token((r.get("bundle") or {}).get("provider")) == sp_family)
+                for r in (rows or ())
+            ):
+                continue
+            unrouted.append(sp)
+            continue
+
+        # Native spawn: 1) match a consumed one-use `native_handover` on `claim_id`, `launched_at` lag, session, and route.
+        handover_hit = None
+        for idx, d in enumerate(claimed_handovers):
+            if idx in used_handovers:
+                continue
+            ts = parse_ts(d.get("launched_at"))
+            if ts is None or not (-5 <= (t - ts).total_seconds() <= HANDOVER_LAUNCH_LAG_SECONDS):
+                continue
+            claim_id = _clean_token(d.get("claim_id"))
+            if sp_tool_id and claim_id and claim_id.split(":")[0] != sp_tool_id:
+                continue
+            d_sessions = _record_sessions(d)
+            if d_sessions and (not sp_session or sp_session not in d_sessions):
+                continue
+            if not _native_route_matches(d.get("bundle") or {}, sp_family, sp_model, sp_effort, accounts):
+                continue
+            handover_hit = idx
+            break
+        if handover_hit is not None:
+            used_handovers.add(handover_hit)
+            continue
+
+        # Native spawn: 2) match a standalone `record` row of the same session and route within `window_seconds`.
+        if any(
+            (ts := parse_ts(r.get("at"))) is not None
+            and -60 <= (t - ts).total_seconds() <= window_seconds
+            and (not (r_sessions := _record_sessions(r)) or (bool(sp_session) and sp_session in r_sessions))
+            and _native_route_matches(r.get("bundle") or {}, sp_family, sp_model, sp_effort, accounts)
+            for r in standalone
+        ):
+            continue
+        unrouted.append(sp)
+    return unrouted
 
 
 # ---------------------------------------------------------------- findings

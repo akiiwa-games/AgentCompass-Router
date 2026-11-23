@@ -182,10 +182,12 @@ class RegistryLaunchRecords(unittest.TestCase):
         self.assertEqual(self.counted(), 0)
         self.assertEqual([r['dispatch_id'] for r in registry.native_handovers(NOW, path=self.path)],
                          [fresh['dispatch_id'], abandoned['dispatch_id']])
-        consumed = registry.claim_native_handover([abandoned['dispatch_id']], call_id='tu-1', now=NOW, path=self.path)
+        self.assertFalse(hasattr(registry, 'claim_native_handover'))
+        consumed = registry.claim_native_handovers([([abandoned['dispatch_id']], 'tu-1')], now=NOW, path=self.path)
         self.assertIsNotNone(consumed)
+        self.assertEqual(len(consumed), 1)
         self.assertEqual(self.counted(), 1)
-        self.assertIsNone(registry.claim_native_handover([abandoned['dispatch_id']], call_id='tu-2', now=NOW, path=self.path))
+        self.assertIsNone(registry.claim_native_handovers([([abandoned['dispatch_id']], 'tu-2')], now=NOW, path=self.path))
 
     def test_a_dispatch_older_than_the_window_is_not_read(self):
         self.claim(0, launched=True, at=NOW - timedelta(seconds=WINDOW) - timedelta(seconds=1))

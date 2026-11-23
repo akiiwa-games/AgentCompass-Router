@@ -723,28 +723,12 @@ def cli_flag_options(words: list, mapping: dict[str, str]) -> dict[str, str]:
     """Extract launch flags (`--opt value` or `--opt=value`) mapped to normalize_launch keys; non-literals become UNKNOWN_CLI_VALUE."""
     options = {}
     for i, word in enumerate(words):
-        if not isinstance(word, str):
-            continue
-        flag, sep, value = word.partition("=")
-        if flag in mapping:
-            if not sep:
-                value = words[i + 1] if i + 1 < len(words) else None
-            options[mapping[flag]] = value if isinstance(value, str) and value else UNKNOWN_CLI_VALUE
+        if isinstance(word, str):
+            flag, sep, value = word.partition("=")
+            if flag in mapping:
+                raw = value if sep else (words[i + 1] if i + 1 < len(words) else None)
+                options[mapping[flag]] = raw if isinstance(raw, str) and raw else UNKNOWN_CLI_VALUE
     return options
-
-
-def paseo_cli_options(words: list) -> dict[str, str]:
-    """The launch options of a parsed `paseo schedule` argv (`--opt value` or `--opt=value`); other words are ignored.
-
-    A value that is not a literal (None from the Python reader) stays present as UNKNOWN_CLI_VALUE, which no route
-    matches, so a dynamic `--provider` is still a launch and is never taken for a routed one.
-    """
-    return cli_flag_options(words, PASEO_SCHEDULE_OPTIONS)
-
-
-def orca_cli_options(words: list) -> dict[str, str]:
-    """The launch options of an `orca orchestration worker-start` / `orca agent launch` argv."""
-    return cli_flag_options(words, ORCA_LAUNCH_OPTIONS)
 
 
 def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
@@ -780,7 +764,7 @@ def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
                 launch("run_dot_task.py")
         elif stem == "orca":
             if tuple(args[:2]) in ORCA_LAUNCH_COMMANDS and not HELP_FLAGS.intersection(literal_args):
-                launch("orca worker launch", orca_cli_options(args[2:]))
+                launch("orca worker launch", cli_flag_options(args[2:], ORCA_LAUNCH_OPTIONS))
         elif stem in SHELL_PROGRAMS:
             dialect = CMD if stem == "cmd" else POWERSHELL if stem in ("pwsh", "powershell") else POSIX
             flags = [i for i, w in enumerate(words) if isinstance(w, str) and (
@@ -853,7 +837,7 @@ def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
         path, rest = parsed
         if path in PASEO_SCHEDULE_COMMANDS:
             # Same launch as MCP create_schedule / update_schedule: the provider settings become its arguments.
-            targets.append((PASEO_SCHEDULE_COMMANDS[path], paseo_cli_options(rest)))
+            targets.append((PASEO_SCHEDULE_COMMANDS[path], cli_flag_options(rest, PASEO_SCHEDULE_OPTIONS)))
         elif path in PASEO_LAUNCH_COMMANDS:
             launch("paseo agent create")
         elif path in (('send',), ('agent', 'send')):
@@ -1245,32 +1229,35 @@ def launch_model_problem(spec: dict) -> str | None:
     """Why a launch call's provider/model carries a malformed `/` pin (empty prefix or model segment), else None."""
     settings = next((v for v in (spec.get("settings"), spec.get("config")) if isinstance(v, dict)), {})
     target = spec.get("target") if isinstance(spec.get("target"), dict) else {}
-    for p_field, raw_prov_val in (
-        ("provider", spec.get("provider")),
-        ("target.provider", target.get("provider")),
-        ("target.driverKind", target.get("driverKind")),
-    ):
+    model_pin_problem = router_owner("model_resolution", "model_pin_problem")
+    for p_field, raw_prov_val in (("provider", spec.get("provider")), ("target.provider", target.get("provider")),
+                                  ("target.driverKind", target.get("driverKind"))):
         raw_provider = str(raw_prov_val or "").strip()
         if raw_provider and raw_provider not in (UNKNOWN_CLI_VALUE, UNSPECIFIED_LAUNCH_VALUE) and "/" in raw_provider:
             head, _, tail = raw_provider.partition("/")
             if not head.strip() or not tail.strip():
                 return (f"invalid_model_pin: {p_field} {raw_provider!r} is malformed "
                         "(empty provider or model segment around '/'); write <provider> or <provider>/<model>.")
-            problem = router_owner("model_resolution", "model_pin_problem")(tail, p_field)
-            if problem:
+            if problem := model_pin_problem(tail, p_field):
                 return problem
-    for field, raw_model in (
-        ("model", spec.get("model")),
-        ("Model", spec.get("Model")),
-        ("target.model", target.get("model")),
-        ("settings.model", settings.get("model")),
-    ):
-        if raw_model in (None, "", UNKNOWN_CLI_VALUE, UNSPECIFIED_LAUNCH_VALUE):
-            continue
-        problem = router_owner("model_resolution", "model_pin_problem")(raw_model, field)
-        if problem:
-            return problem
+    for field, raw_model in (("model", spec.get("model")), ("Model", spec.get("Model")),
+                             ("target.model", target.get("model")), ("settings.model", settings.get("model"))):
+        if raw_model not in (None, "", UNKNOWN_CLI_VALUE, UNSPECIFIED_LAUNCH_VALUE):
+            if problem := model_pin_problem(raw_model, field):
+                return problem
     return None
+
+
+def anthropic_line_matches(requested: str, routed: str | None, accounts: dict | None) -> bool:
+    """Whether `requested` is a declared Anthropic Claude line (`accounts.json` `families`) whose line matches `routed`."""
+    table = accounts.get("families") if isinstance(accounts, dict) else None
+    if not routed or not isinstance(table, dict) or not isinstance(table.get("rows"), list):
+        return False
+    families = table["rows"]
+    if not any(r.get("maker") == "anthropic" and r.get("line") == requested for r in families):
+        return False
+    hit = router_owner("model_resolution", "family_row")(routed, families)
+    return bool(hit and hit.get("maker") == "anthropic" and hit.get("line") == requested)
 
 
 def resolve_target(target: dict, accounts: dict | None) -> tuple[str | None, list[dict]]:
@@ -1290,10 +1277,8 @@ def resolve_target(target: dict, accounts: dict | None) -> tuple[str | None, lis
             dict(bundle, bundle_id=bundle["id"], launch_model=bundle_launch_model(bundle, bundle["account"]) or "")
             for bundle in pin_pool(accounts, account=account, provider=provider)
         ]
-        if target["model"] in CLAUDE_MODEL_FAMILIES:
-            matched = [c for c in pool if same_launch_value("model", target["model"], c.get("launch_model"))]
-        else:
-            matched = pin_matching_bundles(target["model"], pool, accounts)
+        by_line = [c for c in pool if anthropic_line_matches(target["model"], c.get("launch_model"), accounts)]
+        matched = by_line or pin_matching_bundles(target["model"], pool, accounts)
         candidates = [c for c in matched if target.get("effort") in (None, c.get("effort"))]
     if not account and len({c["account"] for c in candidates}) == 1:
         account = candidates[0]["account"]
@@ -1466,16 +1451,6 @@ def check_account_quota_exhausted(
     )
 
 
-def has_route_bundle(row: object) -> bool:
-    """Delegate route-bundle shape check to `decision_ledger.has_route_bundle` (single owner)."""
-    return router_owner("decision_ledger", "has_route_bundle")(row)
-
-
-def carries_route(row: object) -> bool:
-    """Delegate ledger route check to `decision_ledger.carries_route` (single owner)."""
-    return router_owner("decision_ledger", "carries_route")(row)
-
-
 def is_dot_route(row: dict | None) -> bool:
     bundle = row.get("bundle") if isinstance(row, dict) else None
     return isinstance(bundle, dict) and bundle.get("provider") == "dot"
@@ -1498,22 +1473,16 @@ def recent_routes(
             tail = fh.read().decode("utf-8", errors="replace")
     except OSError:
         return []
-
-    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    carries_route = router_owner("decision_ledger", "carries_route")
     rows = []
-    for line in reversed(lines):
+    for line in reversed([ln.strip() for ln in tail.splitlines() if ln.strip()]):
         try:
             row = json.loads(line)
         except ValueError:
             continue
-        if not carries_route(row):
-            continue
-        at = parse_ts(row.get("at"))
-        if at is None:
-            continue
-        age = (now - at).total_seconds()
-        if -60 <= age <= window_seconds:
-            rows.append(row)
+        if carries_route(row) and (at := parse_ts(row.get("at"))) is not None:
+            if -60 <= (now - at).total_seconds() <= window_seconds:
+                rows.append(row)
     return rows
 
 
@@ -1545,14 +1514,14 @@ def _merged_route_bundle(row: dict, accounts: dict | None = None) -> dict:
     if not isinstance(raw_bundle, dict):
         return {}
     bundle_id = raw_bundle.get("bundle_id")
-    catalog_bundle = {}
     if isinstance(bundle_id, str) and bundle_id and isinstance(accounts, dict):
         acct, matches = resolve_target({"bundle_id": bundle_id}, accounts)
         if matches:
-            catalog_bundle = dict(matches[0])
-            if acct and not catalog_bundle.get("account"):
-                catalog_bundle["account"] = acct
-    return {**catalog_bundle, **raw_bundle}
+            cat = dict(matches[0])
+            if acct and not cat.get("account"):
+                cat["account"] = acct
+            return {**cat, **raw_bundle}
+    return dict(raw_bundle)
 
 
 def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
@@ -1562,134 +1531,99 @@ def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
     return normalize_launch(merged)
 
 
-# Claude's Agent/Task tool takes only a family alias and runs the host's current
-# model of that family; the router routes one model per Claude family.
-CLAUDE_MODEL_FAMILIES = frozenset({"sonnet", "opus", "haiku", "fable"})
 CLAUDE_NATIVE_TOOLS = CLAUDE_AGENT_TOOLS | {"dispatch_agent"}
-ANTIGRAVITY_MODEL_TIERS = frozenset({"flash", "flash_lite", "pro"})
 
 
-def same_launch_value(key: str, requested: str, routed: str | None, *, family: str | None = None) -> bool:
-    """Compare what will run: Claude family aliases and Antigravity subagent tier selectors match only their own tier."""
-    if key == "model":
-        if requested in CLAUDE_MODEL_FAMILIES:
-            return bool(routed) and routed.startswith(f"claude-{requested}-")
-        if family == "antigravity" and requested in ANTIGRAVITY_MODEL_TIERS:
-            if not routed:
-                return False
-            low = routed.lower()
-            if requested == "flash_lite":
-                return "flash-lite" in low or "flash_lite" in low
-            if requested == "flash":
-                return "flash" in low and "flash-lite" not in low and "flash_lite" not in low
-            return low.startswith("gemini-") and "flash" not in low
+def same_launch_value(key: str, requested: str, routed: str | None, *, accounts: dict | None = None) -> bool:
+    """Compare what will run: exact wire value, or a declared Anthropic Claude line from `accounts.json` `families`."""
+    if key == "model" and anthropic_line_matches(requested, routed, accounts):
+        return True
     return requested == routed
 
 
 def route_family(row: dict, accounts: dict | None = None) -> str | None:
-    """Provider family of a routed bundle (`claude`, `codex`, `antigravity`, `dot`, etc.)."""
+    """Launcher family of a routed bundle via `provider_inventory.launcher_family` / `account_family`."""
     merged = _merged_route_bundle(row, accounts)
-    acct = str(merged.get("account") or "").strip()
-    prov = str(merged.get("provider") or "").strip()
-    table = (accounts or {}).get("accounts") if isinstance(accounts, dict) else None
-    if isinstance(table, dict) and acct in table and isinstance(table[acct], dict):
-        fam = str(table[acct].get("family") or "").strip()
-        if fam:
-            return fam
-    for token in (prov, acct):
-        if token in ("antigravity", "antigravity-resilient"):
-            return "antigravity"
-        if token == "claude" or token.startswith("claude-"):
-            return "claude"
-        if token == "codex" or token.startswith("codex-"):
-            return "codex"
-    return prov or acct or None
+    prov, acct = str(merged.get("provider") or "").strip(), str(merged.get("account") or "").strip()
+    launcher_family, account_family = router_owner("provider_inventory", "launcher_family", "account_family")
+    raw = ((launcher_family(prov) if prov else None)
+           or (account_family(acct, accounts) if acct else None)
+           or prov or acct or None)
+    return raw.removesuffix("-resilient") if isinstance(raw, str) else None
+
+
+def launch_field_hint(name: str, trigger: str) -> str:
+    if name in CLAUDE_NATIVE_TOOLS:
+        return "传入参数 `model`（及 `effort`）指定已授权路由的模型"
+    if name == "spawn_agent":
+        return "传入参数 `model`（及 `reasoning_effort`）指定已授权路由的模型与档位"
+    if name == "invoke_subagent":
+        return "传入参数 `Model` 指定具体模型 ID（或在 `modelName` 与路由一致的会话中使用 `Model=\"inherit\"`；若宿主无法复现该模型，按 roll 说明告知用户而非自行替换）"
+    if name == "delegate_task":
+        return "传入 `target.driverKind`、`target.model`（及 `target.effort`）"
+    if trigger == "shell:orca worker launch":
+        return "传入 `--agent`、`--model`（及 `--effort`）"
+    return "显式传入与已授权路由一致的 `provider`/`model`/`effort`"
 
 
 def native_launch_spec(
-    name: str,
-    args: dict,
-    trigger: str,
-    payload: dict,
-    targets: list[dict],
-    accounts: dict | None,
+    name: str, args: dict, trigger: str, payload: dict, targets: list[dict], accounts: dict | None,
 ) -> tuple[dict[str, str], str | None]:
-    """Resolve `(requested, required_family)` per host from the facts the call carries, never as a wildcard."""
+    """Resolve `(requested, required_family)` per host from the call's own facts and declared data; never guess."""
     requested = normalize_launch(args)
     if name in CLAUDE_NATIVE_TOOLS:
-        own = native_own_account(name, {}, accounts)
-        if own and not requested.get("account"):
+        if (own := native_own_account(name, {}, accounts)) and not requested.get("account"):
             requested["account"] = own
         raw_model = str(args.get("model") or "").strip()
         if not raw_model or raw_model.lower() == "inherit":
             sub_type = str(args.get("subagent_type") or "").strip()
             declared = custom_agent_model(sub_type, payload.get("cwd")) if sub_type else None
             session_model = str(payload.get("model") or "").strip()
-            if declared:
-                requested["model"] = declared
-            elif sub_type == "Explore":
-                requested["model"] = "haiku"
-            elif session_model and session_model.lower() != "inherit":
-                requested["model"] = session_model
-            else:
-                requested["model"] = UNSPECIFIED_LAUNCH_VALUE
+            requested["model"] = (declared or (session_model if session_model and session_model.lower() != "inherit"
+                                               else UNSPECIFIED_LAUNCH_VALUE))
         return requested, "claude"
     if name == "spawn_agent":
-        own = native_own_account("spawn_agent", {}, accounts)
-        if own and not requested.get("account"):
+        if (own := native_own_account("spawn_agent", {}, accounts)) and not requested.get("account"):
             requested["account"] = own
         if not requested.get("model"):
             session_model = str(payload.get("model") or "").strip()
-            requested["model"] = (
-                session_model if session_model and session_model.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE
-            )
+            requested["model"] = session_model if session_model and session_model.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE
         return requested, "codex"
     if name == "invoke_subagent":
         requested.setdefault("account", "antigravity")
         raw_model = str(args.get("Model") or args.get("model") or "").strip()
         if not raw_model or raw_model.lower() == "inherit":
             session_model = str(payload.get("modelName") or payload.get("model") or "").strip()
-            requested["model"] = (
-                session_model
-                if session_model and session_model.lower() not in ("auto", "inherit")
-                else UNSPECIFIED_LAUNCH_VALUE
-            )
+            requested["model"] = (session_model if session_model and session_model.lower() not in ("auto", "inherit")
+                                  else UNSPECIFIED_LAUNCH_VALUE)
         else:
             requested["model"] = raw_model
         return requested, "antigravity"
     if trigger == "shell:run_dot_task.py":
-        requested.setdefault("provider", "dot")
-        requested.setdefault("account", "dot")
-        requested.setdefault("model", "dot")
+        for k in ("provider", "account", "model"):
+            requested.setdefault(k, "dot")
         return requested, "dot"
     t_prov = str(targets[0].get("provider") or "") if targets else ""
-    if not requested.get("provider") and (t_prov in ("claude", "dot") or t_prov.startswith("claude-")):
+    if not requested.get("provider") and t_prov and router_owner("provider_inventory", "launcher_family")(t_prov) in ("claude", "dot"):
         requested["provider"] = t_prov
     requested.setdefault("provider", UNSPECIFIED_LAUNCH_VALUE)
     requested.setdefault("model", UNSPECIFIED_LAUNCH_VALUE)
     return requested, None
 
 
-def _row_session_ids(row: dict, task: dict, identity: dict[str, str]) -> set[str]:
+def _row_session_ids(row: dict, task: dict | None = None, identity: dict[str, str] | None = None) -> set[str]:
     """Session and parent IDs recorded on a route row (`parent_id`, `host_session_id`, `session_ids`)."""
+    t_doc = task if isinstance(task, dict) else (row.get("task") if isinstance(row.get("task"), dict) else {})
+    ident = identity if identity is not None else correlation_fields(row, t_doc)
     raw_sids = row.get("session_ids") if isinstance(row.get("session_ids"), list) else ()
-    return {
-        str(v) for v in (
-            identity.get("parent"),
-            row.get("host_session_id"),
-            task.get("host_session_id"),
-            *raw_sids,
-        ) if isinstance(v, str) and v
-    }
+    return {str(v) for v in (ident.get("parent"), row.get("host_session_id"), t_doc.get("host_session_id"), *raw_sids)
+            if isinstance(v, str) and v}
 
 
 def _route_label(row: dict) -> str:
     bundle = row.get("bundle") if isinstance(row.get("bundle"), dict) else {}
-    choice = row.get("choice")
-    bid = bundle.get("bundle_id")
-    if choice and bid and choice != bid:
-        return f"{choice}/{bid}"
-    return str(choice or bid or bundle.get("model") or row.get("dispatch_id") or "")
+    choice, bid = row.get("choice"), bundle.get("bundle_id")
+    return f"{choice}/{bid}" if choice and bid and choice != bid else str(choice or bid or bundle.get("model") or row.get("dispatch_id") or "")
 
 
 def matching_routes(
@@ -1702,41 +1636,35 @@ def matching_routes(
     identities: set[str] | None = None,
     paseo_agents_dir: Path | None = None,
     check_stage: bool = True,
-    require_session: bool = False,
     required_family: str | None = None,
 ) -> tuple[list[dict], str]:
-    """Return `(matched_rows, diagnostic)` after correlation and launch-field comparison.
+    """Return `(matched_rows, diagnostic)` after session/correlation and launch-field comparison.
 
-    When both caller and row record session/parent IDs, they must match (`identities` / `context['parent']` against
-    `parent_id`, `host_session_id`, `session_ids`, or the Paseo agent record running that session). When
-    `require_session` is True (named `status: native` hand-overs), a caller with no session ID matches nothing; when
-    `require_session` is False (section 6 standalone `record` rows), a bare-shell `record` without session ID remains
-    eligible below any session-matched candidate.
+    One session rule governs both hand-overs and `record` rows: a row or hand-over that names a session (`row_sessions`
+    non-empty) is matched only by a call that names the same session; a call that names none matches only what names
+    none (such as a bare-shell `record` row, scored below any session-matched candidate).
     """
+    row_predicate = router_owner("decision_ledger", "carries_route" if check_stage else "has_route_bundle")
     caller_sessions = set(identities or ()) | ({context["parent"]} if context.get("parent") else set())
-    if require_session and not caller_sessions:
-        return [], "parent/task/target/chain 不匹配；本次调用未携带会话 ID，无法匹配已命名的原生派发授权"
     candidates = []
     for row in rows:
-        if not (carries_route(row) if check_stage else has_route_bundle(row)):
+        if not row_predicate(row):
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else {}
         identity = correlation_fields(row, task)
         row_sessions = _row_session_ids(row, task, identity)
-        if require_session and not row_sessions:
-            continue
         session_matched = False
-        if caller_sessions and row_sessions:
-            session_matched = bool(caller_sessions & row_sessions) or any(
-                is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions
+        if row_sessions:
+            session_matched = bool(caller_sessions) and (
+                bool(caller_sessions & row_sessions)
+                or any(is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions)
             )
             if not session_matched:
                 continue
         shared = (context.keys() & identity.keys()) - {"parent"}
         if any(context[k] != identity[k] for k in shared):
             continue
-        score = (1 if session_matched else 0) + len(shared)
-        candidates.append((score, row))
+        candidates.append(((1 if session_matched else 0) + len(shared), row))
     if not candidates:
         return [], "parent/task/target/chain 不匹配；没有本次请求的兼容记录"
     strongest = max(score for score, _ in candidates)
@@ -1745,22 +1673,17 @@ def matching_routes(
         latest = candidates[0][1]
         latest_identity = correlation_fields(latest, latest.get("task") if isinstance(latest.get("task"), dict) else {})
         if (context.keys() & latest_identity.keys()) - {"parent"}:
-            # Parent alone may own several concurrent tasks. A task/target/chain
-            # identifies a request closely enough to honor its latest decision.
             candidates = candidates[:1]
-    matched = []
-    mismatches = []
+    matched, mismatches = [], []
     for _, row in candidates:
         chosen = route_spec(row, accounts)
         differences = []
-        if required_family:
-            routed_fam = route_family(row, accounts)
-            if routed_fam != required_family:
-                differences.append(f"provider: requested={required_family!r}, routed={chosen.get('provider') or routed_fam!r}")
+        if required_family and (routed_fam := route_family(row, accounts)) != required_family:
+            differences.append(f"provider: requested={required_family!r}, routed={chosen.get('provider') or routed_fam!r}")
         differences.extend(
             f"{key}: requested={value!r}, routed={chosen.get(key)!r}"
             for key, value in requested.items()
-            if not same_launch_value(key, value, chosen.get(key), family=required_family)
+            if not same_launch_value(key, value, chosen.get(key), accounts=accounts)
         )
         if is_dot_route(row) and trigger != "shell:run_dot_task.py":
             differences.append("dot_text requires run_dot_task.py")
@@ -1772,22 +1695,14 @@ def matching_routes(
 
 
 def match_route(
-    rows: list[dict],
-    requested: dict,
-    context: dict,
-    trigger: str,
-    accounts: dict | None = None,
-    *,
-    identities: set[str] | None = None,
-    paseo_agents_dir: Path | None = None,
-    check_stage: bool = True,
-    require_session: bool = False,
-    required_family: str | None = None,
+    rows: list[dict], requested: dict, context: dict, trigger: str, accounts: dict | None = None, *,
+    identities: set[str] | None = None, paseo_agents_dir: Path | None = None,
+    check_stage: bool = True, required_family: str | None = None,
 ) -> tuple[dict | None, str]:
     matched, diagnostic = matching_routes(
         rows, requested, context, trigger, accounts=accounts,
-        identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=check_stage,
-        require_session=require_session, required_family=required_family,
+        identities=identities, paseo_agents_dir=paseo_agents_dir,
+        check_stage=check_stage, required_family=required_family,
     )
     return (matched[0] if matched else None), diagnostic
 
@@ -1867,6 +1782,7 @@ def check_workflow_record(rows: list[dict], identities: set[str]) -> str | None:
     """A Workflow passes only on this session's `record --constraint user_override --trigger workflow`."""
     if not identities:
         return workflow_deny_reason("hook 输入里没有会话 ID，无法确认授权记录属于本会话")
+    carries_route = router_owner("decision_ledger", "carries_route")
     for row in rows:
         if (carries_route(row) and row.get("stage") == "record" and row.get("constraint") == "user_override"
                 and row.get("trigger") == "workflow" and written_by(row, identities)):
@@ -1883,6 +1799,7 @@ def check_schedule_plan(rows: list[dict], args: dict, context: dict, trigger: st
         return schedule_deny_reason(trigger, f"未指定 {'/'.join(missing)}，无法与路由比对")
     if not identities:
         return schedule_deny_reason(trigger, "hook 输入里没有会话 ID，无法确认 plan 属于本会话")
+    carries_route = router_owner("decision_ledger", "carries_route")
     plans = [row for row in rows if carries_route(row) and row.get("stage") == "plan" and written_by(row, identities)]
     if not plans:
         return schedule_deny_reason(trigger, "最近 15 分钟内本会话没有 plan 记录")
@@ -2145,7 +2062,7 @@ def _decide_checked(
             matching_routes(
                 available_handovers, requested, context, trigger, accounts=accounts,
                 identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=False,
-                require_session=True, required_family=required_family,
+                required_family=required_family,
             ) if available_handovers else ([], "")
         )
         unchecked_refusal = None
@@ -2160,9 +2077,7 @@ def _decide_checked(
                     allowed_handovers.append(h_row)
             if allowed_handovers:
                 reserved_handover_ids.add(allowed_handovers[0]["dispatch_id"])
-                pending_native_claims.append(
-                    ([h["dispatch_id"] for h in allowed_handovers], effective_call_id, trigger)
-                )
+                pending_native_claims.append(([h["dispatch_id"] for h in allowed_handovers], effective_call_id, trigger))
                 continue
         # Fact 2: a recent standalone `record` row of this session (never a `plan` row, workflow record, or roll dispatch).
         if rows is None:
@@ -2190,23 +2105,27 @@ def _decide_checked(
         if unchecked_refusal:
             return format_response(False, harness_kind, unchecked_refusal)
         mismatch_diag = next(
-            (d for d in (handover_diag, record_diag) if d and not d.startswith("parent/task/target/chain")),
-            "",
+            (d for d in (handover_diag, record_diag) if d and not d.startswith("parent/task/target/chain")), "",
         )
         if mismatch_diag:
-            reason = (f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。"
-                      f"请按路由返回的 provider/model/effort 启动，或重新运行 {ROUTER_CMD} roll --brief <task.md>。")
-            return format_response(False, harness_kind, reason)
-        if record_rows and record_diag:
-            reason = (f"[Router Gate] 启动参数与当前会话记录不匹配 ({trigger})：{record_diag}。"
-                      f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。")
-            return format_response(False, harness_kind, reason)
-        if handovers and not identities and not context.get("parent"):
             return format_response(
                 False, harness_kind,
-                f"[Router Gate] 拦截子 agent 启动 ({trigger})：检测到未使用的 status: native 原生派发授权，"
-                "但本次 hook 输入与环境变量均未携带会话 ID，无法确认该授权属于本会话（无会话身份的调用不匹配任何命名 hand-over）。"
-                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，或在强制场景下先运行 `{ROUTER_CMD} record` 记录后启动。",
+                f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。"
+                f"请{launch_field_hint(name, trigger)}，或重新运行 {ROUTER_CMD} roll --brief <task.md>。",
+            )
+        if not identities and not context.get("parent") and any(_row_session_ids(r) for r in (*handovers, *record_rows)):
+            return format_response(
+                False, harness_kind,
+                f"[Router Gate] 拦截子 agent 启动 ({trigger})：检测到带会话身份的路由授权（status: native 或会话 record），"
+                "但本次 hook 输入与环境变量均未携带会话 ID，无法匹配任何命名会话的授权。"
+                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，并重启当前宿主会话（如更新前已启动的 Pi 会话）使新钩子生效；"
+                f"或在当前会话中重新运行 `{ROUTER_CMD} roll --brief <task.md>`。",
+            )
+        if record_rows and record_diag:
+            return format_response(
+                False, harness_kind,
+                f"[Router Gate] 启动参数与当前会话记录不匹配 ({trigger})：{record_diag}。"
+                f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。",
             )
         return format_response(False, harness_kind, build_deny_reason(trigger, win))
     if pending_native_claims and claim_native_handovers_fn is not None:

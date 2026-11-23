@@ -726,7 +726,7 @@ process.stdout.write(JSON.stringify(out));
             self.assertEqual(
                 gate.evaluate_payload(
                     {"session_id": "sess-1", "tool_name": "Agent",
-                     "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
+                     "tool_input": {"subagent_type": "Explore", "model": "claude-haiku-5-5", "prompt": "find files"}},
                     ledger_path=record_ledger, now=T0,
                 ),
                 {},
@@ -734,15 +734,15 @@ process.stdout.write(JSON.stringify(out));
             self.assertEqual(
                 gate.evaluate_payload(
                     {"session_id": "sess-other", "tool_name": "Agent",
-                     "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
+                     "tool_input": {"subagent_type": "Explore", "model": "claude-haiku-5-5", "prompt": "find files"}},
                     ledger_path=record_ledger, now=T0,
                 )["decision"],
                 "block",
             )
             self.assertEqual(
                 gate.evaluate_payload(
-                    {"conversationId": "sess-1",
-                     "toolCall": {"id": "agy-1", "name": "invoke_subagent", "args": {"Model": "flash"}}},
+                    {"conversationId": "sess-1", "modelName": "gemini-3.8-flash-high",
+                     "toolCall": {"id": "agy-1", "name": "invoke_subagent", "args": {"Model": "inherit"}}},
                     ledger_path=record_ledger, now=T0,
                 ),
                 {"decision": "allow"},
@@ -1042,25 +1042,79 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(res["decision"], "block")
         self.assertIsNone(registry.inspect(claim["dispatch_id"]).get("launched_at"))
 
-    def test_sessionless_caller_matches_no_named_handover_while_section_6_record_still_works(self):
-        """Contract Decision & Degrade (F3, F8, F9): a call carrying no session ID matches no named hand-over, leaving
-        another session's hand-over intact; Antigravity `conversationId` + `toolCall.id` matches its own hand-over;
-        and a section 6 standalone `record` row (including a bare-shell record without session_ids) remains reusable
-        within 15 minutes."""
+    def test_native_handover_is_one_use_sequentially_and_under_concurrent_claims(self):
+        """Contract Decision (N6): a `roll` native hand-over authorizes at most one native launch through real writers,
+        both sequentially and when two calls race past `native_handovers` into `claim_native_handovers`, and the unused
+        singular `claim_native_handover` wrapper is gone."""
+        import concurrent.futures
+        import threading
+
+        registry = gate.router_module("dispatch_registry")
+        self.assertFalse(hasattr(registry, "claim_native_handover"))
+        missing = self.state / "missing-n6.jsonl"
+
+        # 1. Sequential: first launch consumes the hand-over, second launch with a distinct tool_use_id is refused.
+        seq_claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
+                                  parent_id="s-n6-seq", session_ids=["s-n6-seq"], task_id="t-n6-seq", now=T0)
+        seq_call = {
+            "session_id": "s-n6-seq", "tool_use_id": "tu-n6-1", "tool_name": "spawn_agent",
+            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"},
+        }
+        self.assertEqual(gate.evaluate_payload(seq_call, ledger_path=missing, now=T0), {})
+        second_seq = gate.evaluate_payload(dict(seq_call, tool_use_id="tu-n6-2"), ledger_path=missing, now=T0)
+        self.assertEqual(second_seq["decision"], "block")
+        self.assertEqual(registry.inspect(seq_claim["dispatch_id"])["claim_id"], "tu-n6-1")
+
+        # 2. Race into `claim_native_handovers`: two concurrent launches both read `native_handovers` while open, then
+        #    race into `claim_native_handovers`; `_handover_open` inside the transaction admits at most one.
+        race_claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
+                                   parent_id="s-n6-race", session_ids=["s-n6-race"], task_id="t-n6-race", now=T0)
+        real_native_handovers = registry.native_handovers
+        barrier = threading.Barrier(2, timeout=5.0)
+
+        def synced_handovers(*args, **kwargs):
+            rows = real_native_handovers(*args, **kwargs)
+            barrier.wait()
+            return rows
+
+        race_base = {
+            "session_id": "s-n6-race", "tool_name": "spawn_agent",
+            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"},
+        }
+        with mock.patch.object(registry, "native_handovers", side_effect=synced_handovers):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(gate.evaluate_payload, dict(race_base, tool_use_id=f"tu-race-{i}"),
+                                ledger_path=missing, now=T0)
+                    for i in range(2)
+                ]
+                verdicts = [f.result(timeout=10.0) for f in futures]
+        allowed = [v for v in verdicts if v == {}]
+        blocked = [v for v in verdicts if v.get("decision") == "block"]
+        self.assertEqual((len(allowed), len(blocked)), (1, 1), verdicts)
+        self.assertIn(registry.inspect(race_claim["dispatch_id"])["claim_id"], ("tu-race-0", "tu-race-1"))
+
+    def test_sessionless_caller_matches_neither_named_handover_nor_named_record_while_bare_record_works(self):
+        """Contract Decision & Degrade (N1, N4, F3, F8, F9): one session rule governs both facts — a hand-over or
+        `record` row that names a session is matched only by a call naming that same session, and a call carrying no
+        session ID matches only what names no session (a bare-shell `record` row)."""
         self.assertFalse(hasattr(gate, "OWN_SESSION_ID_VARS"))
         registry = gate.router_module("dispatch_registry")
         missing = self.state / "missing-f3.jsonl"
         owner_claim = self.handover("antigravity", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
                                     parent_id="agy-owner", session_ids=["agy-owner"], task_id="t-agy-f3", now=T0)
-        # Session-less Antigravity launch cannot steal `agy-owner`'s hand-over:
-        sessionless_agy = {"toolCall": {"id": "tc-anon", "name": "invoke_subagent", "args": {"Model": "flash"}}}
+        # 1. Session-less Antigravity launch cannot steal `agy-owner`'s hand-over, and deny text names setup + restart:
+        sessionless_agy = {"modelName": "gemini-3.8-flash-high",
+                           "toolCall": {"id": "tc-anon", "name": "invoke_subagent", "args": {"Model": "inherit"}}}
         denied = gate.evaluate_payload(sessionless_agy, ledger_path=missing, now=T0)
         self.assertEqual(denied["decision"], "deny", denied)
         self.assertIn("未携带会话 ID", denied["reason"])
+        self.assertIn("setup", denied["reason"])
+        self.assertIn("重启", denied["reason"])
         self.assertIsNone(registry.inspect(owner_claim["dispatch_id"]).get("launched_at"))
-        # Real Antigravity payload (`conversationId` + `toolCall.id`) matches and retries idempotently on `toolCall.id`:
-        real_agy = {"conversationId": "agy-owner", "modelName": "gemini-4-argon-high",
-                    "toolCall": {"id": "tc-owner-1", "name": "invoke_subagent", "args": {"Model": "flash"}}}
+        # Real Antigravity payload (`conversationId` + concrete `modelName` + `toolCall.id`) matches and retries idempotently:
+        real_agy = {"conversationId": "agy-owner", "modelName": "gemini-3.8-flash-high",
+                    "toolCall": {"id": "tc-owner-1", "name": "invoke_subagent", "args": {"Model": "inherit"}}}
         self.assertEqual(gate.evaluate_payload(real_agy, ledger_path=missing, now=T0), {"decision": "allow"})
         self.assertEqual(gate.evaluate_payload(real_agy, ledger_path=missing, now=T0), {"decision": "allow"})
         self.assertEqual(
@@ -1070,41 +1124,87 @@ process.stdout.write(JSON.stringify(out));
             )["decision"],
             "deny",
         )
-        # Section 6 standalone `record` written in a bare shell (`session_ids=[]`) keeps authorizing matching launches:
+        # 2. N1: A `record` row of session `s1` authorizes `s1`, and refuses both `s2` and session-less calls
+        #    (including a v0.7.6-shaped Pi payload without `sessionId`):
+        s1_ledger = self.write_ledger(str(self.state), [
+            self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="hard_constraint",
+                       bundle_id="sol_high", session_ids=["s1"], parent_id="s1"),
+        ])
+        self.assertEqual(
+            gate.evaluate_payload(
+                {"session_id": "s1", "tool_name": "spawn_agent",
+                 "tool_input": {"message": "x", "model": "gpt-6.1-sol", "reasoning_effort": "high"}},
+                ledger_path=s1_ledger, now=T0,
+            ),
+            {},
+        )
+        self.assertEqual(
+            gate.evaluate_payload(
+                {"session_id": "s2", "tool_name": "spawn_agent",
+                 "tool_input": {"message": "x", "model": "gpt-6.1-sol", "reasoning_effort": "high"}},
+                ledger_path=s1_ledger, now=T0,
+            )["decision"],
+            "block",
+        )
+        sless_codex = gate.evaluate_payload(
+            {"tool_name": "spawn_agent",
+             "tool_input": {"message": "x", "model": "gpt-6.1-sol", "reasoning_effort": "high"}},
+            ledger_path=s1_ledger, now=T0,
+        )
+        self.assertEqual(sless_codex.get("decision"), "block", sless_codex)
+        self.assertIn("未携带会话 ID", sless_codex["reason"])
+        self.assertIn("重启", sless_codex["reason"])
+        pi_v076 = gate.evaluate_payload(
+            {"toolName": "spawn_agent", "cwd": str(self.state),
+             "input": {"message": "x", "model": "gpt-6.1-sol", "reasoning_effort": "high"}},
+            ledger_path=s1_ledger, now=T0,
+        )
+        self.assertEqual(pi_v076.get("block"), True, pi_v076)
+        self.assertIn("未携带会话 ID", pi_v076["reason"])
+        self.assertIn("重启", pi_v076["reason"])
+        # 3. F9: Section 6 standalone `record` written in a bare shell (`session_ids=[]`, `parent_id=None`) names no
+        #    session and keeps authorizing matching launches (session-less and sessioned):
         bare_ledger = self.write_ledger(str(self.state), [
             self.route("claude", "claude-haiku-5-5", "high", stage="record", constraint="hard_constraint",
                        bundle_id=None, session_ids=[], parent_id=None),
         ])
+        self.assertEqual(
+            gate.evaluate_payload(
+                {"tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "model": "haiku", "prompt": "find"}},
+                ledger_path=bare_ledger, now=T0,
+            ),
+            {},
+        )
         for idx in range(2):
             self.assertEqual(
                 gate.evaluate_payload(
                     {"session_id": f"s-bare-{idx}", "tool_name": "Agent",
-                     "tool_input": {"subagent_type": "Explore", "prompt": "find"}},
+                     "tool_input": {"subagent_type": "Explore", "model": "haiku", "prompt": "find"}},
                     ledger_path=bare_ledger, now=T0,
                 ),
                 {},
             )
 
     def test_unnamed_model_and_provider_resolve_from_host_facts_never_as_wildcard(self):
-        """Contract Decision (F4): each host's unnamed model/provider resolves from the call's own facts (harness
-        family/account, custom agent frontmatter, `Explore` -> `haiku`, Codex `payload.model`, Antigravity `modelName`
-        / `Model` tier, explicit provider+model on `delegate_task` and `orca`), never as a cross-provider or
-        cross-model wildcard."""
+        """Contract Decision (F4 & N3): each host's route resolves only from what the call carries and declared catalog
+        data (zero model-name or substring rules: `Explore` without `model` and Antigravity `flash`/`flash_lite`/`pro`
+        tier keywords never guess a model), denying and naming the launch field to pass."""
         registry = gate.router_module("dispatch_registry")
         missing = self.state / "missing-f4.jsonl"
 
-        # 1. Claude `Agent`: `Explore` -> claude/haiku (never Codex or Opus); custom `.claude/agents/rev.md` -> opus;
-        #    `general-purpose` without model (and no payload model) -> `<unspecified>`, never a wildcard.
-        codex_claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
-                                    parent_id="s-c1", session_ids=["s-c1"], task_id="t-f4-codex", now=T0)
-        self.assertEqual(
-            gate.evaluate_payload(
-                {"session_id": "s-c1", "tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "prompt": "x"}},
+        # 1. Claude `Agent`: `Explore`, `explore`, and `general-purpose` without `model` (or `model="inherit"`) are
+        #    denied even when the session holds a `claude-haiku-5-5` or `claude-opus-5-5` hand-over, naming `model`;
+        #    custom `.claude/agents/rev.md` frontmatter (`model: opus`) resolves from the file and passes.
+        haiku_claim = self.handover("claude", "claude-haiku-5-5", "high", bundle_id=None,
+                                    parent_id="s-c1", session_ids=["s-c1"], task_id="t-f4-haiku", now=T0)
+        for sub_name in ("Explore", "explore", "general-purpose"):
+            denied_haiku = gate.evaluate_payload(
+                {"session_id": "s-c1", "tool_name": "Agent", "tool_input": {"subagent_type": sub_name, "prompt": "x"}},
                 ledger_path=missing, now=T0,
-            )["decision"],
-            "block",
-        )
-        self.assertIsNone(registry.inspect(codex_claim["dispatch_id"]).get("launched_at"))
+            )
+            self.assertEqual(denied_haiku["decision"], "block", sub_name)
+            self.assertIn("`model`", denied_haiku["reason"])
+        self.assertIsNone(registry.inspect(haiku_claim["dispatch_id"]).get("launched_at"))
 
         opus_claim = self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
                                    parent_id="s-c2", session_ids=["s-c2"], task_id="t-f4-opus", now=T0)
@@ -1118,6 +1218,7 @@ process.stdout.write(JSON.stringify(out));
                 ledger_path=missing, now=T0,
             )
             self.assertEqual(denied["decision"], "block", bad_args)
+            self.assertIn("`model`", denied["reason"])
         self.assertIsNone(registry.inspect(opus_claim["dispatch_id"]).get("launched_at"))
         project = self.state / "proj-f4"
         (project / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
@@ -1131,16 +1232,15 @@ process.stdout.write(JSON.stringify(out));
             {},
         )
 
-        # 2. Codex `spawn_agent`: omitted `tool_input.model` uses top-level `payload.model`; missing both denies.
+        # 2. Codex `spawn_agent`: omitted `tool_input.model` uses top-level `payload.model`; missing both denies naming `model`.
         sol_claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
                                   parent_id="s-x1", session_ids=["s-x1"], task_id="t-f4-sol", now=T0)
-        self.assertEqual(
-            gate.evaluate_payload(
-                {"session_id": "s-x1", "tool_name": "spawn_agent", "tool_input": {"message": "x"}},
-                ledger_path=missing, now=T0,
-            )["decision"],
-            "block",
+        denied_codex = gate.evaluate_payload(
+            {"session_id": "s-x1", "tool_name": "spawn_agent", "tool_input": {"message": "x"}},
+            ledger_path=missing, now=T0,
         )
+        self.assertEqual(denied_codex["decision"], "block")
+        self.assertIn("`model`", denied_codex["reason"])
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-x1", "model": "gpt-6-astra", "tool_name": "spawn_agent", "tool_input": {"message": "x"}},
@@ -1158,7 +1258,20 @@ process.stdout.write(JSON.stringify(out));
             {},
         )
 
-        # 3. Antigravity `invoke_subagent`: omitted/`inherit` `Model` uses concrete `modelName`, refuses `auto`/absent.
+        # 3. Antigravity `invoke_subagent`: omitted/`inherit` `Model` uses concrete `modelName`; `auto`/absent and
+        #    abstract tier keywords (`flash`, `flash_lite`, `pro`) never match by substring and deny naming `Model`/`modelName`.
+        flash_claim = self.handover("antigravity", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
+                                    parent_id="s-af", session_ids=["s-af"], task_id="t-f4-agy-flash", now=T0)
+        for tier_kw in ("flash", "flash_lite", "pro"):
+            denied_tier = gate.evaluate_payload(
+                {"conversationId": "s-af", "modelName": "gemini-3.8-flash-high",
+                 "toolCall": {"id": f"af-{tier_kw}", "name": "invoke_subagent", "args": {"TypeName": "self", "Model": tier_kw}}},
+                ledger_path=missing, now=T0,
+            )
+            self.assertEqual(denied_tier["decision"], "deny", tier_kw)
+            self.assertIn("`Model`", denied_tier["reason"])
+        self.assertIsNone(registry.inspect(flash_claim["dispatch_id"]).get("launched_at"))
+
         argon_claim = self.handover("antigravity", "gemini-4-argon-high", "high", bundle_id="argon_high",
                                     parent_id="s-a1", session_ids=["s-a1"], task_id="t-f4-agy", now=T0)
         for bad_agy in (
@@ -1167,9 +1280,11 @@ process.stdout.write(JSON.stringify(out));
             {"conversationId": "s-a1", "modelName": "gemini-3.8-flash-high",
              "toolCall": {"id": "a-2", "name": "invoke_subagent", "args": {"TypeName": "self"}}},
             {"conversationId": "s-a1",
-             "toolCall": {"id": "a-3", "name": "invoke_subagent", "args": {"TypeName": "self", "Model": "flash"}}},
+             "toolCall": {"id": "a-3", "name": "invoke_subagent", "args": {"TypeName": "self", "Model": "pro"}}},
         ):
-            self.assertEqual(gate.evaluate_payload(bad_agy, ledger_path=missing, now=T0)["decision"], "deny", bad_agy)
+            denied_agy = gate.evaluate_payload(bad_agy, ledger_path=missing, now=T0)
+            self.assertEqual(denied_agy["decision"], "deny", bad_agy)
+            self.assertIn("`Model`", denied_agy["reason"])
         self.assertIsNone(registry.inspect(argon_claim["dispatch_id"]).get("launched_at"))
         self.assertEqual(
             gate.evaluate_payload(
@@ -1181,16 +1296,16 @@ process.stdout.write(JSON.stringify(out));
         )
 
         # 4. Multi-provider `delegate_task` (`target.driverKind`/`target.model`) and `orca orchestration worker-start`
-        #    require explicit provider and model:
+        #    require explicit provider and model and name those fields when missing:
         self.handover("codex", "gpt-6.1-sol", "high", surface="t3", bundle_id="sol_high",
                       parent_id="s-t3", session_ids=["s-t3"], task_id="t-f4-t3", now=T0)
-        self.assertEqual(
-            gate.evaluate_payload(
-                {"session_id": "s-t3", "tool_name": "delegate_task", "tool_input": {"task": "work"}},
-                ledger_path=missing, now=T0,
-            )["decision"],
-            "block",
+        denied_t3 = gate.evaluate_payload(
+            {"session_id": "s-t3", "tool_name": "delegate_task", "tool_input": {"task": "work"}},
+            ledger_path=missing, now=T0,
         )
+        self.assertEqual(denied_t3["decision"], "block")
+        self.assertIn("target.driverKind", denied_t3["reason"])
+        self.assertIn("target.model", denied_t3["reason"])
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-t3", "tool_use_id": "tu-t3-ok", "tool_name": "delegate_task",
@@ -1201,14 +1316,14 @@ process.stdout.write(JSON.stringify(out));
         )
         self.handover("codex", "gpt-6.1-sol", "high", surface="orca", bundle_id="sol_high",
                       parent_id="s-orca", session_ids=["s-orca"], task_id="t-f4-orca", now=T0)
-        self.assertEqual(
-            gate.evaluate_payload(
-                {"session_id": "s-orca", "tool_name": "Bash",
-                 "tool_input": {"command": 'orca orchestration worker-start --spec "x" --worktree current --json'}},
-                ledger_path=missing, now=T0,
-            )["decision"],
-            "block",
+        denied_orca = gate.evaluate_payload(
+            {"session_id": "s-orca", "tool_name": "Bash",
+             "tool_input": {"command": 'orca orchestration worker-start --spec "x" --worktree current --json'}},
+            ledger_path=missing, now=T0,
         )
+        self.assertEqual(denied_orca["decision"], "block")
+        self.assertIn("--agent", denied_orca["reason"])
+        self.assertIn("--model", denied_orca["reason"])
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-orca", "tool_use_id": "tu-orca-ok", "tool_name": "Bash",
@@ -1238,8 +1353,10 @@ process.stdout.write(JSON.stringify(out));
                                   at=(T0 - dt.timedelta(minutes=30)).isoformat())
         expired_record = self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="user_override",
                                     bundle_id="sol_high", at=(T0 - dt.timedelta(minutes=30)).isoformat())
-        self.assertTrue(gate.carries_route(expired_plan))
-        self.assertTrue(gate.carries_route(expired_record))
+        self.assertFalse(hasattr(gate, "has_route_bundle"))
+        self.assertFalse(hasattr(gate, "carries_route"))
+        self.assertTrue(decision_ledger.carries_route(expired_plan))
+        self.assertTrue(decision_ledger.carries_route(expired_record))
         routeless_rows = [
             scorer_unavailable_row,
             no_eligible_row,
@@ -1258,7 +1375,7 @@ process.stdout.write(JSON.stringify(out));
              "provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"},
         ]
         for row in routeless_rows:
-            self.assertFalse(gate.carries_route(row), row)
+            self.assertFalse(decision_ledger.carries_route(row), row)
 
         with tempfile.TemporaryDirectory() as tmp:
             ledger = self.write_ledger(tmp, [expired_plan, expired_record, *routeless_rows])
@@ -1275,6 +1392,7 @@ process.stdout.write(JSON.stringify(out));
 
     def test_rows_of_the_removed_select_and_delegate_stages_authorize_nothing(self):
         """Rule: a row of any stage other than plan/record authorizes nothing, even if it carries a bundle."""
+        decision_ledger = gate.router_module("decision_ledger")
         recent = (T0 - dt.timedelta(minutes=1)).isoformat()
         full_bundle = {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}
         non_launch_rows = [
@@ -1286,11 +1404,11 @@ process.stdout.write(JSON.stringify(out));
              "bundle": full_bundle},
         ]
         for row in non_launch_rows:
-            self.assertFalse(gate.carries_route(row), row)
+            self.assertFalse(decision_ledger.carries_route(row), row)
         # Conversely, un-efforted bundles (dot_text) and record rows without bundle_id do carry a route.
-        self.assertTrue(gate.carries_route(self.route("dot")))
-        self.assertTrue(gate.carries_route(self.route("claude", "claude-opus-5-5", "high", stage="record",
-                                                      constraint="user_override", bundle_id=None)))
+        self.assertTrue(decision_ledger.carries_route(self.route("dot")))
+        self.assertTrue(decision_ledger.carries_route(self.route("claude", "claude-opus-5-5", "high", stage="record",
+                                                                 constraint="user_override", bundle_id=None)))
         with tempfile.TemporaryDirectory() as tmp:
             ledger = self.write_ledger(tmp, non_launch_rows)
             self.assertEqual(gate.recent_routes(ledger, now=T0), [])
@@ -1735,7 +1853,13 @@ process.stdout.write(JSON.stringify(out));
         # launch as it is written, so the own account's exhausted window does not refuse it.
         native = {"tool_name": "Agent", "tool_input": {"subagent_type": "general-purpose", "prompt": "work",
                                                          "model": "opus"}}
-        explore_default = {"tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "prompt": "work"}}
+        proj_agents = self.state / "proj-own-acct"
+        (proj_agents / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
+        (proj_agents / ".claude" / "agents" / "quick-find.md").write_text(
+            "---\nname: quick-find\nmodel: haiku\n---\nFind\n", encoding="utf-8"
+        )
+        custom_no_raw_model = {"cwd": str(proj_agents), "tool_name": "Agent",
+                               "tool_input": {"subagent_type": "quick-find", "prompt": "work"}}
         own_home, lab_home = self.state / ".claude-own", self.state / ".claude-lab"
         real_accounts = gate.load_dispatch_accounts
 
@@ -1784,16 +1908,16 @@ process.stdout.write(JSON.stringify(out));
                             self.assertIn(named, result["reason"])
                         self.assertNotIn("?", result["reason"])
 
-            # A call whose raw `tool_input` omits `model` (`Explore`, whose default model fact is `haiku`) is not
-            # resolved to `own` for `launch_target` even when every catalogued bundle of `claude` is unchecked.
+            # A call whose raw `tool_input` omits `model` (resolved from `.claude/agents/quick-find.md` frontmatter)
+            # is not resolved to `own` for `launch_target` even when every catalogued bundle of `claude` is unchecked.
             every = list(real_accounts()["accounts"]["claude"]["bundles"])
             self.write_settings(accounts={"claude": {"bundles": {b: {"disabled": True} for b in every}}})
             self.handover("claude", "claude-haiku-5-5", "high", bundle_id=None,
                           parent_id="own-all-off", session_ids=["own-all-off"], task_id="t-all-off", now=T0)
-            with self.subTest(launch="Explore default haiku, every model unchecked"), \
+            with self.subTest(launch="custom frontmatter haiku, every model unchecked"), \
                     mock.patch.object(gate, "load_dispatch_accounts", side_effect=discovered(recorded)):
                 self.assertNotIn("reason", gate.evaluate_payload(
-                    dict(explore_default, session_id="own-all-off"), ledger_path=missing, now=T0))
+                    dict(custom_no_raw_model, session_id="own-all-off"), ledger_path=missing, now=T0))
 
             # The own account's window is exhausted and its models are checked: the native launch is not resolved to
             # it for that check, exactly as before the own-account resolution existed.
@@ -1806,7 +1930,7 @@ process.stdout.write(JSON.stringify(out));
             with mock.patch.object(gate, "load_dispatch_accounts", side_effect=discovered(recorded)):
                 for q_idx, (payload, q_model, q_bid) in enumerate((
                     (native, "claude-opus-5-5", "opus55_high"),
-                    (explore_default, "claude-haiku-5-5", None),
+                    (custom_no_raw_model, "claude-haiku-5-5", None),
                 )):
                     with self.subTest(quota=payload["tool_input"].get("model")):
                         sid = f"own-quota-{q_idx}"
@@ -2312,11 +2436,16 @@ process.stdout.write(JSON.stringify(out));
         b = self.route("dot", stage="record", constraint="dot_closed_loop", parent_agent_id="parent-b", task_id="task-b")
         for rows in ([a, b], [b, a]):
             ledger = self.write_ledger(str(self.state), rows)
-            for identity in ({}, {"parentAgentId": "parent-a", "taskId": "task-a"}):
+            for identity in ({"parentAgentId": "parent-a"}, {"parentAgentId": "parent-a", "taskId": "task-a"}):
                 result = gate.evaluate_payload({"tool_name": "delegate_task", "tool_input": {
                     "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}, **identity}},
                     ledger_path=ledger, now=T0)
                 self.assertEqual(result, {})
+            # N1: a session-less call cannot match `parent-a` or `parent-b`'s session-named `record` row.
+            anon = gate.evaluate_payload({"tool_name": "delegate_task", "tool_input": {
+                "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}}},
+                ledger_path=ledger, now=T0)
+            self.assertEqual(anon.get("decision"), "block")
 
     def test_same_task_new_decision_rejects_old_owner_with_diagnostics(self):
         # Both native hand-over re-rolls (superseding the unconsumed row of `(parent_id, task_id)`) and record rows
@@ -2396,7 +2525,8 @@ process.stdout.write(JSON.stringify(out));
                                   ({"parentAgentId": "b"}, "parent/task/target"),
                                   ({"taskId": "task-b"}, "parent/task/target"),
                                   ({"targetAgentId": "target-b"}, "parent/task/target")):
-            args = {"provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}, **extra}
+            args = {"provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"},
+                    "parentAgentId": "a", **extra}
             result = gate.evaluate_payload({"tool_name": "delegate_task", "tool_input": args}, ledger_path=ledger, now=T0)
             self.assertIn(diagnostic, result["reason"])
 

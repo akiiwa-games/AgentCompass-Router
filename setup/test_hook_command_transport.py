@@ -55,7 +55,7 @@ class HookCommandTransportTests(unittest.TestCase):
             self.assertEqual(made.returncode,0,made.stdout+made.stderr)
             settings=json.loads((home/'.claude/settings.json').read_text(encoding='utf-8'))
             command=settings['hooks']['PreToolUse'][0]['hooks'][0]['command']
-            payload={'tool_name':'Agent','tool_input':{'subagent_type':'Explore','prompt':'Only fixture inspection'}}
+            payload={'tool_name':'Agent','tool_input':{'subagent_type':'Explore','model':'claude-haiku-5-5','prompt':'Only fixture inspection'}}
             ledger=home/'ledger.jsonl'
             for name,shell,flags in shells:
                 for recorded in (False,True):

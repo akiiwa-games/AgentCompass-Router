@@ -70,7 +70,7 @@ ROUTER_HOOK_CMD = shlex.join(ROUTER_HOOK_ARGV)
 # The gate's own tool list decides what reaches it: any `mcp__<server>__` prefix of those names, nothing else.
 ROUTER_GATE_MATCHER = router_gate_hook.hook_matcher()
 
-PI_ROUTER_GATE_TS = """import { spawnSync } from "node:child_process";
+_PI_ROUTER_GATE_TEMPLATE = """import { spawnSync } from "node:child_process";
 
 const HOOK_ARGV = __HOOK_ARGV__;
 const WORKER_QUESTION_TOOLS = new Set(__WORKER_QUESTION_TOOLS__);
@@ -126,9 +126,17 @@ export default function (pi: any) {
     return undefined;
   });
 }
-""".replace("__HOOK_ARGV__", json.dumps(ROUTER_HOOK_ARGV)).replace(
-    "__TOOL_NAME_PATTERN__", json.dumps(f"^{router_gate_hook.TOOL_NAME_PATTERN}$")).replace(
-    "__WORKER_QUESTION_TOOLS__", json.dumps(sorted(router_gate_hook.WORKER_QUESTION_TOOLS)))
+"""
+
+
+def render_pi_router_gate_ts(hook_argv: list[str] | None = None) -> str:
+    argv = ROUTER_HOOK_ARGV if hook_argv is None else hook_argv
+    return _PI_ROUTER_GATE_TEMPLATE.replace("__HOOK_ARGV__", json.dumps(argv)).replace(
+        "__TOOL_NAME_PATTERN__", json.dumps(f"^{router_gate_hook.TOOL_NAME_PATTERN}$")).replace(
+        "__WORKER_QUESTION_TOOLS__", json.dumps(sorted(router_gate_hook.WORKER_QUESTION_TOOLS)))
+
+
+PI_ROUTER_GATE_TS = render_pi_router_gate_ts()
 
 # Per-family table of global instruction files, rule kinds, skills layout and router-gate hook locations.
 # Checked against each harness's own documentation and source:
