@@ -118,7 +118,9 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
             f"{name}: priced from its last good usage reading, taken at {at} in the current reset period "
             f"(the latest read failed); a provider hold on a model or pool still wins over this reading")
     if (sync := accounts.get('_host_policy_sync') or {}).get('mode') == 'error':
-        decision.setdefault('warnings', []).append(host_policy.sync_failed(sync.get('error')))
+        warning = (host_policy.upgrade_failed(sync.get('error')) if sync.get('stage') == 'upgrade'
+                   else host_policy.sync_failed(sync.get('error')))
+        decision.setdefault('warnings', []).append(warning)
     state_policy = (host_policy.load_policy() if read_local_state else {'allowed_accounts': list((accounts.get('accounts') or {}).keys())}) if host_policy_config is None else host_policy_config
     state_warnings = account_state.warnings(accounts.get('_discovery'), accounts['accounts'],
                                             lambda name: host_policy.account_allowed(state_policy, name))

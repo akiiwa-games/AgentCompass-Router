@@ -44,9 +44,9 @@ def reference_capabilities():
     return account_fleet.load_capabilities(accounts=account_fleet.load_accounts(account_fleet.reference_fleet_path()))
 
 
-def _load_accounts_with_expiring_subscription(path=None):
-    data = _real_load_accounts(path)
-    if path is None:
+def _load_accounts_with_expiring_subscription(path=None, document=None, *, read_only=False):
+    data = _real_load_accounts(path, document=document, read_only=read_only)
+    if path is None and document is None:
         data['accounts']['grok'] = json.loads(json.dumps(EXPIRING_SUBSCRIPTION))
     return data
 

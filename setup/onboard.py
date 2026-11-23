@@ -171,7 +171,8 @@ def write_override(home: Path, detection: dict, disabled: set[str], dry_run: boo
         if existed:
             backup = home / ".agent-compass" / "backups" / f"onboard-{datetime.now().strftime('%Y%m%d-%H%M%S')}" / path.name
             backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, backup)
+            if not backup.exists():
+                shutil.copy2(path, backup)
             result["backup"] = str(backup)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(accounts_override.normalize(document), indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
@@ -404,16 +405,31 @@ def setup_main(argv: list[str] | None = None) -> int:
                 enabled.add(row["name"])
     import host_policy
     target_policy = host_policy.policy_path()[0] if not args.home else home / ".agent-compass" / "host-policy.json"
+    ov_file = override_path(home)
+    upgrade_accounts = {"accounts": {name: {} for name in dict.fromkeys([
+        *(detection.get("inventory", {}).get("accounts") or {}),
+        *(row["name"] for row in detection["accounts"]),
+    ])}}
+    upgrade_backups = []
+    if not dry and host_policy.upgrade_legacy_disabled(
+        upgrade_accounts, override_path=ov_file, policy_file=target_policy, read_only=True,
+    ):
+        backup_dir = home / ".agent-compass" / "backups" / f"onboard-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        for src in (ov_file, target_policy):
+            if src.is_file():
+                dst = backup_dir / src.name
+                shutil.copy2(src, dst)
+                upgrade_backups.append(str(dst))
     host_policy.upgrade_legacy_disabled(
-        {"accounts": {name: {} for name in dict.fromkeys([
-            *(detection.get("inventory", {}).get("accounts") or {}),
-            *(row["name"] for row in detection["accounts"]),
-        ])}},
-        override_path=override_path(home),
+        upgrade_accounts,
+        override_path=ov_file,
         policy_file=target_policy,
         read_only=dry,
     )
     override = write_override(home, detection, disabled, dry)
+    if upgrade_backups and not override.get("backup"):
+        override["backup"] = upgrade_backups[0]
     policy_path = disable_in_host_policy(home, detection, disabled, dry, target_policy, enabled)
     summary["override"] = override
     summary["host_policy"] = str(policy_path)

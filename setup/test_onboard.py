@@ -668,6 +668,29 @@ class SetupFlowTests(HomeCase):
         _, output = self.run_setup("--no-docs", "--no-skills")
         self.assertIn("No signed-in agent CLI was found", output)
 
+    def test_setup_backs_up_override_and_host_policy_before_legacy_verified_false_upgrade(self):
+        self.cli = {"claude": "claude", "codex": "codex"}
+        self.write(".claude/.credentials.json", CLAUDE_CREDENTIALS)
+        self.write(".codex/auth.json", json.dumps({"tokens": {"access_token": "tok"}}))
+        ov = self.write(".agent-compass/accounts-override.json", json.dumps({
+            "schema_version": 2, "accounts": {"codex": {"verified": False}, "claude": {"verified": True}},
+        }))
+        pol = self.write(".agent-compass/host-policy.json", json.dumps({
+            "allowed_accounts": ["claude", "codex"], "known_accounts": ["claude", "codex"],
+        }))
+        ov_before, pol_before = ov.read_bytes(), pol.read_bytes()
+        code, _ = self.run_setup("--no-docs", "--no-skills")
+        self.assertEqual(code, 0)
+        backups = list((self.home / ".agent-compass" / "backups").rglob("*"))
+        ov_backups = [p for p in backups if p.is_file() and p.name == "accounts-override.json"]
+        pol_backups = [p for p in backups if p.is_file() and p.name == "host-policy.json"]
+        self.assertTrue(ov_backups, backups)
+        self.assertTrue(pol_backups, backups)
+        self.assertEqual(ov_backups[0].read_bytes(), ov_before)
+        self.assertEqual(pol_backups[0].read_bytes(), pol_before)
+        self.assertEqual(json.loads(pol.read_text(encoding="utf-8"))["allowed_accounts"], ["claude"])
+        self.assertNotIn("verified", json.loads(ov.read_text(encoding="utf-8"))["accounts"]["codex"])
+
 
 @pytest.mark.slow
 class OrchestratorTests(HomeCase):

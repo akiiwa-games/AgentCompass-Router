@@ -1387,7 +1387,13 @@ def host_policy_state() -> dict:
         policy, error = None, str(exc)
     names = list(dict.fromkeys([*names, *((policy or {}).get("known_accounts") or []),
                                *((policy or {}).get("allowed_accounts") or [])]))
-    return {"path": path, "explicit": explicit, "allowed": None if policy is None else set(policy["allowed_accounts"]),
+    if policy is None:
+        allowed = None
+    elif "allowed_accounts" in policy:
+        allowed = set(policy["allowed_accounts"])
+    else:
+        allowed = {n for n in names if host_policy.account_allowed(policy, n)}
+    return {"path": path, "explicit": explicit, "allowed": allowed,
             "policy": policy, "accounts": names, "error": error}
 
 

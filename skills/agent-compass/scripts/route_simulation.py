@@ -127,8 +127,8 @@ def accounts_for(mode, account_set=None):
 
 
 def machine_accounts():
-    """The document routing uses on this machine (account_fleet.load_accounts)."""
-    return account_fleet.load_accounts()
+    """The document routing uses on this machine (account_fleet.load_accounts, read-only)."""
+    return account_fleet.load_accounts(read_only=True)
 
 
 def fresh_accounts(document=None, inventory=None):

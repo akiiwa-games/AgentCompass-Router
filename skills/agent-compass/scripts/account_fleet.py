@@ -79,12 +79,13 @@ def reference_fleet_path():
     return _REFERENCE_FLEET['path']
 
 
-def load_accounts(path=None, document=None):
+def load_accounts(path=None, document=None, *, read_only=False):
     """The routing fleet: the reference document (``document``, the file at ``path``, else fleet_document()) with
     discovery and, only for the fleet document itself, the user's own settings layered on top. The source document is
     reference data (the held set, a candidate set, a test fixture) and is checked against the declared launch patterns
     first (launch_problems). What discovery adds comes from the user's machine and is never dropped by a pattern: each
-    launch site makes its values safe (launch_values)."""
+    launch site makes its values safe (launch_values). With ``read_only=True``, skips local state writes
+    (``upgrade_legacy_disabled``, ``sync_discovered``, ``scope_account_holds``)."""
     local = path is None and document is None
     if document is not None:
         source = json.loads(json.dumps(document))
@@ -112,18 +113,24 @@ def load_accounts(path=None, document=None):
                         bundle['_model_disabled'] = bundle.get('disabled', False)
                         bundle['disabled'] = True
     provider_inventory.apply_shared_quota(accounts)
-    try:
-        # An account hold from when the account had one pool now holds only its failed models' pools (provider_retry).
-        provider_retry.scope_account_holds(accounts)
-    except OSError:
-        pass
-    if local:
+    if not read_only:
         try:
-            host_policy.upgrade_legacy_disabled(accounts)
-            accounts['_host_policy_sync'] = host_policy.sync_discovered(accounts)
-        except (OSError, host_policy.HostPolicyError) as exc:
-            # Discovery still reports local facts; existing policy checks retain the denial.
-            accounts['_host_policy_sync'] = {'mode': 'error', 'added': [], 'error': str(exc)}
+            # An account hold from when the account had one pool now holds only its failed models' pools (provider_retry).
+            provider_retry.scope_account_holds(accounts)
+        except OSError:
+            pass
+    if local:
+        if read_only:
+            accounts['_host_policy_sync'] = {'mode': 'read_only', 'added': []}
+        else:
+            stage = 'upgrade'
+            try:
+                host_policy.upgrade_legacy_disabled(accounts)
+                stage = 'sync'
+                accounts['_host_policy_sync'] = host_policy.sync_discovered(accounts)
+            except (OSError, host_policy.HostPolicyError) as exc:
+                # Discovery still reports local facts; existing policy checks retain the denial.
+                accounts['_host_policy_sync'] = {'mode': 'error', 'stage': stage, 'added': [], 'error': str(exc)}
     return accounts_override.normalize(accounts)
 
 
@@ -142,11 +149,12 @@ def account_family(spec):
     return None
 
 
-def load_capabilities(path=None, accounts=None):
+def load_capabilities(path=None, accounts=None, *, read_only=False):
     if path is not None:
         return json.loads(Path(path).read_text(encoding='utf-8-sig'))
     from capability_catalog import compose
-    return compose(load_accounts() if accounts is None else accounts)
+    loaded = (load_accounts(read_only=True) if read_only else load_accounts()) if accounts is None else accounts
+    return compose(loaded)
 
 
 def models_table(accounts):

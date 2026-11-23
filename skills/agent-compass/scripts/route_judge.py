@@ -169,7 +169,7 @@ def record_constraint(args, task=None, classified=None):
     import axis_scores
     import model_resolution
     import provider_retry
-    accounts = account_fleet.load_accounts()
+    accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
     now = datetime.now(timezone.utc)
     usage = usage_reading.usage_snapshot(args.usage_cache, args.accounts, now)
     usage = provider_inventory.merge_usage(usage, accounts, now, args.accounts)
@@ -377,7 +377,7 @@ def record_resume(args, task, classified, bundle, agent_id):
     resume checks, the gate's turn check and `dispatch_registry.prepare`. Returns the finalized decision."""
     started = time.monotonic()
     import account_fleet
-    accounts = account_fleet.load_accounts()
+    accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
     now = datetime.now(timezone.utc)
     usage = usage_reading.usage_snapshot(args.usage_cache, args.accounts, now)
     usage = provider_inventory.merge_usage(usage, accounts, now, args.accounts)
@@ -536,7 +536,7 @@ def _compare_with_router(result, task, usage, now, chosen, fast_requested, class
         result.update({'router_choice': None, 'agrees': None, 'classifier_skipped': True})
     elif task:
         try:
-            loaded_accounts = account_fleet.load_accounts()
+            loaded_accounts = account_fleet.load_accounts() if decision_ledger.LEDGER_WRITES else account_fleet.load_accounts(read_only=True)
             has_cadence = any(
                 isinstance((spec or {}).get('cadence'), dict)
                 for spec in (loaded_accounts.get('accounts') or {}).values()
@@ -544,7 +544,7 @@ def _compare_with_router(result, task, usage, now, chosen, fast_requested, class
             plan_records = ((decision_ledger.read_ledger() if (task.get('chain') or {}).get('id') or has_cadence else [])
                             + dispatch_flow.reservation_records(read_only=not decision_ledger.LEDGER_WRITES)
                             + dispatch_registry.launch_records(loaded_accounts, now))
-            plan = allocator.plan(task, usage, now, records=plan_records,
+            plan = allocator.plan(task, usage, now, records=plan_records, accounts=loaded_accounts,
                                   route={'force_fast': True} if fast_requested else None)
         except (ValueError, KeyError, TypeError) as exc:
             result['router_error'] = f'{type(exc).__name__}: {exc}'
@@ -776,8 +776,9 @@ def classify_pinned(task, args):
         return _unclassified(task, scorer, hours, started)
     import account_fleet
     import task_intake
-    capabilities = account_fleet.load_capabilities()
-    policy = account_fleet.load_accounts()['scoring']
+    loaded = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
+    capabilities = account_fleet.load_capabilities(accounts=loaded)
+    policy = loaded['scoring']
     needs = dict(task.get('needs')) if isinstance(task.get('needs'), dict) else {}
     profile, classified, _, scorer, estimate, alerts = classify_task(
         task, needs, capabilities, policy, getattr(args, 'score_timeout', scorer_client.SCORER_TIMEOUT_SECONDS),
@@ -825,8 +826,8 @@ def plan_stage(document, args):
     import account_fleet
     import allocator
     import task_intake
-    capabilities = account_fleet.load_capabilities()
-    loaded_accounts = account_fleet.load_accounts()
+    loaded_accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
+    capabilities = account_fleet.load_capabilities(accounts=loaded_accounts)
     policy = loaded_accounts['scoring']
     guard_cfg = capabilities.get('remote_reroute_guard') or {}
     has_cadence = any(
@@ -903,7 +904,8 @@ def plan_stage(document, args):
     dot_down = dot_unreachable() if wants_dot and 'dot_text' not in unavailable else None
     if dot_down:
         unavailable.append('dot_text')
-    planned = allocator.plan(task, usage, now, unavailable, records)
+    planned = allocator.plan(task, usage, now, unavailable, records,
+                             accounts=loaded_accounts, capabilities=capabilities)
     planned['_unavailable'] = unavailable
     apply_readiness_gap(planned, loaded_accounts, usage)
     if extra_alerts:
@@ -1001,8 +1003,9 @@ def score_stage(args):
     if not isinstance(task, dict) or not task:
         raise ValueError('Input requires task.')
     import task_intake
-    capabilities = account_fleet.load_capabilities()
-    policy = account_fleet.load_accounts()['scoring']
+    loaded = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
+    capabilities = account_fleet.load_capabilities(accounts=loaded)
+    policy = loaded['scoring']
     profile, scorer = scorer_client.score_task(task, capabilities, args.score_timeout, use_model=not args.dry_run)
     if profile is None:
         result = {'stage': 'score', 'status': 'blocked', 'source': scorer['source'], 'task_profile': None,
@@ -1123,7 +1126,7 @@ def main():
     if args.help or args.stage is None:
         print(stage_help.stage_help(parser, args.stage) if args.stage else stage_help.overview())
         return 0 if args.help else 2
-    if args.stage in ('roll', 'plan', 'providers') and not args.demo:
+    if args.stage in ('roll', 'plan', 'providers') and not args.demo and not args.dry_run:
         # This run keeps the reference set it takes; a due check runs in its own process and applies to the next run.
         public_data.refresh_in_background()
         antigravity_plan.refresh_in_background(state_upgrade.state_dir())
@@ -1274,7 +1277,7 @@ def _stage_result(args):
         result = dispatch_flow.cli(args)
         code = 1 if result.get('state') in ('failed', 'create_failed') else 0
     elif args.stage == 'providers':
-        accounts = account_fleet.load_accounts()
+        accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
         result = {**accounts['_discovery'], 'host_policy_sync': accounts.get('_host_policy_sync'),
                   'public_data': public_data.status()}
         code = 0

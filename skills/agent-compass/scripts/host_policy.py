@@ -1,5 +1,6 @@
 """Local dispatch availability. No profile preserves the shared routing defaults."""
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -86,9 +87,9 @@ def _read_policy_file(path, explicit=False):
 def load_policy():
     path, explicit = policy_path()
     doc = _read_policy_file(path, explicit=explicit)
-    if doc is None:
-        return None
     flagged = _legacy_disabled_from_override()
+    if doc is None:
+        return {'denied_accounts': flagged} if flagged else None
     if not flagged:
         return doc
     result = dict(doc)
@@ -96,6 +97,24 @@ def load_policy():
     if 'known_accounts' in result:
         result['known_accounts'] = list(dict.fromkeys([*result['known_accounts'], *flagged]))
     return result
+
+
+def _enter_upgrade_lock(stack, path):
+    try:
+        stack.enter_context(override_store.locked(path))
+    except OSError as exc:
+        if str(path) not in str(exc):
+            raise type(exc)(f'{path}: {exc}') from exc
+        raise
+
+
+def _write_upgrade_file(path, document):
+    try:
+        override_store.write(path, document)
+    except OSError as exc:
+        if str(path) not in str(exc):
+            raise type(exc)(f'{path}: {exc}') from exc
+        raise
 
 
 def upgrade_legacy_disabled(accounts=None, *, override_path=None, policy_file=None, read_only=False):
@@ -111,7 +130,9 @@ def upgrade_legacy_disabled(accounts=None, *, override_path=None, policy_file=No
     flagged = _legacy_disabled_from_override(ov_path)
     if not flagged or read_only:
         return flagged
-    with override_store.locked(pol_path), override_store.locked(ov_path):
+    with ExitStack() as stack:
+        _enter_upgrade_lock(stack, pol_path)
+        _enter_upgrade_lock(stack, ov_path)
         override_doc = accounts_override.load_override(ov_path)
         flagged = accounts_override.legacy_disabled_accounts(override_doc)
         if not flagged:
@@ -131,19 +152,19 @@ def upgrade_legacy_disabled(accounts=None, *, override_path=None, policy_file=No
             allowed = [name for name in known if name not in flagged]
             policy = {'allowed_accounts': allowed, 'known_accounts': list(dict.fromkeys([*allowed, *flagged]))}
         # Write host-policy.json first so a crash before cleaning accounts-override.json never loses the user's choice.
-        override_store.write(pol_path, policy)
+        _write_upgrade_file(pol_path, policy)
         for name in flagged:
             entry = (override_doc.get('accounts') or {}).get(name)
             if isinstance(entry, dict) and entry.get('verified') is False:
                 entry.pop('verified', None)
-        override_store.write(ov_path, override_doc)
+        _write_upgrade_file(ov_path, override_doc)
         return flagged
 
 
 def sync_discovered(accounts):
     """Admit only unseen, ready registered accounts; a known omission is an intentional deny."""
     policy = load_policy()
-    if policy is None:
+    if policy is None or 'allowed_accounts' not in policy:
         return {'mode': 'default', 'added': []}
     if 'known_accounts' not in policy:
         return {'mode': 'static', 'added': []}
@@ -175,8 +196,10 @@ def sync_discovered(accounts):
     path = policy_path()[0]
     with override_store.locked(path):
         policy = load_policy()
-        if policy is None or 'known_accounts' not in policy:
-            return {'mode': 'default' if policy is None else 'static', 'added': []}
+        if policy is None or 'allowed_accounts' not in policy:
+            return {'mode': 'default', 'added': []}
+        if 'known_accounts' not in policy:
+            return {'mode': 'static', 'added': []}
         seen = set(policy['known_accounts']) | set(policy['allowed_accounts'])
         added = [name for name in ready if name not in seen]
         if added:
@@ -187,14 +210,19 @@ def sync_discovered(accounts):
 
 
 def account_allowed(policy, account):
-    """Whether the account takes part in automatic routing on this host (no policy file: every account does).
+    """Whether the account takes part in automatic routing on this host (no policy file: every account does, unless
+    denied by an un-migrated legacy `verified: false` in accounts-override.json).
 
     An account outside `allowed_accounts` is never chosen by the router: not by a plan, a fallback, an automatic resume
     of an idle worker, nor as the scorer. It is not banned: a route the user names in the request still
     dispatches on it (`route_judge.record_constraint`, constraint `user_override`), and a turn to an existing session on
     it is not a routing choice. The model-management checkbox is the same kind of switch for a model
     (`model_unchecked`)."""
-    return policy is None or account in policy['allowed_accounts']
+    if policy is None:
+        return True
+    if 'allowed_accounts' in policy:
+        return account in policy['allowed_accounts']
+    return account not in (policy.get('denied_accounts') or ())
 
 
 def outside_routing(account):
@@ -216,6 +244,12 @@ def sync_failed(error):
     return (f'host-policy.json could not be updated with newly discovered accounts ({error}); an account discovered since '
             'it was last written is not in its allowed_accounts, so it stays out of automatic routing until the file can '
             'be written')
+
+
+def upgrade_failed(error):
+    """The one wording of an `upgrade_legacy_disabled` that could not write (`account_fleet.load_accounts` keeps the error)."""
+    return (f'legacy verified=false account-off setting could not be upgraded on disk ({error}); the affected account '
+            'stays out of automatic routing in memory until the file can be written')
 
 
 def model_unchecked(bundle, accounts):

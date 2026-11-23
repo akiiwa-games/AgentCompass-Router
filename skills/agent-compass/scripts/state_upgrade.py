@@ -144,6 +144,41 @@ def check_accounts_override(path: Path) -> str | None:
     return None
 
 
+def _path_writable(path: Path) -> bool:
+    """Read-only writability check without creating or modifying files."""
+    if path.exists():
+        return os.access(path, os.W_OK)
+    parent = path.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    return os.access(parent, os.W_OK)
+
+
+def check_legacy_disabled_upgrade(accounts_path: Path, policy_path: Path) -> str | None:
+    """Read-only: flag when a lingering `verified: false` cannot be upgraded because a target file is not writable."""
+    if not accounts_path.exists():
+        return None
+    import accounts_override
+    try:
+        doc = accounts_override.load_override(accounts_path)
+    except (OSError, ValueError):
+        return None
+    flagged = accounts_override.legacy_disabled_accounts(doc)
+    if not flagged:
+        return None
+    unwritable = [p for p in (policy_path, accounts_path) if not _path_writable(p)]
+    if not unwritable:
+        return None
+    target = unwritable[0]
+    extra = f' (and {unwritable[1]})' if len(unwritable) > 1 else ''
+    return format_issue(
+        target,
+        f'legacy verified=false account-off setting ({", ".join(flagged)}) cannot be upgraded because {target}{extra} '
+        'is not writable (the exclusion stays enforced in memory)',
+        f'make "{target}" writable and run "agentcompass providers" or "agentcompass setup"',
+    )
+
+
 def host_policy_fix(path: Path | str) -> str:
     return ('edit the file to a JSON object with "allowed_accounts" (a list of account names) and, if wanted, '
             '"known_accounts", "usage_providers" (lists of names), or '
@@ -495,6 +530,7 @@ def collect_issues(home: Path | None = None, environ: dict | None = None) -> lis
 
     for issue in (
         check_accounts_override(accounts_path),
+        check_legacy_disabled_upgrade(accounts_path, policy_path),
         check_usage_config(sdir / 'usage-config.json'),
         check_host_policy(policy_path),
         check_user_scores(sdir / 'user-scores.json'),

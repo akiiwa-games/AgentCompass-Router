@@ -450,6 +450,98 @@ class HostPolicyTests(unittest.TestCase):
             host_policy.upgrade_legacy_disabled(override_path=override, policy_file=self.path)
         self.assertEqual(override.read_bytes(), before_ov)
 
+    def test_legacy_verified_false_excluded_when_host_policy_absent_or_write_fails(self):
+        """Rule (AGENTS.md, what a released version wrote for the user is kept): a lingering `verified: false` keeps
+        the account out of automatic routing in every path — with no host-policy.json, for a read-only caller, and
+        when the upgrade write fails (PermissionError / TimeoutError)."""
+        import override_store
+        import provider_inventory
+        self.path.unlink(missing_ok=True)
+        override = self.path.parent / 'accounts-override.json'
+        override.write_text(json.dumps({
+            'schema_version': 2, 'accounts': {'codex': {'verified': False}},
+        }), encoding='utf-8', newline='\n')
+        before_ov = override.read_bytes()
+        with patch.dict(host_policy.os.environ, {'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(override)}):
+            # 1. Read-only load_policy with no host-policy.json still denies codex and writes nothing.
+            pol = host_policy.load_policy()
+            self.assertFalse(host_policy.account_allowed(pol, 'codex'))
+            self.assertTrue(host_policy.account_allowed(pol, 'claude'))
+            self.assertFalse(self.path.exists())
+            self.assertEqual(override.read_bytes(), before_ov)
+            self.assertEqual(host_policy.sync_discovered(self.registered(codex='ready', claude='ready')),
+                             {'mode': 'default', 'added': []})
+            self.assertFalse(self.path.exists())
+            # 2. allocator.plan on the no-policy-file case excludes every codex bundle.
+            planned = self.plan()
+            codex_rows = [r for r in planned['ranking'] if r['bundle']['account'] == 'codex']
+            self.assertTrue(codex_rows)
+            self.assertTrue(all('excluded by host policy' in r['excluded'] for r in codex_rows))
+            # 3. When upgrade write fails (PermissionError / TimeoutError), load_accounts records the error naming the
+            # file, and allocator.plan still excludes codex and surfaces the warning.
+            ref = account_fleet.reference_fleet_document()
+            ref_disc = {
+                'accounts': {n: {'family': s.get('family') or n, 'status': 'ready', 'plan': s.get('plan') or 'pro',
+                                 'billing': s.get('billing') or 'subscription', 'sources': ['native'], 'verified': True,
+                                 'models': list({b.get('launch_model') or b['model'] for b in (s.get('bundles') or {}).values()})}
+                             for n, s in ref['accounts'].items()},
+                'launchers': {n: {'family': s.get('family') or n, 'status': 'ready'} for n, s in ref['accounts'].items()},
+            }
+            for exc in (PermissionError('read-only fs'), TimeoutError('Override store is busy')):
+                with self.subTest(exc=type(exc).__name__), \
+                     patch.object(account_fleet, 'fleet_document', return_value=ref), \
+                     patch.object(provider_inventory, 'current', return_value=ref_disc), \
+                     patch.object(override_store, 'write', side_effect=exc):
+                    accts = account_fleet.load_accounts()
+                    sync = accts.get('_host_policy_sync') or {}
+                    self.assertEqual(sync.get('mode'), 'error')
+                    self.assertIn(str(self.path), sync.get('error', ''))
+                    planned_fail = allocator.plan(
+                        {'work_kind': 'code_implementation', 'difficulty': 'hard'},
+                        {'accounts': {}}, now=self.now, accounts=accts, overrides=[], records=[],
+                    )
+                    rows = [r for r in planned_fail['ranking'] if r['bundle']['account'] == 'codex']
+                    self.assertTrue(rows)
+                    self.assertTrue(all('excluded by host policy' in r['excluded'] for r in rows))
+                    warnings = planned_fail.get('decision', {}).get('warnings') or []
+                    self.assertTrue(any(str(self.path) in w for w in warnings), warnings)
+
+    def test_load_accounts_read_only_writes_neither_upgrade_nor_sync_discovered(self):
+        """Rule: read-only fleet loading (plan --dry-run, route_simulation) writes neither host-policy.json nor
+        accounts-override.json, whether a legacy verified=false or a newly discovered account is present."""
+        import provider_inventory
+        override = self.path.parent / 'accounts-override.json'
+        ref = account_fleet.reference_fleet_document()
+        ref_disc = {
+            'accounts': {n: {'family': s.get('family') or n, 'status': 'ready', 'plan': s.get('plan') or 'pro',
+                             'billing': s.get('billing') or 'subscription', 'sources': ['native'], 'verified': True,
+                             'models': list({b.get('launch_model') or b['model'] for b in (s.get('bundles') or {}).values()})}
+                         for n, s in ref['accounts'].items()},
+            'launchers': {n: {'family': s.get('family') or n, 'status': 'ready'} for n, s in ref['accounts'].items()},
+        }
+        # Case A: legacy verified=false, no host-policy.json.
+        self.path.unlink(missing_ok=True)
+        override.write_text(json.dumps({'schema_version': 2, 'accounts': {'codex': {'verified': False}}}),
+                            encoding='utf-8', newline='\n')
+        before_ov = override.read_bytes()
+        with patch.dict(host_policy.os.environ, {'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(override)}), \
+             patch.object(account_fleet, 'fleet_document', return_value=ref), \
+             patch.object(provider_inventory, 'current', return_value=ref_disc):
+            account_fleet.load_accounts(read_only=True)
+            self.assertFalse(self.path.exists())
+            self.assertEqual(override.read_bytes(), before_ov)
+            self.assertFalse(host_policy.account_allowed(host_policy.load_policy(), 'codex'))
+
+        # Case B: existing host-policy.json with known_accounts missing a newly discovered ready account.
+        override.unlink(missing_ok=True)
+        self.write({'allowed_accounts': ['claude'], 'known_accounts': ['claude']})
+        before_pol = self.path.read_bytes()
+        with patch.dict(host_policy.os.environ, {'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(override)}), \
+             patch.object(account_fleet, 'fleet_document', return_value=ref), \
+             patch.object(provider_inventory, 'current', return_value=ref_disc):
+            account_fleet.load_accounts(read_only=True)
+            self.assertEqual(self.path.read_bytes(), before_pol)
+
 
 if __name__ == '__main__':
     unittest.main()

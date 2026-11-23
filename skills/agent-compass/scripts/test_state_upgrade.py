@@ -276,3 +276,23 @@ def test_legacy_verified_false_is_accepted_read_only_for_automatic_upgrade(tmp_p
     path.write_text(stored, encoding='utf-8')
     assert state_upgrade.check_accounts_override(path) is None
     assert path.read_text(encoding='utf-8') == stored
+
+
+def test_doctor_reports_unwritable_file_when_legacy_verified_false_cannot_upgrade(tmp_path):
+    import stat
+    state = tmp_path / '.agent-compass'
+    state.mkdir()
+    ov = state / 'accounts-override.json'
+    pol = state / 'host-policy.json'
+    ov.write_text(json.dumps({'schema_version': 2, 'accounts': {'codex': {'verified': False}}}), encoding='utf-8')
+    pol.write_text(json.dumps({'allowed_accounts': ['claude'], 'known_accounts': ['claude', 'codex']}), encoding='utf-8')
+    os.chmod(ov, stat.S_IREAD)
+    try:
+        issues = state_upgrade.collect_issues(home=tmp_path, environ={
+            'ROUTER_STATE_DIR': str(state),
+            'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(ov),
+            'ROUTER_HOST_POLICY': str(pol),
+        })
+        assert any(str(ov) in issue and 'verified' in issue for issue in issues), issues
+    finally:
+        os.chmod(ov, stat.S_IWRITE | stat.S_IREAD)
