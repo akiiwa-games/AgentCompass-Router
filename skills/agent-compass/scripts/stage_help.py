@@ -38,7 +38,7 @@ STAGES = {
                  ('list', 'clear', 'account', 'model', 'basis'),
                  ('intent', 'window', 'resets_in', 'resets_at', 'expires_in', 'expires_at', 'boost', 'until', 'stop_on_reset',
                   'reset_confirmation', 'rebaseline', 'usage_cache')),
-    'dispatch': ('Drive one dispatch through its lifecycle (prepare, start, status, reconcile, release, fallback, settle).',
+    'dispatch': ('Drive one dispatch through its lifecycle (prepare, start, status, reconcile, release, fallback, abandon, settle).',
                  'dispatch --dispatch-action status --dispatch-id ID', ('dispatch_action', 'dispatch_id'),
                  ('input', 'parent_id', 'basis', 'usage_cache')),
     'launch': ('Start a prepared dispatch, or observe it (the continuation a roll hands back), watching for its answer.',

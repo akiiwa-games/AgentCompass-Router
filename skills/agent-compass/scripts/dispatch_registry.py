@@ -919,7 +919,8 @@ def _plus(value, seconds):
 
 def _unhandled_covered(by_id, row, now):
     """A failed attempt whose failure the fallback covers and that no fallback step holds or decided: no `handled`
-    entry in its chain, or a claim whose own `until` lapsed (its holder died). The fallback is on."""
+    entry in its chain, or a claim no longer held (`claim_held`: its holder ended or its lease lapsed). The fallback is
+    on."""
     import dispatch_fallback
     if row.get('state') not in ('failed', 'create_failed') or not dispatch_fallback.enabled():
         return False
@@ -927,7 +928,7 @@ def _unhandled_covered(by_id, row, now):
     handled = ((root.get('fallback') or {}).get('handled') or {}).get(row['dispatch_id'])
     if isinstance(handled, dict) and handled.get('action') != 'pending':
         return False
-    if isinstance(handled, dict) and later(handled.get('until'), now):
+    if claim_held(handled, now):
         return False
     return bool(dispatch_fallback.failure_of(row)['covered'])
 
@@ -973,11 +974,12 @@ def _chain_hold(by_id, row, now):
     is final for this attempt, or no fallback applies: the notice is sent).
 
     What ends `open`: a fallback step's outcome (relaunched, final, scheduled); a scheduled retry's guard lapsing (its
-    claim then retires the retry, `dispatch_fallback.Chain.claim`, so it never starts); a claim's own `until` lapsing;
+    claim then retires the retry, `dispatch_fallback.Chain.claim`, so it never starts); a claim no longer held
+    (`claim_held`: its holder ended, or its own `until` lapsed);
     the fallback switched off (`AGENTCOMPASS_ROLL_FALLBACK=off`: nothing more is relaunched); and, for a failure no
     observer took, the end of its hold (`_hold_end`). `reconcile` observes such a failure meanwhile (`_awaits_fallback`)
-    so its watcher is restarted and the fallback runs. A live watcher's open fallback is one of these: the watcher holds
-    a claim (`pending`) or a scheduled retry while it runs, so no pid is read here."""
+    so its watcher is restarted and the fallback runs. A live watcher's open fallback is one of these: its step holds a
+    claim (`pending`, naming the step's process) or a scheduled retry while it runs."""
     import dispatch_fallback
     root = by_id.get(chain_root(row), row)
     fallback = root.get('fallback') or {}
@@ -989,7 +991,7 @@ def _chain_hold(by_id, row, now):
         return None, None
     if action == 'scheduled':
         return ('open', fallback.get('until')) if fallback_guard(root, now) else (None, None)
-    if action == 'pending' and later(handled.get('until'), now):
+    if claim_held(handled, now):
         return 'open', handled['until']
     if not _unhandled_covered(by_id, row, now):
         return None, None
@@ -1603,22 +1605,12 @@ def retire_scheduled(fallback, now, result, next_action, root_id=None, *, curren
 
 def fallback_guard(row, now):
     """AgentCompass is between two attempts of this brief (waiting out a transient backoff or relaunching): no worker
-    runs, but one is about to, so the brief counts as dispatched until the guard lapses."""
+    runs, but one is about to, so the brief counts as dispatched until the guard lapses. A relaunch or claim whose step
+    stopped (`claim_stopped`) is no guard: nothing is about to run until a step takes it over."""
     guard = row.get('fallback') or {}
-    if guard.get('state') in ('retrying', 'relaunching') and isinstance(guard.get('until'), str):
-        try:
-            if parse(guard['until']) > now:
-                return True
-        except ValueError:
-            pass
-    for item in (guard.get('handled') or {}).values():
-        if isinstance(item, dict) and item.get('action') == 'pending' and isinstance(item.get('until'), str):
-            try:
-                if parse(item['until']) > now:
-                    return True
-            except ValueError:
-                pass
-    return False
+    if guard.get('state') == 'retrying' and later(guard.get('until'), now) or relaunch_held(guard, now):
+        return True
+    return any(claim_held(item, now) for item in (guard.get('handled') or {}).values())
 
 
 def unresolved(row, now, exempt_chain=None):
@@ -2130,6 +2122,89 @@ def later(first, second):
         return isinstance(first, str) and isinstance(second, datetime) and parse(first) > second
     except ValueError:
         return False
+
+
+def process_started(pid):
+    """When process `pid` started, as the OS counts it (Windows: its creation FILETIME; Linux: its start tick), so a pid
+    the OS reused for another process does not read as the same one. None when no such process runs; 0 where the OS
+    gives no start time (the pid alone then names it)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
+                return None   # ended: a handle someone still holds keeps its pid open, not the process running
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                return None
+            return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return 0
+    except OSError:
+        return None
+    return 0
+
+
+def process_identity():
+    """This process, as a fallback step's claim names its holder (`claim_held`)."""
+    return {'pid': os.getpid(), 'started': process_started(os.getpid())}
+
+
+def step_running(record):
+    """The step a claim or a relaunch in progress names (`holder`) is still at it: it did not release it
+    (`released_at`, dispatch_fallback.Chain.release) and its process still runs. A record that names no holder (written
+    before records named one) is taken at its word until its lease ends."""
+    if not isinstance(record, dict) or record.get('released_at'):
+        return False
+    holder = record.get('holder')
+    if not isinstance(holder, dict):
+        return True
+    started = process_started(holder.get('pid'))
+    return started is not None and holder.get('started') in (None, started)
+
+
+def claim_held(item, now):
+    """A fallback step's claim on a failed attempt (`pending`, dispatch_fallback.Chain.claim) that still binds: its lease
+    runs and its step is still at it (`step_running`). The step's process ending (it exited or was killed, the machine
+    restarted) releases it at once for whoever reads it next; so does the step itself when it stops by an exception
+    (dispatch_fallback.handle). Only a held claim keeps others from taking the attempt over or keeps the brief counted
+    as being relaunched."""
+    return isinstance(item, dict) and item.get('action') == 'pending' and later(item.get('until'), now) \
+        and step_running(item)
+
+
+def relaunch_held(fallback, now):
+    """A step is launching the brief's next attempt (`relaunching`) inside its lease, and is still at it."""
+    return fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and step_running(fallback)
+
+
+def claim_stopped(fallback, now):
+    """A step took this brief's failed attempt and stopped before it finished: inside its lease, a claim (or a relaunch
+    in progress) whose step is no longer at it. Nothing runs the brief until the next step takes the claim over."""
+    if fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and not step_running(fallback):
+        return True
+    return any(isinstance(item, dict) and item.get('action') == 'pending' and later(item.get('until'), now)
+               and not step_running(item) for item in (fallback.get('handled') or {}).values())
 
 
 def agent_resumed(snapshot, row, terminal=None):

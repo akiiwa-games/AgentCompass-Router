@@ -4,7 +4,10 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import textwrap
+import time
 import unittest
 from unittest.mock import patch
 
@@ -888,6 +891,166 @@ class FallbackTests(unittest.TestCase):
                                  ('final', 'resumed', root['dispatch_id']))
                 self.assertFalse(any('switched to' in line for line in fb['lines']), fb['lines'])
                 self.assertEqual(self.fallback_lines()[-1]['action'], 'resumed')
+
+
+    # A step that stopped: its claim ends with it, not with RUN_LEASE (experience run, round 3).
+
+    @staticmethod
+    def ended_process():
+        """The identity of a process that ran and exited, as a claim it took names its holder."""
+        child = subprocess.Popen([sys.executable, '-c', 'pass'])
+        child.wait()
+        return {'pid': child.pid, 'started': 1}
+
+    def killed_step(self, root, relaunching=False):
+        """The watcher's fallback step took the attempt's claim and its process was killed outright: nothing of it ran
+        past the claim (or, `relaunching`, past preparing the next attempt), and no handler of its own ran."""
+        class Killed(BaseException):
+            pass
+
+        def die(*_, **__):
+            raise Killed()
+        with patch.object(registry, 'process_identity', return_value=self.ended_process()), \
+                patch.object(fallback.Chain, 'release', lambda *_: None), \
+                patch.object(*((flow, 'launch') if relaunching else (fallback.Chain, 'run')), die), \
+                self.assertRaises(Killed):
+            self.handle(root['dispatch_id'])
+
+    def failed_root(self):
+        root = self.first()
+        self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
+        return root
+
+    def test_a_killed_steps_claim_is_taken_over_at_once_and_nothing_promises_a_relaunch_meanwhile(self):
+        root = self.failed_root()
+        self.killed_step(root)
+        row = registry.inspect(root['dispatch_id'])
+        self.assertFalse(registry.fallback_guard(row, registry.utcnow()))
+        self.assertEqual(flow.public_chain(row)['next_action'], flow.FALLBACK_STOPPED_NEXT)
+        # The watcher saw its step end without an answer and runs it once more: it takes the claim over, no lease wait.
+        with self.at(minutes=1):
+            out = self.handle(root['dispatch_id'])
+        self.assertEqual(out['action'], 'relaunched')
+        self.assertEqual(len(self.host.creates), 2)
+        self.assert_one_worker()
+
+    def test_observing_the_dispatch_takes_over_a_killed_step(self):
+        """Nobody's watcher left (the machine restarted): the parent's next_argv observation carries the step."""
+        root = self.failed_root()
+        self.killed_step(root)
+        real_handle = fallback.handle
+        with self.at(minutes=1), patch.object(fallback, 'handle', side_effect=lambda dispatch_id, **kw: real_handle(
+                dispatch_id, **dict(kw, judge=self.judge))):
+            seen = flow.launch(root['dispatch_id'], 'parent-a', host=self.host, watch_seconds=0)
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotEqual(seen['dispatch_id'], root['dispatch_id'])
+        self.assertEqual(seen['dispatch_id'], registry.current_attempt(root['dispatch_id']))
+        self.assert_one_worker()
+
+    def test_a_step_that_stops_by_an_exception_releases_its_claim(self):
+        """roll's own synchronous step or a CLI step interrupted (an error of its own, Ctrl+C): released on the way out."""
+        root = self.failed_root()
+        with patch.object(self.judge, 'plan_task', side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.handle(root['dispatch_id'])
+        fb = registry.inspect(root['dispatch_id'])['fallback']
+        self.assertFalse(registry.claim_held(fb['handled'][root['dispatch_id']], registry.utcnow()))
+        self.assertEqual(flow.public_chain(registry.inspect(root['dispatch_id']))['next_action'], flow.FALLBACK_STOPPED_NEXT)
+        out = self.handle(root['dispatch_id'])
+        self.assertEqual(out['action'], 'relaunched')
+        self.assertEqual(len(self.host.creates), 2)
+
+    def test_taking_over_a_step_killed_while_relaunching_releases_the_attempt_it_only_prepared(self):
+        root = self.failed_root()
+        self.killed_step(root, relaunching=True)
+        fb = registry.inspect(root['dispatch_id'])['fallback']
+        prepared = fb['current']
+        self.assertEqual((fb['state'], registry.inspect(prepared)['state']), ('relaunching', 'prepared'))
+        self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
+        self.assertTrue(registry.claim_stopped(fb, registry.utcnow()))
+        out = self.handle(root['dispatch_id'])
+        self.assertEqual(out['action'], 'relaunched')
+        self.assertNotEqual(out['dispatch_id'], prepared)
+        self.assertNotEqual(registry.inspect(prepared)['state'], 'prepared')
+        self.assertNotIn(prepared, [a.get('dispatch_id') for a in out['attempts']])
+        self.assertEqual(len(self.host.creates), 2)
+        self.assert_one_worker()
+
+    def test_a_step_that_ends_twice_without_an_answer_closes_the_brief_as_not_relaunched(self):
+        root = self.failed_root()
+        self.killed_step(root)
+        self.killed_step(root)    # the watcher's one retry took the claim over and ended the same way
+        out = fallback.abandon(root['dispatch_id'], judge=self.judge, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn(fallback.STEP_STOPPED_DETAIL, out['text'])
+        self.assertIn('nothing is running it', out['text'])
+        # Every later reader says the same and starts nothing: a step, an observation, the dispatch's own answer.
+        self.assertEqual(self.handle(root['dispatch_id'])['text'], out['text'])
+        self.assertIsNone(fallback.resume_due(root['dispatch_id'], host=self.host))
+        row = registry.inspect(root['dispatch_id'])
+        self.assertEqual(flow.public_chain(row)['next_action'], out['text'])
+        self.assertFalse(registry.fallback_guard(row, registry.utcnow()))
+        self.assertEqual(len(self.host.creates), 1)
+
+    def test_abandon_leaves_a_claim_a_running_step_holds(self):
+        root = self.failed_root()
+        fallback.Chain.of(root, judge=self.judge, host=self.host).claim(root['dispatch_id'])   # held by this process
+        self.assertEqual(fallback.abandon(root['dispatch_id'], judge=self.judge, host=self.host)['action'], 'pending')
+        self.assertEqual(registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]['action'],
+                         'pending')
+
+    def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
+        """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim
+        on the real SQLite file at once, exactly one takes it and the others read it as being relaunched. Each stays
+        alive until all have answered, so the winner's claim is still held while the others read it."""
+        root = self.failed_root()
+        self.killed_step(root)
+        sync = self.root / 'race'
+        sync.mkdir()
+        script = textwrap.dedent('''
+            import json, os, sys, time
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            import dispatch_fallback, dispatch_registry
+            root_id, sync, me = sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+            chain = dispatch_fallback.Chain.of(dispatch_registry.inspect(root_id))
+            (sync / f'ready-{me}').write_text('')
+            while not (sync / 'go').exists():
+                time.sleep(0.002)
+            try:
+                chain.claim(root_id)
+                answer = {'took': True, 'pid': os.getpid()}
+            except dispatch_fallback.AlreadyHandled as done:
+                answer = {'took': False, 'action': done.outcome.get('action')}
+            (sync / f'answer-{me}').write_text(json.dumps(answer))
+            while not (sync / 'done').exists():
+                time.sleep(0.01)
+        ''')
+        scripts = str(Path(fallback.__file__).resolve().parent)
+        children = [subprocess.Popen([sys.executable, '-X', 'utf8', '-c', script, scripts, root['dispatch_id'], str(sync),
+                                      str(n)]) for n in range(4)]
+        try:
+            deadline = time.monotonic() + 120
+            while len(list(sync.glob('ready-*'))) < 4 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            (sync / 'go').write_text('')
+            while len(list(sync.glob('answer-*'))) < 4 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            answers = [json.loads(p.read_text()) for p in sync.glob('answer-*')]
+        finally:
+            (sync / 'done').write_text('')
+            for child in children:
+                try:
+                    child.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+        self.assertEqual(len(answers), 4, answers)
+        winners = [a for a in answers if a['took']]
+        self.assertEqual(len(winners), 1, answers)
+        self.assertEqual([a['action'] for a in answers if not a['took']], ['pending'] * 3)
+        item = registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]
+        self.assertEqual(item['holder']['pid'], winners[0]['pid'])
+        self.assertEqual(len(self.host.creates), 1)
 
 
 class RollFallbackTests(unittest.TestCase):

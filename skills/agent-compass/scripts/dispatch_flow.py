@@ -107,6 +107,11 @@ MANUAL_NEXT = {
 }
 FALLBACK_RUNNING_NEXT = ('AgentCompass is relaunching this brief itself ({where}); do not roll it again. Run next_argv to '
                          'observe the current attempt; the parent is notified once the dispatch reaches a final state.')
+# A step took the failed attempt and stopped before it finished (registry.claim_stopped): observing the dispatch
+# (next_argv: dispatch launch, dispatch_fallback.resume_due) or the failed attempt's watcher takes the step over.
+FALLBACK_STOPPED_NEXT = ('The AgentCompass step that was relaunching this brief stopped before it finished, so nothing '
+                         'runs the brief at this moment. Run next_argv: observing the dispatch takes the step over and '
+                         'relaunches the brief, or answers why it cannot. Do not roll it again before that.')
 FALLBACK_SCHEDULED_NEXT = ('The last attempt hit a transient provider failure; AgentCompass retries the same model by itself '
                            'at {retry_at} (its backoff) and nothing runs this brief until then. Do not roll it again. Run '
                            'next_argv after that time to observe the retry; the parent is notified once the dispatch '
@@ -332,15 +337,18 @@ def host_call(payload):
 
 def bridge_env():
     """The bridge's environment. Its watcher (a detached child) hands a failed attempt to `agentcompass dispatch
-    --dispatch-action fallback` before it tells the parent anything (paseo_dispatch_bridge.mjs runFallback), and
-    settles the registry with `--dispatch-action settle` before every exit."""
+    --dispatch-action fallback` before it tells the parent anything (paseo_dispatch_bridge.mjs runFallback), closes
+    the attempt with `--dispatch-action abandon` when that step ended twice without an answer, and settles the registry
+    with `--dispatch-action settle` before every exit."""
     env = dict(os.environ)
     env['AGENTCOMPASS_CONTINUATION_ARGV'] = json.dumps(entry.argv('continuation-verdict'))
     env['AGENTCOMPASS_SETTLE_ARGV'] = json.dumps(entry.argv('dispatch', '--dispatch-action', 'settle'))
     if dispatch_fallback.enabled():
         env['AGENTCOMPASS_FALLBACK_ARGV'] = json.dumps(entry.argv('dispatch', '--dispatch-action', 'fallback'))
+        env['AGENTCOMPASS_ABANDON_ARGV'] = json.dumps(entry.argv('dispatch', '--dispatch-action', 'abandon'))
     else:
         env.pop('AGENTCOMPASS_FALLBACK_ARGV', None)
+        env.pop('AGENTCOMPASS_ABANDON_ARGV', None)
     return env
 
 
@@ -402,6 +410,8 @@ def with_fallback(out, row, fallback, now=None):
                    next_action=FALLBACK_SCHEDULED_NEXT.format(retry_at=fallback['retry_at']))
     elif registry.fallback_guard({'fallback': fallback}, now or registry.utcnow()):
         out['next_action'] = FALLBACK_RUNNING_NEXT.format(where=(fallback.get('lines') or ['attempt 1'])[-1])
+    elif registry.claim_stopped(fallback, now or registry.utcnow()):
+        out['next_action'] = FALLBACK_STOPPED_NEXT
     elif fallback.get('state') == 'relaunched' and fallback.get('current') not in (None, row['dispatch_id']) \
             and row['state'] in registry.TERMINAL:
         out['next_action'] = FALLBACK_RELAUNCHED_NEXT.format(current=fallback['current'])
@@ -951,6 +961,10 @@ def cli(args):
         if not args.dispatch_id:
             raise ValueError('fallback requires --dispatch-id')
         return dispatch_fallback.handle(args.dispatch_id)
+    if action == 'abandon':
+        if not args.dispatch_id:
+            raise ValueError('abandon requires --dispatch-id')
+        return dispatch_fallback.abandon(args.dispatch_id)
     if action == 'settle':
         if not args.dispatch_id:
             raise ValueError('settle requires --dispatch-id')

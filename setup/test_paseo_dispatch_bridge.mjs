@@ -10,7 +10,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import {setTimeout as pause} from 'node:timers/promises';
 import {execute, project, normalizeProviderModels, notificationStep, notificationEvents, ensureNotification, notificationReceipt,
   creationFailureClass, creationFailureCode, creationRecord, resolvePaseoPlacement, subscriptionLapsed, providerRetry, retryStreak, retryIsStuck,
-  workedBeforeRetrying, endedOnReply, turnFailure, RETRY_STUCK_CODE, TURN_FAILED_CODE, fallbackArgv, runFallback,
+  workedBeforeRetrying, endedOnReply, turnFailure, RETRY_STUCK_CODE, TURN_FAILED_CODE, fallbackArgv, abandonArgv, runFallback,
   attemptsNote, notificationFile, agentResumed, settleArgv, settleBeforeExit,
   finalReplyText, reportSection, composeNotice, notifyEnd, hostFailure, hostFailureClass, CONDITIONS, RECORDED_ENDS,
   BridgeError, createClient, continuationVerdict, REPORT_INLINE_LIMIT, REPORT_SUMMARY_LIMIT} from './paseo_dispatch_bridge.mjs';
@@ -1394,6 +1394,52 @@ test('a failure the fallback step declines or cannot read is reported as before'
   const f = watchFixture();
   assert.equal(await notificationStep(f.client, f.record, f.persist, 10, async () => assert.fail('finish')), true);
   assert.equal(f.calls.length, 1);
+});
+
+// A fallback step whose process ends without an answer ended its claim with it (dispatch_registry.claim_held): the
+// watcher runs the same step once more, and when that ends the same way it closes the attempt first
+// (`--dispatch-action abandon`, dispatch_fallback.abandon), so its one notice says what the registry says.
+test('a fallback step that ends without an answer runs once more, then the attempt is closed and told once', async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-abandon-'));
+  const saved = {fallback: process.env.AGENTCOMPASS_FALLBACK_ARGV, abandon: process.env.AGENTCOMPASS_ABANDON_ARGV};
+  try {
+    const runs = path.join(folder, 'runs.txt'), dies = path.join(folder, 'dies.mjs'), closes = path.join(folder, 'closes.mjs');
+    const text = 'AgentCompass hit an internal error of its own while starting the next attempt of this brief after its ' +
+      'failure, so nothing is running it:\nattempt 1: m1 on a1 failed: worker_error\nthe next attempt could not be ' +
+      'chosen: step_stopped (the step that relaunches it ended twice without an answer)';
+    fs.writeFileSync(dies, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(runs)}, 'fallback,'); process.exit(3);`);
+    fs.writeFileSync(closes, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(runs)}, 'abandon,'); ` +
+      `console.log(JSON.stringify(${JSON.stringify({action: 'final', result: 'not_relaunched', root_dispatch_id: 'root',
+        text, lines: ['attempt 1: m1 on a1 failed: worker_error']})}));`);
+    process.env.AGENTCOMPASS_FALLBACK_ARGV = JSON.stringify([process.execPath, dies]);
+    process.env.AGENTCOMPASS_ABANDON_ARGV = JSON.stringify([process.execPath, closes]);
+    const f = watchFixture();
+    f.setAgent({status: 'error'});
+    assert.equal(await notificationStep(f.client, f.record, f.persist, 10), true);
+    assert.equal(fs.readFileSync(runs, 'utf8'), 'fallback,fallback,abandon,');
+    assert.equal(f.calls.length, 1);
+    assert.match(f.calls[0][1], /State: not_relaunched\n/);
+    assert.match(f.calls[0][1], /ended twice without an answer/);
+    assert.equal(await notificationStep(f.client, f.record, f.persist, 20), true);
+    assert.equal(f.calls.length, 1);
+  } finally {
+    for (const [key, value] of [['AGENTCOMPASS_FALLBACK_ARGV', saved.fallback], ['AGENTCOMPASS_ABANDON_ARGV', saved.abandon]])
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    fs.rmSync(folder, {recursive: true, force: true});
+  }
+  // The retry that answers is the outcome: nothing is closed.
+  const g = watchFixture();
+  g.setAgent({status: 'error'});
+  const asked = [];
+  assert.equal(await notificationStep(g.client, g.record, g.persist, 10, async (record, action) => {
+    asked.push(action);
+    return asked.length === 1 ? null : {action: 'relaunched', dispatch_id: 'child-2'};
+  }), true);
+  assert.deepEqual(asked, ['fallback', 'fallback']);
+  assert.equal(g.record.status, 'relaunched');
+  assert.equal(g.calls.length, 0);
+  assert.equal(abandonArgv({}), null);
+  assert.deepEqual(abandonArgv({AGENTCOMPASS_ABANDON_ARGV: '["agentcompass","dispatch"]'}), ['agentcompass', 'dispatch']);
 });
 
 test('another observer relaunching the attempt makes this watcher look again later', async () => {

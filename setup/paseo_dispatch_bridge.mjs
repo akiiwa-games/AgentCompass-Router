@@ -72,6 +72,15 @@ export function fallbackArgv(env = process.env) {
   } catch { return null; }
 }
 
+// `agentcompass dispatch --dispatch-action abandon`, handed down beside the fallback step: it closes a failed attempt
+// whose step ended twice without an answer (dispatch_fallback.abandon). Absent, such an attempt is told as unavailable.
+export function abandonArgv(env = process.env) {
+  try {
+    const argv = JSON.parse(env.AGENTCOMPASS_ABANDON_ARGV ?? '');
+    return Array.isArray(argv) && argv.length && argv.every(a => typeof a === 'string' && a) ? argv : null;
+  } catch { return null; }
+}
+
 // The command dispatch_flow.bridge_env always hands down: `agentcompass dispatch --dispatch-action settle`.
 // Absent (an old parent that did not pass it), the watcher still exits and the next reservation read settles from disk.
 export function settleArgv(env = process.env) {
@@ -123,7 +132,8 @@ export function continuationVerdict(agentId, env = process.env) {
   });
 }
 
-const defaultFallback = record => runFallback(record.dispatch_id);
+const defaultFallback = (record, action = 'fallback') =>
+  runFallback(record.dispatch_id, action === 'abandon' ? abandonArgv() : fallbackArgv());
 
 // What dispatch_fallback.write_attempts_file left for a relaunched attempt: the parent's dispatch id and the attempts.
 export function attemptsNote(file) {
@@ -807,7 +817,13 @@ export async function notificationStep(client, record, persist, now = Date.now()
         && record.fallback?.status !== 'done') {
       record.fallback = {status: 'running', at: new Date(now).toISOString()};
       persist();
-      const outcome = await Promise.resolve(fallback(record)).catch(() => null);
+      const step = action => Promise.resolve(fallback(record, action)).catch(() => null);
+      // A step that ended without an answer (its process exited, or its output could not be read) ended its claim with
+      // it (the claim names the step's process: dispatch_registry.claim_held), so the same step runs once more and
+      // takes the attempt over. Twice without an answer, the attempt is closed in the registry first (`abandon`:
+      // not_relaunched), so this watcher's one notice and every later observation say the same.
+      let outcome = await step('fallback') ?? await step('fallback');
+      if (!outcome) outcome = await step('abandon');
       if (outcome?.action === 'pending') {   // another observer is relaunching it: look again next poll
         record.fallback = {status: 'waiting', at: new Date(now).toISOString()};
         persist();

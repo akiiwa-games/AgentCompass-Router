@@ -1069,7 +1069,7 @@ def build_parser():
     parser.add_argument('--objective', help='scorer test: the sample task to classify.')
     parser.add_argument('--input', type=Path, help='plan/score/dispatch prepare: the input JSON document. '
                         'record: a task document ({"task": ...}), to compare the forced route with the router\'s own choice.')
-    parser.add_argument('--dispatch-action', choices=('prepare', 'start', 'status', 'reconcile', 'release', 'fallback', 'settle'), default='prepare')
+    parser.add_argument('--dispatch-action', choices=('prepare', 'start', 'status', 'reconcile', 'release', 'fallback', 'abandon', 'settle'), default='prepare')
     parser.add_argument('--dispatch-id')
     parser.add_argument('--parent-id', help='roll/record/launch/dispatch release: the parent session id (default for roll and '
                         'record: detected from the host session).')

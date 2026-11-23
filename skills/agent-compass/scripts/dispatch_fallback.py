@@ -313,6 +313,12 @@ class Chain:
             fallback.update(state=state, attempts=attempts, lines=lines(attempts), **fields)
             if state not in ('retrying', 'relaunching'):
                 fallback.pop('until', None)
+            fallback.pop('released_at', None)
+            if state == 'relaunching':
+                # The step launching the next attempt: its guard binds while this process runs (registry.relaunch_held).
+                fallback['holder'] = registry.process_identity()
+            else:
+                fallback.pop('holder', None)
             if state != 'retrying':
                 fallback.pop('retry_at', None)
                 fallback.pop('retry_of', None)
@@ -323,9 +329,10 @@ class Chain:
         """Only one observer handles a failed attempt; a second gets the first one's outcome. Returns True when the
         claim is the scheduled same-bundle retry falling due (run it with resume=True), False for a fresh failure.
 
-        A claim stays valid until its own `until`: a step in progress holds it for RUN_LEASE, a scheduled retry until
-        its retry time (no observer may take a failure over while its backoff is still being waited out). Only a claim
-        whose holder died (a pending one past its `until`) or a scheduled retry that is due may be taken.
+        A step in progress holds its claim for RUN_LEASE while its own process runs (the claim names it:
+        registry.claim_held); a scheduled retry holds until its retry time (no observer may take a failure over while
+        its backoff is still being waited out). Only a claim no longer held (its holder ended, released it, or outlived
+        its lease) or a scheduled retry that is due may be taken.
 
         A scheduled retry only runs while the first dispatch's guard holds (fallback `until`, see `schedule`): the
         guard is what keeps the brief from being dispatched again, so a retry found due after it lapsed is retired
@@ -339,7 +346,8 @@ class Chain:
             before = claimed['before'] = handled.get(failed_id)
             action = (before or {}).get('action')
             due = action == 'scheduled' and not registry.later(before.get('retry_at'), now)
-            stale = action == 'pending' and not registry.later(before.get('until') or lease_end(before.get('at')), now)
+            stale = action == 'pending' and not registry.claim_held(
+                {**before, 'until': before.get('until') or lease_end(before.get('at'))}, now)
             resume = due or (stale and bool(before.get('resume')))
             if resume and fallback.get('retry_of') == failed_id and not registry.later(fallback.get('until'), now):
                 registry.retire_scheduled(fallback, now, 'retry_expired', RETRY_EXPIRED_NEXT, self.root_id)
@@ -349,7 +357,8 @@ class Chain:
             claimed['take'] = before is None or due or stale
             if claimed['take']:
                 handled[failed_id] = {'action': 'pending', 'at': registry.stamp(now), 'until': registry.stamp(
-                    now + timedelta(seconds=registry.RUN_LEASE)), **({'resume': True} if resume else {})}
+                    now + timedelta(seconds=registry.RUN_LEASE)), 'holder': registry.process_identity(),
+                    **({'resume': True} if resume else {})}
                 claimed['resume'] = resume
                 fallback['handled'] = handled
                 if resume:
@@ -363,6 +372,44 @@ class Chain:
             raise AlreadyHandled({'action': 'pending', 'root_dispatch_id': self.root_id,
                                   'detail': 'another observer is relaunching this attempt'})
         raise AlreadyHandled(before)
+
+    def release(self, failed_id):
+        """This process's step on `failed_id` stops without an outcome (an exception left `handle`): its claim and its
+        relaunch guard end now, in one transaction, so the next step takes the attempt over at once instead of every
+        observer waiting out RUN_LEASE for a step nobody runs. A claim another process took meanwhile is left alone."""
+        if not self.root or not failed_id:
+            return
+        me = registry.process_identity()
+
+        def change(fallback):
+            now = registry.stamp(registry.utcnow())
+            item = (fallback.get('handled') or {}).get(failed_id)
+            if isinstance(item, dict) and item.get('action') == 'pending' and item.get('holder') == me:
+                fallback['handled'] = {**fallback['handled'], failed_id: {**item, 'released_at': now}}
+            if fallback.get('state') == 'relaunching' and fallback.get('holder') == me:
+                fallback['released_at'] = now
+        try:
+            self.root = registry.update_fallback(self.root['dispatch_id'], change)
+        except Exception:   # noqa: BLE001 - the registry cannot be written: the claim's lease still ends it
+            pass
+
+    def drop_unsent(self):
+        """Taking over a step that stopped while it launched the next attempt (`relaunching`, no longer held:
+        registry.relaunch_held): an attempt it prepared but never claimed sent nothing, so it is released and left out
+        of the chain, and this step chooses the next attempt afresh. One already claimed may have reached the host and
+        stays `current` (`launch_failed`); observing the dispatch settles it."""
+        fallback = (self.root or {}).get('fallback') or {}
+        current = fallback.get('current')
+        if fallback.get('state') != 'relaunching' or not current or current == self.root_id \
+                or registry.relaunch_held(fallback, registry.utcnow()):
+            return
+        try:
+            if registry.inspect(current)['state'] != 'prepared':
+                return
+            registry.release(current, self.parent, 'relaunch_not_started', failed=True)
+        except Exception:   # noqa: BLE001 - its prepare lease lapses on its own
+            return
+        self.attempts = [a for a in self.attempts if a.get('dispatch_id') != current]
 
     def outcome(self, failed_id, outcome):
         if not self.root or not failed_id:
@@ -799,12 +846,54 @@ def handle(dispatch_id, *, judge=None, host=None):
         resume = chain.claim(dispatch_id)
     except AlreadyHandled as done:
         return done.outcome
-    return chain.run(failure_of(row), row, resume=resume)
+    try:
+        chain.drop_unsent()
+        return chain.run(failure_of(row), row, resume=resume)
+    except BaseException:
+        # Stopped without an outcome (an error of its own, an interrupt): the claim ends with this step, not with its
+        # lease. A process killed outright cannot get here; its claim names it, and its end releases it the same way.
+        chain.release(dispatch_id)
+        raise
+
+
+STEP_STOPPED_DETAIL = ("the step that relaunches it ended twice without an answer (its process exited before it "
+                       "finished)")
+
+
+def abandon(dispatch_id, *, judge=None, host=None):
+    """The watcher's fallback step for this failed attempt ended twice without an answer (paseo_dispatch_bridge.mjs:
+    the process ran and exited, or could not be read). Whatever it claimed ended with it, so this closes the attempt
+    in the registry (`not_relaunched`, nothing runs the brief) before the watcher tells the parent: the notice and every
+    later observation then say the same, and no later step relaunches a brief the parent was told to roll again.
+    Another live step's claim, or an outcome already decided, is returned as it stands."""
+    row = registry.inspect(dispatch_id)
+    root_id = registry.chain_root(row)
+    chain = Chain.of(row if root_id == dispatch_id else registry.inspect(root_id), judge=judge, host=host)
+    try:
+        chain.claim(dispatch_id)
+    except AlreadyHandled as done:
+        return done.outcome
+    try:
+        chain.drop_unsent()
+        attempt = next((a for a in chain.attempts if a.get('dispatch_id') == dispatch_id), None)
+        if attempt is None:
+            attempt = chain.entry(row['bundle'], row)
+            chain.attempts.append(attempt)
+        if row['state'] in registry.TERMINAL:
+            chain.failed(attempt, failure_of(row), row)
+        step = {'failure': 'step_stopped', 'detail': STEP_STOPPED_DETAIL, 'error_kind': 'internal'}
+        chain.ledger('not_relaunched', attempt, next_step=step, error_kind='internal')
+        return chain.finish('not_relaunched', {'label': 'step_stopped'}, dispatch_id, step=step, internal=True)
+    except BaseException:
+        chain.release(dispatch_id)
+        raise
 
 
 def resume_due(dispatch_id, *, host=None, now=None):
-    """Any observation of a brief (dispatch launch/observe) starts its scheduled same-bundle retry once it is due, so
-    the retry does not depend on the failed attempt's watcher alone. None when nothing is due."""
+    """Any observation of a brief (dispatch launch/observe) carries what its fallback still owes, so that does not
+    depend on the failed attempt's watcher alone: a scheduled same-bundle retry once it is due, and a failed attempt
+    whose step stopped before it finished (inside its lease, a claim whose holder ended or released it:
+    registry.claim_held), which this step takes over. None when nothing is owed."""
     if not enabled():
         return None
     try:
@@ -812,9 +901,15 @@ def resume_due(dispatch_id, *, host=None, now=None):
         root = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row))
     except (KeyError, ValueError):
         return None
+    now = now or registry.utcnow()
     fallback = root.get('fallback') or {}
+    stopped = [failed_id for failed_id, item in (fallback.get('handled') or {}).items()
+               if isinstance(item, dict) and item.get('action') == 'pending' and registry.later(item.get('until'), now)
+               and not registry.claim_held(item, now)]
+    if stopped:
+        return handle(stopped[0], host=host)
     if fallback.get('state') != 'retrying' or not fallback.get('retry_of') \
-            or registry.later(fallback.get('retry_at'), now or registry.utcnow()):
+            or registry.later(fallback.get('retry_at'), now):
         return None
     return handle(fallback['retry_of'], host=host)
 
