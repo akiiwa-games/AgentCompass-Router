@@ -290,6 +290,8 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
            'bound': bool(isinstance(parent, str) and parent and isinstance(task_id, str) and task_id),
            'created_at': stamp(now), 'valid_until': stamp(now + timedelta(seconds=DECISION_TTL)),
            'constraint': result.get('constraint'),
+           # Why a route was forced (the user's words, the project rule): a relaunch that may not move it says so.
+           **({'basis': str(result['basis'])[:400]} if result.get('constraint') and result.get('basis') else {}),
            **({'listed_rows': listed_rows} if listed_rows else {}),
            **({'route': route} if route else {}),
            'effort_override': bool(explicit and resolved and resolved['id'].startswith('user_override_')),

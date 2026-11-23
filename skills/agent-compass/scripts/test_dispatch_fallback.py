@@ -591,6 +591,112 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(registry.reservations(), [])
         self.assertEqual(self.fallback_lines()[-1]['action'], 'blocked')
 
+    # A next attempt that cannot be made ends in one answer that says why (Chain.next_attempt).
+
+    def worker_error_root(self, task=None, decision=None):
+        root = self.first(task=task, decision=decision)
+        self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
+        return root
+
+    def test_a_defect_in_the_replan_is_named_as_one_with_its_traceback_and_keeps_the_attempts_cause(self):
+        """Rule: the parent's text is the one route_judge.failure_cause allows, a defect of AgentCompass (an exception
+        type outside its refusals, the local state and the host) is said to be one, the ledger line keeps its kind and
+        traceback, and the failed attempt keeps its own cause."""
+        root = self.worker_error_root()
+
+        class Broken:
+            @staticmethod
+            def plan_task(task, args, unavailable=None):
+                return None.missing
+        out = fallback.handle(root['dispatch_id'], judge=Broken, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn('internal error of its own', out['text'])
+        self.assertIn('attempt 1: claude-sonnet-5-5 on claude-lab failed: worker_error', out['text'])
+        self.assertNotIn("'NoneType' object", out['text'])          # failure_cause names the type only
+        line = self.fallback_lines()[-1]
+        self.assertEqual((line['action'], line['error_kind']), ('not_relaunched', 'internal'))
+        self.assertIn('AttributeError', line['traceback'])
+        self.assertEqual(line['failed']['failure'], 'worker_error')
+        self.assertEqual(line['next_step']['failure'], 'replan_failed')
+
+    def test_a_refusal_of_the_local_state_reads_as_one_in_the_owners_words(self):
+        root = self.worker_error_root()
+        real_prepare = registry.prepare
+        error = OSError(13, 'Permission denied', 'D:/work/state/dispatch.sqlite3')
+
+        def locked(*a, **kw):
+            if kw.get('attempt'):
+                raise error
+            return real_prepare(*a, **kw)
+        with patch.object(registry, 'prepare', side_effect=locked):
+            out = self.handle(root['dispatch_id'])
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn(route_judge.failure_cause(error), out['text'])
+        self.assertNotIn('internal error', out['text'])
+        self.assertEqual(self.fallback_lines()[-1]['error_kind'], 'environment')
+
+    def test_a_stored_task_with_no_profile_is_not_replanned_and_says_so(self):
+        """Rule: a re-plan that answers an error is not "no candidate left": the dispatch ends not_relaunched with the
+        re-plan's own reason, after one attempt."""
+        task = {k: v for k, v in self.task.items() if k != 'profile'}
+        root = self.worker_error_root(task=task, decision=self.issue(task=task))
+        out = fallback.handle(root['dispatch_id'], judge=route_judge, host=self.host)
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'), out.get('text'))
+        self.assertNotIn('every startable candidate', out['text'])
+        self.assertIn('not_replanned', out['text'])
+        self.assertIn('scorer_unavailable', out['text'])
+        self.assertEqual(len(self.host.creates), 1)
+
+    def test_a_due_retry_that_cannot_be_issued_ends_in_one_answer_not_a_past_promise(self):
+        import sqlite3
+        task = dict(self.task, can_wait_hours=1)
+        root = self.transient_root(task=task)
+        self.assertEqual(self.handle(root['dispatch_id'])['action'], 'scheduled')
+        with self.at(minutes=3), patch.object(registry, 'issue', side_effect=sqlite3.OperationalError('database is locked')):
+            out = self.handle(root['dispatch_id'])
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertIn('retry_failed', out['text'])
+        public = flow.public_chain(registry.inspect(root['dispatch_id']))
+        self.assertNotIn('by itself', public['next_action'])
+        self.assertEqual(len(self.host.creates), 1)
+
+    def rule_forced(self, task=None):
+        result = {'stage': 'record', 'choice': 'constraint', 'constraint': 'hard_constraint',
+                  'basis': 'project rule: this repository is edited by sonnet', 'selected_bundle': dict(self.bundle),
+                  'decision': {'action': 'start'}}
+        return dict(result, **registry.issue(result, task or self.task, self.now))
+
+    def test_a_route_a_project_rule_forces_is_never_moved_to_another_model(self):
+        """Rule (FORCED_ROUTES): a hard_constraint route, like the owner's model, is retried only as the rule allows and
+        otherwise ends saying the forced route could not start."""
+        self.scopes = ['model']
+        root = self.first(decision=self.rule_forced())
+        self.host.end(root['dispatch_id'], 'error', terminal={
+            'reason': 'error', 'failure_code': 'provider_turn_failed', 'provider_message': 'model overloaded'})
+        out = self.handle(root['dispatch_id'])
+        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+        self.assertEqual(len(self.host.creates), 1)
+        self.assertIn('forced (hard_constraint: project rule', out['text'])
+        self.assertIn('could not start', out['text'])
+
+    def test_a_route_a_project_rule_forces_is_retried_on_itself_after_a_transient_failure(self):
+        task = dict(self.task, can_wait_hours=1)
+        root = self.transient_root(task=task, decision=self.rule_forced(task))
+        self.assertEqual(self.handle(root['dispatch_id'])['action'], 'scheduled')
+        with self.at(minutes=3):
+            out = self.handle(root['dispatch_id'])
+        self.assertEqual(out['action'], 'relaunched')
+        self.assertEqual(self.host.creates, ['claude-lab/claude-sonnet-5-5'] * 2)
+        routed = [e for e in self.ledger if e.get('stage') in ('plan', 'record')]
+        self.assertEqual([(e['stage'], e['constraint']) for e in routed], [('record', 'hard_constraint')])
+
+    def test_every_error_roll_answers_for_a_final_outcome_is_in_the_roll_reference(self):
+        import roll
+        text = (Path(__file__).resolve().parents[1] / 'references' / 'roll-reference.md').read_text(encoding='utf-8')
+        self.assertEqual(len(roll.FALLBACK_ERRORS), len(fallback.NOTHING_RUNS))
+        for code in roll.FALLBACK_ERRORS:
+            self.assertIn(f'`{code}`', text)
+
     # One worker per brief, observation, bookkeeping.
 
     def test_a_second_observer_reads_the_first_ones_outcome_instead_of_relaunching(self):
@@ -981,6 +1087,30 @@ class StoredTaskRelaunchTests(unittest.TestCase):
                 again = fallback.handle(root['dispatch_id'], judge=route_judge, host=self.host)
                 self.assertEqual((again['action'], again['result']), ('final', 'not_relaunched'))
                 self.assertIn(again['result'], fallback.NOTHING_RUNS)
+
+    def test_a_launch_that_fails_after_prepare_releases_it_and_leaves_one_worker_at_most(self):
+        """Review finding 1: the relaunch's claim raises after its prepare. One answer (the brief did not start), the
+        prepared row released, and following that answer (roll again, then observe the old dispatch) starts one worker."""
+        real_claim = registry.claim
+        calls = []
+
+        def claim(*a, **kw):
+            calls.append(1)
+            if len(calls) == 2:      # the relaunch's claim
+                raise ValueError('fixture: account_disabled_in_magpie at claim')
+            return real_claim(*a, **kw)
+        result, code, creates = self.roll_refused_first('claim-raises', patch.object(registry, 'claim', side_effect=claim))
+        self.assertEqual((result['caller_action'], result['error']), ('tell_user', 'relaunch_not_started'), result.get('next'))
+        self.assertIn('did not start', result['next'])
+        root = self.root_of(result)
+        attempts = [registry.inspect(a['dispatch_id']) for a in root['fallback']['attempts'] if a.get('dispatch_id')]
+        self.assertFalse([r for r in attempts if r['state'] == 'prepared'], [r['state'] for r in attempts])
+        again, _, more = self.roll_refused_first('claim-raises', refuse=False)
+        self.assertEqual(again['caller_action'], 'already_launched_do_not_respawn', again.get('next'))
+        before = len(self.host.creates)
+        flow.launch(root['dispatch_id'], 'parent-a', host=self.host, watch_seconds=0)
+        self.assertEqual(len(self.host.creates), before)
+        self.assertLessEqual(len(self.host.alive()), 1)
 
     def test_the_bridge_sends_the_text_of_every_final_result_after_which_nothing_runs(self):
         """paseo_dispatch_bridge.mjs composeNotice keeps its own copy of NOTHING_RUNS: the two lists are one."""

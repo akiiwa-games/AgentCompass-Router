@@ -21,10 +21,12 @@ Contract:
   (can_wait_hours); a retry nobody started by then is retired (`retry_expired`), never run beside a new dispatch of
   the brief. The parent's release of the dispatch cancels a scheduled retry (registry.retire_scheduled), and a parent
   follow-up that resumes a failed attempt's worker retires any pending retry or switch (`resumed`) and restores that
-  attempt as `current`. A model the owner named (`roll --model`, a
-  `user_override` decision) follows the same can_wait_hours rule and is never switched: when its backoff does not fit,
-  the parent is told (`owner_named`). A worker the caller named (`roll --resume`, constraint `explicit_resume`) is
-  never retried on a new worker nor replaced: its failure is reported as it is (`worker_named`).
+  attempt as `current`. A forced route (FORCED_ROUTES: the model the owner named, `roll --model` or `record
+  --constraint user_override`; a project rule or user instruction, `record --constraint hard_constraint`) follows the same
+  can_wait_hours rule and is never moved to another model: when its backoff does not fit, the parent is told
+  (`owner_named` for the owner's model, `not_relaunched` saying the forced route could not start for a rule's). A worker
+  the caller named (`roll --resume`, constraint `explicit_resume`) is never retried on a new worker nor replaced: its
+  failure is reported as it is (`worker_named`).
 - Otherwise: allocation runs again on the original decision's allocation task (its classifier profile, needs such as
   local_only, fast) with every bundle that failed in this dispatch marked unavailable; the classifier is not asked
   again. The winner is launched with the first dispatch's title, workspace, cwd, access, parent and the original prompt,
@@ -38,10 +40,16 @@ Contract:
 - Bound: every failure puts its bundle in the dispatch's excluded set (a transient one after its single same-bundle
   retry), and allocation never returns an excluded bundle, so one dispatch makes at most (startable candidates +
   transient retries) attempts, and ends `blocked` with every attempt's cause once allocation has nothing left.
-- A promise is kept or answered: a next attempt that cannot be made before anything is sent (its re-plan raises, or its
-  decision cannot be prepared) ends the dispatch `not_relaunched`. Every final result after which nothing runs the brief
-  (NOTHING_RUNS) carries its own text, and that text is what the parent reads: roll's answer when roll ran the step,
-  the watcher's one notice when the watcher did, and any later observation of the dispatch.
+- A promise is kept or answered: `Chain.next_attempt` owns one next attempt from choosing it (re-plan or same-model
+  retry) to its launch. Anything in it that fails before a create is sent releases what it prepared and ends the
+  dispatch `not_relaunched`, so no prepared row is left for a later observation to start; a re-plan that answers an
+  error (no profile to plan with, for one) ends there too, saying so, never `blocked`. A launch that fails after the
+  create may have been sent keeps that attempt as `current`: observing the dispatch settles it, and nothing else starts.
+  The failure's text is the one `route_judge.failure_cause` allows; the ledger line keeps its kind (`error_kind`:
+  `internal` for a defect of AgentCompass, told apart in the parent's text too) and its traceback. Every final result
+  after which nothing runs the brief (NOTHING_RUNS) carries its own text, and that text is what the parent reads: roll's
+  answer when roll ran the step, the watcher's one notice when the watcher did, and any later observation of the
+  dispatch.
 - Bookkeeping: each attempt is its own registry row with its own decision, lease, labels and holds, linked by
   `attempt_of` (the first dispatch, the id the parent holds) and `previous_attempt`; the first dispatch keeps
   `fallback` = {state, current, attempts, handled, outcome}. Each step writes a `stage: fallback` ledger line and each
@@ -50,6 +58,7 @@ Contract:
 import argparse
 import json
 import os
+import traceback
 from pathlib import Path
 from datetime import timedelta
 
@@ -58,6 +67,25 @@ import dispatch_registry as registry
 PROVIDER_FAILURES = ('provider_retry_stuck', 'provider_turn_failed')
 TRANSIENT = 'transient'
 NOT_COVERED_SCOPES = ('none', 'task_input')
+# The constraints of a forced route: the one place that says a route may not be substituted by another model. The owner's
+# own naming (`roll --model`, `record --constraint user_override`) and a project rule or user instruction (`record
+# --constraint hard_constraint`, its --basis says which). Either is retried only as the rule allows (a transient failure
+# whose backoff fits can_wait_hours), never relaunched on another model.
+FORCED_ROUTES = ('user_override', 'hard_constraint')
+
+
+def forced_route(decision):
+    """The constraint that forces this decision's route (FORCED_ROUTES), or None when a relaunch may choose again."""
+    constraint = (decision or {}).get('constraint')
+    return constraint if constraint in FORCED_ROUTES else None
+
+
+class NotReplanned(Exception):
+    """The re-plan answered an error code instead of a route or `none` (`scorer_unavailable`: a stored task with no
+    profile to plan with): the next attempt cannot be chosen, which is not "no candidate left"."""
+
+    def __init__(self, error):
+        super().__init__(f'the stored task could not be planned again ({error})')
 
 
 # The sentence beside `disabled` and `unsettled`, for a person who runs the action: the watcher branches on `action`
@@ -185,7 +213,9 @@ class Chain:
             import route_judge as judge
         self.judge, self.host = judge, host
         self.decision = decision
-        self.owner_named = decision.get('constraint') == 'user_override'
+        self.forced_by = forced_route(decision)
+        self.owner_named = self.forced_by == 'user_override'
+        self.basis = decision.get('basis')
         # `roll --resume <id>` named a worker, not a route: no other worker, and no retry on a new one, replaces it.
         self.worker_named = decision.get('constraint') == 'explicit_resume'
         task = dict(decision.get('allocation_task') or decision['task'])
@@ -349,7 +379,6 @@ class Chain:
         """From one failed attempt to the next live worker, a scheduled retry or a final state. `row` is the failed
         attempt's row (None when its bundle was refused before a row existed); `bundle` the refused bundle then.
         `resume`: the scheduled same-bundle retry of `row` is due (claim said so); it starts without deciding again."""
-        import usage_reading
         failed_id = row['dispatch_id'] if row else None
         while True:
             attempt = next((a for a in self.attempts if row and a.get('dispatch_id') == row['dispatch_id']), None)
@@ -366,12 +395,12 @@ class Chain:
                 self.failed(attempt, failure, row)
                 self.ledger('worker_named', attempt)
                 return self.finish('worker_named', failure, failed_id)
+            due = resume
             if resume:
                 resume = False
                 resumed_id = self.resumed_attempt(row)
                 if resumed_id:
                     return self.settle_resumed(resumed_id, attempt, failed_id)
-                choice = (self.same_bundle(attempt), 'retry_same', 0)
             else:
                 self.failed(attempt, failure, row)
                 if not failure['covered']:
@@ -380,44 +409,64 @@ class Chain:
                 resumed_id = self.resumed_attempt(row)
                 if resumed_id:
                     return self.settle_resumed(resumed_id, attempt, failed_id)
-                try:
-                    choice = self.next_choice(attempt)
-                except Exception as exc:   # noqa: BLE001 - nothing was sent yet: the brief ends here, and says why
-                    return self.not_relaunched(attempt, None, 'replan_failed', exc, failed_id)
-            if choice is None:
-                kind = 'owner_named' if self.owner_named else 'blocked'
-                self.ledger(kind, attempt, excluded=sorted(self.excluded()))
-                return self.finish(kind, failure, failed_id)
-            decision, how, wait = choice
-            if how == 'scheduled':
-                return self.schedule(attempt, wait, failed_id)
-            if how == 'switch':
-                resumed_id = self.resumed_attempt(row)
-                if resumed_id:
-                    self.attempts[kept:] = []
-                    return self.settle_resumed(resumed_id, attempt, failed_id)
-            new_bundle = decision['selected_bundle']
-            self.ledger(how, attempt, next={'decision_id': decision['decision_id'], **bundle_view(new_bundle)})
-            try:
-                new = registry.prepare(decision['decision_id'], self.task, dict(
-                    self.launch, initialPrompt=relaunch_prompt(self.launch['initialPrompt'], self.attempts)),
-                    usage_reading.usage_snapshot(None), access=self.access,
-                    workspace=self.workspace, cwd=self.cwd,
-                    attempt={'attempt_of': self.root_id, 'attempt': len(self.attempts) + 1,
-                             'previous_attempt': (row or {}).get('dispatch_id')} if self.root else None)
-            except registry.CapacityChanged as exc:
-                row, bundle, failure = None, new_bundle, refused(exc)
+            step = self.next_attempt(attempt, row, failed_id, kept, retry_due=due)
+            if step[0] == 'again':
+                _, row, bundle, failure = step
                 continue
-            except Exception as exc:   # noqa: BLE001 - a writer appeared, the decision cannot dispatch, or anything else
-                live = self.live_attempt(failed_id)
-                if live:
-                    # Another attempt of this brief already runs (its own watcher reports): this failure is settled by
-                    # it, and the chain's record must keep pointing at it.
-                    return self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': live,
-                                                    'root_dispatch_id': self.root_id, 'attempts': self.attempts,
-                                                    'lines': lines(self.attempts),
-                                                    'detail': 'another attempt of this brief is live'})
-                return self.not_relaunched(attempt, new_bundle, 'not_prepared', exc, failed_id)
+            return step[1]
+
+    def next_attempt(self, attempt, row, failed_id, kept, retry_due=False):
+        """One next attempt of the brief, owned from choosing it (re-plan, or the same-model retry: `retry_due`, the
+        scheduled one fallen due) to its launch. ('again', row, bundle, failure) when the attempt failed in a way the
+        chain goes on from (a bundle refused at prepare or claim, a worker that ended at once); ('done', outcome)
+        otherwise. Anything that fails here before a create was sent releases what this step prepared and ends the
+        dispatch `not_relaunched` (no prepared row is left for a later observation to start); a launch that fails after
+        the create may have been sent keeps that attempt as `current`, which observing the dispatch settles."""
+        import usage_reading
+        label = 'retry_failed' if retry_due else 'replan_failed'
+        try:
+            choice = (self.same_bundle(attempt), 'retry_same', 0) if retry_due else self.next_choice(attempt)
+        except NotReplanned as exc:
+            return 'done', self.not_relaunched(attempt, None, 'not_replanned', exc, failed_id)
+        except Exception as exc:   # noqa: BLE001 - nothing was sent yet: the brief ends here, and says why
+            return 'done', self.not_relaunched(attempt, None, label, exc, failed_id)
+        if choice is None:
+            if self.forced_by == 'hard_constraint':
+                self.ledger('not_relaunched', attempt, excluded=sorted(self.excluded()), forced_by=self.forced_by)
+                return 'done', self.finish('not_relaunched', {'covered': True}, failed_id, forced=True)
+            kind = 'owner_named' if self.owner_named else 'blocked'
+            self.ledger(kind, attempt, excluded=sorted(self.excluded()))
+            return 'done', self.finish(kind, {'covered': True}, failed_id)
+        decision, how, wait = choice
+        if how == 'scheduled':
+            return 'done', self.schedule(attempt, wait, failed_id)
+        if how == 'switch':
+            resumed_id = self.resumed_attempt(row)
+            if resumed_id:
+                self.attempts[kept:] = []
+                return 'done', self.settle_resumed(resumed_id, attempt, failed_id)
+        new_bundle = decision['selected_bundle']
+        self.ledger(how, attempt, next={'decision_id': decision['decision_id'], **bundle_view(new_bundle)})
+        try:
+            new = registry.prepare(decision['decision_id'], self.task, dict(
+                self.launch, initialPrompt=relaunch_prompt(self.launch['initialPrompt'], self.attempts)),
+                usage_reading.usage_snapshot(None), access=self.access,
+                workspace=self.workspace, cwd=self.cwd,
+                attempt={'attempt_of': self.root_id, 'attempt': len(self.attempts) + 1,
+                         'previous_attempt': (row or {}).get('dispatch_id')} if self.root else None)
+        except registry.CapacityChanged as exc:
+            return 'again', None, new_bundle, refused(exc)
+        except Exception as exc:   # noqa: BLE001 - a writer appeared, the decision cannot dispatch, or anything else
+            live = self.live_attempt(failed_id)
+            if live:
+                # Another attempt of this brief already runs (its own watcher reports): this failure is settled by
+                # it, and the chain's record must keep pointing at it.
+                return 'done', self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': live,
+                                                        'root_dispatch_id': self.root_id, 'attempts': self.attempts,
+                                                        'lines': lines(self.attempts),
+                                                        'detail': 'another attempt of this brief is live'})
+            return 'done', self.not_relaunched(attempt, new_bundle, 'not_prepared', exc, failed_id)
+        try:
             if self.root is None:
                 # Refused before the first row existed: this attempt becomes the dispatch the parent holds.
                 self.root = new
@@ -433,18 +482,48 @@ class Chain:
                 receipt = dispatch_flow.launch(new['dispatch_id'], self.parent, host=self.host, watch_seconds=0)
             except registry.CapacityChanged as exc:   # refused at claim: nothing was sent
                 registry.release(new['dispatch_id'], self.parent, 'refused_at_claim', failed=True)
-                row, bundle, failure = registry.inspect(new['dispatch_id']), new_bundle, refused(exc)
-                continue
+                return 'again', registry.inspect(new['dispatch_id']), new_bundle, refused(exc)
             current = registry.inspect(new['dispatch_id'])
-            # A relaunched worker can finish before this read: completed is this attempt's success, not its failure.
-            if current['state'] in registry.TERMINAL and current['state'] not in ('expired', 'completed'):
-                row, bundle, failure = current, new_bundle, failure_of(current)
-                continue
-            self.save('relaunched', current=current['dispatch_id'])
-            outcome = {'action': 'relaunched', 'dispatch_id': current['dispatch_id'], 'root_dispatch_id': self.root_id,
-                       'agent_id': current.get('agent_id'), 'attempts': self.attempts, 'lines': lines(self.attempts),
-                       'receipt': receipt}
-            return self.outcome(failed_id, outcome)
+        except Exception as exc:   # noqa: BLE001 - after prepare: release what was prepared, unless a create may be out
+            return 'done', self.launch_failed(new, new_bundle, attempt, exc, failed_id)
+        # A relaunched worker can finish before this read: completed is this attempt's success, not its failure.
+        if current['state'] in registry.TERMINAL and current['state'] not in ('expired', 'completed'):
+            return 'again', current, new_bundle, failure_of(current)
+        self.save('relaunched', current=current['dispatch_id'])
+        outcome = {'action': 'relaunched', 'dispatch_id': current['dispatch_id'], 'root_dispatch_id': self.root_id,
+                   'agent_id': current.get('agent_id'), 'attempts': self.attempts, 'lines': lines(self.attempts),
+                   'receipt': receipt}
+        return 'done', self.outcome(failed_id, outcome)
+
+    def launch_failed(self, new, new_bundle, attempt, exc, failed_id):
+        """The prepared attempt `new` raised before it was confirmed launched. Still `prepared` (its claim never took,
+        so nothing was sent): it is released and its entry dropped, and the dispatch ends `not_relaunched`. Past that
+        (claimed: a create may have reached the host), it stays the chain's `current`: observing the dispatch finds the
+        worker by its labels or settles the row, and no other attempt starts meanwhile."""
+        try:
+            state = registry.inspect(new['dispatch_id'])['state']
+        except Exception:   # noqa: BLE001 - the row cannot be read: whether a create went out is unknown
+            state = None
+        if state == 'prepared':
+            try:
+                registry.release(new['dispatch_id'], self.parent, 'relaunch_not_started', failed=True)
+            except Exception:   # noqa: BLE001 - its lease lapses on its own; the chain no longer names it
+                pass
+            self.attempts = [a for a in self.attempts if a.get('dispatch_id') != new['dispatch_id']]
+            if self.root and self.root['dispatch_id'] == new['dispatch_id']:
+                self.root = None
+            return self.not_relaunched(attempt, new_bundle, 'not_launched', exc, failed_id)
+        cause = self.cause_of(exc)
+        self.ledger('launch_unconfirmed', attempt, next={'dispatch_id': new['dispatch_id'], **bundle_view(new_bundle)},
+                    error_kind=cause['kind'], error=cause['text'], traceback=traceback.format_exc()[-4000:])
+        try:
+            self.save('relaunched', current=new['dispatch_id'])
+        except Exception:   # noqa: BLE001 - the root still names it from `relaunching`
+            pass
+        return self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': new['dispatch_id'],
+                                        'root_dispatch_id': self.root_id, 'attempts': self.attempts,
+                                        'lines': lines(self.attempts), 'receipt': {},
+                                        'detail': 'the launch failed after its claim; observing the dispatch settles it'})
 
     def next_choice(self, attempt):
         """(decision, 'retry_same' | 'switch', 0) for the next attempt now, (None, 'scheduled', seconds) for a same-bundle
@@ -454,7 +533,7 @@ class Chain:
             if wait > 0:
                 return None, 'scheduled', wait
             return self.same_bundle(attempt), 'retry_same', 0
-        if self.owner_named:
+        if self.forced_by:
             return None
         decision = self.replan()
         return (decision, 'switch', 0) if decision else None
@@ -486,14 +565,15 @@ class Chain:
         bundle = dict(failed_row['bundle'])
         # A named route keeps what its record decided: the rows a provider listed for a model the shipped data has no row
         # for (provider_inventory), and its route fields (an unclassified launch stays priced from its hours).
-        failed_decision = registry.decision_record(failed_row['decision_id']) if self.owner_named else {}
+        failed_decision = registry.decision_record(failed_row['decision_id']) if self.forced_by else {}
         listed = failed_decision.get('listed_rows')
-        result = {'stage': 'record' if self.owner_named else 'plan', 'source': 'fallback_retry',
+        result = {'stage': 'record' if self.forced_by else 'plan', 'source': 'fallback_retry',
                   'choice': bundle.get('bundle_id'), 'selected_bundle': bundle, 'decision': {'action': 'start'},
                   'parent_id': self.parent,
-                  **({'constraint': 'user_override',
-                      'basis': f'AgentCompass transient retry of dispatch {self.root_id} on the owner-named model'}
-                     if self.owner_named else
+                  **({'constraint': self.forced_by,
+                      'basis': f'AgentCompass transient retry of dispatch {self.root_id} on the route forced by '
+                               f'{self.forced_by}: {self.basis or ""}'[:400]}
+                     if self.forced_by else
                      {'basis': f'AgentCompass transient retry of dispatch {self.root_id} on its routed bundle'})}
         issued = registry.issue(result, self.task, allocation_task=failed_decision.get('allocation_task') or self.task,
                                 listed_rows=listed, route=failed_decision.get('route'))
@@ -573,8 +653,10 @@ class Chain:
             # The stored allocation task, as AgentCompass keeps it: never through a caller's entry (plan_stage), whose
             # rewrite of the router's own marks would bind the new decision to another task than the one prepared.
             decision, _ = self.judge.plan_task(self.task, args, sorted(excluded))
+            if decision.get('error'):
+                raise NotReplanned(decision['error'])
             bundle = decision.get('selected_bundle') or {}
-            if (decision.get('error') or decision.get('choice') in (None, 'none', 'split') or not bundle
+            if (decision.get('choice') in (None, 'none', 'split') or not bundle
                     or (decision.get('decision') or {}).get('action') == 'defer'
                     or not decision.get('decision_id')):
                 return None
@@ -590,21 +672,51 @@ class Chain:
             return decision
         return None
 
+    @staticmethod
+    def cause_of(exc):
+        """{kind, text} of an exception that stopped a next attempt. The text is the one route_judge.failure_cause allows
+        (the owner of what a failure may say). The kind tells a refusal of this repository's rules or of the local state
+        (`refused`, `environment`, `data`) from a defect of AgentCompass (`internal`: any other exception type, such as an
+        AttributeError or a TypeError, raised by its code or by data in a shape it does not read), which the
+        parent's text names as such and the ledger line keeps with its traceback."""
+        import sqlite3
+        import route_judge
+        import public_data
+        if isinstance(exc, NotReplanned):
+            return {'kind': 'not_replanned', 'text': str(exc)[:400]}
+        if isinstance(exc, public_data.ReferenceDataError):
+            kind = 'data'
+        elif isinstance(exc, ValueError):
+            kind = 'refused'
+        elif isinstance(exc, (OSError, sqlite3.Error, TimeoutError, RuntimeError)):
+            kind = 'environment'    # the local state, the host or its reply (a RuntimeError carries a host's answer)
+        else:
+            # A KeyError, TypeError or AttributeError: a defect of the code, or data in a shape the code does not read;
+            # the type cannot tell which, the traceback can.
+            kind = 'internal'
+        return {'kind': kind, 'text': route_judge.failure_cause(exc)}
+
     def not_relaunched(self, attempt, bundle, label, exc, failed_id):
         """The failed attempt was one AgentCompass promised to relaunch, and the next attempt could not be made before
-        anything was sent (its plan raised, or its decision could not be prepared). The brief ends here with a final
-        outcome that says so, which roll answers and the watcher sends (NOTHING_RUNS): never `declined`, whose answer is
-        the failed row's own promise to relaunch."""
-        failed = self.entry(bundle) if bundle else attempt
+        anything was sent (its choice raised or answered an error, or its decision could not be prepared or launched).
+        The brief ends here with a final outcome that says so, which roll answers and the watcher sends (NOTHING_RUNS):
+        never `declined`, whose answer is the failed row's own promise to relaunch. A next attempt with a bundle is an
+        attempt of its own and lists as one; a choice that failed leaves the failed attempt's own cause as it was."""
+        cause = self.cause_of(exc)
+        step = {'failure': label, 'detail': cause['text'], 'error_kind': cause['kind']}
         if bundle:
+            failed = self.entry(bundle)
             self.attempts.append(failed)
-        self.failed(failed, {'covered': False, 'kind': None, 'scope': None, 'label': label,
-                             'detail': f'{type(exc).__name__}: {exc}'[:300]})
-        self.ledger('not_relaunched', failed)
-        return self.finish('not_relaunched', {'label': label}, failed_id)
+            self.failed(failed, {'covered': False, 'kind': None, 'scope': None, 'label': label, 'detail': cause['text']})
+            step = None
+        self.ledger('not_relaunched', self.attempts[-1] if bundle else attempt,
+                    **({'next_step': step} if step else {}), error_kind=cause['kind'],
+                    traceback=traceback.format_exc()[-4000:])
+        return self.finish('not_relaunched', {'label': label}, failed_id, step=step, internal=cause['kind'] == 'internal')
 
-    def finish(self, kind, failure, failed_id):
-        text = final_text(kind, self.attempts, self.task)
+    def finish(self, kind, failure, failed_id, step=None, internal=False, forced=False):
+        text = final_text(kind, self.attempts, self.task, step=step, internal=internal,
+                          forced_by=self.forced_by if forced else None, basis=self.basis)
         self.save('final', outcome={'result': kind, 'next_action': text}, current=(
             self.attempts[-1].get('dispatch_id') if self.attempts else None) or self.root_id)
         outcome = {'action': 'final', 'result': kind, 'covered': bool(failure.get('covered')),
@@ -625,9 +737,21 @@ RETRY_EXPIRED_NEXT = ('AgentCompass scheduled a retry of this brief on the same 
 NOTHING_RUNS = ('blocked', 'owner_named', 'older_profile', 'worker_named', 'retry_expired', 'not_relaunched')
 
 
-def final_text(kind, attempts, task):
+def final_text(kind, attempts, task, step=None, internal=False, forced_by=None, basis=None):
     listed = '\n'.join(lines(attempts))
+    if kind == 'not_relaunched' and forced_by:
+        return (f'The route of this brief was forced ({forced_by}: {(basis or "no basis recorded")[:200]}), so AgentCompass '
+                f'retried only what that allows and does not move it to another model, and the forced route could not '
+                f'start:\n{listed}\nNothing is running this brief. Tell the user; the rule that forces the route decides '
+                'what runs it instead.')
     if kind == 'not_relaunched':
+        if step:
+            listed += f"\nthe next attempt could not be chosen: {step['failure']} ({step['detail']})"
+        if internal:
+            return ('AgentCompass hit an internal error of its own while starting the next attempt of this brief after its '
+                    f'failure, so nothing is running it:\n{listed}\nThis is a defect of AgentCompass (its code, or local '
+                    'or reference data in a shape it does not read), not of the brief or the accounts; its traceback is in the local ledger (stage fallback, action not_relaunched). Tell the '
+                    'user; rolling the brief again routes it afresh (nothing holds it now).')
         return ('AgentCompass could not start the next attempt of this brief after its failure, so nothing is running '
                 f'it:\n{listed}\nThe brief did not start. Roll it again to route it afresh (nothing holds it now), or '
                 'tell the user.')

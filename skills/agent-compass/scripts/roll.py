@@ -1073,6 +1073,8 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
 # result not named here is its own code.
 FINAL_ERRORS = {'blocked': 'no_candidate_left', 'owner_named': 'owner_named_model_failed',
                 'not_relaunched': 'relaunch_not_started'}
+# Every `error` roll answers for such an outcome, in NOTHING_RUNS order (roll-reference.md lists each; a test holds them equal).
+FALLBACK_ERRORS = tuple(FINAL_ERRORS.get(ending, ending) for ending in dispatch_fallback.NOTHING_RUNS)
 
 
 def fallback_result(out, outcome, decision, parent, args):
