@@ -1201,8 +1201,13 @@ def target_spec(spec: dict, labels: dict) -> dict[str, str]:
     return target
 
 
+CLAUDE_NATIVE_TOOLS = CLAUDE_AGENT_TOOLS | {"dispatch_agent"}
+
+
 def launch_target(name: str, args: dict, trigger: str, raw_input: dict | None = None) -> dict[str, str]:
     target = target_spec(args, args.get("labels") if isinstance(args.get("labels"), dict) else {})
+    if name in CLAUDE_NATIVE_TOOLS:
+        target["harness"] = "claude"
     if (name in CODEMODE_TOOLS | SHELL_TOOLS or name == SHELL_LAUNCH) and not target.get("provider"):
         for source in (args, raw_input):
             if not source:
@@ -1248,40 +1253,42 @@ def launch_model_problem(spec: dict) -> str | None:
     return None
 
 
-def anthropic_line_matches(requested: str, routed: str | None, accounts: dict | None) -> bool:
-    """Whether `requested` is a declared Anthropic Claude line (`accounts.json` `families`) whose line matches `routed`."""
-    table = accounts.get("families") if isinstance(accounts, dict) else None
-    if not routed or not isinstance(table, dict) or not isinstance(table.get("rows"), list):
+def model_line_matches(requested: str, routed: str | None, accounts: dict | None) -> bool:
+    """Whether `requested` is a declared `line` in `accounts.json` `families` matching `routed` (`model_resolution`)."""
+    if not routed or not isinstance(accounts, dict):
         return False
-    families = table["rows"]
-    if not any(r.get("maker") == "anthropic" and r.get("line") == requested for r in families):
+    family_patterns, family_row = router_owner("model_resolution", "family_patterns", "family_row")
+    try:
+        families = family_patterns(accounts)
+    except router_owner("public_data", "ReferenceDataError"):
         return False
-    hit = router_owner("model_resolution", "family_row")(routed, families)
-    return bool(hit and hit.get("maker") == "anthropic" and hit.get("line") == requested)
+    return any(r.get("line") == requested for r in families) and bool((hit := family_row(routed, families)) and hit.get("line") == requested)
 
 
 def resolve_target(target: dict, accounts: dict | None) -> tuple[str | None, list[dict]]:
     """Owning account and the bundles the target can be, by bundle_id or by model/effort/Pi harness."""
     table = (accounts or {}).get("accounts") or {}
     provider = target.get("provider")
-    account = target.get("account") or (
-        "antigravity" if provider == "antigravity-resilient" else provider if provider in table else None)
+    account = target.get("account") or (provider if provider in table else None)
     candidates = []
     if target.get("bundle_id") and table:
         candidates = router_owner("account_fleet", "bundle_rows")(accounts, target["bundle_id"])
     elif not target.get("bundle_id") and bool(target.get("model")):
         if target["model"] != UNKNOWN_CLI_VALUE:
             router_owner("model_resolution", "check_model_pin")(target["model"], "model")
-        pin_pool, pin_matching_bundles = router_owner("account_fleet", "pin_pool", "pin_matching_bundles")
-        pool = [
-            dict(bundle, bundle_id=bundle["id"], launch_model=bundle_launch_model(bundle, bundle["account"]) or "")
-            for bundle in pin_pool(accounts, account=account, provider=provider)
-        ]
-        by_line = [c for c in pool if anthropic_line_matches(target["model"], c.get("launch_model"), accounts)]
+        pin_pool, pin_matching_bundles, bundle_harness = router_owner("account_fleet", "pin_pool", "pin_matching_bundles", "bundle_harness")
+        pool = [dict(b, bundle_id=b["id"], launch_model=bundle_launch_model(b, b["account"]) or "")
+                for b in pin_pool(accounts, account=account, provider=provider)]
+        by_line = ([c for c in pool if bundle_harness(c, c["account"], c["bundle_id"]) == "claude"
+                    and model_line_matches(target["model"], c.get("launch_model"), accounts)]
+                   if target.get("harness") == "claude" else [])
         matched = by_line or pin_matching_bundles(target["model"], pool, accounts)
         candidates = [c for c in matched if target.get("effort") in (None, c.get("effort"))]
     if not account and len({c["account"] for c in candidates}) == 1:
         account = candidates[0]["account"]
+    elif not account and provider and table:
+        owners = {b["account"] for b in router_owner("account_fleet", "pin_pool")(accounts, provider=provider)}
+        account = next(iter(owners)) if len(owners) == 1 else None
     return account, [c for c in candidates if c["account"] == account]
 
 
@@ -1513,14 +1520,11 @@ def _merged_route_bundle(row: dict, accounts: dict | None = None) -> dict:
     raw_bundle = row.get("bundle")
     if not isinstance(raw_bundle, dict):
         return {}
-    bundle_id = raw_bundle.get("bundle_id")
-    if isinstance(bundle_id, str) and bundle_id and isinstance(accounts, dict):
-        acct, matches = resolve_target({"bundle_id": bundle_id}, accounts)
+    bid = raw_bundle.get("bundle_id")
+    if isinstance(bid, str) and bid and isinstance(accounts, dict):
+        acct, matches = resolve_target({"bundle_id": bid}, accounts)
         if matches:
-            cat = dict(matches[0])
-            if acct and not cat.get("account"):
-                cat["account"] = acct
-            return {**cat, **raw_bundle}
+            return {**matches[0], **({"account": acct} if acct and not matches[0].get("account") else {}), **raw_bundle}
     return dict(raw_bundle)
 
 
@@ -1531,34 +1535,25 @@ def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
     return normalize_launch(merged)
 
 
-CLAUDE_NATIVE_TOOLS = CLAUDE_AGENT_TOOLS | {"dispatch_agent"}
-
-
-def same_launch_value(key: str, requested: str, routed: str | None, *, accounts: dict | None = None) -> bool:
-    """Compare what will run: exact wire value, or a declared Anthropic Claude line from `accounts.json` `families`."""
-    if key == "model" and anthropic_line_matches(requested, routed, accounts):
-        return True
-    return requested == routed
+def same_launch_value(key: str, requested: str, routed: str | None, *, accounts: dict | None = None, allow_line: bool = False) -> bool:
+    """Compare what will run: exact wire value, or (for Claude native tools) a declared `families` `line`."""
+    return (allow_line and key == "model" and model_line_matches(requested, routed, accounts)) or requested == routed
 
 
 def route_family(row: dict, accounts: dict | None = None) -> str | None:
-    """Launcher family of a routed bundle via `provider_inventory.launcher_family` / `account_family`."""
-    merged = _merged_route_bundle(row, accounts)
-    prov, acct = str(merged.get("provider") or "").strip(), str(merged.get("account") or "").strip()
-    launcher_family, account_family = router_owner("provider_inventory", "launcher_family", "account_family")
-    raw = ((launcher_family(prov) if prov else None)
-           or (account_family(acct, accounts) if acct else None)
-           or prov or acct or None)
-    return raw.removesuffix("-resilient") if isinstance(raw, str) else None
+    """Product/execution family of a routed bundle via `provider_inventory.bundle_family`."""
+    return router_owner("provider_inventory", "bundle_family")(_merged_route_bundle(row, accounts), accounts)
 
 
 def launch_field_hint(name: str, trigger: str) -> str:
     if name in CLAUDE_NATIVE_TOOLS:
-        return "传入参数 `model`（及 `effort`）指定已授权路由的模型"
+        return "传入参数 `model`（模型系列别名）指定已授权路由的模型"
     if name == "spawn_agent":
         return "传入参数 `model`（及 `reasoning_effort`）指定已授权路由的模型与档位"
     if name == "invoke_subagent":
-        return "传入参数 `Model` 指定具体模型 ID（或在 `modelName` 与路由一致的会话中使用 `Model=\"inherit\"`；若宿主无法复现该模型，按 roll 说明告知用户而非自行替换）"
+        return ("在当前会话 `modelName` 与已授权路由一致时传入 `Model=\"inherit\"`"
+                "（`invoke_subagent` 的 `Model` 仅接受抽象档位枚举，不接受具体模型 ID；"
+                "若当前会话模型与路由不一致，请告知用户或改用不带 `--parent-host native` 的 `roll` 直接启动）")
     if name == "delegate_task":
         return "传入 `target.driverKind`、`target.model`（及 `target.effort`）"
     if trigger == "shell:orca worker launch":
@@ -1567,7 +1562,7 @@ def launch_field_hint(name: str, trigger: str) -> str:
 
 
 def native_launch_spec(
-    name: str, args: dict, trigger: str, payload: dict, targets: list[dict], accounts: dict | None,
+    name: str, args: dict, trigger: str, payload: dict, accounts: dict | None,
 ) -> tuple[dict[str, str], str | None]:
     """Resolve `(requested, required_family)` per host from the call's own facts and declared data; never guess."""
     requested = normalize_launch(args)
@@ -1590,7 +1585,6 @@ def native_launch_spec(
             requested["model"] = session_model if session_model and session_model.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE
         return requested, "codex"
     if name == "invoke_subagent":
-        requested.setdefault("account", "antigravity")
         raw_model = str(args.get("Model") or args.get("model") or "").strip()
         if not raw_model or raw_model.lower() == "inherit":
             session_model = str(payload.get("modelName") or payload.get("model") or "").strip()
@@ -1603,9 +1597,6 @@ def native_launch_spec(
         for k in ("provider", "account", "model"):
             requested.setdefault(k, "dot")
         return requested, "dot"
-    t_prov = str(targets[0].get("provider") or "") if targets else ""
-    if not requested.get("provider") and t_prov and router_owner("provider_inventory", "launcher_family")(t_prov) in ("claude", "dot"):
-        requested["provider"] = t_prov
     requested.setdefault("provider", UNSPECIFIED_LAUNCH_VALUE)
     requested.setdefault("model", UNSPECIFIED_LAUNCH_VALUE)
     return requested, None
@@ -1637,6 +1628,7 @@ def matching_routes(
     paseo_agents_dir: Path | None = None,
     check_stage: bool = True,
     required_family: str | None = None,
+    allow_line: bool = False,
 ) -> tuple[list[dict], str]:
     """Return `(matched_rows, diagnostic)` after session/correlation and launch-field comparison.
 
@@ -1683,7 +1675,7 @@ def matching_routes(
         differences.extend(
             f"{key}: requested={value!r}, routed={chosen.get(key)!r}"
             for key, value in requested.items()
-            if not same_launch_value(key, value, chosen.get(key), accounts=accounts)
+            if not same_launch_value(key, value, chosen.get(key), accounts=accounts, allow_line=allow_line)
         )
         if is_dot_route(row) and trigger != "shell:run_dot_task.py":
             differences.append("dot_text requires run_dot_task.py")
@@ -1697,12 +1689,12 @@ def matching_routes(
 def match_route(
     rows: list[dict], requested: dict, context: dict, trigger: str, accounts: dict | None = None, *,
     identities: set[str] | None = None, paseo_agents_dir: Path | None = None,
-    check_stage: bool = True, required_family: str | None = None,
+    check_stage: bool = True, required_family: str | None = None, allow_line: bool = False,
 ) -> tuple[dict | None, str]:
     matched, diagnostic = matching_routes(
         rows, requested, context, trigger, accounts=accounts,
         identities=identities, paseo_agents_dir=paseo_agents_dir,
-        check_stage=check_stage, required_family=required_family,
+        check_stage=check_stage, required_family=required_family, allow_line=allow_line,
     )
     return (matched[0] if matched else None), diagnostic
 
@@ -1874,16 +1866,22 @@ def decide(
             "请运行 `agentcompass setup` 使钩子与技能目录来自同一次安装后重试。")
 
 
+def _expand_subagent_calls(calls: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Expand a non-empty Antigravity `invoke_subagent` `Subagents` list into one launch per entry."""
+    expanded: list[tuple[str, dict]] = []
+    for name, args in calls:
+        entries = args.get("Subagents") if base_tool_name(name) == "invoke_subagent" and isinstance(args, dict) else None
+        if isinstance(entries, list) and entries:
+            shared = {k: v for k, v in args.items() if k != "Subagents"}
+            expanded.extend((name, {**shared, **e} if isinstance(e, dict) else {**shared, "Model": UNSPECIFIED_LAUNCH_VALUE}) for e in entries)
+        else:
+            expanded.append((name, args))
+    return expanded
+
+
 def _decide_checked(
-    payload: dict,
-    tool_name: str,
-    tool_input: dict,
-    harness_kind: str,
-    ledger_path: Path | None,
-    now: dt.datetime | None,
-    window_seconds: int | None,
-    usage_cache_path: Path | None,
-    paseo_agents_dir: Path | None,
+    payload: dict, tool_name: str, tool_input: dict, harness_kind: str, ledger_path: Path | None,
+    now: dt.datetime | None, window_seconds: int | None, usage_cache_path: Path | None, paseo_agents_dir: Path | None,
 ) -> dict:
     caller_id = str(payload.get("parent_agent_id") or payload.get("callerAgentId")
                     or os.environ.get("PASEO_AGENT_ID") or "").strip() or None
@@ -1892,6 +1890,7 @@ def _decide_checked(
 
     calls = wrapped_agent_calls(tool_name, tool_input) or [(tool_name, tool_input)]
     calls.extend(cli_turn_calls(tool_name, tool_input))
+    calls = _expand_subagent_calls(calls)
 
     if any(re.split(r'__|\.', name)[-1] in WORKER_QUESTION_TOOLS for name, _ in calls):
         worker = os.environ.get('AGENTCOMPASS_WORKER') == '1' or (
@@ -2041,7 +2040,8 @@ def _decide_checked(
                 'provider/settings/labels may not). An unbound ledger entry is not launch authorization.')
         effective_call_id = (f"{raw_call_id}:{native_launch_index}" if (raw_call_id and native_launch_index) else raw_call_id)
         native_launch_index += 1
-        requested, required_family = native_launch_spec(name, args, trigger, payload, targets, accounts)
+        requested, required_family = native_launch_spec(name, args, trigger, payload, accounts)
+        allow_line = name in CLAUDE_NATIVE_TOOLS
         context = correlation_fields(payload, tool_input, args)
         native_handovers, claim_native_handovers_fn, roll_decision_ids = router_owner(
             "dispatch_registry",
@@ -2062,7 +2062,7 @@ def _decide_checked(
             matching_routes(
                 available_handovers, requested, context, trigger, accounts=accounts,
                 identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=False,
-                required_family=required_family,
+                required_family=required_family, allow_line=allow_line,
             ) if available_handovers else ([], "")
         )
         unchecked_refusal = None
@@ -2092,7 +2092,7 @@ def _decide_checked(
             match_route(
                 record_rows, requested, context, trigger, accounts=accounts,
                 identities=identities, paseo_agents_dir=paseo_agents_dir,
-                required_family=required_family,
+                required_family=required_family, allow_line=allow_line,
             ) if record_rows else (None, "")
         )
         if row is not None and (reason := check_route_authority(row, trigger)):
@@ -2118,8 +2118,7 @@ def _decide_checked(
                 False, harness_kind,
                 f"[Router Gate] 拦截子 agent 启动 ({trigger})：检测到带会话身份的路由授权（status: native 或会话 record），"
                 "但本次 hook 输入与环境变量均未携带会话 ID，无法匹配任何命名会话的授权。"
-                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，并重启当前宿主会话（如更新前已启动的 Pi 会话）使新钩子生效；"
-                f"或在当前会话中重新运行 `{ROUTER_CMD} roll --brief <task.md>`。",
+                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，并重启当前宿主会话（如更新前已启动的 Pi 会话）使新钩子生效。",
             )
         if record_rows and record_diag:
             return format_response(

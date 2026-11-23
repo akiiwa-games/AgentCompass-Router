@@ -1103,7 +1103,7 @@ process.stdout.write(JSON.stringify(out));
         missing = self.state / "missing-f3.jsonl"
         owner_claim = self.handover("antigravity", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
                                     parent_id="agy-owner", session_ids=["agy-owner"], task_id="t-agy-f3", now=T0)
-        # 1. Session-less Antigravity launch cannot steal `agy-owner`'s hand-over, and deny text names setup + restart:
+        # 1. Session-less Antigravity launch cannot steal `agy-owner`'s hand-over, and deny text names setup + restart (N9: never roll):
         sessionless_agy = {"modelName": "gemini-3.8-flash-high",
                            "toolCall": {"id": "tc-anon", "name": "invoke_subagent", "args": {"Model": "inherit"}}}
         denied = gate.evaluate_payload(sessionless_agy, ledger_path=missing, now=T0)
@@ -1111,6 +1111,7 @@ process.stdout.write(JSON.stringify(out));
         self.assertIn("未携带会话 ID", denied["reason"])
         self.assertIn("setup", denied["reason"])
         self.assertIn("重启", denied["reason"])
+        self.assertNotIn("roll --brief", denied["reason"])
         self.assertIsNone(registry.inspect(owner_claim["dispatch_id"]).get("launched_at"))
         # Real Antigravity payload (`conversationId` + concrete `modelName` + `toolCall.id`) matches and retries idempotently:
         real_agy = {"conversationId": "agy-owner", "modelName": "gemini-3.8-flash-high",
@@ -1154,6 +1155,7 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(sless_codex.get("decision"), "block", sless_codex)
         self.assertIn("未携带会话 ID", sless_codex["reason"])
         self.assertIn("重启", sless_codex["reason"])
+        self.assertNotIn("roll --brief", sless_codex["reason"])
         pi_v076 = gate.evaluate_payload(
             {"toolName": "spawn_agent", "cwd": str(self.state),
              "input": {"message": "x", "model": "gpt-6.1-sol", "reasoning_effort": "high"}},
@@ -1162,6 +1164,7 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(pi_v076.get("block"), True, pi_v076)
         self.assertIn("未携带会话 ID", pi_v076["reason"])
         self.assertIn("重启", pi_v076["reason"])
+        self.assertNotIn("roll --brief", pi_v076["reason"])
         # 3. F9: Section 6 standalone `record` written in a bare shell (`session_ids=[]`, `parent_id=None`) names no
         #    session and keeps authorizing matching launches (session-less and sessioned):
         bare_ledger = self.write_ledger(str(self.state), [
@@ -1204,6 +1207,7 @@ process.stdout.write(JSON.stringify(out));
             )
             self.assertEqual(denied_haiku["decision"], "block", sub_name)
             self.assertIn("`model`", denied_haiku["reason"])
+            self.assertNotIn("`effort`", denied_haiku["reason"])
         self.assertIsNone(registry.inspect(haiku_claim["dispatch_id"]).get("launched_at"))
 
         opus_claim = self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
@@ -1269,7 +1273,8 @@ process.stdout.write(JSON.stringify(out));
                 ledger_path=missing, now=T0,
             )
             self.assertEqual(denied_tier["decision"], "deny", tier_kw)
-            self.assertIn("`Model`", denied_tier["reason"])
+            self.assertIn("`Model=\"inherit\"`", denied_tier["reason"])
+            self.assertNotIn("指定具体模型 ID", denied_tier["reason"])
         self.assertIsNone(registry.inspect(flash_claim["dispatch_id"]).get("launched_at"))
 
         argon_claim = self.handover("antigravity", "gemini-4-argon-high", "high", bundle_id="argon_high",
@@ -1306,6 +1311,65 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(denied_t3["decision"], "block")
         self.assertIn("target.driverKind", denied_t3["reason"])
         self.assertIn("target.model", denied_t3["reason"])
+
+        # 5. N8: Each entry of an `invoke_subagent` `Subagents` list is one launch (its own `Model` checked, one
+        #    hand-over per entry, and zero claims committed when any entry fails or fewer hand-overs exist than entries).
+        n8_single = self.handover("antigravity-resilient", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
+                                  parent_id="s-n8", session_ids=["s-n8"], task_id="t-n8-1", now=T0)
+        for label, subagents in (
+            ("two pro entries", [{"TypeName": "research", "Model": "pro"}, {"TypeName": "research", "Model": "pro"}]),
+            ("one mismatched concrete model", [{"TypeName": "research", "Model": "gemini-4-argon-high"}]),
+            ("three inherit entries on one handover", [{"TypeName": "research"}, {"TypeName": "research"}, {"TypeName": "research"}]),
+        ):
+            with self.subTest(n8=label):
+                res_n8 = gate.evaluate_payload(
+                    {"conversationId": "s-n8", "modelName": "gemini-3.8-flash-high",
+                     "toolCall": {"id": f"tc-{label}", "name": "invoke_subagent", "args": {"Subagents": subagents}}},
+                    ledger_path=missing, now=T0,
+                )
+                self.assertEqual(res_n8["decision"], "deny", (label, res_n8))
+                self.assertEqual(registry.inspect(n8_single["dispatch_id"])["state"], "prepared", label)
+        # Adding a second matching hand-over lets a two-entry `Subagents` call pass, claiming both idempotently:
+        n8_second = self.handover("antigravity-resilient", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
+                                  parent_id="s-n8", session_ids=["s-n8"], task_id="t-n8-2", now=T0)
+        batch_ok = {
+            "conversationId": "s-n8", "modelName": "gemini-3.8-flash-high",
+            "toolCall": {"id": "tc-n8-two", "name": "invoke_subagent",
+                         "args": {"Subagents": [{"TypeName": "research", "Model": "inherit"}, {"TypeName": "research"}]}},
+        }
+        self.assertEqual(gate.evaluate_payload(batch_ok, ledger_path=missing, now=T0), {"decision": "allow"})
+        self.assertEqual(gate.evaluate_payload(batch_ok, ledger_path=missing, now=T0), {"decision": "allow"})
+        self.assertEqual(registry.inspect(n8_single["dispatch_id"])["state"], "launched")
+        self.assertEqual(registry.inspect(n8_second["dispatch_id"])["state"], "launched")
+        self.assertEqual(
+            gate.evaluate_payload(
+                {"conversationId": "s-n8", "modelName": "gemini-3.8-flash-high",
+                 "toolCall": {"id": "tc-n8-third", "name": "invoke_subagent",
+                              "args": {"Subagents": [{"TypeName": "research"}]}}},
+                ledger_path=missing, now=T0,
+            )["decision"],
+            "deny",
+        )
+
+        # 6. N11: `model_line_matches` reads `families` through `model_resolution.family_patterns` (returning False on
+        #    `ReferenceDataError` and applying only to Claude native tools, never matching `pro` on `spawn_agent`), and
+        #    `router_gate_hook.py` carries no `"anthropic"` or `"-resilient"` name rules.
+        self.assertFalse(hasattr(gate, "anthropic_line_matches"))
+        self.assertFalse(gate.model_line_matches("sonnet", "claude-sonnet-5-5", {"accounts": {}}))
+        pro_claim = self.handover("codex", "gpt-6-pro", "high", bundle_id=None,
+                                  parent_id="s-n11-pro", session_ids=["s-n11-pro"], task_id="t-n11-pro", now=T0)
+        self.assertEqual(
+            gate.evaluate_payload(
+                {"session_id": "s-n11-pro", "tool_name": "spawn_agent",
+                 "tool_input": {"message": "x", "model": "pro", "reasoning_effort": "high"}},
+                ledger_path=missing, now=T0,
+            )["decision"],
+            "block",
+        )
+        self.assertEqual(registry.inspect(pro_claim["dispatch_id"])["state"], "prepared")
+        gate_src = Path(gate.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("anthropic", gate_src.lower())
+        self.assertNotIn("-resilient", gate_src)
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-t3", "tool_use_id": "tu-t3-ok", "tool_name": "delegate_task",

@@ -79,6 +79,24 @@ def load_decision_ledger():
     return decision_ledger
 
 
+def load_router_gate():
+    setup_dir = Path(__file__).resolve().parent.parent / "setup"
+    if str(setup_dir) not in sys.path:
+        sys.path.insert(0, str(setup_dir))
+    import router_gate_hook
+    return router_gate_hook
+
+
+def _is_builtin_tool_agent(agent_type: object, cwd: object = None, is_builtin: object = None) -> bool:
+    """Single owner (`router_gate_hook.host_tool_agent`): skip Claude Code built-in tool agents unless overridden."""
+    if is_builtin is False:
+        return False
+    name = _clean_token(agent_type)
+    if not name:
+        return False
+    return load_router_gate().host_tool_agent("Agent", {"subagent_type": name}, cwd)
+
+
 def load_audit_registry(path: Path | None = None) -> tuple[list[dict], set[str]]:
     """Read `(dispatches, roll_decision_ids)` read-only from `dispatch.sqlite3`; `([], set())` when absent or unreadable."""
     target = path or Path(os.environ.get("ROUTER_DISPATCH_DB") or DISPATCH_DB)
@@ -381,7 +399,19 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
         except OSError:
             continue
     for path in claude_subagent_files:
-        first_ts, model, session_id = None, None, None
+        first_ts, model, session_id, real_cwd, agent_type = None, None, None, None, None
+        is_builtin, tool_use_id = None, None
+        meta_path = Path(path).with_suffix(".meta.json")
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                meta = None
+            if isinstance(meta, dict):
+                agent_type = _clean_token(meta.get("agentType") or meta.get("subagent_type"))
+                is_builtin = meta.get("isBuiltIn") if isinstance(meta.get("isBuiltIn"), bool) else None
+                tool_use_id = _clean_token(meta.get("toolUseId"))
+                model = _clean_token(meta.get("model"))
         try:
             with open(path, encoding="utf-8", errors="replace") as stream:
                 for line in stream:
@@ -394,21 +424,30 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
                         first_ts = ts
                     if not session_id and isinstance(obj.get("sessionId"), str) and obj.get("sessionId"):
                         session_id = obj["sessionId"]
+                    if not real_cwd and isinstance(obj.get("cwd"), str) and obj.get("cwd"):
+                        real_cwd = obj["cwd"]
+                    if not agent_type:
+                        agent_type = _clean_token(obj.get("agentType") or obj.get("subagent_type") or obj.get("agent_type"))
                     msg = obj.get("message") or {}
                     if isinstance(msg, dict) and msg.get("model"):
                         model = msg.get("model")
-                    if first_ts and model and session_id:
+                    if first_ts and model and session_id and real_cwd:
                         break
         except OSError:
             continue
         if first_ts and first_ts >= cutoff:
+            if _is_builtin_tool_agent(agent_type, real_cwd or Path(path).parent, is_builtin):
+                continue
             parent_dir = Path(path).parent.parent.name if Path(path).parent.name == "subagents" else ""
             spawns.append({
                 "at": first_ts,
                 "kind": "claude-subagent",
                 "label": f"claude-subagent/{model or '?'}",
-                "cwd": parent_dir,
+                "cwd": real_cwd or parent_dir,
                 **({"session_id": session_id} if session_id else {}),
+                **({"agent_type": agent_type} if agent_type else {}),
+                **({"is_builtin": is_builtin} if isinstance(is_builtin, bool) else {}),
+                **({"tool_use_id": tool_use_id} if tool_use_id else {}),
             })
     for s in codex_sessions:
         if s.get("subagent") and s.get("first") and s["first"] >= cutoff:
@@ -469,15 +508,13 @@ def _record_sessions(row: dict) -> set[str]:
 
 
 def _bundle_family(bundle: dict, accounts: dict | None) -> str | None:
-    prov, acct = str(bundle.get("provider") or "").strip(), str(bundle.get("account") or "").strip()
     try:
+        if str(SKILL_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SKILL_SCRIPTS))
         import provider_inventory
-        raw = ((provider_inventory.launcher_family(prov) if prov else None)
-               or (provider_inventory.account_family(acct, accounts) if acct else None)
-               or prov or acct or None)
+        return provider_inventory.bundle_family(bundle, accounts)
     except Exception:
-        raw = prov or acct or None
-    return raw.removesuffix("-resilient") if isinstance(raw, str) else None
+        return _clean_token(bundle.get("provider") or bundle.get("account"))
 
 
 def _native_route_matches(bundle: dict, sp_family: str | None, sp_model: str | None, sp_effort: str | None,
@@ -534,6 +571,10 @@ def find_unrouted_spawns(
     unrouted: list[dict] = []
 
     for sp in spawns:
+        if (isinstance(sp, dict) and sp.get("kind") == "claude-subagent"
+                and _is_builtin_tool_agent(sp.get("agent_type") or sp.get("subagent_type"),
+                                           sp.get("cwd") or None, sp.get("is_builtin"))):
+            continue
         t = parse_ts(sp.get("at")) if isinstance(sp, dict) else None
         if t is None:
             unrouted.append(sp)

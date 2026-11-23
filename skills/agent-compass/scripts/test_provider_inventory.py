@@ -1345,3 +1345,20 @@ class PlanTemplateTests(unittest.TestCase):
                           plan='plus', accounts_extra={'plan_templates': {'codex': {'plus': {
                               'windows': {'custom': {'hours': 24}}}}}})
         self.assertEqual(list(spec['windows']), ['custom'])
+
+    def test_bundle_family_resolves_from_declared_harnesses_and_accounts_without_suffix_rules(self):
+        import account_fleet
+        accounts = account_fleet.fleet_document()
+        for bundle, expected in (
+            ({'provider': 'claude', 'account': 'claude'}, 'claude'),
+            ({'provider': 'claude-lab', 'account': 'claude-lab'}, 'claude'),
+            ({'provider': 'codex', 'account': 'codex'}, 'codex'),
+            ({'provider': 'pi', 'account': 'codex'}, 'pi'),
+            ({'provider': 'omp', 'account': 'codex'}, 'omp'),
+            ({'provider': 'antigravity-resilient', 'account': 'antigravity'}, 'antigravity'),
+            ({'provider': 'antigravity-resilient'}, 'antigravity'),
+            ({'provider': 'antigravity', 'account': 'antigravity'}, 'antigravity'),
+            ({'provider': 'dot', 'account': 'dot'}, 'dot'),
+        ):
+            with self.subTest(bundle=bundle):
+                self.assertEqual(inventory.bundle_family(bundle, accounts), expected)

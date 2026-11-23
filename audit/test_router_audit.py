@@ -301,6 +301,67 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(scanned[0].get("session_id"), "s2")
         self.assertEqual(len(audit.find_unrouted_spawns(scanned, s1_scan_record)), 1)
 
+        # 6. N11 & N12: `audit` has no `-resilient` suffix rule (delegates to `provider_inventory.bundle_family`), and
+        #    built-in Claude tool agents (`web-fetch`, `statusline-setup`, `claude-code-guide`) are skipped via the
+        #    gate's own `host_tool_agent` unless overridden by `.claude/agents/<name>.md` or `isBuiltIn: false`.
+        self.assertNotIn("-resilient", Path(audit.__file__).read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_plain = Path(tmp) / "plain-repo"
+            repo_plain.mkdir()
+            repo_custom = Path(tmp) / "custom-repo"
+            (repo_custom / ".claude" / "agents").mkdir(parents=True)
+            (repo_custom / ".claude" / "agents" / "web-fetch.md").write_text("---\nname: web-fetch\n---\nCustom\n", encoding="utf-8")
+            sub_dir = Path(tmp) / "projects" / "slug" / "s-wf" / "subagents"
+            sub_dir.mkdir(parents=True)
+            builtin_files = []
+            for idx, agent_name in enumerate(("web-fetch", "statusline-setup", "claude-code-guide")):
+                jf = sub_dir / f"agent-b{idx}.jsonl"
+                mf = sub_dir / f"agent-b{idx}.meta.json"
+                jf.write_text(json.dumps({
+                    "timestamp": (scan_base + dt.timedelta(minutes=6)).isoformat(),
+                    "sessionId": "s-wf",
+                    "cwd": str(repo_plain),
+                    "message": {"model": "claude-haiku-5-5"},
+                }) + "\n", encoding="utf-8")
+                mf.write_text(json.dumps({"agentType": agent_name, "isBuiltIn": True, "toolUseId": f"tu-b{idx}"}), encoding="utf-8")
+                builtin_files.append(str(jf))
+            self.assertEqual(audit.scan_subagent_spawns((), builtin_files, (), scan_base), [])
+            # Direct `find_unrouted_spawns` also skips built-in tool agents via the same single owner:
+            direct_builtin = [{
+                "at": scan_base + dt.timedelta(minutes=6),
+                "kind": "claude-subagent",
+                "label": "claude-subagent/claude-haiku-5-5",
+                "cwd": str(repo_plain),
+                "session_id": "s-wf",
+                "agent_type": "web-fetch",
+            }]
+            self.assertEqual(audit.find_unrouted_spawns(direct_builtin, []), [])
+            # Overridden by project `.claude/agents/web-fetch.md` OR `isBuiltIn: false` -> NOT skipped, flagged unrouted:
+            overridden_jf = sub_dir / "agent-custom.jsonl"
+            overridden_mf = sub_dir / "agent-custom.meta.json"
+            overridden_jf.write_text(json.dumps({
+                "timestamp": (scan_base + dt.timedelta(minutes=7)).isoformat(),
+                "sessionId": "s-wf",
+                "cwd": str(repo_custom),
+                "message": {"model": "claude-haiku-5-5"},
+            }) + "\n", encoding="utf-8")
+            overridden_mf.write_text(json.dumps({"agentType": "web-fetch", "isBuiltIn": True}), encoding="utf-8")
+            scanned_custom = audit.scan_subagent_spawns((), [str(overridden_jf)], (), scan_base)
+            self.assertEqual(len(scanned_custom), 1)
+            self.assertEqual(len(audit.find_unrouted_spawns(scanned_custom, [])), 1)
+            explicit_non_builtin_jf = sub_dir / "agent-nonbuiltin.jsonl"
+            explicit_non_builtin_mf = sub_dir / "agent-nonbuiltin.meta.json"
+            explicit_non_builtin_jf.write_text(json.dumps({
+                "timestamp": (scan_base + dt.timedelta(minutes=8)).isoformat(),
+                "sessionId": "s-wf",
+                "cwd": str(repo_plain),
+                "message": {"model": "claude-haiku-5-5"},
+            }) + "\n", encoding="utf-8")
+            explicit_non_builtin_mf.write_text(json.dumps({"agentType": "web-fetch", "isBuiltIn": False}), encoding="utf-8")
+            scanned_nb = audit.scan_subagent_spawns((), [str(explicit_non_builtin_jf)], (), scan_base)
+            self.assertEqual(len(scanned_nb), 1)
+            self.assertEqual(len(audit.find_unrouted_spawns(scanned_nb, [])), 1)
+
     def test_old_shape_ledger_rows_are_skipped_with_count_in_report(self):
         import json
         import tempfile

@@ -1939,6 +1939,11 @@ def current():
     return result
 
 
+INDEPENDENT_HARNESSES = ('claude', 'codex', 'pi', 'omp', 'opencode', 'grok', 'dot', 'chatgpt-web', 'grok-bot')
+# Paseo names the Antigravity launcher `antigravity-resilient` while its discovered/template family is `antigravity` (_discover_antigravity).
+LAUNCHER_PRODUCT_FAMILIES = {'antigravity-resilient': 'antigravity'}
+
+
 def launcher_family(provider):
     if provider in ('claude', 'codex', 'pi', 'omp', 'opencode', 'antigravity-resilient'):
         return provider
@@ -1956,9 +1961,30 @@ def account_family(account, accounts=None, inventory=None):
     spec = obj(obj((accounts or {}).get('accounts')).get(account))
     if row.get('family') or spec.get('family'):
         return row.get('family') or spec['family']
-    families = {b.get('harness') or b.get('provider') for b in obj(spec.get('bundles')).values()
-                if isinstance(b, dict)} - {None}
+    families = {
+        LAUNCHER_PRODUCT_FAMILIES.get(fam, fam)
+        for b in obj(spec.get('bundles')).values() if isinstance(b, dict)
+        for fam in (b.get('harness') or b.get('provider'),) if fam is not None
+    }
     return next(iter(families)) if len(families) == 1 else None
+
+
+def bundle_family(bundle, accounts=None):
+    """Product/execution family of `bundle` from declared launcher and account data (`LAUNCHER_PRODUCT_FAMILIES`)."""
+    if not isinstance(bundle, dict):
+        return None
+    prov = str(bundle.get('provider') or '').strip()
+    acct = str(bundle.get('account') or '').strip()
+    if prov in INDEPENDENT_HARNESSES:
+        return prov
+    if prov in LAUNCHER_PRODUCT_FAMILIES:
+        return LAUNCHER_PRODUCT_FAMILIES[prov]
+    launched = launcher_family(prov) if prov else None
+    if launched in INDEPENDENT_HARNESSES:
+        return launched
+    if launched in LAUNCHER_PRODUCT_FAMILIES:
+        return LAUNCHER_PRODUCT_FAMILIES[launched]
+    return (account_family(acct, accounts) if acct else None) or (account_family(prov, accounts) if prov else None) or launched or prov or acct or None
 
 
 # The plan names each family reports or a user may write, word for word once the vendor's name is dropped. Anything
