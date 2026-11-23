@@ -154,6 +154,8 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         base_doc = account_fleet.reference_fleet_document()
         self.accounts = account_fleet.load_accounts(document=base_doc)
         self.accounts['accounts']['claude']['plan'] = 'max20'
+        for fable_bid in ('fable51_high', 'fable52_high'):
+            self.accounts['accounts']['claude']['bundles'][fable_bid].pop('disabled', None)
         self.accounts['accounts']['claude-lab']['plan'] = 'max20'
         self.accounts['accounts']['codex']['plan'] = 'pro'
         self.accounts['accounts']['antigravity']['plan'] = 'ultra20'
@@ -186,7 +188,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         self.ledger = self.state / 'router-ledger.jsonl'
         self.db_path = self.state / 'dispatch.sqlite3'
 
-    def _run_roll(self, argv, *, env, selected_bundle=None, cli_ok=True, paseo_ok=False):
+    def _run_roll(self, argv, *, env, selected_bundle=None, cli_ok=True, paseo_ok=False, host_error='host_connection_failed'):
         import datetime as dt
         from pathlib import Path
         import dispatch_flow as flow
@@ -251,7 +253,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
                     stdout.write(b'ok')
 
         def fake_host(req):
-            if req.get('operation') == 'create' and paseo_ok:
+            if paseo_ok and host_error == 'host_connection_failed' and req.get('operation') == 'create':
                 prov, _, mod = req['request']['provider'].partition('/')
                 return {
                     'ok': True, 'sent': True,
@@ -262,7 +264,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
                               'labels': req['request']['labels']},
                     'completion_notification': {'status': 'watching'},
                 }
-            return {'ok': False, 'error': 'host_connection_failed', 'condition': 'refused'}
+            return {'ok': False, 'sent': False, 'error': host_error, 'condition': 'refused'}
 
         orig_build_task = roll.build_task
         orig_plan_stage = route_judge.plan_stage
@@ -299,17 +301,21 @@ class NativeExpressibilityContractTests(unittest.TestCase):
     def test_caller_native_host_identifies_all_eight_hosts_from_env_without_guessing(self):
         self.assertEqual(wc.caller_native_host('orca', {}), 'orca')
         self.assertEqual(wc.caller_native_host('t3', {}), 't3')
-        self.assertIsNone(wc.caller_native_host('paseo', {'CLAUDE_SESSION_ID': 'c1'}))
+        self.assertIsNone(wc.caller_native_host('paseo', {'CLAUDE_CODE_SESSION_ID': 'c1'}))
         self.assertIsNone(wc.caller_native_host('herdr', {'HC_TERMINAL_ID': 'h1'}))
         self.assertIsNone(wc.caller_native_host('native', {}))
-        self.assertEqual(wc.caller_native_host('native', {'CLAUDE_SESSION_ID': 'c1'}), 'claude')
+        self.assertEqual(wc.caller_native_host('native', {'CLAUDE_CODE_SESSION_ID': 'c1'}), 'claude')
         self.assertEqual(wc.caller_native_host('native', {'CLAUDECODE': '1'}), 'claude')
         self.assertEqual(wc.caller_native_host('native', {'CODEX_THREAD_ID': 'x1'}), 'codex')
+        self.assertEqual(wc.caller_native_host('native', {'CODEX_SESSION_ID': 'x2'}), 'codex')
         self.assertEqual(wc.caller_native_host('native', {'ANTIGRAVITY_CONVERSATION_ID': 'a1'}), 'antigravity-resilient')
         self.assertEqual(wc.caller_native_host('native', {'PI_SESSION_ID': 'p1'}), 'pi')
         self.assertEqual(wc.caller_native_host('native', {'OPENCODE_SESSION_ID': 'o1'}), 'opencode')
+        # Unsourced markers are excluded and never identify a native host:
+        for unsourced in ({'CLAUDE_SESSION_ID': 'c-legacy'}, {'CODEX_CI': '1'}, {'CODEX_SANDBOX': 'seatbelt'}):
+            self.assertIsNone(wc.caller_native_host('native', unsourced), unsourced)
         # Conflicting session markers refuse to guess:
-        self.assertIsNone(wc.caller_native_host('native', {'CLAUDE_SESSION_ID': 'c1', 'CODEX_THREAD_ID': 'x1'}))
+        self.assertIsNone(wc.caller_native_host('native', {'CLAUDE_CODE_SESSION_ID': 'c1', 'CODEX_THREAD_ID': 'x1'}))
 
     def test_declared_native_tools_cite_vendor_sources_and_link_to_harness_capabilities(self):
         tools = self.account_fleet.NATIVE_HOST_TOOLS
@@ -326,15 +332,24 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         from pathlib import Path
         bundles = self.account_fleet.bundles(self.accounts)
         sonnet = dict(bundles['sonnet55_high'], bundle_id='sonnet55_high', account='claude')
+        fable52 = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-2', 'effort': 'high', 'bundle_id': 'fable52_high'}
+        fable51 = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high', 'bundle_id': 'fable51_high'}
         sol = dict(bundles['sol_high'], bundle_id='sol_high', account='codex')
         flash = dict(bundles['flash_high'], bundle_id='flash_high', account='antigravity')
         pi_astra = dict(bundles['pi_astra_high'], bundle_id='pi_astra_high', account='pi')
 
         cases = (
-            ('claude', sonnet,
-             ['--parent-host', 'native', '--parent-id', 'c-1', '--parent-address', 'inbox:c1', '--new-worker', '--task-id', 'tc-1'],
-             {'CLAUDE_SESSION_ID': 'c-1'},
+            ('claude-same-family-same-row', fable51,
+             ['--parent-host', 'native', '--parent-id', 'c-1', '--parent-address', 'inbox:c1',
+              '--parent-model', 'claude-fable-5-1', '--new-worker', '--task-id', 'tc-1'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-1'},
              lambda lf: {'session_id': 'c-1', 'tool_use_id': 'u-c1', 'tool_name': 'Agent',
+                         'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', **lf}}),
+            ('claude-other-family-target-row', fable52,
+             ['--parent-host', 'native', '--parent-id', 'c-2', '--parent-address', 'inbox:c2',
+              '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'tc-2'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-2'},
+             lambda lf: {'session_id': 'c-2', 'tool_use_id': 'u-c2', 'tool_name': 'Agent',
                          'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', **lf}}),
             ('codex', sol,
              ['--parent-host', 'native', '--parent-id', 'x-1', '--parent-address', 'inbox:x1', '--new-worker', '--task-id', 'tx-1'],
@@ -352,7 +367,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
              {'ORCA_AGENT_SESSION_ID': 'o-1'},
              lambda lf: {'session_id': 'o-1', 'tool_use_id': 'u-o1', 'tool_name': 'Bash',
                          'tool_input': {'command': f'orca orchestration worker-start --spec "go" --agent {lf["--agent"]} --model {lf["--model"]} --effort {lf["--effort"]} --json'}}),
-            ('t3-claude', sonnet,
+            ('t3-codex', sol,
              ['--parent-host', 't3', '--new-worker', '--task-id', 'tt-1'],
              {'CODEX_THREAD_ID': 't3-1'},
              lambda lf: {'session_id': 't3-1', 'tool_use_id': 'u-t1', 'tool_name': 'delegate_task',
@@ -383,24 +398,66 @@ class NativeExpressibilityContractTests(unittest.TestCase):
 
     def test_inexpressible_route_never_answers_native_and_launches_or_blocks(self):
         bundles = self.account_fleet.bundles(self.accounts)
+        sonnet = dict(bundles['sonnet55_high'], bundle_id='sonnet55_high', account='claude')
         sonnet_lab = dict(bundles['lab_sonnet55_high'], bundle_id='lab_sonnet55_high', account='claude-lab')
+        fable_target = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-2', 'effort': 'high', 'bundle_id': 'fable52_high'}
         fable_older = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high', 'bundle_id': 'fable51_high'}
         sol = dict(bundles['sol_high'], bundle_id='sol_high', account='codex')
+        sol_fast = dict(sol, fast=True)
         pi_astra = dict(bundles['pi_astra_high'], bundle_id='pi_astra_high', account='pi')
         argon_high = dict(bundles['argon_high'], bundle_id='argon_high', account='antigravity')
         custom_unlaunchable = {'provider': 'acp', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high'}
 
         inexpressible_cases = (
-            ('claude-cross-provider', sol, ['--parent-host', 'native', '--parent-id', 'c1', '--parent-address', 'in:c1'], {'CLAUDE_SESSION_ID': 'c1'}),
-            ('claude-other-account', sonnet_lab, ['--parent-host', 'native', '--parent-id', 'c2', '--parent-address', 'in:c2'], {'CLAUDE_SESSION_ID': 'c2'}),
-            ('claude-non-target-version', fable_older, ['--parent-host', 'native', '--parent-id', 'c3', '--parent-address', 'in:c3'], {'CLAUDE_SESSION_ID': 'c3'}),
+            # B1 rule cases for Claude line alias:
+            ('claude-unknown-parent-model', sonnet,
+             ['--parent-host', 'native', '--parent-id', 'c0', '--parent-address', 'in:c0'],
+             {'CLAUDE_CODE_SESSION_ID': 'c0'}),
+            ('claude-same-family-older-parent-newer-route', fable_target,
+             ['--parent-host', 'native', '--parent-id', 'c-sf1', '--parent-address', 'in:csf1', '--parent-model', 'claude-fable-5-1'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-sf1'}),
+            ('claude-same-family-newer-parent-older-route', fable_older,
+             ['--parent-host', 'native', '--parent-id', 'c-sf2', '--parent-address', 'in:csf2', '--parent-model', 'claude-fable-5-2'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-sf2'}),
+            ('claude-other-family-non-target-route', fable_older,
+             ['--parent-host', 'native', '--parent-id', 'c-of', '--parent-address', 'in:cof', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-of'}),
+            ('claude-unknown-parent-family', fable_target,
+             ['--parent-host', 'native', '--parent-id', 'c-uf', '--parent-address', 'in:cuf', '--parent-model', 'custom-bedrock-model-v1'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-uf'}),
+            ('claude-env-default-line-model', fable_target,
+             ['--parent-host', 'native', '--parent-id', 'c-env1', '--parent-address', 'in:ce1', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-env1', 'ANTHROPIC_DEFAULT_FABLE_MODEL': 'claude-fable-5-1'}),
+            ('claude-env-subagent-model', sonnet,
+             ['--parent-host', 'native', '--parent-id', 'c-env2', '--parent-address', 'in:ce2', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-env2', 'CLAUDE_CODE_SUBAGENT_MODEL': 'haiku'}),
+            ('claude-env-effort-override', sonnet,
+             ['--parent-host', 'native', '--parent-id', 'c-env3', '--parent-address', 'in:ce3', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-env3', 'CLAUDE_CODE_EFFORT_LEVEL': 'low'}),
+            ('claude-cross-provider', sol,
+             ['--parent-host', 'native', '--parent-id', 'c1', '--parent-address', 'in:c1', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c1'}),
+            ('claude-other-account', sonnet_lab,
+             ['--parent-host', 'native', '--parent-id', 'c2', '--parent-address', 'in:c2', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c2'}),
+            # Codex, Antigravity, Orca, T3, bare Pi, OpenCode, unknown:
+            ('codex-fast-bundle', sol_fast,
+             ['--parent-host', 'native', '--parent-id', 'x-fast', '--parent-address', 'in:xf'],
+             {'CODEX_THREAD_ID': 'x-fast'}),
             ('codex-pi-harness', pi_astra, ['--parent-host', 'native', '--parent-id', 'x1', '--parent-address', 'in:x1'], {'CODEX_THREAD_ID': 'x1'}),
             ('agy-no-parent-model', argon_high, ['--parent-host', 'native', '--parent-id', 'a1', '--parent-address', 'in:a1'], {'ANTIGRAVITY_CONVERSATION_ID': 'a1'}),
             ('agy-mismatched-parent-model', argon_high,
              ['--parent-host', 'native', '--parent-id', 'a2', '--parent-address', 'in:a2', '--parent-model', 'gemini-3.8-flash-high'],
              {'ANTIGRAVITY_CONVERSATION_ID': 'a2'}),
+            # Multi-account family (`claude` + `claude-lab` both ready) or unsupported effort on Orca / T3:
+            ('orca-ambiguous-claude-accounts', sonnet, [], {'ORCA_AGENT_SESSION_ID': 'o0'}),
             ('orca-other-claude-account', sonnet_lab, [], {'ORCA_AGENT_SESSION_ID': 'o1'}),
+            ('orca-opencode-with-effort', {'provider': 'opencode', 'account': 'opencode', 'model': 'gpt-6.1-sol', 'effort': 'high', 'bundle_id': 'oc_sol_high'},
+             [], {'ORCA_AGENT_SESSION_ID': 'o-oc'}),
+            ('t3-ambiguous-claude-accounts', sonnet, ['--parent-host', 't3'], {'CODEX_THREAD_ID': 't0'}),
             ('t3-other-claude-account', sonnet_lab, ['--parent-host', 't3'], {'CODEX_THREAD_ID': 't1'}),
+            ('t3-opencode-with-effort', {'provider': 'opencode', 'account': 'opencode', 'model': 'gpt-6.1-sol', 'effort': 'high', 'bundle_id': 'oc_sol_high'},
+             ['--parent-host', 't3'], {'CODEX_THREAD_ID': 't-oc'}),
             ('bare-pi', sol, ['--parent-host', 'native', '--parent-id', 'p1', '--parent-address', 'in:p1'], {'PI_SESSION_ID': 'p1'}),
             ('opencode', sol, ['--parent-host', 'native', '--parent-id', 'oc1', '--parent-address', 'in:oc1'], {'OPENCODE_SESSION_ID': 'oc1'}),
             ('unknown-native-env', sol, ['--parent-host', 'native', '--parent-id', 'u1', '--parent-address', 'in:u1'], {}),
@@ -416,18 +473,93 @@ class NativeExpressibilityContractTests(unittest.TestCase):
                                                env=env, selected_bundle=bundle, cli_ok=False, paseo_ok=False)
                 self.assertEqual((code_b, res_b['status']), (2, 'blocked'), (label, res_b))
                 self.assertNotEqual(res_b['status'], 'native')
+        # Codex `[agents.default]` `config_file` in `CODEX_HOME/config.toml` layers after requested overrides -> not expressible:
+        from pathlib import Path
+        codex_cfg = self.home / '.codex' / 'config.toml'
+        codex_cfg.write_text('[agents.default]\nconfig_file = "custom-role.toml"\n', encoding='utf-8')
+        try:
+            res_cfg, code_cfg = self._run_roll(
+                ['--parent-host', 'native', '--parent-id', 'x-cfg', '--parent-address', 'in:xcfg', '--new-worker', '--task-id', 'inexp-cfg'],
+                env={'CODEX_THREAD_ID': 'x-cfg'}, selected_bundle=sol, cli_ok=True,
+            )
+            self.assertEqual((code_cfg, res_cfg['status']), (0, 'launched'), res_cfg)
+        finally:
+            codex_cfg.unlink(missing_ok=True)
         # Unlaunchable non-CLI family also blocks instead of returning unrecorded `native`:
         res_u, code_u = self._run_roll(['--parent-host', 'native', '--parent-id', 'c-u', '--parent-address', 'in:cu',
-                                        '--new-worker', '--task-id', 'inexp-acp'],
-                                       env={'CLAUDE_SESSION_ID': 'c-u'}, selected_bundle=custom_unlaunchable, cli_ok=False)
+                                        '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'inexp-acp'],
+                                       env={'CLAUDE_CODE_SESSION_ID': 'c-u'}, selected_bundle=custom_unlaunchable, cli_ok=False)
         self.assertEqual((code_u, res_u['status']), (2, 'blocked'))
         self.assertEqual(self.registry.native_handovers(path=self.db_path), [])
+
+    def test_claude_older_version_without_effort_is_refused_with_non_native_roll_way_out(self):
+        """B3: `Agent` without `effort` is never accepted silently; both `next_action` and the gate denial name v2.1.292+
+        and tell an older Claude Code session to re-run `roll` without `--parent-host native`."""
+        sonnet = dict(self.account_fleet.bundles(self.accounts)['sonnet55_high'], bundle_id='sonnet55_high', account='claude')
+        res_n, code_n = self._run_roll(
+            ['--parent-host', 'native', '--parent-id', 'c-old', '--parent-address', 'in:cold',
+             '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'b3-task'],
+            env={'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet,
+        )
+        self.assertEqual((code_n, res_n['status']), (0, 'native'))
+        self.assertIn('v2.1.292', res_n['next_action'])
+        self.assertIn('without `--parent-host native`', res_n['next_action'])
+        with patch.dict(os.environ, {'ROUTER_DISPATCH_DB': str(self.db_path), 'ROUTER_STATE_DIR': str(self.state),
+                                     'ROUTER_PROVIDER_HOME': str(self.home), 'CLAUDE_CODE_SESSION_ID': 'c-old'}), \
+                patch.object(self.gate, 'load_dispatch_accounts', return_value=self.accounts):
+            denied = self.gate.evaluate_payload(
+                {'session_id': 'c-old', 'tool_use_id': 'u-old', 'tool_name': 'Agent',
+                 'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', 'model': 'sonnet'}},
+                ledger_path=self.ledger,
+            )
+        self.assertEqual(denied['decision'], 'block')
+        self.assertIn('v2.1.292', denied['reason'])
+        self.assertIn('--parent-host native', denied['reason'])
+        # Hand-over stays unconsumed, and following the instruction (`roll` without `--parent-host native`) launches via CLI:
+        self.assertEqual(len([h for h in self.registry.native_handovers(path=self.db_path) if not h.get('launched_at')]), 1)
+        res_cli, code_cli = self._run_roll(
+            ['--new-worker', '--task-id', 'b3-task-cli'],
+            env={'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet, cli_ok=True,
+        )
+        self.assertEqual((code_cli, res_cli['status']), (0, 'launched'))
+
+    def test_cli_launch_for_native_caller_writes_cli_footer_without_unreachable_inbox_on_both_paths(self):
+        """B4: both CLI launch paths (no Paseo, and Paseo `parent_agent_not_found` fallback) share one owner and write
+        `Parent host: cli` with `no worker-to-parent mailbox`, matching `next_action` ('nothing calls back')."""
+        import json
+        from pathlib import Path
+        import dispatch_flow as flow
+        sol = dict(self.account_fleet.bundles(self.accounts)['sol_high'], bundle_id='sol_high', account='codex')
+        res_direct, code_direct = self._run_roll(
+            ['--parent-host', 'native', '--parent-id', 'c-cli1', '--parent-address', 'in:unreachable-1',
+             '--new-worker', '--task-id', 'b4-direct'],
+            env={'CLAUDE_CODE_SESSION_ID': 'c-cli1'}, selected_bundle=sol, cli_ok=True, paseo_ok=False,
+        )
+        self.assertEqual((code_direct, res_direct['status']), (0, 'launched'))
+        self.assertIn('nothing calls back', res_direct['next_action'])
+        full_direct = json.loads(Path(res_direct['details']).read_text(encoding='utf-8'))
+        prompt_direct = Path(full_direct['worker_prompt_file']).read_text(encoding='utf-8')
+        self.assertIn('Parent host: `cli`. Parent message address: `none (no worker-to-parent mailbox)`.', prompt_direct)
+        self.assertNotIn('in:unreachable-1', prompt_direct)
+
+        res_fb, code_fb = self._run_roll(
+            ['--parent-host', 'native', '--parent-id', 'c-cli2', '--parent-address', 'in:unreachable-2',
+             '--new-worker', '--task-id', 'b4-fb'],
+            env={'CLAUDE_CODE_SESSION_ID': 'c-cli2'}, selected_bundle=sol, cli_ok=True, paseo_ok=True,
+            host_error='parent_agent_not_found',
+        )
+        self.assertEqual((code_fb, res_fb['status']), (0, 'launched'))
+        self.assertIn('nothing calls back', res_fb['next_action'])
+        full_fb = json.loads(Path(res_fb['details']).read_text(encoding='utf-8'))
+        prompt_fb = Path(full_fb['worker_prompt_file']).read_text(encoding='utf-8')
+        self.assertIn('Parent host: `cli`. Parent message address: `none (no worker-to-parent mailbox)`.', prompt_fb)
+        self.assertNotIn('in:unreachable-2', prompt_fb)
 
     def test_named_inexpressible_route_is_obeyed_never_substituted_and_never_native(self):
         for idx, (flags, env, expected_model, expected_account) in enumerate((
             (['--parent-host', 'native', '--parent-id', 'nc-1', '--parent-address', 'in:nc1',
               '--provider', 'codex', '--account', 'codex', '--model', 'gpt-6.1-sol', '--effort', 'high', '--basis', 'user named sol'],
-             {'CLAUDE_SESSION_ID': 'nc-1'}, 'gpt-6.1-sol', 'codex'),
+             {'CLAUDE_CODE_SESSION_ID': 'nc-1'}, 'gpt-6.1-sol', 'codex'),
             (['--parent-host', 'native', '--parent-id', 'na-1', '--parent-address', 'in:na1',
               '--parent-model', 'gemini-3.8-flash-high',
               '--provider', 'antigravity-resilient', '--account', 'antigravity', '--model', 'gemini-4-argon-high', '--basis', 'user named argon'],

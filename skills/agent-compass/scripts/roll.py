@@ -583,6 +583,13 @@ def without_paseo(out, why):
                                f'Paseo was not used: {why}. This worker runs through its own CLI, and nothing calls back.'])
 
 
+def _prepare_cli_launch(source_text, parent, out, why=None):
+    """One owner for every CLI worker launch: unwatched `cli` contract with no parent mailbox, plus any Paseo warning."""
+    cli_text, prompt_file = prepare_worker_prompt(source_text, parent, 'cli', None, watched=False)
+    updated = dict(out, worker_prompt_file=str(prompt_file))
+    return cli_text, (without_paseo(updated, why) if why else updated)
+
+
 def python(script, *argv):
     return [sys.executable, '-X', 'utf8', str(script), *argv]
 
@@ -608,8 +615,9 @@ def strip_injected_contract(text):
 
 def recipient_footer(parent, host='paseo', address=None):
     parent = require_parent_id(parent)
+    target_addr = 'none (no worker-to-parent mailbox)' if host == 'cli' else (address or parent)
     return (f'Parent session agent ID: `{parent}`.\n'
-            f'Parent host: `{host}`. Parent message address: `{address or parent}`.')
+            f'Parent host: `{host}`. Parent message address: `{target_addr}`.')
 
 
 def communication_contract(watched=False):
@@ -1023,10 +1031,10 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
         except registry.WorkspaceBusy as busy:
             return workspace_blocked(out, busy.workspace, busy.holders, dispatch_mode='cli')
         # The Paseo parent was not on the host, so this launch has no completion watcher. Rebuild the unwatched contract.
-        text, prompt_file = prepare_worker_prompt(text, parent, 'cli', out.get('parent_address'))
-        out['worker_prompt_file'] = str(prompt_file)
-        res, code = cli(args, without_paseo(out, 'Paseo does not know the parent agent (parent_agent_not_found)'),
-                        decision['selected_bundle'], text)
+        cli_text, cli_out = _prepare_cli_launch(
+            text, parent, out, 'Paseo does not know the parent agent (parent_agent_not_found)',
+        )
+        res, code = cli(args, cli_out, decision['selected_bundle'], cli_text)
         settle_claim(claim_row, res, 'cli_not_launched', new_worker=bool(getattr(args, 'new_worker', False)))
         return res, code
     failed = receipt.get('state') in ('failed', 'create_failed')
@@ -1327,7 +1335,7 @@ def cli(args, out, bundle, text, *, native_spec=None, why_not_native=''):
     env = {k: v for k, v in subscription_cli.subscription_env().items() if not k.startswith(HOST_SESSION_ENV)}
     env.update(provider_env)
     env.update(AGENTCOMPASS_WORKER='1', ROUTER_PARENT_AGENT_ID=out['parent_id'],
-               ROUTER_PARENT_HOST=out['parent_host'], ROUTER_PARENT_ADDRESS=out['parent_address'])
+               ROUTER_PARENT_HOST='cli', ROUTER_PARENT_ADDRESS='')
     run = CLI_RUNS_DIR / f'{time.strftime("%Y%m%d-%H%M%S")}-{launch_values.path_part(bundle["provider"])}-{os.getpid()}'
     run.mkdir(parents=True, exist_ok=True)
     (run / 'brief.md').write_bytes(text.encode('utf-8'))
@@ -1830,8 +1838,12 @@ def _run(args, judge):
                     **({'hook_model': native_spec['hook_model']} if native_spec.get('hook_model') else {}),
                     **({'dispatch_id': claim_row['dispatch_id']} if canonical_ws else {}),
                     next=placed['next']), 0
-    cli_out = (without_paseo(out, no_paseo_because)
-               if no_paseo_because and parent_host not in NATIVE_HOSTS else out)
-    res, code = cli(args, cli_out, bundle, text, native_spec=native_spec, why_not_native=why_not_native)
+    cli_text, cli_out = _prepare_cli_launch(
+        text, parent, out, no_paseo_because if (no_paseo_because and parent_host not in NATIVE_HOSTS) else None,
+    )
+    res, code = cli(args, cli_out, bundle, cli_text, native_spec=native_spec, why_not_native=why_not_native)
+    if res.get('caller_action') == 'launch_with_native_host_tool' and native_spec is not None:
+        _, native_pf = prepare_worker_prompt(text, parent, native_spec['host'], parent_address, watched=False)
+        res = dict(res, worker_prompt_file=str(native_pf))
     settle_claim(claim_row, res, 'cli_not_launched', new_worker=new_worker_flag)
     return res, code

@@ -619,23 +619,32 @@ def unaccepted_effort(harness, model, effort, accepted):
 NATIVE_HOST_TOOLS = {
     'claude': {
         # Anthropic Claude Code docs (fetched 2026-11-24):
-        # - https://code.claude.com/docs/en/sub-agents.md ("Choose a model", "Choose an effort level"):
+        # - https://code.claude.com/docs/en/sub-agents.md ("Choose a model", "Which version a model alias selects",
+        #   "Choose an effort level"):
         #   "On an Agent tool call, the parameter takes a model alias, not a full model ID or `inherit`"
-        #   (aliases `sonnet`, `opus`, `haiku`, `fable`), plus per-invocation `effort` (v2.1.292+).
-        # - https://code.claude.com/docs/en/model-config.md ("Model aliases", "Adjust effort level"):
-        #   each alias points to the current generation of its line (`families` row `models[0]`), or the parent's own
-        #   version when in the same family; runs on the calling session's own Claude account.
+        #   (aliases `sonnet`, `opus`, `haiku`, `fable`), plus per-invocation `effort` (requires Claude Code v2.1.292+;
+        #   overridden by `CLAUDE_CODE_EFFORT_LEVEL`).
+        #   "By default, a subagent with a model alias runs on the version the alias points to. With a family alias such as
+        #   `opus` in the `model` field or per-invocation parameter, the subagent runs on its parent conversation's model in
+        #   two cases: Same family ... Unknown family ..."
+        # - https://code.claude.com/docs/en/model-config.md ("Model aliases", "Environment variables"):
+        #   on the first-party Anthropic API without `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL`, each alias
+        #   resolves to its newest Anthropic version (`families` row `models[0]`) when the parent is in another known family.
+        # - https://code.claude.com/docs/en/env-vars.md (subprocess environment variables; no session model or version env var).
         'tool': 'Agent',
         'account_scope': 'own_session',
         'session_family': 'claude',
         'harness': 'claude',
         'model_mode': 'line_target',
+        'known_lines': ('opus', 'sonnet', 'haiku', 'fable'),
         'model_field': 'model',
         'effort_field': 'effort',
+        'effort_min_version': 'v2.1.292',
         'as_of': '2026-11-24',
         'sources': (
             'https://code.claude.com/docs/en/sub-agents.md',
             'https://code.claude.com/docs/en/model-config.md',
+            'https://code.claude.com/docs/en/env-vars.md',
             'https://code.claude.com/docs/en/hooks.md',
         ),
     },
@@ -643,8 +652,10 @@ NATIVE_HOST_TOOLS = {
         # OpenAI Codex CLI source & docs (fetched 2026-11-24):
         # - https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
         #   (`SpawnAgentArgs`: `model: Option<String>`, `reasoning_effort: Option<ReasoningEffort>`)
+        # - https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/agent/child_config.rs
+        #   (omitted `model` inherits `agent_default_subagent_model` else parent turn's model; `roll` always passes explicit
+        #   `model` and `reasoning_effort`, and refuses when `[agents.default]` / `[agent_roles.default]` sets `config_file`).
         # - https://developers.openai.com/codex/multi-agent/
-        #   Spawns a Codex child agent inside the calling Codex session's own account and `codex` harness.
         'tool': 'spawn_agent',
         'account_scope': 'own_session',
         'session_family': 'codex',
@@ -655,6 +666,7 @@ NATIVE_HOST_TOOLS = {
         'as_of': '2026-11-24',
         'sources': (
             'https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs',
+            'https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/agent/child_config.rs',
             'https://developers.openai.com/codex/multi-agent/',
         ),
     },
@@ -679,30 +691,44 @@ NATIVE_HOST_TOOLS = {
         ),
     },
     'orca': {
-        # Orca CLI orchestration docs (fetched 2026-11-24):
+        # Orca CLI orchestration specs & account routers (fetched 2026-11-24):
         # - https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx
-        #   `orca orchestration worker-start --agent <agent-id> --model <opaque-model-id> [--effort <level>]` supports
-        #   configured local CLI agents (`claude`, `codex`, `antigravity`, `grok`, `pi`, `opencode`).
+        # - https://raw.githubusercontent.com/stablyai/orca/main/src/cli/specs/orchestration-worker-specs.ts
+        # - https://raw.githubusercontent.com/stablyai/orca/main/src/shared/agent-launch/catalog/tui-agent.ts
+        # - https://raw.githubusercontent.com/stablyai/orca/main/src/main/claude/structured/launch/claude-launch-account.ts
+        # - https://raw.githubusercontent.com/stablyai/orca/main/src/main/codex-accounts/account-management/runtime-selection.ts
+        #   `orca orchestration worker-start` has no account flag; the Orca server uses its own active managed account or the
+        #   single system default home (never the caller shell's `CLAUDE_CONFIG_DIR`/`CODEX_HOME`), and `opencode` effort is unsupported.
         'tool': 'shell:orca worker launch',
-        'account_scope': 'multi_provider',
+        'account_scope': 'single_default_account',
         'harnesses': ('claude', 'codex', 'antigravity-resilient', 'pi', 'opencode', 'grok'),
         'agent_names': {'antigravity-resilient': 'antigravity'},
+        'effort_unsupported_harnesses': ('opencode',),
         'model_mode': 'wire_id',
         'agent_field': '--agent',
         'model_field': '--model',
         'effort_field': '--effort',
         'as_of': '2026-11-24',
-        'sources': ('https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx',),
+        'sources': (
+            'https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx',
+            'https://raw.githubusercontent.com/stablyai/orca/main/src/cli/specs/orchestration-worker-specs.ts',
+            'https://raw.githubusercontent.com/stablyai/orca/main/src/shared/agent-launch/catalog/tui-agent.ts',
+            'https://raw.githubusercontent.com/stablyai/orca/main/src/main/claude/structured/launch/claude-launch-account.ts',
+            'https://raw.githubusercontent.com/stablyai/orca/main/src/main/codex-accounts/account-management/runtime-selection.ts',
+        ),
     },
     't3': {
-        # T3 Code Orchestrator MCP contracts & drivers (fetched 2026-11-24):
+        # T3 Code Orchestrator MCP contracts & server target resolution (fetched 2026-11-24):
         # - https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/contracts/src/orchestratorMcp.ts
-        #   (`OrchestratorMcpDelegateTaskInput`, `OrchestratorMcpTarget`: `{driverKind, model, options}`)
+        #   (`OrchestratorMcpTarget`: `driverKind` has no `providerInstanceId` from AgentCompass)
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/mcp/OrchestratorMcpService.ts
         # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/builtInDrivers.ts
-        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/CodexManagedHome.ts
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/provider-pi/src/server/modelCapabilities.ts
+        #   T3's server resolves `driverKind` across its registered instances (default instance uses the single default home,
+        #   never the caller shell's `CLAUDE_CONFIG_DIR`/`CODEX_HOME`).
         'tool': 'delegate_task',
-        'account_scope': 'multi_provider',
+        'account_scope': 'single_default_account',
         'drivers': {
             'claude': 'claudeAgent',
             'codex': 'codex',
@@ -711,12 +737,15 @@ NATIVE_HOST_TOOLS = {
             'opencode': 'opencode',
             'grok': 'grok',
         },
-        'option_effort_ids': {'codex': 'reasoningEffort', 'claude': 'effort'},
+        'option_effort_ids': {'codex': 'reasoningEffort', 'claude': 'effort', 'pi': 'thinking'},
         'model_mode': 'wire_id',
         'as_of': '2026-11-24',
         'sources': (
             'https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/contracts/src/orchestratorMcp.ts',
+            'https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/mcp/OrchestratorMcpService.ts',
             'https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/builtInDrivers.ts',
+            'https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/CodexManagedHome.ts',
+            'https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/provider-pi/src/server/modelCapabilities.ts',
         ),
     },
     'pi': {
@@ -748,10 +777,15 @@ NATIVE_HOST_TOOLS = {
 }
 
 
+def harness_family(harness):
+    """Execution/account family of a harness name (`antigravity-resilient` -> `antigravity`)."""
+    return 'antigravity' if harness == 'antigravity-resilient' else harness
+
+
 def t3_driver_family(driver_kind):
     """Map a T3 `target.driverKind` (`claudeAgent`, `antigravity`, ...) back to its provider family via `NATIVE_HOST_TOOLS`."""
     drivers = (NATIVE_HOST_TOOLS.get('t3') or {}).get('drivers') or {}
-    reverse = {v: ('antigravity' if k == 'antigravity-resilient' else k) for k, v in drivers.items()}
+    reverse = {v: harness_family(k) for k, v in drivers.items()}
     return reverse.get(driver_kind, driver_kind)
 
 HARNESS_CAPABILITIES = {

@@ -149,7 +149,9 @@ class BatchLauncherTests(unittest.TestCase):
                 patch.object(roll.subprocess, 'Popen', side_effect=AssertionError('started')):
             result, code = roll.cli(argparse.Namespace(workspace=None), out, {'provider': 'pi', 'model': self.hostile[0]},
                                     'task')
-        self.assertEqual((result['launched'], code), (False, 1))
+        self.assertFalse(result['launched'])
+        self.assertEqual(roll.status_of(result, code), 'blocked')
+        self.assertEqual((result['dispatch_mode'], result['error']), ('none', 'cli_launch_failed'))
         self.assertIn('cannot be started without cmd.exe', result['next'])
         self.assertEqual(public_data._EFFECTS[0], before)                     # refused before the launch's effect
         with patch.dict(scorer_client.SCORER, {'provider': 'claude'}), \

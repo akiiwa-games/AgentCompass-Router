@@ -90,18 +90,27 @@ def require_parent_id(value):
 
 HOSTS = ('paseo', 'native', 'orca', 't3', 'herdr')
 NATIVE_HOSTS = ('native', 'orca', 't3')
-# Environment facts that identify the caller's own harness under `--parent-host native` (never guessed from a name).
+# Environment facts that identify the caller's own harness under `--parent-host native` (never guessed from a name;
+# every marker has a verified upstream source as of 2026-11-24; unsourced names are excluded):
+# - Claude Code: `CLAUDE_CODE_SESSION_ID` and `CLAUDECODE=1` (https://code.claude.com/docs/en/env-vars.md).
+# - Codex CLI: `CODEX_THREAD_ID` and `CODEX_SESSION_ID` (`openai/codex` `codex-rs/core/src/exec_env.rs`,
+#   `codex-rs/protocol/src/shell_environment.rs`).
+# - Antigravity: `ANTIGRAVITY_CONVERSATION_ID` (live Antigravity subprocess environment, `cli-1.5.15`).
+# - Pi: `PI_SESSION_ID` (`badlogic/pi-mono` `packages/coding-agent/src/core/tools/bash.ts`).
+# - OpenCode: `OPENCODE_SESSION_ID` (`anomalyco/opencode` `packages/core/src/tool/plugin/shell.ts`).
 CALLER_HARNESS_ENV = (
-    ('claude', ('CLAUDE_SESSION_ID', 'CLAUDE_CODE_SESSION_ID'), ('CLAUDECODE', '1')),
-    ('codex', ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_SANDBOX', 'CODEX_CI'), None),
+    ('claude', ('CLAUDE_CODE_SESSION_ID',), ('CLAUDECODE', '1')),
+    ('codex', ('CODEX_THREAD_ID', 'CODEX_SESSION_ID'), None),
     ('antigravity-resilient', ('ANTIGRAVITY_CONVERSATION_ID',), None),
     ('pi', ('PI_SESSION_ID',), None),
     ('opencode', ('OPENCODE_SESSION_ID',), None),
 )
-# Orca's own mailbox spelling (src/shared/orca-session-address-prefix.ts, structured-worker-handle.ts).
+# Orca's own session/terminal env and mailbox spelling (`stablyai/orca` `src/cli/orchestration/identity/terminal-identity.ts`,
+# `src/shared/agent-session/identity/orca-session-address-prefix.ts`, `src/shared/orchestration/workers/structured-worker-handle.ts`).
 ORCA_SESSION_ADDRESS_PREFIX = 'orca_session_id:'
 ORCA_WORKER_HANDLE_PREFIX = 'structworker_'
-# T3 Code injects these only into its Pi provider; Claude and Codex threads reach its MCP tools without any env marker.
+# T3 Code injects these into its Pi provider (`pingdotgg/t3code` `packages/provider-pi/src/server/mcpExtensionSource.ts`,
+# `packages/provider-pi/src/server/mcpInjection.ts`); Claude and Codex threads pass `--parent-host t3` or `ROUTER_PARENT_HOST=t3`.
 T3_MCP_ENV = ('T3_MCP_URL', 'T3_MCP_BEARER_TOKEN')
 
 

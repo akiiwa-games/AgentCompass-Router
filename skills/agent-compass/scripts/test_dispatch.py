@@ -2337,7 +2337,9 @@ class RollTests(unittest.TestCase):
         self.assertEqual(registry.reservations(), [])
 
     def test_roll_inside_orca_and_t3_hands_back_the_host_command_without_paseo(self):
-        decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision={'action': 'start'})
+        sonnet_bundle = dict(account_fleet.bundles(self.accounts)['sonnet55_high'], bundle_id='sonnet55_high')
+        decision = dict(stage='plan', choice='sonnet55_high', selected_bundle=sonnet_bundle, decision={'action': 'start'})
+        self.usage['accounts']['claude'] = self.usage['accounts']['claude-lab']
         cases = (
             ({'ORCA_AGENT_SESSION_ID': 'orca-sess', 'ORCA_TERMINAL_HANDLE': 'term_1'}, {}, 'orca',
              'orca_session_id:orca-sess', 'worker-start',
@@ -2346,7 +2348,8 @@ class RollTests(unittest.TestCase):
              {'target': {'driverKind': 'claudeAgent', 'model': 'claude-sonnet-5-5', 'options': {'effort': 'high'}}}),
         )
         for env, flags, host, address, command, expected_fields in cases:
-            with self.subTest(host=host), patch.object(flow, 'host_call', side_effect=AssertionError('must not use Paseo')):
+            with self.subTest(host=host), \
+                    patch.object(flow, 'host_call', side_effect=AssertionError('must not use Paseo')):
                 (result, code), _ = self.roll(decision, parent='', env=env, reachable=True, **flags)
             self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'native', 0))
             self.assertEqual(result['launch_fields'], expected_fields)
@@ -2364,7 +2367,8 @@ class RollTests(unittest.TestCase):
             (result, code), seen = self.roll(
                 decision, parent='', parent_host='native',
                 parent_id='coordinator-session', parent_address='run:coordinator-run', reachable=True,
-                env={'CLAUDE_SESSION_ID': 'coordinator-session', 'CLAUDE_CONFIG_DIR': str(lab_home)},
+                parent_model='claude-sonnet-5-5',
+                env={'CLAUDE_CODE_SESSION_ID': 'coordinator-session', 'CLAUDE_CONFIG_DIR': str(lab_home)},
             )
         self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'native', 0))
         self.assertEqual((result['native_tool'], result['launch_fields']), ('Agent', {'model': 'sonnet', 'effort': 'high'}))
@@ -4011,8 +4015,14 @@ class RollLifecycleTests(unittest.TestCase):
 
         # Conversely, a writer claimed on a native host blocks a subsequent Paseo writer in the same directory.
         ws_native = self.ws_dir('native-held')
+        self.usage['accounts']['claude'] = self.usage['accounts']['claude-lab']
+        orca_decision = dict(
+            self.fresh_decision(),
+            choice='sonnet55_high',
+            selected_bundle=dict(account_fleet.bundles(self.accounts)['sonnet55_high'], bundle_id='sonnet55_high'),
+        )
         (held_native, held_code), _ = self.roll(
-            self.fresh_decision(), parent='', reachable=False, workspace=ws_native, new_worker=True,
+            orca_decision, parent='', reachable=False, workspace=ws_native, new_worker=True,
             parent_host='orca', parent_id='orca-owner', parent_address='orca_session_id:orca-owner',
             hours=0.001, task=None, task_id='native-writer', resume=None, fast=False, keep_whole=None,
             access=None, account=None, verbose=True)

@@ -839,7 +839,7 @@ process.stdout.write(JSON.stringify(out));
 
         accounts = account_fleet.load_accounts(account_fleet.reference_fleet_path())
         accounts["accounts"]["claude-lab"]["plan"] = "max20"
-        self.write_settings(allowed=["claude-lab", "codex", "antigravity"])
+        self.write_settings(allowed=["claude", "claude-lab", "codex", "antigravity"])
         usage = {
             "read_ok": True,
             "accounts": {
@@ -886,15 +886,17 @@ process.stdout.write(JSON.stringify(out));
         }
         accounts["_discovery"] = disc_payload
 
-        def run_real_roll(*argv, env=None, host_fn=fake_paseo_host, current_accounts=None):
+        def run_real_roll(*argv, env=None, host_fn=fake_paseo_host, current_accounts=None, current_usage=None, current_disc=None):
             args = route_judge.build_parser().parse_args(["roll", "--brief", str(brief), *argv])
             args.brief = args.brief[0]
             active_accounts = current_accounts or accounts
-            active_accounts.setdefault("_discovery", disc_payload)
+            active_disc = current_disc or disc_payload
+            active_usage = current_usage or usage
+            active_accounts.setdefault("_discovery", active_disc)
             with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "parent-a", **(env or {})}), \
                     mock.patch.object(account_fleet, "load_accounts", return_value=active_accounts), \
-                    mock.patch.object(registry.provider_inventory, "current", return_value=disc_payload), \
-                    mock.patch.object(usage_reading, "usage_snapshot", side_effect=lambda *_, **__: usage), \
+                    mock.patch.object(registry.provider_inventory, "current", return_value=active_disc), \
+                    mock.patch.object(usage_reading, "usage_snapshot", side_effect=lambda *_, **__: active_usage), \
                     mock.patch.object(subscription_cli, "subscription_env", side_effect=lambda account=None: dict(os.environ)), \
                     mock.patch.object(subscription_cli, "cli_prefix", side_effect=lambda name: [name]), \
                     mock.patch.object(roll_mod, "WORKER_PROMPTS_DIR", self.state / "wp"), \
@@ -947,8 +949,8 @@ process.stdout.write(JSON.stringify(out));
         #   c0: `--parent-host native` inside Claude Code (`Agent` with `launch_fields`)
         res_c0, code_c0 = run_real_roll(
             "--task-id", "t-native-0", "--parent-host", "native", "--parent-id", "claude-s0",
-            "--parent-address", "inbox:s0", "--new-worker",
-            env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "claude-s0", "CLAUDE_CONFIG_DIR": str(lab_home)},
+            "--parent-address", "inbox:s0", "--parent-model", "claude-sonnet-5-5", "--new-worker",
+            env={"PASEO_AGENT_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-s0", "CLAUDE_CONFIG_DIR": str(lab_home)},
         )
         self.assertEqual((code_c0, res_c0["status"], res_c0["native_tool"], res_c0["launch_fields"]),
                          (0, "native", "Agent", {"model": "sonnet", "effort": "high"}))
@@ -960,12 +962,22 @@ process.stdout.write(JSON.stringify(out));
             "block",
         )
 
-        #   c1: `surface in NATIVE_HOSTS` (`orca` terminal with inner Claude session -> `orca orchestration worker-start`)
+        #   c1: `surface in NATIVE_HOSTS` (`orca` terminal with inner Claude session on the single default `claude` home)
+        default_claude_home = Path(os.environ["HOME"]) / ".claude"
+        default_claude_home.mkdir(parents=True, exist_ok=True)
+        orca_accounts = json.loads(json.dumps(accounts))
+        orca_accounts["accounts"]["claude"]["plan"] = "max20"
+        orca_disc = {
+            "accounts": {"claude": {"family": "claude", "status": "ready", "home": str(default_claude_home)}},
+            "launchers": {"claude": {"family": "claude", "status": "ready"}},
+        }
+        orca_accounts["_discovery"] = orca_disc
+        orca_usage = {"read_ok": True, "accounts": {"claude": usage["accounts"]["claude-lab"]}}
         res_c1, code_c1 = run_real_roll(
             "--task-id", "t-native-1", "--new-worker",
+            current_accounts=orca_accounts, current_usage=orca_usage, current_disc=orca_disc,
             env={"PASEO_AGENT_ID": "", "ORCA_AGENT_SESSION_ID": "orca-s1",
-                 "ORCA_TERMINAL_HANDLE": "term_1", "CLAUDE_CODE_SESSION_ID": "claude-s1",
-                 "CLAUDE_CONFIG_DIR": str(lab_home)},
+                 "ORCA_TERMINAL_HANDLE": "term_1", "CLAUDE_CODE_SESSION_ID": "claude-s1"},
         )
         self.assertEqual((code_c1, res_c1["status"], res_c1["native_tool"]),
                          (0, "native", "shell:orca worker launch"))
@@ -983,8 +995,8 @@ process.stdout.write(JSON.stringify(out));
         with mock.patch.object(flow, "paseo_reachable", return_value=False), \
                 mock.patch.object(roll_mod, "provider_definition", return_value=("custom-no-cli", {})):
             res_c2, code_c2 = run_real_roll(
-                "--task-id", "t-native-2", "--parent-id", "sess-c2", "--new-worker",
-                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c2", "CLAUDE_CONFIG_DIR": str(lab_home)},
+                "--task-id", "t-native-2", "--parent-id", "sess-c2", "--parent-model", "claude-sonnet-5-5", "--new-worker",
+                env={"PASEO_AGENT_ID": "", "CLAUDE_CODE_SESSION_ID": "sess-c2", "CLAUDE_CONFIG_DIR": str(lab_home)},
             )
         self.assertEqual((code_c2, res_c2["status"]), (0, "native"))
         c2_payload = {"session_id": "sess-c2", "tool_use_id": "c2-a", "tool_name": "Agent",
@@ -1000,8 +1012,8 @@ process.stdout.write(JSON.stringify(out));
                 mock.patch.object(roll_mod, "provider_definition", return_value=("claude", {})), \
                 mock.patch.object(roll_mod.subprocess, "Popen", side_effect=OSError("missing binary")):
             res_c3, code_c3 = run_real_roll(
-                "--task-id", "t-native-3", "--parent-id", "sess-c3", "--new-worker", "--verbose",
-                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c3", "CLAUDE_CONFIG_DIR": str(lab_home)},
+                "--task-id", "t-native-3", "--parent-id", "sess-c3", "--parent-model", "claude-sonnet-5-5", "--new-worker", "--verbose",
+                env={"PASEO_AGENT_ID": "", "CLAUDE_CODE_SESSION_ID": "sess-c3", "CLAUDE_CONFIG_DIR": str(lab_home)},
             )
         self.assertEqual((code_c3, res_c3["dispatch_mode"], res_c3["caller_action"]),
                          (0, "native", "launch_with_native_host_tool"))
