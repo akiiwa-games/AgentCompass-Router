@@ -1,0 +1,26 @@
+{
+  "about": "Account situations of packaging/experience_run.py. A scenario is an account set, the usage every window starts the day at, and the user's own switches. Add a scenario by adding an entry. accounts: name (the sign-in slot: claude, claude-2, codex, codex-2, opencode), family (claude | codex | opencode) and plan (a plan of references/plan-templates.json; opencode has none). usage: a usage_states name for every account; usage_by_account names one per account. switches: outside_allowed (accounts taken out of host-policy allowed_accounts after setup), unchecked ({account, model}: every bundle of that model on that account unchecked in model management), plan_ends ({account, in_hours, basis}: `agentcompass override --expires-in`). days: how many working days the stream is played (nights are skipped on the simulated clock).",
+  "usage_states": {
+    "about": "Each state gives [used percent, share of the period already elapsed] for the short windows (under 24 h) and the long ones, at the first hour of the day.",
+    "fresh": {"short": [0, 0.0], "long": [0, 0.0]},
+    "mid_period": {"short": [25, 0.4], "long": [50, 0.5]},
+    "nearly_empty": {"short": [70, 0.4], "long": [93, 0.6]},
+    "short_empty": {"short": [100, 0.5], "long": [30, 0.3]},
+    "scarce": {"short": [90, 0.3], "long": [96, 0.7]},
+    "late_period_unused": {"short": [5, 0.2], "long": [20, 0.9]}
+  },
+  "scenarios": [
+    {"name": "claude-pro-alone", "accounts": [{"name": "claude", "family": "claude", "plan": "pro"}], "usage": "fresh", "days": 1},
+    {"name": "codex-plus-alone-mid", "accounts": [{"name": "codex", "family": "codex", "plan": "plus"}], "usage": "mid_period", "days": 1},
+    {"name": "two-vendors-fresh", "accounts": [{"name": "claude", "family": "claude", "plan": "pro"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "fresh", "days": 1},
+    {"name": "two-vendors-main-nearly-empty", "accounts": [{"name": "claude", "family": "claude", "plan": "max5"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "mid_period", "usage_by_account": {"claude": "nearly_empty"}, "days": 1},
+    {"name": "two-vendors-short-window-empty", "accounts": [{"name": "claude", "family": "claude", "plan": "max20"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "short_empty", "days": 1},
+    {"name": "large-fleet-mid", "accounts": [{"name": "claude", "family": "claude", "plan": "max20"}, {"name": "claude-2", "family": "claude", "plan": "pro"}, {"name": "codex", "family": "codex", "plan": "pro"}, {"name": "codex-2", "family": "codex", "plan": "plus"}, {"name": "opencode", "family": "opencode"}], "usage": "mid_period", "days": 1},
+    {"name": "large-fleet-everything-scarce", "accounts": [{"name": "claude", "family": "claude", "plan": "max20"}, {"name": "claude-2", "family": "claude", "plan": "pro"}, {"name": "codex", "family": "codex", "plan": "pro"}, {"name": "codex-2", "family": "codex", "plan": "plus"}, {"name": "opencode", "family": "opencode"}], "usage": "scarce", "days": 1},
+    {"name": "free-only", "accounts": [{"name": "opencode", "family": "opencode"}], "usage": "fresh", "days": 1},
+    {"name": "two-vendors-plan-ends", "accounts": [{"name": "claude", "family": "claude", "plan": "pro"}, {"name": "codex", "family": "codex", "plan": "pro"}], "usage": "late_period_unused", "switches": {"plan_ends": [{"account": "codex", "in_hours": 30, "basis": "my ChatGPT Pro subscription ends tomorrow evening"}]}, "days": 1},
+    {"name": "two-vendors-codex-outside-allowed", "accounts": [{"name": "claude", "family": "claude", "plan": "max5"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "fresh", "switches": {"outside_allowed": ["codex"]}, "days": 1},
+    {"name": "two-vendors-opus-unchecked", "accounts": [{"name": "claude", "family": "claude", "plan": "max5"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "fresh", "switches": {"unchecked": [{"account": "claude", "model": "claude-opus-5-5"}]}, "days": 1},
+    {"name": "two-vendors-week", "accounts": [{"name": "claude", "family": "claude", "plan": "pro"}, {"name": "codex", "family": "codex", "plan": "plus"}], "usage": "fresh", "days": 5}
+  ]
+}

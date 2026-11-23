@@ -93,6 +93,8 @@
 !/packaging/*.md
 !/packaging/verify-release/
 !/packaging/verify-release/**
+!/packaging/experience/
+!/packaging/experience/*.json
 !/.github/
 /.github/*
 !/.github/RELEASE_NOTES.md
