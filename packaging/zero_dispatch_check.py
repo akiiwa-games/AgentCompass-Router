@@ -65,6 +65,7 @@ ROOT = sc.ROOT
 PARENT = "parent-session-7"
 GIT_BASH = "C:" + chr(92) + "Program Files" + chr(92) + "Git" + chr(92) + "bin" + chr(92) + "bash.exe"     # Claude Code runs hook commands through bash on Windows
 TASK_BODY = "Rename the helper foo to bar in util.py and update its two callers."
+LOCAL_ONLY_REASON = "fixture classification: this edit stays in the local repository"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -94,12 +95,15 @@ class ScorerServer:
                 if "SCORER-GARBAGE" in user:
                     return self._send(200, {"choices": [{"message": {"content": "I cannot classify this."}}]})
                 is_rt = "REALTIME-LOOP" in user
+                # A brief the classifier keeps on this machine (needs.local_only_by: classifier), as it does for most
+                # work in a local repository.
+                local = "CLASSIFY-LOCAL-ONLY" in user
                 profile = {"work_kind": "gui_control" if is_rt else "code_implementation",
                            "primary_level": 2, "secondary_kind": "none", "secondary_level": 0,
-                           "needs_visual": is_rt, "local_only": is_rt, "wants_fast": False,
+                           "needs_visual": is_rt, "local_only": is_rt or local, "wants_fast": False,
                            "access": "read-only" if is_rt else "write", "expected_hours": 0.5,
                            "task_count": "1",
-                           "reason": "fixture classification of a small bounded edit"}
+                           "reason": LOCAL_ONLY_REASON if local else "fixture classification of a small bounded edit"}
                 self._send(200, {"choices": [{"message": {"content": json.dumps(profile)}}]})
 
             def _send(self, status, body):
@@ -635,9 +639,13 @@ def step_paseo_host(z: Zero):
 
     op = run.operation("Paseo host: definite creation failure releases the reservation", "the host rejects the create before anything exists: the same roll relaunches the brief on another candidate (or reports the cause with fallback off), the reservation is released, a re-roll can launch")
     z.set_fault(create="reject")
-    result = z.call(op, "roll", "--task", z.task("ok", "reject"), **env)
+    # The classifier marks this brief local-only, so the relaunch plans the task AgentCompass stored with that mark.
+    result = z.call(op, "roll", "--task", z.task("ok", "reject") + "CLASSIFY-LOCAL-ONLY\n", **env)
     doc = parse(result.stdout) or {}
     attempts = doc.get("attempts") or details(doc).get("attempts") or (details(doc).get("worker") or {}).get("attempts") or []
+    ledger = z.box.state / "router-ledger.jsonl"
+    marked = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if LOCAL_ONLY_REASON in line] if ledger.is_file() else []
+    op.check("the classifier marked the rejected brief local-only", any(r.get("local_only") for r in marked), len(marked))
     op.check("roll relaunches the rejected brief by itself and lists both attempts", doc.get("status") == "launched" and len(attempts) >= 2, json.dumps(doc)[:400])
     relaunched = (details(doc).get("worker") or {}).get("dispatch_id")
     z.set_fault(create="reject")
