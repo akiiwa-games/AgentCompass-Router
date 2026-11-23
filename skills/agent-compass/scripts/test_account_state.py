@@ -105,10 +105,10 @@ class Machine(unittest.TestCase):
     def community(family, plan, window):
         return axis_scores.load_five_axis()['capacity'][family][plan][window]['capacity_usd']
 
-    def route(self, account='codex'):
+    def route(self, account='codex', now=None):
         accounts = account_fleet.load_accounts()
-        usage = usage_reading.usage_snapshot(accounts=list(accounts['accounts']), inventory=accounts.get('_discovery'))
-        result = allocator.plan(TASK, usage, accounts=accounts, overrides=[], records=[])
+        usage = usage_reading.usage_snapshot(accounts=list(accounts['accounts']), now=now, inventory=accounts.get('_discovery'))
+        result = allocator.plan(TASK, usage, now=now, accounts=accounts, overrides=[], records=[])
         rows = [c for c in result['ranking'] if (c.get('bundle') or {}).get('account') == account]
         return rows, result['decision'].get('warnings') or []
 
@@ -913,16 +913,37 @@ class TemplateTests(Machine):
     def test_the_plus_five_hour_window_is_a_feasibility_limit(self):
         self.codex_login('plus')
         spec = self.spec()
+        cap_5h = self.community('codex', 'plus', 'five_hour')
+        margin_pct = account_fleet.load_accounts()['scoring']['small_short_safety_margin_pct']
         self.assertEqual(spec['capacity_usd'], {w: self.community('codex', 'plus', w) for w in ('usage', 'five_hour')})
-        # The 5-hour window is feasibility only: it keeps work off an account that cannot finish it, and prices nothing.
-        eligible = {}
-        for used in (0.0, 99.0):
+        # The 5-hour window is feasibility only: it excludes bundles whose task spend exceeds full 5h capacity, prices
+        # nothing while room remains, and holds fitting bundles for its observed reset when the current period is empty.
+        by_used = {}
+        for used in (0.0, 40.0, 99.0):
             self.cache(codex={'plan_label': 'plus', 'windows': self.windows(40.0) + [
                 {'id': 'five_hour', 'label': '5h', 'used_pct': used, 'resets_at': (self.now + timedelta(hours=4)).isoformat()}]})
-            rows, _ = self.route()
-            eligible[used] = [c for c in rows if not c['excluded']]
-        self.assertTrue(eligible[0.0])
-        self.assertFalse(eligible[99.0])
+            rows, _ = self.route(now=self.now)
+            by_used[used] = [c for c in rows if c['bundle'].get('harness') == 'codex']
+        over_full = [c for c in by_used[0.0] if 100.0 * c['expected_usd'] / cap_5h > 100.0 - margin_pct]
+        within_full = [c for c in by_used[0.0] if not c['excluded']]
+        self.assertTrue(over_full)
+        self.assertTrue(all(any('five_hour full capacity' in r for r in c['excluded']) for c in over_full), over_full)
+        self.assertTrue(within_full)
+        self.assertTrue(all(c['available_in_hours'] is None for c in within_full))
+        startable_40 = {c['id']: c for c in by_used[40.0] if not c['excluded'] and c['available_in_hours'] is None}
+        self.assertTrue(startable_40)
+        for bid, row_40 in startable_40.items():
+            row_0 = next(c for c in within_full if c['id'] == bid)
+            self.assertEqual(row_40['components']['opportunity_cost'], row_0['components']['opportunity_cost'])
+            self.assertEqual(row_40['score'], row_0['score'])
+        over_full_99 = [c for c in by_used[99.0] if 100.0 * c['expected_usd'] / cap_5h > 100.0 - margin_pct]
+        eligible_99 = [c for c in by_used[99.0] if not c['excluded']]
+        self.assertTrue(all(any('five_hour full capacity' in r for r in c['excluded']) for c in over_full_99), over_full_99)
+        self.assertEqual([c['id'] for c in eligible_99], [c['id'] for c in within_full])
+        self.assertFalse([c for c in eligible_99 if not c['available_in_hours']])
+        for c in eligible_99:
+            self.assertEqual(c['waiting_on'], 'five_hour')
+            self.assertAlmostEqual(c['available_in_hours'], 4.0, places=2)
 
 
 class ResidueTests(Machine):

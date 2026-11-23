@@ -1101,7 +1101,11 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(row['capacity']['window'], 'usage')
         scarce = allocator.plan(task, usage_windows(self.now, {'codex': [('usage', 0, 100)]}), self.now,
                                 accounts=accounts, overrides=[], records=[], host_policy_config=None)
-        self.assertTrue(next(c for c in scarce['ranking'] if c['id'] == omp_id)['excluded'])
+        scarce_row = next(c for c in scarce['ranking'] if c['id'] == omp_id)
+        self.assertEqual(scarce_row['excluded'], [], scarce_row)
+        self.assertEqual(scarce_row['bundle']['account'], 'codex')
+        self.assertEqual(scarce_row['waiting_on'], 'usage')
+        self.assertAlmostEqual(scarce_row['available_in_hours'], 100.0, places=2)
 
     def test_pi_on_the_codex_subscription_adds_no_twin_of_a_codex_pi_bundle(self):
         # LITTLESPRING 2026-11-03: Pi signed in as the Codex account re-derived every pi-harness model under `pi`,

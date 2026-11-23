@@ -483,11 +483,12 @@ class GrokBotTests(unittest.TestCase):
             },
         }
 
-        def evaluate_grok_bot(plan_label, used_pct, tier_error=None, *, host_policy_cfg=None, read_local=False):
+        def evaluate_grok_bot(plan_label, used_pct, tier_error=None, *, host_policy_cfg=None, read_local=False,
+                              resets_at=reset_iso):
             grok_row = {
                 'provider_id': 'grok', 'available': True, 'stale': False, 'fetched_at': now.isoformat(),
                 'plan_label': plan_label, 'plan_source': 'settings_api' if plan_label else None,
-                'windows': [{'id': 'credits', 'used_pct': used_pct, 'resets_at': reset_iso}],
+                'windows': [{'id': 'credits', 'used_pct': used_pct, 'resets_at': resets_at}],
             }
             if tier_error:
                 grok_row['usage_details'] = {'plan_tier_error': tier_error}
@@ -541,9 +542,15 @@ class GrokBotTests(unittest.TestCase):
         self.assertNotIn('grok/supergrok', ' '.join(low_cand['notes']))
         self.assertGreater(high_cand['components']['opportunity_cost'], low_cand['components']['opportunity_cost'])
 
-        # Rule: exhausted credits window excludes grok-bot.
+        # Rule: exhausted credits window with an observed reset waits on `credits`; with no observed reset it excludes.
         exhausted_cand, _ = evaluate_grok_bot('SuperGrok', 99.0, host_policy_cfg=None, read_local=False)
-        self.assertTrue(any('credits' in r for r in exhausted_cand['excluded']), exhausted_cand['excluded'])
+        self.assertEqual(exhausted_cand['excluded'], [], exhausted_cand['excluded'])
+        self.assertEqual(exhausted_cand['waiting_on'], 'credits')
+        self.assertAlmostEqual(exhausted_cand['available_in_hours'], 120.0, places=2)
+        unobserved_reset_cand, _ = evaluate_grok_bot('SuperGrok', 99.0, host_policy_cfg=None, read_local=False,
+                                                     resets_at=None)
+        self.assertTrue(unobserved_reset_cand['excluded'])
+        self.assertIsNone(unobserved_reset_cand['available_in_hours'])
 
     def test_roll_delivery_preserves_receipts_without_replay(self):
         prompt = self.root / 'prompt.md'
