@@ -555,8 +555,10 @@ def _compare_with_router(result, task, usage, now, chosen, fast_requested, class
                            and fast_requested == bool((plan.get('selected_bundle') or {}).get('fast')),
                            'classifier_skipped': False,
                            'router_reason': plan['decision'].get('reason'),
-                           'override_cost': None if row is None else {'excluded': row['excluded'], 'score': row['score'],
-                                                                      'notes': row['notes']}})
+                           'override_cost': None if row is None else {
+                               'excluded': row['excluded'], 'score': row['score'], 'notes': row['notes'],
+                               **({'available_in_hours': row['available_in_hours'], 'waiting_on': row['waiting_on']}
+                                  if row.get('available_in_hours') else {})}})
             if classified and row is not None and isinstance(row.get('expected_usd'), (int, float)):
                 result['expected_usd'] = row['expected_usd']    # the pinned bundle's own price, as the launch reserves it
 

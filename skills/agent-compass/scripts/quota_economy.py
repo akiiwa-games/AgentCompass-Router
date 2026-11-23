@@ -301,13 +301,16 @@ def five_axis_table_integral(table, spend_usd):
     return table['cum'][k] + _quadratic_integral(table['lam'], k, x - k) * table['step']
 
 
-def five_axis_spend_cost(rec, ladder, spend_usd, task_hours, spend_max=None, tables=None, fresh_lump=None):
+def five_axis_spend_cost(rec, ladder, spend_usd, task_hours, spend_max=None, tables=None, fresh_lump=None, *,
+                         start_offset_hours=0.0):
     """cost_i = integral over [U, U + S] of lambda_w(y) dy: the fit the rest of the period loses because this candidate
     takes `spend_usd` of window `rec` (same unit as the fit, so N = F - cost needs no weight). A task that crosses the
     reset is split by time: the part before it is priced on the current period, the part after it on a fresh period
-    (n = 0, e = 0). `spend_max` (default `spend_usd`) is the largest spend any candidate takes of this window; `tables`
-    caches the price tables built for it ('now', 'fresh'). `fresh_lump` is the new period's untruncated burst size (the
-    record's own `lump_usd` when not given). Returns {'cost', 'lambda_start', 'need_start', 'need_end',
+    (n = 0, e = 0). When another window defers the start by `start_offset_hours` inside this window's current period,
+    the pre-reset horizon at start is `reset_hours - start_offset_hours` while `(U, e)` stay at the observed reading.
+    `spend_max` (default `spend_usd`) is the largest spend any candidate takes of this window; `tables` caches the price
+    tables built for it ('now', 'fresh'). `fresh_lump` is the new period's untruncated burst size (the record's own
+    `lump_usd` when not given). Returns {'cost', 'lambda_start', 'need_start', 'need_end',
     'spend_before', 'spend_after'}."""
     tables = {} if tables is None else tables
     spend = max(0.0, float(spend_usd))
@@ -315,8 +318,10 @@ def five_axis_spend_cost(rec, ladder, spend_usd, task_hours, spend_max=None, tab
     raw_hours = float(task_hours or 0.0)
     hours = max(1e-9, raw_hours)
     tau = rec.get('reset_hours')
-    crossing = raw_hours > 0 and tau is not None and tau != float('inf') and float(tau) < hours - 1e-12
-    before = spend * (float(tau) / hours) if crossing else spend
+    tau_at_start = (None if tau is None or tau == float('inf')
+                    else max(0.0, float(tau) - max(0.0, float(start_offset_hours or 0.0))))
+    crossing = raw_hours > 0 and tau_at_start is not None and tau_at_start < hours - 1e-12
+    before = spend * (tau_at_start / hours) if crossing else spend
     after = spend - before
     if 'now' not in tables:
         tables['now'] = five_axis_price_table(rec, ladder, spend_max)
@@ -481,11 +486,11 @@ class FiveAxisEconomy:
             none_open *= (1.0 - a)
         return five_axis_outside_value(alts, best), best, 1.0 - none_open
 
-    def window_cost(self, wkey, rec, spend, econ_hours):
+    def window_cost(self, wkey, rec, spend, econ_hours, start_offset_hours=0.0):
         tables = self._tables.setdefault((wkey, round(rec['used_usd'], 6), round(rec['elapsed_frac'], 9),
                                           round(rec['capacity_usd'], 6), round(rec['lump_usd'], 6)), {})
         return five_axis_spend_cost(rec, self.ladder(wkey), spend, econ_hours, self.spend_max.get(wkey, spend), tables,
-                                    fresh_lump=self.lump(wkey))
+                                    fresh_lump=self.lump(wkey), start_offset_hours=start_offset_hours)
 
     def report(self):
         """One block per priced window for the plan's `system.quota_windows` (and the README page): its state and its
@@ -579,7 +584,8 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                 **({k: st[k] for k in ('natural_reset_hours', 'expected_reset_at') if k in st}),
             }
             if not row['short'] and spend > 0:
-                got = econ.window_cost((own_qsrc, wid), rec, spend, econ_h)
+                got = econ.window_cost((own_qsrc, wid), rec, spend, econ_h,
+                                       start_offset_hours=float(st.get('start_offset_hours') or 0.0))
                 unit_cost = float((1.0 + float(got['cost'])) - 1.0)
                 row.update(priced=True, cost=unit_cost, opportunity_cost=unit_cost,
                            quota_price=round(got['lambda_start'], 6), need_start=round(got['need_start'], 4),

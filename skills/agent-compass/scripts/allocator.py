@@ -47,8 +47,8 @@ def advised_hours(hours):
     return round(advised, 1)
 
 
-def named_pin_block(task, candidates):
-    """Why what the user named cannot run, one line per row; [] when the task names nothing."""
+def named_pin_block(task, candidates, can_wait=0.0):
+    """Why what the user named cannot run within `can_wait` hours, one line per row; [] when the task names nothing."""
     if not (task.get('constraint_model') or task.get('constraint_bundle') or task.get('constraint_effort') or task.get('pinned_bundle')):
         return []
     off_pin = ('explicit model constraint', 'explicit effort constraint')
@@ -63,7 +63,16 @@ def named_pin_block(task, candidates):
              or ':'.join(x for x in (spelled, eff_part) if x))
     if not rows:
         return [f'{named}: no configured bundle offers it']
-    return [f"{named} via {c['id']}: {'; '.join(c['excluded'])}" for c in rows if c['excluded']]
+    out = []
+    for c in rows:
+        reasons = list(c['excluded'])
+        if not reasons and (c.get('available_in_hours') or 0) > can_wait:
+            reasons = [f'{w} quota exhausted (resets in {advised_hours(h)}h)'
+                       for w, h in (c.get('waits') or {}).items() if h > can_wait] or [
+                f"available in {advised_hours(c['available_in_hours'])}h"]
+        if reasons:
+            out.append(f"{named} via {c['id']}: {'; '.join(reasons)}")
+    return out
 
 
 def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None, capabilities=None, overrides=None,
@@ -164,7 +173,7 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
             (c for c in candidates if c['excluded']),
             key=lambda c: (len(c['excluded']), -(c['components']['fit'] if c['components'].get('fit') is not None else float('-inf'))),
         )[:2]
-        named_block = named_pin_block(task, candidates)
+        named_block = named_pin_block(task, candidates, task['can_wait_hours'])
         decision.update({'action': 'none',
                          'reason': 'No eligible bundle. Closest: ' + ' | '.join(
                              f"{c['id']}: {'; '.join(candidate_eval.said_exclusions(c))}" for c in closest)})
@@ -174,16 +183,6 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
             decision['local_settings'] = {
                 'exclusions': [f"{c['id']}: {said}" for c in closest for said in candidate_eval.said_exclusions(c)],
                 'named_route_reaches': all(set(k) <= set(candidate_eval.LIFTED_BY_NAMING) for k in kinds)}
-        # When a bundle is held back only by quota, say when that quota returns, so the parent can wait.
-        waits = sorted((wait[0], wait[1], c['id'], c['bundle']['account']) for c in candidates if c['excluded']
-                       and (wait := quota_pools.quota_wait(c, usage)) is not None)
-        if waits:
-            hours, window, bundle_id, account = waits[0]
-            decision['next_reset'] = {'bundle': bundle_id, 'account': account, 'window': window, 'hours': advised_hours(hours),
-                                      'at': (now + timedelta(hours=hours)).isoformat()}
-            # First: the answer a caller reads is cut short, and this is the fact that says what to do.
-            decision['reason'] = (f"{bundle_id} is held back by {account}'s {window} quota, which returns in {advised_hours(hours)}h: "
-                                  f"wait, or decide otherwise. {decision['reason']}")
         if named_block:
             # What the user named cannot run. Say why and stop; nothing else stands in for it.
             decision['blocked'] = 'named_model_unavailable'
@@ -195,14 +194,33 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
         return result
     can_wait = task['can_wait_hours']
     ready = [c for c in eligible if (c['available_in_hours'] or 0) <= can_wait]
-    pool = ready or eligible
+    if not ready and not task.get('user_named_bundle') and (named_block := named_pin_block(task, candidates, can_wait)):
+        # What the user named cannot run within can_wait_hours. Say why and stop; nothing else stands in for it.
+        decision['action'] = 'none'
+        decision['blocked'] = 'named_model_unavailable'
+        decision.setdefault('warnings', []).extend(named_block)
+        decision['reason'] = ' | '.join(named_block)
+        result['next'] = ('The model the user named cannot run now: ' + '; '.join(named_block)[:300]
+                          + '. Tell the user; do not substitute another model.')
+        result['choice'] = 'none'
+        return result
+    # Rule: `can_wait_hours` is the one limit on waiting. Within it, candidates compete by `five_axis_order` (net score
+    # first, then wait). When nothing eligible can start within it, defer to the candidate that can start soonest (equal
+    # waits broken by `five_axis_order`), never to a higher score days away; the caller rolls again once that window resets.
+    pool = ready or sorted(
+        eligible,
+        key=lambda c: (round(float(c['available_in_hours'] or 0.0), 4), *candidate_ranking.five_axis_order(c)),
+    )
     pinned_cand = (
         candidate_ranking.candidate_for_bundle(pool, task['pinned_bundle'], task.get('force_fast'))
         if task.get('pinned_bundle') else None
     )
     top = pinned_cand or pool[0]
-    better = eligible[0]
-    if better is not top and better['available_in_hours']:
+    # Bounded by `can_wait_hours`: never name candidates beyond the caller's allowed wait as an improvement. On an unpinned
+    # plan `ready[0]` already chose the highest-scoring candidate within `can_wait_hours`, so this is set only when
+    # `pinned_bundle` picked a lower-scoring bundle while a higher-scoring candidate can start within `can_wait_hours`.
+    better = ready[0] if ready else None
+    if better is not None and better is not top and better['available_in_hours'] and better['score'] > top['score']:
         decision['better_if_waiting'] = {'bundle': better['id'], 'hours': round(better['available_in_hours'], 1),
                                          'score_gain': round(better['score'] - top['score'], 4)}
     forced = pinned_cand is not None
@@ -218,7 +236,7 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
         within = f'within {can_wait:g}h' if can_wait else 'now'
         decision['reason'] = (f"The chain owner {top['id']} can resume in {advised_hours(top['available_in_hours'])}h{after}."
                               if top is resume and top['action'] == 'resume'
-                              else f"Nothing eligible can start {within}; the best, {top['id']}, can start in {advised_hours(top['available_in_hours'])}h{after}.")
+                              else f"Nothing eligible can start {within}; the earliest, {top['id']}, can start in {advised_hours(top['available_in_hours'])}h{after}.")
     # The margin is to the best other model, not to another effort, harness or account of the same model.
     rival = next((c for c in pool if c is not top
                   and account_fleet.row_key(c['bundle']['model'], accounts) != account_fleet.row_key(top['bundle']['model'], accounts)), None)

@@ -326,9 +326,11 @@ class NamedRoutesReachPastTheCadence(unittest.TestCase):
         self.assertIn(f'of {LIMIT} dispatches', said[0])
         self.assertTrue(said[0].endswith('launched because the user named it in this request'), said[0])
         self.assertTrue(registry.decision_record(result['decision_id'])['dispatchable'])
-        # The router by itself would not choose it: the automatic plan of the same task excludes the account.
+        # The router by itself would not choose it now: the automatic plan holds the account on cadence.
         import candidate_eval
-        self.assertIn(candidate_eval.OVER_CADENCE, result['override_cost']['excluded'])
+        self.assertNotEqual(result['router_choice'], 'pro_max')
+        self.assertEqual(result['override_cost']['waiting_on'], candidate_eval.CADENCE)
+        self.assertGreater(result['override_cost']['available_in_hours'], 0.0)
         # Two channels, one source: the warning the caller passes on is the alert's own sentence.
         alert = [a['message'] for a in result['alerts'] if a['code'] == 'advisor_cadence']
         self.assertEqual([f'{alert[0]}; launched because the user named it in this request'], said)
@@ -347,9 +349,8 @@ class NamedRoutesReachPastTheCadence(unittest.TestCase):
         self.assertEqual((row['decision_id'], row.get('outside_automatic_routing')), (result['decision_id'], ['cadence']))
 
     def test_a_named_paseo_route_is_prepared_with_the_warning_and_an_automatic_one_is_not(self):
-        import candidate_eval
         launch = {'title': 'Fixture', 'initialPrompt': 'Read the brief', 'cwd': str(self.root)}
-        for age_h, held in ((1.0, 'excluded'), (11.9, 'deferred')):     # a seat frees in ~11 h, or in ~0.1 h
+        for age_h, held in ((1.0, 'eleven-hours'), (11.9, 'six-minutes')):     # a seat frees in ~11 h, or in ~0.1 h
             with self.subTest(held=held):
                 (self.root / 'ledger.jsonl').unlink(missing_ok=True)
                 self.fill('claude', age_h=age_h)
@@ -363,8 +364,7 @@ class NamedRoutesReachPastTheCadence(unittest.TestCase):
                                           'selected_bundle': dict(row['bundle'])}, automatic, self.now)
                 with self.assertRaises(registry.CapacityChanged) as refused:
                     registry.prepare(planned['decision_id'], automatic, launch, self.usage, self.fleet)
-                self.assertRegex(str(refused.exception),
-                                 candidate_eval.OVER_CADENCE if held == 'excluded' else 'reset not yet observed')
+                self.assertRegex(str(refused.exception), 'reset not yet observed')
 
     def test_a_named_resume_takes_the_turn_with_the_warning(self):
         import usage_reading

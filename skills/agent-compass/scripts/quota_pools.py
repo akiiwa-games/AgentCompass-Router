@@ -344,27 +344,6 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
     return found
 
 
-QUOTA_REASON = re.compile(r'^([\w.-]+)(?::| has | is )')
-
-
-def quota_wait(candidate, usage):
-    """`(hours, window)`: hours until every quota window that excludes a candidate has reset, and the window that sets
-    that wait (the last to return); None when anything other than its own account's quota windows (ability, policy,
-    model management, route) excludes it."""
-    account = (candidate.get('bundle') or {}).get('account')
-    windows = (((usage or {}).get('accounts') or {}).get(account) or {}).get('windows') or []
-    resets = {str(w.get('id')): w.get('seconds_until_reset') for w in windows if isinstance(w, dict)}
-    hours, binding = 0.0, None
-    for reason in candidate.get('excluded') or []:
-        match = QUOTA_REASON.match(str(reason))
-        seconds = resets.get(match.group(1)) if match else None
-        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
-            return None
-        if binding is None or seconds / 3600 >= hours:
-            hours, binding = seconds / 3600, match.group(1)
-    return hours, binding
-
-
 def pool_size(observed):
     """How many accounts a window reading pools (a Magpie pool reports `accounts: N`); 1 for a single account."""
     count = (observed or {}).get('accounts')
@@ -453,23 +432,27 @@ def window_state(wid, spec, observed, account_spec, now, short_hours, account_st
     return row
 
 
-def after_reset(state, hours):
-    """The same allowance once it renews: in full, or what the state says comes back (`renews_to`). None when the plan
-    ends first."""
+def after_reset(state, hours, *, start_hours=None):
+    """The same allowance once it renews: in full, or what the state says comes back (`renews_to`). `start_hours`
+    anchors the candidate's start when another window defers past this window's reset. None when no reset was observed,
+    the reading is stale or predicted, or the plan ends first."""
     wait = state['reset_hours']
+    if state.get('unstarted'):
+        return None  # An unstarted rolling window has no observed reset timestamp.
     if state.get('expected_reset_at') and wait < state.get('natural_reset_hours', wait):
         return None  # A prediction must never authorize work against an imagined refill.
-    if wait <= 0 or state.get('stale'):
+    if wait <= 0 or wait == float('inf') or state.get('stale'):
         return None
+    at = wait if start_hours is None else max(wait, float(start_hours))
     expiry = state['expiry_hours']
-    left = None if expiry is None else expiry - wait
+    left = None if expiry is None else expiry - at
     if left is not None and left <= 0:
         return None
     end = state['hours'] if left is None else min(state['hours'], left)
     full = state.get('full', 100.0)
     # A rolling limit gives back only what has left it by then (`renews_to`, cadence_window_state).
-    return dict(state, remaining=state.get('renews_to', full), reset_hours=wait + state['hours'], end_hours=end,
-                target_remaining=full * min(1.0, end / state['hours']), deferred_hours=wait,
+    return dict(state, remaining=state.get('renews_to', full), reset_hours=at + state['hours'], end_hours=end,
+                target_remaining=full * min(1.0, end / state['hours']), deferred_hours=at,
                 expiry_hours=left)
 
 

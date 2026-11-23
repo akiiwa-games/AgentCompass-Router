@@ -914,12 +914,15 @@ class FiveAxisTests(unittest.TestCase):
                        **{**base,
                           'claude-opus-5-5': row(demand(0.733, 0.8, 0.8, 0.800), usd=22.86),
                           'gpt-6.1-sol': row(demand(0.587, 0.787, 0.787, 0.732), usd=6.12)})
-        # Without can_wait_hours: resolves to the best immediately startable candidate when there is one (never a deferral).
+        # Without can_wait_hours: resolves to the best immediately startable candidate when there is one (never a deferral),
+        # and `better_if_waiting` never names candidates beyond `can_wait_hours`.
         immediate = self.plan(self.accounts, doc, state='5h-only scarce',
                               profile={'work_kind': 'architecture_reasoning', 'axis_demand': demand(3, 3, 0, 0), 'access': 'read-only'})
         self.assertEqual(immediate['decision']['action'], 'start')
         self.assertEqual(immediate['selected_bundle']['account'], 'codex')
-        self.assertIn(immediate['decision']['better_if_waiting']['bundle'], ('opus55_xhigh', 'opus55_max'))
+        self.assertNotIn('better_if_waiting', immediate['decision'])
+        chosen_now = next(c for c in immediate['ranking'] if c['id'] == immediate['choice'])
+        self.assertGreater(immediate['ranking'][0]['score'], chosen_now['score'])
         # With can_wait_hours: defers iff the waiting candidate has strictly higher unrounded N = F - C.
         routine = self.plan(self.accounts, doc, state='5h-only scarce', can_wait_hours=4.0,
                             profile={'axis_demand': demand(0, 1, 0, 0)})

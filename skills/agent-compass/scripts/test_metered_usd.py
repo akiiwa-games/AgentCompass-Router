@@ -191,7 +191,7 @@ class UncappedRouting(unittest.TestCase):
         subscription = [c for c in plan['ranking'] if c['bundle']['account'] == 'claude' and not c['excluded']]
         if subscription:
             self.assertEqual(usd['excluded'], [candidate_eval.METERED_LAST_RESORT])
-        self.assertNotIn('usd_probe', str(plan['decision'].get('next_reset') or ''))
+        self.assertNotIn('next_reset', plan['decision'])
 
         spent = _accounts(100)
         spent['accounts']['usd']['bundles']['usd_probe']['model'] = 'gpt-6.1-sol'
@@ -200,6 +200,7 @@ class UncappedRouting(unittest.TestCase):
         spent_plan = allocator.plan(task, usage, NOW, accounts=fleet, overrides=[], records=[],
                                     host_policy_config=None, read_local_state=False)
         row = next(c for c in spent_plan['ranking'] if c['id'] == 'usd_probe')
+        self.assertIsNone(row['available_in_hours'])
         text = ' '.join(map(str, row['excluded']))
         self.assertIn('does not reset', text)
         self.assertNotIn('resets in', text)

@@ -111,10 +111,11 @@ class AllocatorTests(unittest.TestCase):
 
     def test_a_high_coupling_chain_asks_its_window_for_the_whole_chain_and_a_medium_one_for_the_step(self):
         """Rule (`candidate_eval.evaluate_bundle`, quota-window check): the hours a window must cover are the chain's `total_hours`
-        (scaled by the bundle's duration) when `coupling` is `high`, else the step's `expected_hours`; the window is excluded when
-        what is left minus that spend is under the safety margin. The spend of one step is read from the plan's own row (expected
-        USD over the window's capacity), the chain's is that times chain hours / step hours, so the fixture follows the data: the
-        window is left with the margin plus the midpoint of the two, which covers the step but not the chain."""
+        (scaled by the bundle's duration) when `coupling` is `high`, else the step's `expected_hours`; when what is left minus that
+        spend is under the safety margin, the window holds the bundle back until its reset. The spend of one step is read from the
+        plan's own row (expected USD over the window's capacity), the chain's is that times chain hours / step hours, so the
+        fixture follows the data: the window is left with the margin plus the midpoint of the two, which covers the step now
+        but holds the high-coupling chain until reset."""
         step_hours, chain_hours, margin = 1, 3, 5
         task = lambda coupling: {'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': step_hours,
                                  'chain': self.chain(coupling=coupling, total=chain_hours)}
@@ -127,12 +128,14 @@ class AllocatorTests(unittest.TestCase):
         left = margin + (step_pct + chain_pct) / 2
         self.assertLess(left, 100)
         usage = self.usage(codex=[('usage', left, 100)])
-        short = lambda result: [r for r in result['ranking'] if r['id'] == 'sol_xhigh'][0]['excluded']
+        owner_row = lambda result: [r for r in result['ranking'] if r['id'] == 'sol_xhigh'][0]
         high = self.plan(task('high'), usage)
-        self.assertTrue(short(high), 'a window that covers the step but not the whole chain excludes the owner of a high-coupling chain')
-        self.assertNotEqual(high['choice'], 'sol_xhigh', 'an excluded owner is not chosen: the ranking picks the next route')
+        self.assertEqual(owner_row(high)['excluded'], [])
+        self.assertEqual((owner_row(high)['available_in_hours'], owner_row(high)['waiting_on']), (100.0, 'usage'),
+                         'a window that covers the step but not the whole chain holds the high-coupling chain owner until reset')
+        self.assertNotEqual(high['choice'], 'sol_xhigh', 'a quota-held owner does not start now: the ranking picks a ready route')
         medium = self.plan(task('medium'), usage)
-        self.assertEqual(short(medium), [], 'the same window covers the step of a medium-coupling chain')
+        self.assertIsNone(owner_row(medium)['available_in_hours'], 'the same window covers the step of a medium-coupling chain now')
         self.assertEqual((medium['choice'], medium['decision']['action']), ('sol_xhigh', 'resume'))
 
     def test_chain_continuity_and_handoff_rotation(self):
@@ -318,17 +321,21 @@ class AllocatorTests(unittest.TestCase):
             antigravity=[('gemini-5h', 90, 3), ('gemini-weekly', 2, 100), ('3p-5h', 90, 3), ('3p-weekly', 2, 100)],
             **{'claude-lab': [('five_hour', 95, 3), ('seven_day', 83, 100), ('weekly_fable', 100, 100)]},
         )
-        # Rule: an exhausted window excludes its candidates. With every big pool spent, only claude-lab rows stay eligible
-        # and the plan still routes; which claude-lab effort wins is not pinned.
+        # Rule (`candidate_eval.evaluate_bundle`, `allocator.plan`): exhausted windows with a known reset hold their
+        # candidates in `available_in_hours` rather than `excluded`, while with `can_wait_hours == 0` only ready-now
+        # candidates (`claude-lab`) compete to start immediately.
         empty_plan = self.plan({'work_kind': 'exploration_forensics'}, all_big_empty)
-        open_rows = [c for c in empty_plan['ranking'] if c['score'] is not None and not c['excluded']]
-        self.assertTrue(open_rows)
-        self.assertEqual({c['bundle']['account'] for c in open_rows}, {'claude-lab'}, [c['id'] for c in open_rows])
-        self.assertNotIn(empty_plan['choice'], (None, 'none'))
+        ready_rows = [c for c in empty_plan['ranking'] if not c['excluded'] and not c['available_in_hours']]
+        self.assertTrue(ready_rows)
+        self.assertEqual({c['bundle']['account'] for c in ready_rows}, {'claude-lab'}, [c['id'] for c in ready_rows])
+        self.assertEqual(empty_plan['decision']['action'], 'start')
+        self.assertEqual(empty_plan['selected_bundle']['account'], 'claude-lab')
 
         task = {'work_kind': 'exploration_forensics', 'difficulty': 'hard', 'expected_hours': 0.7, 'needs': {'local_only': True}}
         usage_low = self.usage(**{'claude-lab': [('five_hour', 23, 2.5), ('seven_day', 61, 130)], 'claude': [('five_hour', 0, 2.0), ('seven_day', 0, 100)]})
-        self.assertTrue(self.rows(self.plan(task, usage_low))['lab_sonnet55_high']['excluded'])
+        low_row = self.rows(self.plan(task, usage_low))['lab_sonnet55_high']
+        self.assertFalse(low_row['excluded'])
+        self.assertEqual((low_row['available_in_hours'], low_row['waiting_on']), (2.5, 'five_hour'))
 
         usage_40 = self.usage(**{'claude-lab': [('five_hour', 40, 2.5), ('seven_day', 61, 130)], 'claude': [('five_hour', 0, 2.0), ('seven_day', 0, 100)]})
         usage_40['accounts']['claude-lab']['fetched_at'] = (self.now + timedelta(seconds=12)).isoformat()
@@ -340,7 +347,9 @@ class AllocatorTests(unittest.TestCase):
             'usage': {'claude-lab': {'windows': [{'id': 'five_hour', 'used_pct': 60.0}, {'id': 'seven_day', 'used_pct': 39.0}]}},
         }]
         s2 = self.rows(allocator.plan(task, usage_40, self.now + timedelta(minutes=2), records=inflight))['lab_sonnet55_high']
-        self.assertTrue(s2['excluded'])
+        self.assertFalse(s2['excluded'])
+        self.assertEqual(s2['waiting_on'], 'five_hour')
+        self.assertGreater(s2['available_in_hours'], 0.0)
         self.assertTrue(any('$3.08' in n and 'reserved by in-flight' in n for n in s2['notes']), s2['notes'])
 
         # Unstarted 5h window (used_pct=0, resets_at=None) still enforces 5h wall against oversized or burst tasks
@@ -743,15 +752,191 @@ class AllocatorTests(unittest.TestCase):
                 again = self.waiting_fixture(reset, 100, can_wait=advised, seven_left=60)['decision']
                 self.assertNotIn('Nothing eligible can start within', again['reason'])
 
-    def test_quota_wait_is_the_last_window_to_return_and_none_for_any_other_exclusion(self):
-        """Rule (`quota_pools.quota_wait`): a candidate excluded only by its account's quota windows returns when the last of
-        them resets, and the window that sets that is named; one excluded for anything else has no quota wait."""
-        usage = {'accounts': {'a': {'windows': [{'id': 'five_hour', 'seconds_until_reset': 3 * 3600},
-                                                {'id': 'seven_day', 'seconds_until_reset': 100 * 3600}]}}}
-        candidate = {'bundle': {'account': 'a'}, 'excluded': ['five_hour is empty for 3.0h', 'seven_day has 1% left']}
-        self.assertEqual(quota_pools.quota_wait(candidate, usage), (100.0, 'seven_day'))
-        self.assertEqual(quota_pools.quota_wait(dict(candidate, excluded=candidate['excluded'][:1]), usage), (3.0, 'five_hour'))
-        self.assertIsNone(quota_pools.quota_wait(dict(candidate, excluded=[*candidate['excluded'], 'excluded by host policy']), usage))
+    def test_quota_held_candidates_wait_at_any_horizon_while_reading_facts_stay_exclusions(self):
+        """Rule (`candidate_eval.evaluate_bundle`, `quota_pools.after_reset`): a candidate held back only by quota windows
+        (short, small-short, 0%-remaining fresh, multi-day weekly, or `cadence`) with a known reset keeps `available_in_hours`
+        and `waiting_on`, whatever the length of the wait, and `--can-wait-hours` reaches past 6h. Reading and capacity facts
+        (stale readings, unknown remaining share, insufficient full capacity, non-resetting allowances, subscription ending
+        before `wait + hours`, confirmed-exhaustion latches) remain exclusions."""
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        accounts['accounts']['claude']['bundles']['fable52_high']['disabled'] = False
+        for wait_h in (2.5, 8.0, 100.0, 168.0):
+            usage = self.usage(
+                claude=[('five_hour', 0, wait_h), ('seven_day', 80, 140), ('weekly_fable', 100, 140)],
+                codex=[('usage', 0, wait_h)],
+                **{'claude-lab': [('five_hour', 0, wait_h), ('seven_day', 80, 140), ('weekly_fable', 100, 140)]},
+            )
+            for name in ('claude', 'codex', 'claude-lab'):
+                usage['accounts'][name]['status'] = 'fresh'
+                usage['accounts'][name]['fetched_at'] = self.now.isoformat()
+            planned = allocator.plan(
+                with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.5,
+                           'needs': {'local_only': True}, 'can_wait_hours': 10.0}),
+                usage, self.now, accounts=copy.deepcopy(accounts), overrides=[],
+                host_policy_config={'allowed_accounts': ['claude', 'codex', 'claude-lab']},
+            )
+            for bid, exp_win in (('opus55_high', 'five_hour'), ('astra_high', 'usage'), ('lab_sonnet55_high', 'five_hour')):
+                cand = self.rows(planned)[bid]
+                self.assertEqual(cand['excluded'], [], (wait_h, bid, cand['excluded']))
+                self.assertAlmostEqual(cand['available_in_hours'], wait_h, places=6)
+                self.assertEqual(cand['waiting_on'], exp_win)
+            self.assertNotIn('next_reset', planned['decision'])
+            self.assertEqual(planned['decision']['action'], 'defer')
+            if wait_h == 8.0:
+                self.assertNotIn('Nothing eligible can start within', planned['decision']['reason'])
+
+        # Reading and capacity facts stay exclusions:
+        # 1. Stale reading on an empty window
+        stale_u = self.usage(codex=[('usage', 0, 8.0)])
+        stale_u['accounts']['codex']['status'] = 'stale'
+        stale_plan = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.5,
+                       'needs': {'local_only': True}}),
+            stale_u, self.now, accounts=copy.deepcopy(accounts), overrides=[],
+            host_policy_config={'allowed_accounts': ['codex']},
+        )
+        self.assertTrue(self.rows(stale_plan)['astra_high']['excluded'])
+        self.assertEqual(stale_plan['choice'], 'none')
+
+        # 2. Subscription ending before `wait + hours` (both single-window and multi-window)
+        exp_accounts = copy.deepcopy(accounts)
+        exp_accounts['accounts']['claude']['expires_at'] = (self.now + timedelta(hours=50)).isoformat()
+        exp_u = self.usage(claude=[('five_hour', 90, 3.0), ('seven_day', 0, 49.5), ('weekly_fable', 100, 100.0)])
+        exp_plan = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 1.0,
+                       'needs': {'local_only': True}}),
+            exp_u, self.now, accounts=exp_accounts, overrides=[],
+            host_policy_config={'allowed_accounts': ['claude']},
+        )
+        opus_exp = self.rows(exp_plan)['opus55_high']
+        self.assertIn('subscription ends before the work would finish', opus_exp['excluded'])
+
+        # 3. Confirmed-exhaustion latch (`quota_exhaustion`) stays an exclusion even when a reset timestamp is in the future
+        latched_accounts = copy.deepcopy(accounts)
+        latched_accounts['_discovery'] = {'accounts': {'codex': {'status': 'ready', 'exhausted_windows': ['usage']}}}
+        latched_u = self.usage(codex=[('usage', 0, 4.0)])
+        latched_plan = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 0.5,
+                       'needs': {'local_only': True}}),
+            latched_u, self.now, accounts=latched_accounts, overrides=[],
+            host_policy_config={'allowed_accounts': ['codex']},
+        )
+        self.assertTrue(any('confirmed exhausted' in r for r in self.rows(latched_plan)['astra_high']['excluded']))
+
+    def test_can_wait_hours_orders_by_ranking_within_limit_and_earliest_start_beyond_limit(self):
+        """Rules 2 & 3 (`allocator.plan`, `candidate_ranking.five_axis_order`):
+        - Within `can_wait_hours`, candidates compete by `five_axis_order`, and nothing starting after `can_wait_hours` is
+          chosen while any candidate starts within `can_wait_hours`.
+        - When nothing eligible can start within `can_wait_hours`, `plan` defers to the least `available_in_hours` (ties broken
+          by `five_axis_order`), never to a higher score days away; `better_if_waiting` never names a candidate beyond
+          `can_wait_hours`."""
+        import candidate_ranking
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        accounts['accounts']['claude']['bundles']['fable52_high']['disabled'] = False
+        # Codex returns in 8h; Claude returns in 120h (5 days); Claude-lab returns in 3h on five_hour.
+        usage = self.usage(
+            claude=[('five_hour', 90, 3.0), ('seven_day', 0, 120.0), ('weekly_fable', 0, 120.0)],
+            codex=[('usage', 0, 8.0)],
+            **{'claude-lab': [('five_hour', 0, 3.0), ('seven_day', 85, 100.0), ('weekly_fable', 100, 100.0)]},
+        )
+        task_base = {'work_kind': 'architecture_reasoning', 'difficulty': 'coupled', 'expected_hours': 0.5,
+                     'needs': {'local_only': True}}
+        policy_cfg = {'allowed_accounts': ['claude', 'codex', 'claude-lab']}
+
+        # 1. Beyond limit (`can_wait_hours=0` and `can_wait_hours=2`): nothing starts within limit, so earliest start (3.0h) wins,
+        #    never a higher-scoring candidate 8h or 120h away.
+        for limit in (0, 2.0):
+            beyond = allocator.plan(with_prof({**task_base, 'can_wait_hours': limit}),
+                                    copy.deepcopy(usage), self.now, accounts=copy.deepcopy(accounts),
+                                    overrides=[], host_policy_config=policy_cfg)
+            elig = [c for c in beyond['ranking'] if not c['excluded']]
+            least_wait = min(c['available_in_hours'] for c in elig)
+            chosen = self.rows(beyond)[beyond['choice']]
+            self.assertEqual(beyond['decision']['action'], 'defer')
+            self.assertAlmostEqual(chosen['available_in_hours'], least_wait, places=6)
+            # Among equal least waits, `five_axis_order` breaks ties:
+            tied = sorted((c for c in elig if round(c['available_in_hours'], 4) == round(least_wait, 4)),
+                          key=candidate_ranking.five_axis_order)
+            self.assertEqual(beyond['choice'], tied[0]['id'])
+            self.assertNotIn('better_if_waiting', beyond['decision'])
+
+        # 2. Within limit (`can_wait_hours=10`): 3h and 8h candidates are in `ready`; 120h candidates are excluded from winning,
+        #    and `choice` equals the first `five_axis_order` candidate with `(available_in_hours or 0) <= 10`.
+        within_10 = allocator.plan(with_prof({**task_base, 'can_wait_hours': 10.0}),
+                                   copy.deepcopy(usage), self.now, accounts=copy.deepcopy(accounts),
+                                   overrides=[], host_policy_config=policy_cfg)
+        elig_10 = [c for c in within_10['ranking'] if not c['excluded']]
+        ready_10 = sorted((c for c in elig_10 if (c['available_in_hours'] or 0) <= 10.0),
+                          key=candidate_ranking.five_axis_order)
+        self.assertEqual(within_10['choice'], ready_10[0]['id'])
+        self.assertLessEqual(self.rows(within_10)[within_10['choice']]['available_in_hours'] or 0.0, 10.0)
+        self.assertNotIn('better_if_waiting', within_10['decision'])
+
+    def test_deferral_and_long_wait_pricing_are_invariant_to_input_order_and_respect_crossed_resets(self):
+        """Rules (`AGENTS.md` order invariance; `candidate_eval.evaluate_bundle` & `quota_economy.five_axis_spend_cost`
+        post-wait window alignment):
+        - Reversing account/bundle/window order changes neither `choice`, `start_after_hours`, nor per-candidate scores/waits.
+        - A second drawn window whose reset falls at or before `available_in_hours` is priced on its renewed cycle (`used_usd == 0`),
+          not its expired pre-wait cycle; one resetting after `available_in_hours` keeps its observed `used_usd` and splits
+          crossing spend at `reset_hours - available_in_hours`."""
+        with_prof = lambda d: {**d, 'profile': profile_for(d)}
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        accounts['accounts']['claude']['bundles']['fable52_high']['disabled'] = False
+        # `fable52_high` on `claude` draws `five_hour`, `seven_day` (resets in 20h, 80% used), and `weekly_fable` (empty, resets in 100h).
+        usage = self.usage(
+            claude=[('five_hour', 90, 3.0), ('seven_day', 20, 20.0), ('weekly_fable', 0, 100.0)],
+            codex=[('usage', 0, 50.0)],
+        )
+        rev_accounts = copy.deepcopy(accounts)
+        rev_accounts['accounts'] = dict(reversed(list(rev_accounts['accounts'].items())))
+        for spec in rev_accounts['accounts'].values():
+            if isinstance(spec, dict) and isinstance(spec.get('bundles'), dict):
+                spec['bundles'] = dict(reversed(list(spec['bundles'].items())))
+            if isinstance(spec, dict) and isinstance(spec.get('windows'), dict):
+                spec['windows'] = dict(reversed(list(spec['windows'].items())))
+        rev_usage = copy.deepcopy(usage)
+        for row in rev_usage['accounts'].values():
+            row['windows'] = list(reversed(row['windows']))
+
+        for can_wait in (0.0, 60.0, 120.0):
+            task = with_prof({'work_kind': 'creative_ideation', 'difficulty': 'coupled',
+                              'expected_hours': 0.5, 'needs': {'local_only': True}, 'can_wait_hours': can_wait})
+            a = allocator.plan(copy.deepcopy(task), copy.deepcopy(usage), self.now, accounts=copy.deepcopy(accounts),
+                               overrides=[], host_policy_config={'allowed_accounts': ['claude', 'codex']})
+            b = allocator.plan(copy.deepcopy(task), copy.deepcopy(rev_usage), self.now, accounts=copy.deepcopy(rev_accounts),
+                               overrides=[], host_policy_config={'allowed_accounts': ['codex', 'claude']})
+            self.assertEqual((a['choice'], a['decision']['action'], a['decision'].get('start_after_hours'), a['decision'].get('wait_for')),
+                             (b['choice'], b['decision']['action'], b['decision'].get('start_after_hours'), b['decision'].get('wait_for')))
+            self.assertEqual([c['id'] for c in a['ranking'] if not c['excluded']],
+                             [c['id'] for c in b['ranking'] if not c['excluded']])
+            by_id_a = {c['id']: (c['score'], c['available_in_hours'], c['waiting_on'], tuple(sorted(c['excluded']))) for c in a['ranking']}
+            by_id_b = {c['id']: (c['score'], c['available_in_hours'], c['waiting_on'], tuple(sorted(c['excluded']))) for c in b['ranking']}
+            self.assertEqual(by_id_a, by_id_b)
+
+        # Crossed reset check on `fable52_high`: `seven_day` (reset 20h <= 100h wait on `weekly_fable`) is renewed (`used_usd == 0`).
+        fable = self.rows(a)['fable52_high']
+        seven_econ = next(w for w in fable['economy']['windows'] if w['window'] == 'seven_day')
+        self.assertEqual(seven_econ['used_usd'], 0.0)
+        self.assertTrue(any('seven_day also renews before the 100.0h wait ends' in n for n in fable['notes']), fable['notes'])
+
+        # Uncrossed reset check: `five_hour` defers by 4h while `seven_day` resets in 4.5h (0.5h after start) on a multi-hour task.
+        cross_u = self.usage(claude=[('five_hour', 0, 4.0), ('seven_day', 50, 4.5), ('weekly_fable', 100, 100.0)])
+        cross_plan = allocator.plan(
+            with_prof({'work_kind': 'code_implementation', 'difficulty': 'hard', 'expected_hours': 3.0,
+                       'needs': {'local_only': True}, 'can_wait_hours': 5.0}),
+            cross_u, self.now, accounts=copy.deepcopy(accounts), overrides=[],
+            host_policy_config={'allowed_accounts': ['claude']},
+        )
+        opus = self.rows(cross_plan)['opus55_high']
+        seven_cross = next(w for w in opus['economy']['windows'] if w['window'] == 'seven_day')
+        self.assertGreater(seven_cross['used_usd'], 0.0)
+        self.assertGreater(seven_cross['spend_after_reset'], 0.0)
+        self.assertAlmostEqual(
+            seven_cross['spend_before_reset'] / (seven_cross['spend_before_reset'] + seven_cross['spend_after_reset']),
+            0.5 / opus['duration_hours'], places=2,
+        )
 
     def test_fast_that_the_plan_did_not_apply_says_why(self):
         """Rule (`allocator.plan`): a task that wants fast mode and is routed to a plain bundle carries the reason the plan
@@ -823,8 +1008,10 @@ class OverrideContractTests(unittest.TestCase):
                               self.usage, self.now, accounts=self.accounts, overrides=[self.override])
         astra = next(r for r in plan['ranking'] if r['id'] == 'astra_high')
         sol = next(r for r in plan['ranking'] if r['id'] == 'sol_high')
-        self.assertTrue(astra['excluded'])
-        self.assertIsNone(astra['available_in_hours'])
+        # Rule: an overdue `expected_reset_at` never grants immediate capacity; the candidate still waits on the observed 6-day reset.
+        self.assertFalse(astra['excluded'])
+        self.assertEqual((astra['available_in_hours'], astra['waiting_on']), (144.0, 'usage'))
+        self.assertNotEqual(plan['choice'], 'astra_high')
         self.assertEqual(astra['components']['boost'], 0.35)
         self.assertNotIn('boost', sol['components'])
         self.assertTrue(any('overdue_uncertain' in n for n in astra['notes']))

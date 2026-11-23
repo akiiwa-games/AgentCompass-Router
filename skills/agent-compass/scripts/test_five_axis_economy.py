@@ -125,7 +125,11 @@ def row(decision, bundle_id, fast=False):
 
 
 def price_of(decision, account):
-    return next(c['components']['quota_price'] for c in eligible(decision) if c['bundle']['account'] == account)
+    for w in (decision.get('decision') or {}).get('system', {}).get('quota_windows') or ():
+        if w.get('quota_source') == account:
+            return w['quota_price']
+    return next(c['components']['quota_price'] for c in eligible(decision)
+                if c['bundle']['account'] == account and not c.get('available_in_hours'))
 
 
 def assert_ranking_follows_the_documented_order(decision):
@@ -298,16 +302,16 @@ class FleetEconomyTests(unittest.TestCase):
         self.assert_used_share_monotone(lambda used: self.fleet.plan(0.6, used), (0.6, 0.75, 0.9))
 
     def assert_used_share_monotone(self, plan_at, levels, account='codex'):
-        """Raising `account`'s used share never lowers any candidate's C, and an over-line candidate on that pool
+        """Raising `account`'s used share never lowers any current-period candidate's C, and an over-line candidate on that pool
         (need probability at the end of its run above one half: past the line) climbs past a candidate on another pool
         only when that candidate's C rose by more than its own: N = F + continuity + boost - C with F, continuity and
         boost unchanged, and another pool's quota price may rise with this pool's scarcity (its outside alternative got
-        dearer). Siblings on the same tight pool may reorder among themselves, so the rank is taken relative to the
-        other pools."""
+        dearer). Candidates that no longer fit the current period wait for the next period's reset and are priced on that
+        renewal (`available_in_hours > 0`), so current-period monotonicity compares start-now rows (`not available_in_hours`)."""
         prev = None
         for used in levels:
             d = plan_at(used)
-            rows = eligible(d)
+            rows = [c for c in eligible(d) if not c.get('available_in_hours')]
             cost = {c['id']: c['components']['opportunity_cost'] for c in rows}
             pos = {c['id']: i for i, c in enumerate(rows)}
             mine = {c['id'] for c in rows if c['bundle']['account'] == account}
@@ -330,8 +334,8 @@ class FleetEconomyTests(unittest.TestCase):
         self.assertEqual(prices, sorted(prices))
         self.assertLess(prices[0], 0.5 * prices[-1])
         alone = price_of(self.fleet.plan(0.5, 0.9, allowed=('codex',)), 'codex')
-        full = self.fleet.plan(1.0, 0.9)         # Claude is out of room: excluded, so it cannot be anyone's outside point
-        self.assertTrue(all(c['bundle']['account'] != 'claude' for c in eligible(full)))
+        full = self.fleet.plan(1.0, 0.9)         # Claude is out of room now: defers to reset, so it cannot be anyone's outside point
+        self.assertTrue(all(c.get('available_in_hours') for c in eligible(full) if c['bundle']['account'] == 'claude'))
         self.assertAlmostEqual(price_of(full, 'codex'), alone, places=9)
         self.assertGreater(price_of(self.fleet.plan(0.99, 0.9), 'codex'), prices[-1] * 0.98)
 
@@ -692,10 +696,10 @@ class ReadFailureAndHoldTests(unittest.TestCase):
             self.assertTrue(any('priced from the reading taken at ' + read_at.isoformat() in n for n in c['notes']))
         self.assertTrue(any(read_at.isoformat() in w and 'last good usage reading' in w
                             for w in failed['decision']['warnings']))
-        # the same reading prices the same: the scores of the real candidates are the fresh ones (a stale state never
-        # renews, so a candidate that would have waited for a reset may gain a fast twin; those are left out here)
+        # the same reading prices the same: the scores of the startable candidates are the fresh ones (a stale state never
+        # renews, so candidates that wait for a reset in `fresh` and fast twins are left out here)
         same = lambda d: [(c['id'], c['score']) for c in eligible(d)
-                          if c['bundle']['account'] == 'claude' and not c['bundle'].get('fast')]
+                          if c['bundle']['account'] == 'claude' and not c['bundle'].get('fast') and not c.get('available_in_hours')]
         self.assertEqual(same(fresh), same(failed))
         self.assertNotIn('reading_at', fresh['ranking'][0]['components'])
         snap = ledger_snapshot.decision_snapshot(failed)
@@ -1167,7 +1171,8 @@ class PoolIndependenceTests(unittest.TestCase):
         state gives, which is the remaining capacity entering as room)."""
         d_low, econ_low = self.economies(0.5, 0.5)
         d_high, econ_high = self.economies(0.96, 0.5)
-        self.assertFalse([c for c in eligible(d_high) if c['bundle']['account'] == 'claude'])
+        self.assertFalse([c for c in eligible(d_high) if c['bundle']['account'] == 'claude' and not c.get('available_in_hours')])
+        self.assertTrue(all(c['available_in_hours'] == 84.0 for c in eligible(d_high) if c['bundle']['account'] == 'claude'))
         key = next(k for k in econ_low.points if k[0] == 'claude')
         self.assertEqual(econ_high.ladder(key)['steps'], econ_low.ladder(key)['steps'])
         self.assertEqual(econ_high.lump(key), econ_low.lump(key))
@@ -1567,16 +1572,18 @@ class ChatGPTWebCadenceTests(unittest.TestCase):
         self.assertEqual(dot_row['components']['opportunity_cost'], 0.0)
         self.assertNotIn('dot/cadence', window_reports(d_remote))
 
-    def test_the_cadence_excludes_at_its_limit_and_not_below(self):
-        # accounts.json: at most `limit` dispatches per window. One seat left starts now; none left waits for the oldest
-        # dispatch to leave the window.
+    def test_the_cadence_defers_at_its_limit_and_not_below(self):
+        # accounts.json: at most `limit` dispatches per window. One seat left starts now; none left waits on `cadence` for
+        # enough dispatches to leave the window, whatever the length of that wait.
         import candidate_eval
         for seats in range(7):
             d = self._plan(seats_used=seats, cadence_reset_h=9.0)
             pro = next(c for c in d['ranking'] if c['id'] == 'pro_max' and not c['bundle'].get('fast'))
             with self.subTest(seats=seats):
-                self.assertEqual(candidate_eval.OVER_CADENCE in pro['excluded'], seats >= 5, pro['excluded'])
-                self.assertEqual(any(n.startswith('cadence has 0 of 5') for n in pro['notes']), seats >= 5, pro['notes'])
+                self.assertEqual(pro['excluded'], [], pro['excluded'])
+                self.assertEqual(pro['available_in_hours'] is not None, seats >= 5, pro)
+                self.assertEqual(pro['waiting_on'], candidate_eval.CADENCE if seats >= 5 else None)
+                self.assertEqual(any('cadence frees' in n for n in pro['notes']), seats >= 5, pro['notes'])
 
     def test_a_free_seat_of_a_rolling_limit_never_expires(self):
         # A rolling limit gives a seat back one window after its dispatch, whatever the others did: while a seat is free
@@ -1600,8 +1607,8 @@ class ChatGPTWebCadenceTests(unittest.TestCase):
         self.assertFalse(any('full renewal' in n for n in pro['notes']), pro['notes'])
 
     def test_an_account_with_quota_windows_is_held_to_its_cadence(self):
-        # One rule for every account that declares a cadence: the plan excludes at `limit`, and below it the account's
-        # own quota windows are priced as they are without the cadence.
+        # One rule for every account that declares a cadence: the plan defers on `cadence` at `limit`, and below it the
+        # account's own quota windows are priced as they are without the cadence.
         def codex_rows(d):
             return {c['id']: c for c in d['ranking'] if c['bundle']['account'] == 'codex' and not c['bundle'].get('fast')}
         def recs(n):
@@ -1619,7 +1626,10 @@ class ChatGPTWebCadenceTests(unittest.TestCase):
         full = codex_rows(self._plan(records=recs(5), cadence_on='codex'))
         for bid, c in full.items():
             with self.subTest(bundle=bid):
-                self.assertIn(candidate_eval.OVER_CADENCE, c['excluded'])
+                self.assertEqual(c['excluded'], [])
+                self.assertEqual(c['waiting_on'], candidate_eval.CADENCE)
+                self.assertGreater(c['available_in_hours'], 0.0)
+                self.assertIn(candidate_eval.CADENCE, c.get('waits') or {})
 
 
 if __name__ == '__main__':

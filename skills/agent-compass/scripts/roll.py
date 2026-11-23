@@ -518,13 +518,8 @@ def files_not_sent(out, args, provider):
 
 
 def none_next(decision):
-    """What a caller reads when no worker fits: when the plan found a candidate held back only by quota, which one, which
-    window and for how long, and the ways out; else where the closest candidates and their exclusions are."""
-    reset = (decision.get('decision') or {}).get('next_reset')
-    if reset:
-        return (f"Nothing can start now: {reset['bundle']} is held back by {reset['account']}'s {reset['window']} quota, which "
-                f"returns in {reset['hours']}h (at {reset['at']}). Wait that long and roll again, or do the task yourself, "
-                'or ask the user.')
+    """What a caller reads when no worker fits: when only the user's own local settings keep the closest candidates out,
+    name them and the ways out that work; else point to the closest candidates and their exclusions in `route.reason`."""
     settings = (decision.get('decision') or {}).get('local_settings')
     if settings:
         way = ("To use one on the user's word, name it with --provider, --account, --model and --basis (the user's own "

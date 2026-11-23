@@ -245,6 +245,8 @@ class PublicationHistoryTests(unittest.TestCase):
 RELEASED_READER_KEYS = {
     'needs_judgment_margin': (8, "v0.7.1 to v0.7.3, whose allocator.plan indexes policy['needs_judgment_margin'] "
                                  "(KeyError once two models are eligible)"),
+    'defer_if_reset_within_hours': (8, "v0.7.1 to v0.7.6, whose candidate_eval.evaluate_bundle indexes "
+                                       "policy['defer_if_reset_within_hours'] (KeyError on any quota or cadence window)"),
 }
 
 

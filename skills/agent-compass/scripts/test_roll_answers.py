@@ -117,22 +117,22 @@ class HandBuilt(unittest.TestCase):
 class BlockedAnswers(Plain):
     """Finding 1: `none` and `defer` say the fact that decided them, first, and a way out that works for it."""
 
-    def test_none_held_by_quota_names_the_candidate_the_window_and_the_hours_before_the_cut(self):
-        # Rule (allocator.plan, quota_pools.quota_wait): an account whose windows are exhausted returns when the last of the
-        # exhausted windows resets; the answer names that account, that window and that wait (the fixture sets all three),
-        # and says to wait, before the cut that `reason` gets.
+    def test_quota_held_roll_defers_and_names_the_account_the_window_and_the_hours(self):
+        # Rule (allocator.plan, roll.defer_next): an account held back only by resetting quota windows defers until the
+        # last exhausted window resets; the answer (`caller_action: wait_for_reset`) names that account, that window and
+        # that wait in both `reason` and `next_action`, and tells the caller to roll again then.
         for label, five, seven in (('five-hour-empty', 1, 100), ('both-empty', 1, 1)):
             with self.subTest(label):
                 five_hours, seven_hours = 3.0, 100.0
                 self.set_remaining(five, seven, five_hours=five_hours, seven_hours=seven_hours)
                 res, code = self.run_roll(task_id='t-' + label)
-                self.assertEqual((code, res['status']), (2, 'blocked'))
+                self.assertEqual((code, res['status'], res.get('caller_action')), (2, 'blocked', 'wait_for_reset'))
                 exhausted = {'five_hour': five_hours} | ({'seven_day': seven_hours} if seven < 5 else {})
                 window = max(exhausted, key=exhausted.get)
                 for text in (res['reason'][:160], res['next_action']):
                     for fact in ('claude-lab', window, f'{exhausted[window]:.1f}h'):
                         self.assertIn(fact, text)
-                self.assertIn('wait', res['next_action'].lower())
+                self.assertIn('roll again then', res['next_action'].lower())
                 self.setUp()
 
 

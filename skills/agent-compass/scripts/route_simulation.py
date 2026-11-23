@@ -278,9 +278,10 @@ def run_state(accounts, usage, now, tasks, host_policy_config, *, mode='machine'
     for task in tasks:
         decision = allocator.plan(task, usage, now, accounts=copy.deepcopy(accounts), overrides=[], records=[],
                                   host_policy_config=host_policy_config, read_local_state=read_local)
+        deferred = (decision.get('decision') or {}).get('action') == 'defer'
         selected = decision.get('selected_bundle') or {}
-        wins_bundle[decision.get('choice') or 'none'] += 1
-        wins_model[label(selected)] += 1
+        wins_bundle['defer' if deferred else (decision.get('choice') or 'none')] += 1
+        wins_model['defer' if deferred else label(selected)] += 1
         top = next((c['score'] for c in decision['ranking'] if c['score'] is not None), None)
         for c in decision['ranking']:
             row = seen[c['id']]
