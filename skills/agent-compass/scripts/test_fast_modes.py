@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import allocator
 import account_fleet
 import axis_scores
+import candidate_eval
 import candidate_ranking
 import dispatch_registry as registry
 import fast_modes
@@ -145,7 +146,20 @@ class FastModesTests(unittest.TestCase):
         self.assertTrue(candidate_ranking.candidate_for_bundle(rows(dict(task, force_fast=True)), 'opus55_high', False)['excluded'])
         accounts['accounts']['claude']['bundles']['opus55_high']['disabled'] = False
         usage = usage_windows(now, {'claude': [('five_hour', 0, 3), ('seven_day', 0, 100)]})
-        self.assertTrue(candidate_ranking.candidate_for_bundle(rows(dict(task, force_fast=True)), 'opus55_high', False)['excluded'])
+        forced_empty = allocator.plan(dict(task), usage, now, accounts=accounts, route={'force_fast': True})
+        self.assertEqual(forced_empty['choice'], 'none')
+        self.assertEqual([c for c in forced_empty['ranking'] if not c['excluded']], [])
+        self.assertIsNone(candidate_ranking.candidate_for_bundle(forced_empty['ranking'], 'opus55_high', True))
+        self.assertIn(candidate_eval.FAST_WAIT_REFUSAL,
+                      candidate_ranking.candidate_for_bundle(forced_empty['ranking'], 'opus55_high', False)['excluded'])
+        self.assertIn(fast_modes.refusal('claude', 'claude-sonnet-5-5', accounts['models']['claude-sonnet-5-5']),
+                      candidate_ranking.candidate_for_bundle(forced_empty['ranking'], 'sonnet55_medium', False)['excluded'])
+        # Without `force_fast`, `--fast` is a preference: the plain candidate waits on its window reset with `fast_not_offered`.
+        waited_plain = candidate_ranking.candidate_for_bundle(rows(dict(task)), 'opus55_high', False)
+        self.assertEqual(waited_plain['excluded'], [])
+        self.assertEqual(waited_plain['waiting_on'], 'seven_day')
+        self.assertAlmostEqual(waited_plain['available_in_hours'], 100.0, places=2)
+        self.assertEqual(waited_plain['fast_not_offered'], candidate_eval.FAST_WAIT_REFUSAL)
 
 
 if __name__ == '__main__':

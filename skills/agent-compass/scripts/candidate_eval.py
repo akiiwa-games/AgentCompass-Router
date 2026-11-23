@@ -49,6 +49,7 @@ CADENCE = 'cadence'
 # Pins). The account and model switches are lifted earlier too, for a named bundle (evaluate_bundle `user_named`).
 AUTOMATIC_ROUTING_EXCLUSIONS = (OUT_OF_AUTOMATIC_ROUTING, UNCHECKED)
 AUTOMATIC_ROUTING_WAITS = (CADENCE,)
+FAST_WAIT_REFUSAL = 'this candidate must wait for a window reset, and fast mode is offered only to one that can start now'
 
 
 def said_exclusions(candidate):
@@ -862,10 +863,16 @@ def evaluate_bundle(bundle, task, ctx):
             else:
                 result['notes'].append(f'data error: {err}; fast mode not enabled')
                 result.setdefault('data_errors', []).append(err)
+    elif not pool and not result['excluded'] and not task.get('disable_fast') and task.get('force_fast'):
+        # Forced fast mode requires a verified fast contract and an immediate start; a candidate held for a window reset
+        # cannot run fast now and never falls back to a plain non-fast candidate.
+        if not fast_modes.supported(harness, model, info):
+            exclude(fast_modes.refusal(harness, model, info))
+        else:
+            exclude(FAST_WAIT_REFUSAL)
     if not result['excluded'] and not result.get('_five_fast_candidate') and 'fast_not_offered' not in result:
         result['fast_not_offered'] = ('fast mode is switched off for this task' if task.get('disable_fast') else
-                                      'this candidate must wait for a window reset, and fast mode is offered only to one '
-                                      'that can start now' if available_at is not None else None)
+                                      FAST_WAIT_REFUSAL if available_at is not None else None)
     result['capacity'] = None           # the economy sets the priced window (apply_five_axis_economy)
     result['expected_hours'] = round(hours, 2)
     result['duration_hours'] = round(hours, 4)
