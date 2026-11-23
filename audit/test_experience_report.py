@@ -70,3 +70,9 @@ def test_write_builds_report_and_summary_from_rows(tmp_path):
     assert [m["model"] for m in scenario["models_with_nothing"]] == ["n@codex"]
     assert scenario["usd_by_difficulty"]["moderate"]["sum"] == 1.5
     assert "## s" in path.read_text(encoding="utf-8")
+
+
+def test_a_reset_after_the_days_last_act_is_overnight():
+    scenario = {"timeline": [{"at": 1.0}, {"at": 9.5}, {"at": 25.0}],
+                "resets": [{"at": 4.0, "unused": 10}, {"at": 13.0, "unused": 100}, {"at": 26.0, "unused": 50}]}
+    assert [r["overnight"] for r in report.overnight(scenario)] == [False, True, True]

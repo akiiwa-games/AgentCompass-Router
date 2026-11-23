@@ -137,6 +137,16 @@ def window_timelines(scenario: dict) -> dict:
     return dict(series)
 
 
+def overnight(scenario: dict) -> list[dict]:
+    """Each reset with `overnight` set when it fell after the day's last act (the session was off, and the experience run
+    skips the night), so a window that refilled unused while nobody worked is told apart from one the day left unused."""
+    ends: dict[int, float] = {}
+    for point in scenario.get("timeline") or ():
+        day = int(point["at"] // 24)
+        ends[day] = max(ends.get(day, point["at"]), point["at"])
+    return [dict(r, overnight=r["at"] > ends.get(int(r["at"] // 24), float("inf"))) for r in scenario.get("resets") or ()]
+
+
 def run_outs(scenario: dict) -> list[dict]:
     """Charges that did not fit under 100 % (the window ran out with this launch), in time order."""
     return [c for c in scenario.get("charges") or [] if c.get("pct") is not None and c.get("applied") is not None and c["applied"] + 1e-9 < c["pct"]]
@@ -200,7 +210,7 @@ def summarize(rows: dict) -> dict:
                 questions["trivial_on_dearer"].append({"answer": ref(scenario, a), "brief": a["brief"], "chosen": q["chosen"], "cheaper": q["cheaper"],
                                                        "ratio": q["ratio"], "reason": a.get("decision_reason")})
         roll_seconds = [a["seconds"] for a in read if isinstance(a.get("seconds"), (int, float))]
-        resets = scenario.get("resets") or []
+        resets = overnight(scenario)
         scenarios.append({
             "name": scenario["name"], "error": scenario.get("error"), "seconds": scenario.get("seconds"),
             "processes_ended": scenario.get("processes_ended") or [],
@@ -219,7 +229,8 @@ def summarize(rows: dict) -> dict:
             "usd_by_difficulty": usd_by_difficulty(launched),
             "windows": {k: {"start": v[0][1] if v else None, "peak": max((u for _, u in v), default=None), "end": v[-1][1] if v else None}
                         for k, v in window_timelines(scenario).items()},
-            "resets": resets, "unused_at_reset": round(sum(r["unused"] for r in resets), 1),
+            "resets": resets, "unused_at_reset": round(sum(r["unused"] for r in resets if not r["overnight"]), 1),
+            "unused_overnight": round(sum(r["unused"] for r in resets if r["overnight"]), 1),
             "run_outs": [{"charge": c, "next": [ref(scenario, a) | {"status": a.get("status"), "model": a.get("model")} for a in after_run_out(scenario, c)]}
                          for c in run_outs(scenario)],
             "deferrals": [{"chain": c["id"], "brief": c["briefs"], "waits": c.get("waits")} for c in chains if c.get("waits")],
@@ -309,7 +320,7 @@ def look_first(rows: dict, summary: dict, limit: int = 10) -> list[dict]:
         items.append({"weight": 30 + len(outs), "title": f"{len(outs)} launch(es) charged more than the window had left (the window ran out)",
                       "rows": [{"scenario": n, "chain": r["charge"]["chain"], "window": f"{r['charge']['account']}/{r['charge']['window']}",
                                 "pct": r["charge"]["pct"], "applied": r["charge"]["applied"]} for n, r in outs[:8]]})
-    unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"] if r["unused"] >= 80 and r["window"] not in ("five_hour",)]
+    unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"] if r["unused"] >= 80 and r["window"] not in ("five_hour",) and not r["overnight"]]
     if unused:
         items.append({"weight": 15 + len(unused), "title": f"{len(unused)} long window(s) reset with 80 % or more unused", "rows": [{"scenario": n, **r} for n, r in unused[:8]]})
     slow = [(s["name"], s["roll_seconds"]) for s in summary["scenarios"] if (s["roll_seconds"].get("max") or 0) > SLOW_ROLL_SECONDS]
@@ -376,8 +387,8 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
         for row in item["rows"][:8]:
             out.append(f"   - `{json.dumps(row, ensure_ascii=False, default=str)[:400]}`")
     out += ["", "## Across scenarios", ""]
-    head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets (pp)", "roll s median/p90/max", "error"]
-    out += md_table(head, [[s["name"], s["chains"], s["workers"], len(s["not_launched"]), len(s["dead_ends"]), len(s["broken_promises"]), s["unused_at_reset"],
+    head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets in the day / overnight (pp)", "roll s median/p90/max", "error"]
+    out += md_table(head, [[s["name"], s["chains"], s["workers"], len(s["not_launched"]), len(s["dead_ends"]), len(s["broken_promises"]), f'{s["unused_at_reset"]} / {s["unused_overnight"]}',
                             f"{s['roll_seconds']['median']}/{s['roll_seconds']['p90']}/{s['roll_seconds']['max']}", "yes" if s["error"] else ""]
                            for s in summary["scenarios"]])
     out += ["", "Answers a session read, by status / caller_action, all scenarios:", ""]
@@ -461,7 +472,8 @@ def render_scenario(scenario: dict, s: dict) -> list[str]:
                         [[k, v["start"], v["peak"], v["end"], sparkline(timelines.get(k, []))] for k, v in s["windows"].items()])
     if s["resets"]:
         out += ["", "Resets (quota left unused at each):", ""]
-        out += md_table(["hour", "window", "used before", "unused"], [[r["at"], f"{r['account']}/{r['window']}", r["used_before"], r["unused"]] for r in s["resets"]])
+        out += md_table(["hour", "window", "used before", "unused", "overnight"],
+                        [[r["at"], f"{r['account']}/{r['window']}", r["used_before"], r["unused"], "yes" if r["overnight"] else ""] for r in s["resets"]])
     if s["run_outs"]:
         out += ["", "Moments a window ran out and the answers right after:", ""]
         for item in s["run_outs"]:
