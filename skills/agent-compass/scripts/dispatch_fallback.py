@@ -38,6 +38,10 @@ Contract:
 - Bound: every failure puts its bundle in the dispatch's excluded set (a transient one after its single same-bundle
   retry), and allocation never returns an excluded bundle, so one dispatch makes at most (startable candidates +
   transient retries) attempts, and ends `blocked` with every attempt's cause once allocation has nothing left.
+- A promise is kept or answered: a next attempt that cannot be made before anything is sent (its re-plan raises, or its
+  decision cannot be prepared) ends the dispatch `not_relaunched`. Every final result after which nothing runs the brief
+  (NOTHING_RUNS) carries its own text, and that text is what the parent reads: roll's answer when roll ran the step,
+  the watcher's one notice when the watcher did, and any later observation of the dispatch.
 - Bookkeeping: each attempt is its own registry row with its own decision, lease, labels and holds, linked by
   `attempt_of` (the first dispatch, the id the parent holds) and `previous_attempt`; the first dispatch keeps
   `fallback` = {state, current, attempts, handled, outcome}. Each step writes a `stage: fallback` ledger line and each
@@ -376,7 +380,10 @@ class Chain:
                 resumed_id = self.resumed_attempt(row)
                 if resumed_id:
                     return self.settle_resumed(resumed_id, attempt, failed_id)
-                choice = self.next_choice(attempt)
+                try:
+                    choice = self.next_choice(attempt)
+                except Exception as exc:   # noqa: BLE001 - nothing was sent yet: the brief ends here, and says why
+                    return self.not_relaunched(attempt, None, 'replan_failed', exc, failed_id)
             if choice is None:
                 kind = 'owner_named' if self.owner_named else 'blocked'
                 self.ledger(kind, attempt, excluded=sorted(self.excluded()))
@@ -401,7 +408,7 @@ class Chain:
             except registry.CapacityChanged as exc:
                 row, bundle, failure = None, new_bundle, refused(exc)
                 continue
-            except ValueError as exc:   # a writer appeared in the workspace, or the decision cannot dispatch
+            except Exception as exc:   # noqa: BLE001 - a writer appeared, the decision cannot dispatch, or anything else
                 live = self.live_attempt(failed_id)
                 if live:
                     # Another attempt of this brief already runs (its own watcher reports): this failure is settled by
@@ -410,12 +417,7 @@ class Chain:
                                                     'root_dispatch_id': self.root_id, 'attempts': self.attempts,
                                                     'lines': lines(self.attempts),
                                                     'detail': 'another attempt of this brief is live'})
-                attempt_next = self.entry(new_bundle)
-                self.attempts.append(attempt_next)
-                self.failed(attempt_next, {'covered': False, 'kind': None, 'scope': None,
-                                           'label': 'not_prepared', 'detail': str(exc)[:300]})
-                self.ledger('declined', attempt_next)
-                return self.finish('declined', {'label': 'not_prepared'}, failed_id)
+                return self.not_relaunched(attempt, new_bundle, 'not_prepared', exc, failed_id)
             if self.root is None:
                 # Refused before the first row existed: this attempt becomes the dispatch the parent holds.
                 self.root = new
@@ -588,6 +590,19 @@ class Chain:
             return decision
         return None
 
+    def not_relaunched(self, attempt, bundle, label, exc, failed_id):
+        """The failed attempt was one AgentCompass promised to relaunch, and the next attempt could not be made before
+        anything was sent (its plan raised, or its decision could not be prepared). The brief ends here with a final
+        outcome that says so, which roll answers and the watcher sends (NOTHING_RUNS): never `declined`, whose answer is
+        the failed row's own promise to relaunch."""
+        failed = self.entry(bundle) if bundle else attempt
+        if bundle:
+            self.attempts.append(failed)
+        self.failed(failed, {'covered': False, 'kind': None, 'scope': None, 'label': label,
+                             'detail': f'{type(exc).__name__}: {exc}'[:300]})
+        self.ledger('not_relaunched', failed)
+        return self.finish('not_relaunched', {'label': label}, failed_id)
+
     def finish(self, kind, failure, failed_id):
         text = final_text(kind, self.attempts, self.task)
         self.save('final', outcome={'result': kind, 'next_action': text}, current=(
@@ -603,8 +618,19 @@ RETRY_EXPIRED_NEXT = ('AgentCompass scheduled a retry of this brief on the same 
                       'retired and nothing runs this brief. Tell the user; roll it again if it is still wanted.')
 
 
+# The final results after which nothing runs the brief though its failure did not say so: the outcome's own text is what
+# the parent reads (roll's answer, dispatch observe via dispatch_flow.with_fallback, and the watcher's notice, whose
+# list in paseo_dispatch_bridge.mjs composeNotice is this one). `declined` is not among them: its failure was one
+# AgentCompass does not relaunch, and the failed row's own text says what to do.
+NOTHING_RUNS = ('blocked', 'owner_named', 'older_profile', 'worker_named', 'retry_expired', 'not_relaunched')
+
+
 def final_text(kind, attempts, task):
     listed = '\n'.join(lines(attempts))
+    if kind == 'not_relaunched':
+        return ('AgentCompass could not start the next attempt of this brief after its failure, so nothing is running '
+                f'it:\n{listed}\nThe brief did not start. Roll it again to route it afresh (nothing holds it now), or '
+                'tell the user.')
     if kind == 'blocked':
         return ('AgentCompass retried or relaunched this brief on every startable candidate and none is left:\n'
                 f'{listed}\nNothing is running it. The holds and cooldowns behind these failures lift on their own '

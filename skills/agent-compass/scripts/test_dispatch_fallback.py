@@ -944,6 +944,51 @@ class StoredTaskRelaunchTests(unittest.TestCase):
         self.assertNotIn('not_prepared', ' '.join(result['attempts']))
         self.assertEqual(root['fallback']['state'], 'relaunched')
 
+    def test_a_relaunch_that_cannot_be_made_ends_in_one_answer_that_nothing_runs(self):
+        """Whatever stops the next attempt before anything is sent, the promise is answered: roll tells the session the
+        brief did not start, and every later observation of the dispatch says the same, never 'relaunches by itself'."""
+        real_prepare = registry.prepare
+
+        def failing_prepare(*a, **kw):
+            if kw.get('attempt'):   # the relaunch's prepare
+                raise RuntimeError('fixture: the relaunch cannot be prepared')
+            return real_prepare(*a, **kw)
+
+        def failing_plan(task, args, unavailable=None):
+            if unavailable:   # the relaunch's plan: the failed bundle is out of it
+                raise RuntimeError('fixture: the relaunch cannot be planned')
+            return real_plan(task, args, unavailable)
+        for task_id in ('prepare-raises', 'replan-raises'):
+            with self.subTest(task_id=task_id):
+                if task_id == 'prepare-raises':
+                    stop = patch.object(registry, 'prepare', side_effect=failing_prepare)
+                else:
+                    real_plan = route_judge.plan_task
+                    stop = patch.object(route_judge, 'plan_task', side_effect=failing_plan)
+                result, code, creates = self.roll_refused_first(task_id, stop)
+                self.assertEqual(len(creates), 1)
+                self.assertEqual((result['caller_action'], result['error']), ('tell_user', 'relaunch_not_started'),
+                                 result.get('next'))
+                self.assertIn('did not start', result['next'])
+                self.assertNotIn('by itself', result['next'])
+                root = self.root_of(result)
+                self.assertEqual((root['fallback']['state'], root['fallback']['outcome']['result']),
+                                 ('final', 'not_relaunched'))
+                observed = flow.public_chain(root)
+                self.assertIn('did not start', observed['next_action'])
+                self.assertNotIn('by itself', observed['next_action'])
+                # The watcher, arriving second, reads the same final outcome, which its notice carries (NOTHING_RUNS).
+                again = fallback.handle(root['dispatch_id'], judge=route_judge, host=self.host)
+                self.assertEqual((again['action'], again['result']), ('final', 'not_relaunched'))
+                self.assertIn(again['result'], fallback.NOTHING_RUNS)
+
+    def test_the_bridge_sends_the_text_of_every_final_result_after_which_nothing_runs(self):
+        """paseo_dispatch_bridge.mjs composeNotice keeps its own copy of NOTHING_RUNS: the two lists are one."""
+        import re
+        bridge = (Path(__file__).resolve().parents[3] / 'setup' / 'paseo_dispatch_bridge.mjs').read_text(encoding='utf-8')
+        found = re.search(r"const NOTHING_RUNS = new Set\(\[([^\]]*)\]\)", bridge)
+        self.assertIsNotNone(found)
+        self.assertEqual(sorted(re.findall(r"'([a-z_]+)'", found.group(1))), sorted(fallback.NOTHING_RUNS))
 
 
 if __name__ == '__main__':

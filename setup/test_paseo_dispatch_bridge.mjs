@@ -1364,6 +1364,22 @@ test('a dispatch with no candidate left sends one notification listing every att
   assert.equal(f.calls.length, 1);
 });
 
+test('a relaunch that could not be started sends one notification with its own text, not the failed worker\'s', async () => {
+  const f = watchFixture();
+  f.setAgent({status: 'error'});
+  const text = 'AgentCompass could not start the next attempt of this brief after its failure, so nothing is running it:\n' +
+    'attempt 1: m1 on a1 failed: worker_error; switched to m2 on a2\nattempt 2: m2 on a2 failed: not_prepared (x)\n' +
+    'The brief did not start. Roll it again to route it afresh (nothing holds it now), or tell the user.';
+  const outcome = {action: 'final', result: 'not_relaunched', root_dispatch_id: 'root', text,
+    lines: ['attempt 1: m1 on a1 failed: worker_error; switched to m2 on a2', 'attempt 2: m2 on a2 failed: not_prepared (x)']};
+  assert.equal(await notificationStep(f.client, f.record, f.persist, 10, async () => outcome), true);
+  assert.equal(f.calls.length, 1);
+  assert.match(f.calls[0][1], /State: not_relaunched\n/);
+  assert.match(f.calls[0][1], /The brief did not start/);
+  await notificationStep(f.client, f.record, f.persist, 20, async () => assert.fail('ran twice'));
+  assert.equal(f.calls.length, 1);
+});
+
 test('a failure the fallback step declines or cannot read is reported as before', async () => {
   for (const outcome of [null, {action: 'disabled'}, {action: 'final', result: 'declined', lines: ['attempt 1: x']}]) {
     const f = watchFixture();

@@ -1069,6 +1069,12 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
         1 if failed else 0
 
 
+# roll's `error` for a final relaunch outcome after which nothing runs the brief (dispatch_fallback.NOTHING_RUNS); a
+# result not named here is its own code.
+FINAL_ERRORS = {'blocked': 'no_candidate_left', 'owner_named': 'owner_named_model_failed',
+                'not_relaunched': 'relaunch_not_started'}
+
+
 def fallback_result(out, outcome, decision, parent, args):
     """roll's answer once dispatch_fallback has relaunched the brief or found nothing left to start it on."""
     attempts = outcome.get('lines') or []
@@ -1103,9 +1109,10 @@ def fallback_result(out, outcome, decision, parent, args):
                           f'({bundle.get("model")} on {bundle.get("account")}). Do NOT call create_agent, Agent, '
                           'spawn_agent, or invoke_subagent again. ' + notif_text),
                     worker=worker), 0
-    if outcome.get('action') == 'final' and outcome.get('result') in ('blocked', 'owner_named'):
-        return dict(out, launched=False, dispatch_mode='paseo', caller_action='tell_user', error='no_candidate_left'
-                    if outcome['result'] == 'blocked' else 'owner_named_model_failed', attempts=attempts,
+    if outcome.get('action') == 'final' and outcome.get('result') in dispatch_fallback.NOTHING_RUNS:
+        # Nothing runs the brief: the outcome's own text, never the failed row's promise to relaunch it.
+        return dict(out, launched=False, dispatch_mode='paseo', caller_action='tell_user',
+                    error=FINAL_ERRORS.get(outcome['result'], outcome['result']), attempts=attempts,
                     next=outcome.get('text'),
                     worker={'provider': (decision.get('selected_bundle') or {}).get('provider'),
                             'dispatch_id': outcome.get('root_dispatch_id'), 'attempts': attempts,

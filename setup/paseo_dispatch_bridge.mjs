@@ -51,6 +51,9 @@ const RETRY_STUCK = 'provider retry stuck';
 // classifier's scope; this list only says which sightings to hand over before telling the parent anything).
 const FALLBACK_REASONS = new Set(['error', RETRY_STUCK, CREATE_FAILED]);
 const FALLBACK_TEXT_LIMIT = 6000;
+// The final fallback results after which nothing runs the brief: the notice carries the outcome's own text
+// (dispatch_fallback.NOTHING_RUNS, the same list).
+const NOTHING_RUNS = new Set(['blocked', 'owner_named', 'older_profile', 'worker_named', 'retry_expired', 'not_relaunched']);
 // A watcher's fallback step that is not over: running, waiting on another observer, or a retry scheduled.
 const FALLBACK_OPEN = new Set(['running', 'scheduled', 'waiting']);
 // A final reply at or under this length is in the one end notice. A longer one is written beside the receipt
@@ -630,7 +633,7 @@ export async function composeNotice(client, record, event) {
   const note = attemptsNote(notificationFile(record.dispatch_id));
   const root = record.fallback?.root_dispatch_id ?? note?.root_dispatch_id;
   const attempts = record.fallback?.lines ?? note?.lines;
-  const final = event.key === 'terminal' && ['blocked', 'owner_named', 'retry_expired'].includes(record.fallback?.result)
+  const final = event.key === 'terminal' && NOTHING_RUNS.has(record.fallback?.result)
     && record.fallback?.text;
   const attemptsText = !final && Array.isArray(attempts) && attempts.length > 1 && event.key === 'terminal'
     ? `Attempts:\n${attempts.map(line => `- ${line}`).join('\n')}\n` : '';
