@@ -39,7 +39,8 @@ UNVERIFIABLE_FAMILIES = ("antigravity", "opencode", "grok")
 CLI_ACCOUNTS = ("claude", "codex", "pi", "antigravity", "opencode", "grok")
 HOOK_EXPLANATION = (
     "The router gate hook blocks every sub-agent launch (including Claude Code's built-in Explore agent) "
-    "unless `roll` recorded a routing decision in the last 15 minutes. It enforces routing, "
+    "unless `roll` handed that native launch to this session (`status: native`, consumed once) or `record` "
+    "recorded a forced route for this session. It enforces routing, "
     "but it will block agents until you get used to running `roll` first. You can remove it at any time with "
     "`{undo}`."
 )

@@ -62,7 +62,8 @@ class HookCommandTransportTests(unittest.TestCase):
                     with self.subTest(shell=name,recorded=recorded):
                         if recorded:
                             ledger.write_text(json.dumps({'at':datetime.now(timezone.utc).isoformat(),
-                                'stage':'plan','choice':'sol_high','source':'deterministic_allocator',
+                                'stage':'record','choice':'constraint','source':'constraint_record',
+                                'constraint':'user_override','basis':'transport fixture',
                                 'bundle':{'provider':'codex','account':'codex','model':'gpt-6.1-sol',
                                           'effort':'high','bundle_id':'sol_high'}})+'\n',encoding='utf-8')
                         else:ledger.unlink(missing_ok=True)

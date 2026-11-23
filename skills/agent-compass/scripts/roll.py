@@ -775,11 +775,14 @@ def grok_bot(args, out, prompt_file, task, bundle, *, decision=None):
     return result, 1 if receipt['state'] == 'failed' else 0
 
 
-def settle_claim(claim_row, res, refusal):
+def settle_claim(claim_row, res, refusal, *, new_worker=False):
     """A host claim after its start: stamped launched when the worker started, or may have (Herdr's uncertain send,
-    `launched` None); canceled with `refusal` when nothing started (`launched` False)."""
+    `launched` None); canceled with `refusal` when nothing started (`launched` False), recording a separate one-use
+    `native` hand-over when `roll.cli` hands launch to the caller (`launch_with_native_host_tool`)."""
     if res.get('launched') is False:
         registry.settle_host_claim(claim_row['dispatch_id'], 'canceled', refusal)
+        if res.get('caller_action') == 'launch_with_native_host_tool':
+            registry.hand_over_native(claim_row['dispatch_id'], new_worker=new_worker)
     else:
         registry.host_claim_launched(claim_row['dispatch_id'])
 
@@ -1018,7 +1021,7 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
         out['worker_prompt_file'] = str(prompt_file)
         res, code = cli(args, without_paseo(out, 'Paseo does not know the parent agent (parent_agent_not_found)'),
                         decision['selected_bundle'], text)
-        settle_claim(claim_row, res, 'cli_not_launched')
+        settle_claim(claim_row, res, 'cli_not_launched', new_worker=bool(getattr(args, 'new_worker', False)))
         return res, code
     failed = receipt.get('state') in ('failed', 'create_failed')
     # launched_at records the single-use claim, before create is sent. Only a
@@ -1646,6 +1649,7 @@ def _run(args, judge):
             if refusal := named_route_refusal(args):
                 raise ValueError(refusal)
             args.constraint = 'user_override'
+            args._from_roll = True
             # Only the model is pinned: the task is classified exactly as an automatic roll's, and the pinned bundle
             # is priced and reserved from that profile.
             classified = judge.classify_pinned(task, args)
@@ -1732,12 +1736,15 @@ def _run(args, judge):
     if not canonical_ws and landing and access == 'write':
         out = same_cwd_warning(out, landing, parent)
     usage = usage_reading.usage_snapshot(getattr(args, 'usage_cache', None))
+    new_worker_flag = bool(getattr(args, 'new_worker', False))
     try:
         claim_row = registry.record_host_claim(
             surface, decision, task, bundle,
             label=getattr(args, 'title', None) or title_of(text),
             usage=usage, access=access,
             workspace=canonical_ws, cwd=landing,
+            native_handover=(surface in NATIVE_HOSTS),
+            new_worker=new_worker_flag,
         )
     except registry.WorkspaceBusy as busy:
         return workspace_blocked(out, busy.workspace, busy.holders,
@@ -1746,12 +1753,12 @@ def _run(args, judge):
         import host_herdr
         res, code = host_herdr.launch(out, bundle, prompt_file, task['task_id'],
                                       cwd=landing, dispatch_id=claim_row['dispatch_id'])
-        settle_claim(claim_row, res, 'herdr_preflight_failed')
+        settle_claim(claim_row, res, 'herdr_preflight_failed', new_worker=new_worker_flag)
         return res, code
     if surface in NATIVE_HOSTS:
         return dict(out, launched=False, dispatch_mode='native', caller_action='launch_with_native_host_tool',
                     **({'dispatch_id': claim_row['dispatch_id']} if canonical_ws else {}),
                     next=placed['next']), 0
     res, code = cli(args, without_paseo(out, no_paseo_because) if no_paseo_because else out, bundle, text)
-    settle_claim(claim_row, res, 'cli_not_launched')
+    settle_claim(claim_row, res, 'cli_not_launched', new_worker=new_worker_flag)
     return res, code

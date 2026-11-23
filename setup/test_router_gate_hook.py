@@ -33,8 +33,9 @@ def setUpModule():
         "HOME": _state.name, "USERPROFILE": _state.name,
     })
     _environment.start()
-    for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CODEX_HOME"):
-        os.environ.pop(name, None)   # restored by _environment.stop(); discovery must not see the host's config homes
+    for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CODEX_HOME",
+                 "PASEO_AGENT_ID", *gate.OWN_SESSION_ID_VARS):
+        os.environ.pop(name, None)   # restored by _environment.stop(); discovery and session IDs stay isolated
     home = Path(_state.name)
     _gate_paths = mock.patch.multiple(gate, HOME=home,
         DEFAULT_LEDGER=home / '.agent-compass/router-ledger.jsonl',
@@ -381,6 +382,53 @@ process.stdout.write(JSON.stringify(out));
     def route(self, provider="codex", model=_UNSET, effort=_UNSET, **fields):
         return writer_ledger_row(provider, model, effort, **fields)
 
+    def handover(
+        self,
+        provider: str = "codex",
+        model: object = _UNSET,
+        effort: object = _UNSET,
+        *,
+        surface: str = "native",
+        account: str | None = None,
+        bundle_id: str | None = None,
+        parent_id: str = "parent-native",
+        task_id: str = "task-native",
+        host_session_id: str | None = None,
+        session_ids: list[str] | None = None,
+        constraint: str | None = None,
+        decision_id: str | None = None,
+        new_worker: bool = False,
+        now: dt.datetime = T0,
+        bundle_extra: dict | None = None,
+    ) -> dict:
+        """Record a one-use native hand-over through `dispatch_registry.record_host_claim` as `roll` writes it."""
+        registry = gate.router_module("dispatch_registry")
+        resolved_model = ("dot" if provider == "dot" else "gpt-6-astra") if model is _UNSET else model
+        resolved_effort = (None if provider == "dot" else "high") if effort is _UNSET else effort
+        resolved_account = account if account is not None else _default_account(provider)
+        bundle = {
+            "provider": provider,
+            "account": resolved_account,
+            "model": resolved_model,
+            **({"effort": resolved_effort} if resolved_effort is not None else {}),
+            **({"bundle_id": bundle_id} if bundle_id is not None else {}),
+            **(bundle_extra or {}),
+        }
+        decision = {
+            "decision_id": decision_id or f"dec-{task_id}-{provider}",
+            "choice": bundle_id or ("dot_text" if provider == "dot" else f"{provider}_choice"),
+            **({"constraint": constraint} if constraint else {}),
+        }
+        task = {
+            "parent_agent_id": parent_id,
+            "task_id": task_id,
+            **({"host_session_id": host_session_id} if host_session_id else {}),
+        }
+        with mock.patch.object(registry, "own_session_ids", return_value=list(session_ids or ())):
+            return registry.record_host_claim(
+                surface, decision, task, bundle, native_handover=True, new_worker=new_worker, now=now,
+            )
+
     def test_worker_questions_are_blocked_but_main_questions_and_messages_pass(self):
         worker_id = self.existing_agent()
         agent_file = self.state / 'agents' / 'project' / (worker_id + '.json')
@@ -638,29 +686,265 @@ process.stdout.write(JSON.stringify(out));
             routes = gate.recent_routes(ledger, now=T0)
             self.assertTrue(any(r.get("choice") == route["choice"] for r in routes))
 
-    def test_allows_subagent_when_recent_plan_or_record_exists(self):
+    def test_native_launch_requires_native_handover_or_standalone_record_never_plan(self):
+        """Contract: a `plan` row never authorizes a native launch; only an unconsumed `roll` native hand-over or a
+        recent standalone `record` row of this session does."""
         with tempfile.TemporaryDirectory() as tmp:
-            for row in (
-                self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
-                           at=(T0 - dt.timedelta(minutes=4)).isoformat()),
-                self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="user_override",
-                           bundle_id="sol_high", at=(T0 - dt.timedelta(minutes=4)).isoformat()),
+            plan_row = self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
+                                  session_ids=["sess-1"], parent_id="sess-1",
+                                  at=(T0 - dt.timedelta(minutes=2)).isoformat())
+            plan_ledger = self.write_ledger(tmp, [plan_row])
+            # 1. A recent `plan` row (even from the same session and matching model) blocks every native launch tool.
+            for payload, blocked_key, blocked_val in (
+                ({"session_id": "sess-1", "tool_name": "Agent",
+                  "tool_input": {"subagent_type": "Explore", "prompt": "find files"}}, "decision", "block"),
+                ({"session_id": "sess-1", "tool_name": "spawn_agent",
+                  "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"}}, "decision", "block"),
+                ({"toolCall": {"name": "invoke_subagent", "args": {"Subagents": []}}}, "decision", "deny"),
             ):
-                ledger = self.write_ledger(tmp, [row])
-                with self.subTest(stage=row["stage"]):
-                    res = gate.evaluate_payload(
-                        {"tool_name": "Agent", "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
-                        ledger_path=ledger,
-                        now=T0,
-                    )
-                    self.assertEqual(res, {})
+                verdict = gate.evaluate_payload(payload, ledger_path=plan_ledger, now=T0)
+                self.assertEqual(verdict.get(blocked_key), blocked_val, payload)
+                self.assertNotIn("兼容检查", verdict.get("reason", ""))
 
-                    agy_res = gate.evaluate_payload(
-                        {"toolCall": {"name": "invoke_subagent", "args": {"Subagents": []}}},
-                        ledger_path=ledger,
-                        now=T0,
-                    )
-                    self.assertEqual(agy_res, {"decision": "allow"})
+            # 2. A standalone `record` row of this session authorizes matching native launches (and blocks another session).
+            record_row = self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="user_override",
+                                    bundle_id="sol_high", session_ids=["sess-1"], parent_id="sess-1",
+                                    at=(T0 - dt.timedelta(minutes=4)).isoformat())
+            record_ledger = self.write_ledger(tmp, [record_row])
+            self.assertEqual(
+                gate.evaluate_payload(
+                    {"session_id": "sess-1", "tool_name": "Agent",
+                     "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
+                    ledger_path=record_ledger, now=T0,
+                ),
+                {},
+            )
+            self.assertEqual(
+                gate.evaluate_payload(
+                    {"session_id": "sess-other", "tool_name": "Agent",
+                     "tool_input": {"subagent_type": "Explore", "prompt": "find files"}},
+                    ledger_path=record_ledger, now=T0,
+                )["decision"],
+                "block",
+            )
+            self.assertEqual(
+                gate.evaluate_payload(
+                    {"toolCall": {"name": "invoke_subagent", "args": {"Subagents": []}}},
+                    ledger_path=record_ledger, now=T0,
+                ),
+                {"decision": "allow"},
+            )
+
+            # 3. An unconsumed `roll` native hand-over authorizes one launch (even at minute 16, past the 15-min ledger
+            # window), is idempotent on retries of the same tool_use_id, blocks a second launch, and degrades at 24h.
+            missing = Path(tmp) / "missing.jsonl"
+            claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
+                                  parent_id="sess-native", session_ids=["sess-native"], now=T0)
+            at_min_16 = T0 + dt.timedelta(minutes=16)
+            call_1 = {"session_id": "sess-native", "tool_use_id": "tu-1", "tool_name": "spawn_agent",
+                      "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"}}
+            # Another session cannot consume it
+            other_sess = dict(call_1, session_id="sess-stranger", tool_use_id="tu-stranger")
+            self.assertEqual(gate.evaluate_payload(other_sess, ledger_path=missing, now=at_min_16)["decision"], "block")
+            # Wrong model does not consume the hand-over
+            wrong_model = dict(call_1, tool_use_id="tu-wrong",
+                               tool_input={"message": "work", "model": "gpt-6-astra", "effort": "high"})
+            wrong_res = gate.evaluate_payload(wrong_model, ledger_path=missing, now=at_min_16)
+            self.assertEqual(wrong_res["decision"], "block")
+            self.assertIn("model: requested='gpt-6-astra'", wrong_res["reason"])
+            self.assertNotIn("兼容检查", wrong_res["reason"])
+            # First matching launch at minute 16 passes and consumes the hand-over; same tool_use_id retry stays allowed
+            self.assertEqual(gate.evaluate_payload(call_1, ledger_path=missing, now=at_min_16), {})
+            self.assertEqual(gate.evaluate_payload(call_1, ledger_path=missing, now=at_min_16), {})
+            registry = gate.router_module("dispatch_registry")
+            self.assertEqual(registry.inspect(claim["dispatch_id"])["state"], "launched")
+            # Second launch with a new tool_use_id (or none) is blocked
+            for second_id in ("tu-2", None):
+                second_call = {k: v for k, v in dict(call_1, tool_use_id=second_id).items() if v is not None}
+                self.assertEqual(gate.evaluate_payload(second_call, ledger_path=missing, now=at_min_16)["decision"], "block")
+            # Unconsumed hand-over past MAX_LIFETIME (24h) degrades to blocked
+            stale_claim = self.handover("codex", "gpt-6.1-sol", "high", bundle_id="sol_high",
+                                        parent_id="sess-stale", session_ids=["sess-stale"], task_id="task-stale", now=T0)
+            after_24h = T0 + dt.timedelta(seconds=registry.MAX_LIFETIME + 1)
+            stale_call = {"session_id": "sess-stale", "tool_use_id": "tu-stale", "tool_name": "spawn_agent",
+                          "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"}}
+            self.assertEqual(gate.evaluate_payload(stale_call, ledger_path=missing, now=after_24h)["decision"], "block")
+            self.assertIsNone(registry.inspect(stale_claim["dispatch_id"]).get("launched_at"))
+
+    def test_real_roll_writers_authorize_only_when_roll_hands_over_natively(self):
+        """End-to-end with the real `roll`, `route_judge`, `decision_ledger` and `dispatch_registry` writers:
+        (a) a Paseo-launched `roll` (automatic or `--provider` pinned) blocks native launches in that session;
+        (b) a deferred `roll` (`action: defer`) blocks native launches;
+        (c) all three `roll` `dispatch_mode == 'native'` answers (`NATIVE_HOSTS`, `cli` without CLI family, `cli` Popen
+            failure) record a one-use native hand-over that authorizes exactly one native launch;
+        (d) two wrapped native launches in one `exec` call cannot share a single hand-over."""
+        roll_mod = gate.router_module("roll")
+        route_judge = gate.router_module("route_judge")
+        decision_ledger = gate.router_module("decision_ledger")
+        registry = gate.router_module("dispatch_registry")
+        flow = gate.router_module("dispatch_flow")
+        account_fleet = gate.router_module("account_fleet")
+        usage_reading = gate.router_module("usage_reading")
+        subscription_cli = gate.router_module("subscription_cli")
+        rts = gate.router_module("router_test_support")
+
+        accounts = account_fleet.load_accounts(account_fleet.reference_fleet_path())
+        accounts["accounts"]["claude-lab"]["plan"] = "max20"
+        self.write_settings(allowed=["claude-lab", "codex", "antigravity"])
+        usage = {
+            "read_ok": True,
+            "accounts": {
+                "claude-lab": {
+                    "status": "fresh", "fetched_at": T0.isoformat(),
+                    "windows": [
+                        {"id": "five_hour", "used_pct": 10, "remaining_pct_before_reset": 90,
+                         "observed_remaining_pct": 90, "seconds_until_reset": 9000,
+                         "resets_at": (T0 + dt.timedelta(hours=2.5)).isoformat()},
+                        {"id": "seven_day", "used_pct": 10, "remaining_pct_before_reset": 90,
+                         "observed_remaining_pct": 90, "seconds_until_reset": 400000,
+                         "resets_at": (T0 + dt.timedelta(hours=110)).isoformat()},
+                    ],
+                },
+            },
+        }
+        brief = self.state / "brief.md"
+        brief.write_text("# Implement fix\n", encoding="utf-8")
+        ledger = self.state / "ledger.jsonl"
+
+        def fake_paseo_host(request):
+            op = request.get("operation")
+            if op == "workspace_agents":
+                return {"ok": True, "placeable": True, "agents": []}
+            if op == "create":
+                now_iso = dt.datetime.now(UTC).isoformat()
+                prov, _, mod = request["request"]["provider"].partition("/")
+                snap = {
+                    "id": "agent-paseo-1", "provider": prov, "model": mod,
+                    "currentModeId": request["request"]["settings"].get("modeId"),
+                    "thinkingOptionId": request["request"]["settings"].get("thinkingOptionId"),
+                    "status": "running", "updatedAt": now_iso, "labels": request["request"]["labels"],
+                }
+                return {"ok": True, "sent": True, "agent": snap, "completion_notification": {"status": "watching"}}
+            return {"ok": False, "error": "agent_not_observed"}
+
+        original_build_task = roll_mod.build_task
+
+        def run_real_roll(*argv, env=None, host_fn=fake_paseo_host, current_accounts=None):
+            args = route_judge.build_parser().parse_args(["roll", "--brief", str(brief), *argv])
+            args.brief = args.brief[0]
+            active_accounts = current_accounts or accounts
+            with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "parent-a", **(env or {})}), \
+                    mock.patch.object(account_fleet, "load_accounts", return_value=active_accounts), \
+                    mock.patch.object(registry.provider_inventory, "current", return_value={
+                        "accounts": {}, "launchers": {"claude-lab": {"family": "claude", "status": "ready"}}}), \
+                    mock.patch.object(usage_reading, "usage_snapshot", side_effect=lambda *_, **__: usage), \
+                    mock.patch.object(subscription_cli, "subscription_env", side_effect=lambda account=None: dict(os.environ)), \
+                    mock.patch.object(subscription_cli, "cli_prefix", side_effect=lambda name: [name]), \
+                    mock.patch.object(roll_mod, "WORKER_PROMPTS_DIR", self.state / "wp"), \
+                    mock.patch.object(roll_mod, "RESULTS_DIR", self.state / "rr"), \
+                    mock.patch.object(flow, "host_call", host_fn), \
+                    mock.patch.object(roll_mod, "build_task",
+                                      lambda *a, **k: dict(original_build_task(*a, **k),
+                                                           profile=rts.profile_for({"work_kind": "code_implementation", "difficulty": "hard"}))):
+                return roll_mod.run(args, route_judge)
+
+        # (a) Paseo-launched roll (both automatic `plan` row and `--provider` pinned `record` row) never authorizes native Agent
+        for extra_flags, tid in (((), "t-paseo-auto"),
+                                 (("--provider", "claude-lab", "--account", "claude-lab", "--model", "claude-sonnet-5-5",
+                                   "--effort", "high", "--basis", "user asked"), "t-paseo-pinned")):
+            res, code = run_real_roll("--task-id", tid, *extra_flags)
+            self.assertEqual((code, res["status"]), (0, "launched"))
+            with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "parent-a"}):
+                denied = gate.evaluate_payload(
+                    {"session_id": "parent-a", "tool_name": "Agent",
+                     "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}},
+                    ledger_path=ledger, now=dt.datetime.now(UTC),
+                )
+            self.assertEqual(denied["decision"], "block", (tid, denied))
+
+        # (b) Deferred roll (`action: defer`) writes a `plan` row with a bundle and still authorizes no native launch
+        defer_accounts = json.loads(json.dumps(accounts))
+        defer_accounts["accounts"]["claude-lab"]["cadence"] = {"window_seconds": 4 * 3600, "limit": 1}
+        defer_accounts["scoring"]["defer_if_reset_within_hours"] = 4
+        now_live = dt.datetime.now(UTC)
+        prior = registry.record_host_claim(
+            "cli", {"decision_id": "prior-cadence"}, {"parent_agent_id": "parent-a", "task_id": "t-prior"},
+            dict(account_fleet.bundles(defer_accounts)["lab_sonnet55_high"], bundle_id="lab_sonnet55_high"),
+            now=now_live - dt.timedelta(hours=2),
+        )
+        registry.host_claim_launched(prior["dispatch_id"], now=now_live - dt.timedelta(hours=2))
+        registry.settle_host_claim(prior["dispatch_id"], "completed", now=now_live - dt.timedelta(hours=1))
+        res_def, code_def = run_real_roll("--task-id", "t-defer", "--can-wait-hours", "4", "--new-worker",
+                                          current_accounts=defer_accounts)
+        self.assertEqual((code_def, res_def["status"], res_def.get("caller_action")), (2, "blocked", "wait_for_reset"))
+        self.assertEqual(decision_ledger.read_ledger(ledger)[-1].get("action"), "defer")
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "parent-a"}):
+            denied_def = gate.evaluate_payload(
+                {"session_id": "parent-a", "tool_name": "Agent",
+                 "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}},
+                ledger_path=ledger, now=dt.datetime.now(UTC),
+            )
+        self.assertEqual(denied_def["decision"], "block")
+
+        # (c) All three `dispatch_mode == 'native'` paths of `roll` authorize one native launch and block the second:
+        #   c1: `surface in NATIVE_HOSTS` (`orca` terminal with inner Claude session)
+        res_c1, code_c1 = run_real_roll(
+            "--task-id", "t-native-1", "--new-worker",
+            env={"PASEO_AGENT_ID": "", "ORCA_AGENT_SESSION_ID": "orca-s1",
+                 "ORCA_TERMINAL_HANDLE": "term_1", "CLAUDE_CODE_SESSION_ID": "claude-s1"},
+        )
+        self.assertEqual((code_c1, res_c1["status"]), (0, "native"))
+        c1_payload = {"session_id": "claude-s1", "tool_use_id": "c1-a", "tool_name": "Agent",
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+        self.assertEqual(gate.evaluate_payload(c1_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
+        self.assertEqual(
+            gate.evaluate_payload(dict(c1_payload, tool_use_id="c1-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
+            "block",
+        )
+
+        #   c2: `roll.cli` when `family not in CLI_RUNS` (no Paseo reachable and no local CLI runner for provider)
+        with mock.patch.object(flow, "paseo_reachable", return_value=False), \
+                mock.patch.object(roll_mod, "provider_definition", return_value=("custom-no-cli", {})):
+            res_c2, code_c2 = run_real_roll(
+                "--task-id", "t-native-2", "--parent-id", "sess-c2", "--new-worker",
+                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c2"},
+            )
+        self.assertEqual((code_c2, res_c2["status"]), (0, "native"))
+        c2_payload = {"session_id": "sess-c2", "tool_use_id": "c2-a", "tool_name": "Agent",
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+        self.assertEqual(gate.evaluate_payload(c2_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
+        self.assertEqual(
+            gate.evaluate_payload(dict(c2_payload, tool_use_id="c2-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
+            "block",
+        )
+
+        #   c3: `roll.cli` when `subprocess.Popen` raises OSError (`CLI could not start ... start it natively`)
+        with mock.patch.object(flow, "paseo_reachable", return_value=False), \
+                mock.patch.object(roll_mod, "provider_definition", return_value=("claude", {})), \
+                mock.patch.object(roll_mod.subprocess, "Popen", side_effect=OSError("missing binary")):
+            res_c3, code_c3 = run_real_roll(
+                "--task-id", "t-native-3", "--parent-id", "sess-c3", "--new-worker", "--verbose",
+                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c3"},
+            )
+        self.assertEqual((code_c3, res_c3["dispatch_mode"], res_c3["caller_action"]),
+                         (1, "native", "launch_with_native_host_tool"))
+        c3_payload = {"session_id": "sess-c3", "tool_use_id": "c3-a", "tool_name": "Agent",
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+        self.assertEqual(gate.evaluate_payload(c3_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
+        self.assertEqual(
+            gate.evaluate_payload(dict(c3_payload, tool_use_id="c3-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
+            "block",
+        )
+
+        # (d) Two wrapped `spawn_agent` calls inside one `exec` payload cannot share a single hand-over
+        self.handover("codex", "gpt-6-astra", "high", parent_id="sess-wrap", session_ids=["sess-wrap"],
+                      task_id="t-wrap", now=T0)
+        two_spawns = {
+            "session_id": "sess-wrap", "tool_use_id": "wrap-1", "tool_name": "exec",
+            "tool_input": 'await spawn_agent({message: "one", model: "gpt-6-astra"}); '
+                          'await spawn_agent({message: "two", model: "gpt-6-astra"})',
+        }
+        self.assertEqual(gate.evaluate_payload(two_spawns, ledger_path=ledger, now=T0)["decision"], "block")
 
     def test_expired_or_self_only_ledger_entry_still_blocks(self):
         """Rule: a plan/record row without a route bundle (or outside the TTL window) authorizes nothing."""
@@ -678,9 +962,12 @@ process.stdout.write(JSON.stringify(out));
             no_eligible_row = captured[-1]
 
         recent = (T0 - dt.timedelta(minutes=1)).isoformat()
-        expired = self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
-                             at=(T0 - dt.timedelta(minutes=30)).isoformat())
-        self.assertTrue(gate.carries_route(expired))
+        expired_plan = self.route("codex", "gpt-6.1-sol", "high", choice="sol_high", bundle_id="sol_high",
+                                  at=(T0 - dt.timedelta(minutes=30)).isoformat())
+        expired_record = self.route("codex", "gpt-6.1-sol", "high", stage="record", constraint="user_override",
+                                    bundle_id="sol_high", at=(T0 - dt.timedelta(minutes=30)).isoformat())
+        self.assertTrue(gate.carries_route(expired_plan))
+        self.assertTrue(gate.carries_route(expired_record))
         routeless_rows = [
             scorer_unavailable_row,
             no_eligible_row,
@@ -702,7 +989,7 @@ process.stdout.write(JSON.stringify(out));
             self.assertFalse(gate.carries_route(row), row)
 
         with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(tmp, [expired, *routeless_rows])
+            ledger = self.write_ledger(tmp, [expired_plan, expired_record, *routeless_rows])
             self.assertEqual(gate.recent_routes(ledger, now=T0), [])
             res = gate.evaluate_payload(
                 {"tool_name": "spawn_agent", "tool_input": {"message": "hi"}},
@@ -757,7 +1044,8 @@ process.stdout.write(JSON.stringify(out));
                 )
                 self.assertEqual(res, {}, msg=cmd)
 
-            dot_row = self.route("dot", at=(T0 - dt.timedelta(minutes=2)).isoformat())
+            dot_row = self.route("dot", stage="record", constraint="dot_closed_loop",
+                                 at=(T0 - dt.timedelta(minutes=2)).isoformat())
             self.assertNotIn("effort", dot_row["bundle"])
             self.assertTrue(gate.is_dot_route(dot_row))
             self.assertFalse(gate.is_dot_route({"stage": "plan", "choice": "dot_text"}))
@@ -890,7 +1178,8 @@ process.stdout.write(JSON.stringify(out));
                 )
                 other_ledger = self.write_ledger(
                     tmp,
-                    [self.route("pi", "gpt-6-astra", "high", choice="pi_astra_high", bundle_id="pi_astra_high")],
+                    [self.route("pi", "gpt-6-astra", "high", stage="record", constraint="user_override",
+                                bundle_id="pi_astra_high")],
                 )
                 res_mismatch = gate.evaluate_payload(
                     {
@@ -943,25 +1232,30 @@ process.stdout.write(JSON.stringify(out));
                 "agentId": agent_id, "prompt": "continue"}}, now=T0)["reason"])
 
     def test_pi_launch_namespace_matches_canonical_ledger_on_schedule_and_host_launch(self):
-        # Actual ledger records retain canonical model, not bundle.launch_model.
+        # Actual ledger and handover records retain canonical model, not bundle.launch_model.
         for prov, canonical_model, launch_model in (
             ("pi", "gpt-6-astra", "openai-codex/gpt-6-astra"),
             ("opencode", "deepseek-v4.1-flash-free", "opencode/deepseek-v4.1-flash-free"),
         ):
-            ledger = self.write_ledger(str(self.state), [self.route(prov, canonical_model, "high", session_ids=["s1"])])
-            for args in (
+            plan_ledger = self.write_ledger(str(self.state), [self.route(prov, canonical_model, "high", session_ids=["s1"])])
+            for idx, args in enumerate((
                 {"provider": f"{prov}/{launch_model}"},
                 {"provider": prov, "model": launch_model},
-            ):
+            )):
                 args["settings"] = {"thinkingOptionId": "high"}
-                host_launch = {"tool_name": "delegate_task", "tool_input": args}
+                host_launch = {"session_id": "s1", "tool_use_id": f"pi-{prov}-{idx}",
+                               "tool_name": "delegate_task", "tool_input": args}
                 schedule = {"tool_name": "mcp__paseo__create_schedule", "session_id": "s1",
                             "tool_input": dict(args, prompt="work", cron="7 * * * *")}
-                self.assertEqual(gate.evaluate_payload(host_launch, ledger_path=ledger, now=T0), {})
-                self.assertEqual(gate.evaluate_payload(schedule, ledger_path=ledger, now=T0), {})
+                # Plan row authorizes schedule only, not native delegate_task; native handover authorizes delegate_task.
+                self.assertEqual(gate.evaluate_payload(schedule, ledger_path=plan_ledger, now=T0), {})
+                self.assertEqual(gate.evaluate_payload(host_launch, ledger_path=plan_ledger, now=T0)["decision"], "block")
+                self.handover(prov, canonical_model, "high", surface="t3", parent_id="s1", session_ids=["s1"],
+                              task_id=f"t-{prov}-{idx}", now=T0)
+                self.assertEqual(gate.evaluate_payload(host_launch, ledger_path=plan_ledger, now=T0), {})
 
     def test_pi_namespace_normalization_preserves_owner_model_and_effort_checks(self):
-        ledger = self.write_ledger(str(self.state), [self.route("pi")])
+        ledger = self.write_ledger(str(self.state), [self.route("pi", stage="record", constraint="user_override")])
         for provider, effort, diagnostic in (
             ("pi/openai-codex/gpt-6.1-sol", "high", "model"),
             ("pi/openai-codex/gpt-6-astra", "max", "effort"),
@@ -975,13 +1269,16 @@ process.stdout.write(JSON.stringify(out));
     def test_antigravity_high_model_accepts_omitted_thinking_option(self):
         for provider in ("antigravity", "antigravity-resilient"):
             for model in ("gemini-4-argon-high", "gemini-3.8-flash-high"):
-                ledger = self.write_ledger(str(self.state), [self.route(provider, model, "high", session_ids=["s1"])])
+                plan_ledger = self.write_ledger(str(self.state), [self.route(provider, model, "high", session_ids=["s1"])])
                 args = {"provider": provider + "/" + model, "settings": {"modeId": "full-access"}}
-                self.assertEqual(gate.evaluate_payload({"tool_name": "delegate_task", "tool_input": args},
-                                                      ledger_path=ledger, now=T0), {})
                 self.assertEqual(gate.evaluate_payload({"tool_name": "mcp__paseo__create_schedule", "session_id": "s1",
                     "tool_input": dict(args, prompt="work", cron="7 * * * *")},
-                    ledger_path=ledger, now=T0), {})
+                    ledger_path=plan_ledger, now=T0), {})
+                self.handover(provider, model, "high", surface="t3", parent_id="s1", session_ids=["s1"],
+                              task_id=f"t-{provider}-{model}", now=T0)
+                self.assertEqual(gate.evaluate_payload({"session_id": "s1", "tool_name": "delegate_task",
+                                                       "tool_input": args},
+                                                       ledger_path=plan_ledger, now=T0), {})
 
     def test_quota_never_blocks_inspection_even_with_provider_or_agent_id(self):
         self.exhausted_cache()
@@ -1136,16 +1433,26 @@ process.stdout.write(JSON.stringify(out));
 
         self.write_settings(accounts={"claude": {"bundles": {
             f"sonnet55_{e}": {"disabled": True} for e in ("low", "medium", "high", "xhigh", "max")}}})
+        missing = self.state / "missing.jsonl"
         with mock.patch.object(gate, "load_dispatch_accounts", side_effect=claude_only):
-            for constraint, refused in (("user_override", False), ("hard_constraint", True), (None, True)):
-                row = self.route("claude", "claude-sonnet-5-5", "high",
-                                 **({"stage": "record", "constraint": constraint} if constraint else {}))
+            # Both standalone `record` rows and `roll` native hand-overs pass on unchecked models only with `user_override`.
+            for constraint, refused in (("user_override", False), ("hard_constraint", True)):
+                row = self.route("claude", "claude-sonnet-5-5", "high", stage="record", constraint=constraint)
                 ledger = self.write_ledger(str(self.state), [row])
-                with self.subTest(launch="native", constraint=constraint):
+                with self.subTest(launch="native-record", constraint=constraint):
                     result = gate.evaluate_payload(native, ledger_path=ledger, now=T0)
                     self.assertEqual("reason" in result, refused, result)
                     if refused:
                         self.assertIn("在模型管理中未勾选", result["reason"])
+            for constraint, refused in (("user_override", False), (None, True)):
+                claim = self.handover("claude", "claude-sonnet-5-5", "high", parent_id="sess-u", session_ids=["sess-u"],
+                                      task_id=f"tu-{constraint}", constraint=constraint, now=T0)
+                with self.subTest(launch="native-handover", constraint=constraint):
+                    result = gate.evaluate_payload(dict(native, session_id="sess-u"), ledger_path=missing, now=T0)
+                    self.assertEqual("reason" in result, refused, result)
+                    if refused:
+                        self.assertIn("在模型管理中未勾选", result["reason"])
+                        self.assertIsNone(registry.inspect(claim["dispatch_id"]).get("launched_at"))
 
     def test_a_native_launch_resolves_to_the_sessions_own_account_only_when_discovery_records_it(self):
         # Gate contract (parent-address-gate.md): a native sub-agent runs on the calling session's own account. When
@@ -1178,16 +1485,26 @@ process.stdout.write(JSON.stringify(out));
             (recorded, None, True),
             ({}, None, False), (ambiguous, None, False),    # not recorded / not one account: unresolved, as before
         )
-        def opus_row(constraint):
-            return self.route("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
-                              **({"stage": "record", "constraint": constraint} if constraint else {}))
-
+        missing = self.state / "missing.jsonl"
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(own_home)}):
-            for rows, constraint, refused in cases:
-                ledger = self.write_ledger(str(self.state), [opus_row(constraint)])
+            for idx, (rows, constraint, refused) in enumerate(cases):
+                if constraint:
+                    ledger = self.write_ledger(
+                        str(self.state),
+                        [self.route("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                                    stage="record", constraint=constraint)],
+                    )
+                    sess = {}
+                else:
+                    ledger = missing
+                    sess = {"session_id": f"own-sess-{idx}"}
                 with self.subTest(rows=sorted(rows), ambiguous=rows is ambiguous, constraint=constraint), \
                         mock.patch.object(gate, "load_dispatch_accounts", side_effect=discovered(rows)):
-                    result = gate.evaluate_payload(native, ledger_path=ledger, now=T0)
+                    if not constraint:
+                        self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                                      parent_id=sess["session_id"], session_ids=[sess["session_id"]],
+                                      task_id=f"own-m-{idx}", now=T0)
+                    result = gate.evaluate_payload(dict(native, **sess), ledger_path=ledger, now=T0)
                     self.assertEqual("reason" in result, refused, result)
                     if refused:
                         self.assertIn("在模型管理中未勾选", result["reason"])
@@ -1195,15 +1512,21 @@ process.stdout.write(JSON.stringify(out));
                             self.assertIn(named, result["reason"])
                         self.assertNotIn("?", result["reason"])
                     with self.subTest(launch="no model"):
-                        self.assertNotIn("reason", gate.evaluate_payload(no_model, ledger_path=ledger, now=T0))
+                        if not constraint:
+                            self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                                          parent_id=sess["session_id"], session_ids=[sess["session_id"]],
+                                          task_id=f"own-nom-{idx}", now=T0)
+                        self.assertNotIn("reason", gate.evaluate_payload(dict(no_model, **sess), ledger_path=ledger, now=T0))
 
             # A launch that names no model is not resolved to the own account even when every model of it is unchecked.
             every = list(real_accounts()["accounts"]["claude"]["bundles"])
             self.write_settings(accounts={"claude": {"bundles": {b: {"disabled": True} for b in every}}})
-            ledger = self.write_ledger(str(self.state), [opus_row(None)])
+            self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                          parent_id="own-all-off", session_ids=["own-all-off"], task_id="t-all-off", now=T0)
             with self.subTest(launch="no model, every model unchecked"), \
                     mock.patch.object(gate, "load_dispatch_accounts", side_effect=discovered(recorded)):
-                self.assertNotIn("reason", gate.evaluate_payload(no_model, ledger_path=ledger, now=T0))
+                self.assertNotIn("reason", gate.evaluate_payload(
+                    dict(no_model, session_id="own-all-off"), ledger_path=missing, now=T0))
 
             # The own account's window is exhausted and its models are checked: the native launch is not resolved to
             # it for that check, exactly as before the own-account resolution existed.
@@ -1213,12 +1536,14 @@ process.stdout.write(JSON.stringify(out));
                 "available": True, "stale": False, "fetched_at": T0.isoformat(),
                 "windows": [{"id": w, "used_pct": 100, "resets_at": (T0 + dt.timedelta(hours=3)).isoformat()}
                             for w in ("five_hour", "seven_day")]}}}), encoding="utf-8")
-            ledger = self.write_ledger(str(self.state), [opus_row(None)])
             with mock.patch.object(gate, "load_dispatch_accounts", side_effect=discovered(recorded)):
-                for payload in (native, no_model):
+                for q_idx, payload in enumerate((native, no_model)):
                     with self.subTest(quota=payload["tool_input"].get("model")):
-                        self.assertNotIn("reason", gate.evaluate_payload(payload, ledger_path=ledger, now=T0,
-                                                                         usage_cache_path=cache))
+                        sid = f"own-quota-{q_idx}"
+                        self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
+                                      parent_id=sid, session_ids=[sid], task_id=f"tq-{q_idx}", now=T0)
+                        self.assertNotIn("reason", gate.evaluate_payload(
+                            dict(payload, session_id=sid), ledger_path=missing, now=T0, usage_cache_path=cache))
 
     def test_a_caller_known_only_by_its_host_session_owns_the_worker_whose_parent_record_runs_that_session(self):
         # Gate contract (parent-address-gate.md): ownership is proven when every parent label names the caller, by its
@@ -1713,8 +2038,8 @@ process.stdout.write(JSON.stringify(out));
                 self.assertIn("不一致", result["reason"])
 
     def test_interleaved_decisions_match_older_route_in_both_orders(self):
-        a = self.route(parent_agent_id="parent-a", task_id="task-a")
-        b = self.route("dot", parent_agent_id="parent-b", task_id="task-b")
+        a = self.route(stage="record", constraint="user_override", parent_agent_id="parent-a", task_id="task-a")
+        b = self.route("dot", stage="record", constraint="dot_closed_loop", parent_agent_id="parent-b", task_id="task-b")
         for rows in ([a, b], [b, a]):
             ledger = self.write_ledger(str(self.state), rows)
             for identity in ({}, {"parentAgentId": "parent-a", "taskId": "task-a"}):
@@ -1724,43 +2049,77 @@ process.stdout.write(JSON.stringify(out));
                 self.assertEqual(result, {})
 
     def test_same_task_new_decision_rejects_old_owner_with_diagnostics(self):
-        identity = {"parent_agent_id": "parent-a", "task_id": "task-a"}
-        ledger = self.write_ledger(str(self.state), [self.route(**identity), self.route("pi", **identity)])
+        # Both native hand-over re-rolls (superseding the unconsumed row of `(parent_id, task_id)`) and record rows
+        # honor the newest decision for an identified task and reject the superseded route with field diagnostics.
+        missing = self.state / "missing.jsonl"
+        first_claim = self.handover("codex", "gpt-6-astra", "high", surface="t3",
+                                    parent_id="parent-a", session_ids=["parent-a"], task_id="task-a", now=T0)
+        self.handover("pi", "gpt-6-astra", "high", surface="t3", bundle_id="pi_astra_high",
+                      parent_id="parent-a", session_ids=["parent-a"], task_id="task-a",
+                      now=T0 + dt.timedelta(seconds=5))
+        registry = gate.router_module("dispatch_registry")
+        self.assertEqual(registry.inspect(first_claim["dispatch_id"])["state"], "canceled")
+        handover_res = gate.evaluate_payload({"session_id": "parent-a", "tool_name": "delegate_task", "tool_input": {
+            "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}}},
+            ledger_path=missing, now=T0 + dt.timedelta(seconds=10))
+        self.assertEqual(handover_res["decision"], "block")
+        self.assertIn("provider: requested='codex', routed='pi'", handover_res["reason"])
+        self.assertIn("pi_astra_high", handover_res["reason"])
+        self.assertNotIn("兼容检查", handover_res["reason"])
+
+        identity = {"parent_agent_id": "parent-r", "task_id": "task-r"}
+        ledger = self.write_ledger(str(self.state), [
+            self.route(stage="record", constraint="user_override", **identity),
+            self.route("pi", stage="record", constraint="user_override", bundle_id="pi_astra_high", **identity),
+        ])
         result = gate.evaluate_payload({"tool_name": "delegate_task", "tool_input": {
-            "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}, **identity}},
+            "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"},
+            "parentAgentId": "parent-r", "taskId": "task-r"}},
             ledger_path=ledger, now=T0)
         self.assertEqual(result["decision"], "block")
         self.assertIn("provider: requested='codex', routed='pi'", result["reason"])
-        self.assertIn("pi_choice", result["reason"])
-        self.assertIn("dispatch", result["reason"])
+        self.assertIn("pi_astra_high", result["reason"])
+        self.assertNotIn("兼容检查", result["reason"])
 
     def test_parent_alone_does_not_collapse_concurrent_tasks(self):
-        ledger = self.write_ledger(str(self.state), [self.route(parent_agent_id="a"), self.route("dot", parent_agent_id="a")])
+        missing = self.state / "missing.jsonl"
+        self.handover("codex", "gpt-6-astra", "high", surface="t3", parent_id="a", session_ids=["a"], task_id="t1", now=T0)
+        self.handover("dot", surface="t3", parent_id="a", session_ids=["a"], task_id="t2", now=T0 + dt.timedelta(seconds=1))
         self.assertEqual(gate.evaluate_payload({"session_id": "a", "tool_name": "delegate_task", "tool_input": {
-            "provider": "codex/gpt-6-astra"}}, ledger_path=ledger, now=T0), {})
+            "provider": "codex/gpt-6-astra"}}, ledger_path=missing, now=T0 + dt.timedelta(seconds=2)), {})
 
     def test_a_host_terminal_parent_matches_the_harness_session_it_runs(self):
         # Issue #2: roll inside an Orca terminal records the Orca session as the parent (the worker's reply
         # address) and the Claude Code session it runs in; Claude's hook payload carries only the latter.
-        ledger = self.write_ledger(str(self.state), [self.route(parent_agent_id="orca-sess", host_session_id="claude-uuid")])
+        missing = self.state / "missing.jsonl"
         launch = {"tool_name": "delegate_task", "tool_input": {"provider": "codex/gpt-6-astra"}}
-        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="claude-uuid"), ledger_path=ledger, now=T0), {})
-        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="orca-sess"), ledger_path=ledger, now=T0), {})
-        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="other-claude"), ledger_path=ledger, now=T0)["decision"],
+        self.handover("codex", "gpt-6-astra", "high", surface="orca",
+                      parent_id="orca-sess", host_session_id="claude-uuid", task_id="t-orca-1", now=T0)
+        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="other-claude"), ledger_path=missing, now=T0)["decision"],
                          "block")
+        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="claude-uuid"), ledger_path=missing, now=T0), {})
+        self.handover("codex", "gpt-6-astra", "high", surface="orca",
+                      parent_id="orca-sess", host_session_id="claude-uuid", task_id="t-orca-2", now=T0)
+        self.assertEqual(gate.evaluate_payload(dict(launch, session_id="orca-sess"), ledger_path=missing, now=T0), {})
 
     def test_nested_task_correlation_and_ttl_are_enforced(self):
-        ledger = self.write_ledger(str(self.state), [self.route(task={"task_id": "a"}), self.route("pi", task={"task_id": "a"})])
+        ledger = self.write_ledger(str(self.state), [
+            self.route(stage="record", constraint="user_override", task={"task_id": "a"}),
+            self.route("pi", stage="record", constraint="user_override", task={"task_id": "a"}),
+        ])
         payload = {"tool_name": "delegate_task", "tool_input": {"provider": "codex/gpt-6-astra", "taskId": "a"}}
         self.assertIn("routed='pi'", gate.evaluate_payload(payload, ledger_path=ledger, now=T0)["reason"])
-        expired = self.route()
+        expired = self.route(stage="record", constraint="user_override")
         expired["at"] = (T0 - dt.timedelta(minutes=16)).isoformat()
-        ledger = self.write_ledger(str(self.state), [expired, self.route("dot")])
+        ledger = self.write_ledger(str(self.state), [expired, self.route("dot", stage="record", constraint="dot_closed_loop")])
         self.assertEqual(gate.evaluate_payload(payload, ledger_path=ledger, now=T0)["decision"], "block")
 
     @mock.patch.object(gate, 'load_dispatch_accounts', return_value={})
     def test_structured_model_effort_and_correlation_mismatches(self, _settings):
-        ledger = self.write_ledger(str(self.state), [self.route(parent_agent_id="a", task_id="task-a", agent_id="target-a")])
+        ledger = self.write_ledger(str(self.state), [
+            self.route(stage="record", constraint="user_override",
+                       parent_agent_id="a", task_id="task-a", agent_id="target-a"),
+        ])
         for extra, diagnostic in (({"provider": "pi/gpt-6-astra"}, "provider"),
                                   ({"provider": "codex/gpt-6-sol"}, "model"),
                                   ({"settings": {"thinkingOptionId": "max"}}, "effort"),
@@ -1773,7 +2132,9 @@ process.stdout.write(JSON.stringify(out));
 
     def test_claude_agent_tool_family_alias_is_the_routed_model(self):
         # Claude's Agent tool accepts only family aliases; each row changes one condition.
-        ledger = self.write_ledger(str(self.state), [self.route("claude", "claude-sonnet-5-5", "high")])
+        ledger = self.write_ledger(str(self.state), [
+            self.route("claude", "claude-sonnet-5-5", "high", stage="record", constraint="user_override"),
+        ])
         for model, effort, blocked_on in (("sonnet", "high", None),
                                           ("claude-sonnet-5-5", "high", None),
                                           ("opus", "high", "model"),
@@ -1786,7 +2147,7 @@ process.stdout.write(JSON.stringify(out));
                 else:
                     self.assertEqual(result, {})
         # An alias names a Claude family; it cannot claim a non-Claude route.
-        ledger = self.write_ledger(str(self.state), [self.route()])
+        ledger = self.write_ledger(str(self.state), [self.route(stage="record", constraint="user_override")])
         result = gate.evaluate_payload({"tool_name": "Agent", "tool_input": {"prompt": "x", "model": "sonnet"}},
                                        ledger_path=ledger, now=T0)
         self.assertIn("model: requested='sonnet'", result["reason"])
@@ -1983,7 +2344,9 @@ process.stdout.write(JSON.stringify(out));
                                                        ledger_path=missing, now=T0), {})
 
     def test_prefixed_launch_passes_with_the_same_route_as_a_bare_one(self):
-        ledger = self.write_ledger(str(self.state), [self.route("claude", "claude-sonnet-5-5", "high")])
+        ledger = self.write_ledger(str(self.state), [
+            self.route("claude", "claude-sonnet-5-5", "high", stage="record", constraint="user_override"),
+        ])
         args = {"subagent_type": "general-purpose", "prompt": "do it", "model": "sonnet", "effort": "high"}
         for name in ("Agent", "mcp__magpie__Agent"):
             with self.subTest(name=name):
@@ -2842,26 +3205,58 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
         ("auto:codex:codex:deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-1017",
          "deepseek/deepseek-v4-flash", ("opencode/deepseek-v4-flash", "deepseek-v4.1-flash-1017")),
     )
+    registry = gate.router_module("dispatch_registry")
     ledger_path = tmp_path / "ledger.jsonl"
-    for bid, row_model, own_wire, rival_wires in pairs:
-        for stage, choice, extra in (
-            ("plan", bid, {}),
-            ("record", "constraint", {"constraint": "user_override"}),
-        ):
-            ledger_path.write_text(json.dumps(writer_ledger_row(
-                "codex", row_model, "high", stage=stage, choice=choice, bundle_id=bid, **extra,
-            )) + "\n", encoding="utf-8")
-            ok = gate.evaluate_payload({
+    missing_ledger = tmp_path / "missing.jsonl"
+    for p_idx, (bid, row_model, own_wire, rival_wires) in enumerate(pairs):
+        # 1. A `plan` row alone never authorizes `delegate_task`, while a native hand-over (from `roll`) does once
+        #    and rejects rival wire spellings without consuming the hand-over.
+        ledger_path.write_text(json.dumps(writer_ledger_row(
+            "codex", row_model, "high", stage="plan", choice=bid, bundle_id=bid,
+        )) + "\n", encoding="utf-8")
+        plan_denied = gate.evaluate_payload({
+            "session_id": f"s-wire-{p_idx}",
+            "tool_name": "delegate_task",
+            "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
+        }, ledger_path=ledger_path, now=T0)
+        assert plan_denied.get("decision") == "block", (bid, plan_denied)
+
+        with mock.patch.object(registry, "own_session_ids", return_value=[f"s-wire-{p_idx}"]):
+            registry.record_host_claim(
+                "t3", {"decision_id": f"dec-wire-{p_idx}", "choice": bid},
+                {"parent_agent_id": f"s-wire-{p_idx}", "task_id": f"t-wire-{p_idx}"},
+                {"provider": "codex", "account": "codex", "model": row_model, "effort": "high", "bundle_id": bid},
+                native_handover=True, now=T0,
+            )
+        for wrong in rival_wires:
+            denied = gate.evaluate_payload({
+                "session_id": f"s-wire-{p_idx}",
                 "tool_name": "delegate_task",
-                "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
+                "tool_input": {"provider": f"codex/{wrong}", "settings": {"thinkingOptionId": "high"}},
+            }, ledger_path=missing_ledger, now=T0)
+            assert "model:" in denied.get("reason", ""), (bid, "handover", wrong, denied)
+        ok_handover = gate.evaluate_payload({
+            "session_id": f"s-wire-{p_idx}",
+            "tool_name": "delegate_task",
+            "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
+        }, ledger_path=missing_ledger, now=T0)
+        assert ok_handover == {}, (bid, "handover", ok_handover)
+
+        # 2. A standalone `record` row also resolves the catalog wire `launch_model` via `bundle_id`.
+        ledger_path.write_text(json.dumps(writer_ledger_row(
+            "codex", row_model, "high", stage="record", choice="constraint", bundle_id=bid, constraint="user_override",
+        )) + "\n", encoding="utf-8")
+        ok = gate.evaluate_payload({
+            "tool_name": "delegate_task",
+            "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
+        }, ledger_path=ledger_path, now=T0)
+        assert ok == {}, (bid, "record", ok)
+        for wrong in rival_wires:
+            denied = gate.evaluate_payload({
+                "tool_name": "delegate_task",
+                "tool_input": {"provider": f"codex/{wrong}", "settings": {"thinkingOptionId": "high"}},
             }, ledger_path=ledger_path, now=T0)
-            assert ok == {}, (bid, stage, ok)
-            for wrong in rival_wires:
-                denied = gate.evaluate_payload({
-                    "tool_name": "delegate_task",
-                    "tool_input": {"provider": f"codex/{wrong}", "settings": {"thinkingOptionId": "high"}},
-                }, ledger_path=ledger_path, now=T0)
-                assert "model:" in denied.get("reason", ""), (bid, stage, wrong, denied)
+            assert "model:" in denied.get("reason", ""), (bid, "record", wrong, denied)
 
     # M12c & R2-1 (A2) through `gate.evaluate_payload`: `resolve_target` matches over `account_fleet.pin_pool` BEFORE
     # filtering by `effort` or `disabled`, so a missing effort on `vendor-a/novel-unmeasured` never falls back onto
@@ -2879,13 +3274,18 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
         },
     }
     monkeypatch.setattr(gate, "load_dispatch_accounts", lambda: m12c_accounts)
-    ledger_path.write_text(json.dumps(writer_ledger_row(
-        "codex", "vendor-a/novel-unmeasured", "medium", choice="b_va_high@medium",
-    )) + "\n", encoding="utf-8")
+    with mock.patch.object(registry, "own_session_ids", return_value=["s-m12c"]):
+        registry.record_host_claim(
+            "t3", {"decision_id": "dec-m12c", "choice": "b_va_high@medium"},
+            {"parent_agent_id": "s-m12c", "task_id": "t-m12c"},
+            {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured", "effort": "medium"},
+            native_handover=True, now=T0,
+        )
     res_m12c = gate.evaluate_payload({
+        "session_id": "s-m12c",
         "tool_name": "delegate_task",
         "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "medium"}},
-    }, ledger_path=ledger_path, now=T0)
+    }, ledger_path=missing_ledger, now=T0)
     assert res_m12c == {}, res_m12c
 
     a2_accounts = json.loads(json.dumps(accounts))
@@ -2900,19 +3300,32 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
         },
     }
     monkeypatch.setattr(gate, "load_dispatch_accounts", lambda: a2_accounts)
-    for stage, extra, should_allow in (
-        ("plan", {}, False),
-        ("record", {"constraint": "hard_constraint"}, False),
-        ("record", {"constraint": "user_override"}, True),
+    with mock.patch.object(registry, "own_session_ids", return_value=["s-a2-auto"]):
+        registry.record_host_claim(
+            "t3", {"decision_id": "dec-a2-auto", "choice": "b_va_high"},
+            {"parent_agent_id": "s-a2-auto", "task_id": "t-a2-auto"},
+            {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured", "effort": "high",
+             "bundle_id": "b_va_high"},
+            native_handover=True, now=T0,
+        )
+    verdict_auto = gate.evaluate_payload({
+        "session_id": "s-a2-auto",
+        "tool_name": "delegate_task",
+        "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "high"}},
+    }, ledger_path=missing_ledger, now=T0)
+    assert verdict_auto.get("decision") == "block", verdict_auto
+    for extra, should_allow in (
+        ({"constraint": "hard_constraint"}, False),
+        ({"constraint": "user_override"}, True),
     ):
         ledger_path.write_text(json.dumps(writer_ledger_row(
-            "codex", "vendor-a/novel-unmeasured", "high", stage=stage, choice="b_va_high", bundle_id="b_va_high", **extra,
+            "codex", "vendor-a/novel-unmeasured", "high", stage="record", choice="b_va_high", bundle_id="b_va_high", **extra,
         )) + "\n", encoding="utf-8")
         verdict = gate.evaluate_payload({
             "tool_name": "delegate_task",
             "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "high"}},
         }, ledger_path=ledger_path, now=T0)
-        assert (verdict == {}) is should_allow, (stage, extra, verdict)
+        assert (verdict == {}) is should_allow, (extra, verdict)
 
     # Round 4: bare model target names every bundle of the row across accounts, while `P/name` obeys `P` (and falls back
     # only when `P` names nothing in the pool):

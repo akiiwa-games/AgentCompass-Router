@@ -171,6 +171,22 @@ class RegistryLaunchRecords(unittest.TestCase):
             registry.save(connection, stored)
         self.assertEqual(self.counted(), 0)
 
+    def test_a_native_handover_counts_once_consumed_and_not_when_abandoned(self):
+        fresh = registry.record_host_claim('native', {'decision_id': 'dec-fresh'},
+                                           {'parent_agent_id': 'parent-a', 'task_id': 'task-fresh'}, BUNDLE,
+                                           native_handover=True, now=NOW - timedelta(minutes=1), path=self.path)
+        abandoned = registry.record_host_claim('native', {'decision_id': 'dec-abandoned'},
+                                               {'parent_agent_id': 'parent-a', 'task_id': 'task-native'}, BUNDLE,
+                                               native_handover=True, now=NOW - timedelta(minutes=20), path=self.path)
+        # Neither an in-lease unconsumed hand-over nor one past PREPARE_LEASE counts before consumption.
+        self.assertEqual(self.counted(), 0)
+        self.assertEqual([r['dispatch_id'] for r in registry.native_handovers(NOW, path=self.path)],
+                         [fresh['dispatch_id'], abandoned['dispatch_id']])
+        consumed = registry.claim_native_handover([abandoned['dispatch_id']], call_id='tu-1', now=NOW, path=self.path)
+        self.assertIsNotNone(consumed)
+        self.assertEqual(self.counted(), 1)
+        self.assertIsNone(registry.claim_native_handover([abandoned['dispatch_id']], call_id='tu-2', now=NOW, path=self.path))
+
     def test_a_dispatch_older_than_the_window_is_not_read(self):
         self.claim(0, launched=True, at=NOW - timedelta(seconds=WINDOW) - timedelta(seconds=1))
         self.assertEqual(registry.launch_records(self.accounts, NOW, path=self.path), [])

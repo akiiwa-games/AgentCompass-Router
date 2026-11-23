@@ -5,7 +5,7 @@ with a live lease hold budget. No daemon or agent is started by this module.
 """
 from contextlib import contextmanager
 from copy import deepcopy
-from worker_context import require_parent_id
+from worker_context import own_session_ids, require_parent_id
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -269,7 +269,7 @@ def earlier_version(task):
     return None
 
 
-def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=None, route=None):
+def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=None, route=None, *, from_roll=False):
     """Register a decision, without committing capacity. Legacy unbound decisions cannot dispatch. `listed_rows`
     (provider_inventory.listed_rows) are the rows of a model the user named that the shipped data has no row for and the
     account's provider lists: the decision keeps them, and `prepare` plans with them. `route`: the route fields a record
@@ -298,6 +298,7 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
            'constraint': result.get('constraint'),
            # Why a route was forced (the user's words, the project rule): a relaunch that may not move it says so.
            **({'basis': str(result['basis'])[:400]} if result.get('constraint') and result.get('basis') else {}),
+           **({'from_roll': True} if from_roll else {}),
            **({'listed_rows': listed_rows} if listed_rows else {}),
            **({'route': route} if route else {}),
            'effort_override': bool(explicit and resolved and resolved['id'].startswith('user_override_')),
@@ -467,7 +468,7 @@ def launch_record(row, now, since=None):
         at = None
     elif launched and row.get('state') != 'create_failed':
         at = row['launched_at']
-    elif row.get('state') in ACTIVE and created and lease is not None and lease > now:
+    elif row.get('state') in ACTIVE and not row.get('native_handover') and created and lease is not None and lease > now:
         at = row['created_at']
     else:
         at = None
@@ -1875,7 +1876,12 @@ def dispatch_constraint(dispatch_id, path=None):
     """The constraint of the decision a dispatch launches (`user_override`, `explicit_resume`, ...), else None. The spawn
     gate reads it to admit a bound launch on an unchecked model only when the user named that route."""
     try:
-        return decision_record(inspect(dispatch_id, path)['decision_id'], path).get('constraint')
+        row = inspect(dispatch_id, path)
+        if row.get('constraint'):
+            return row['constraint']
+        did = str(row['decision_id'])
+        parts = did.split(':')
+        return decision_record(parts[1] if len(parts) == 3 else did, path).get('constraint')
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -2548,11 +2554,25 @@ def open_host_claims(now=None, path=None):
                 if r.get('dispatch_mode', 'paseo') != 'paseo' and unresolved(r, now)]
 
 
+def _supersede_native_handovers(connection, parent_id, task_id, now):
+    """Cancel earlier unconsumed native hand-overs of `(parent_id, task_id)` when the same task is rolled again."""
+    if not parent_id or not task_id:
+        return
+    for old in rows(connection, 'dispatches'):
+        if (old.get('native_handover') is True
+                and not old.get('launched_at')
+                and (old.get('state') not in TERMINAL or old.get('state') == 'expired')
+                and (old.get('parent_id'), old.get('task_id')) == (parent_id, task_id)):
+            event(old, 'canceled', now, 'superseded_by_reroll')
+            save(connection, old)
+
+
 def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None, access='write',
-                      workspace=None, cwd=None, now=None, path=None):
+                      workspace=None, cwd=None, native_handover=False, new_worker=False, now=None, path=None):
     """Record a non-Paseo host dispatch (`orca`, `t3`, `native`, `herdr`, `cli`) in `dispatches` under the same
     canonical-directory writer rule and SQLite BEGIN IMMEDIATE transaction as Paseo. The claim is `prepared`: it holds the
-    workspace before the worker starts, and carries a launch time only once host_claim_launched says it started."""
+    workspace before the worker starts, and carries a launch time only once host_claim_launched (or claim_native_handover
+    when `native_handover` is True) says it started."""
     parent_id = task.get('parent_agent_id')
     require_parent_id(parent_id)
     now = now or utcnow()
@@ -2564,6 +2584,7 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
     raw_usd = (decision.get('expected_usd') if isinstance(decision.get('expected_usd'), (int, float))
                else bundle_copy.get('expected_usd'))
     expected_usd = float(raw_usd) if isinstance(raw_usd, (int, float)) and not isinstance(raw_usd, bool) else None
+    sids = own_session_ids()
     with transaction(path) as connection:
         expire(connection, now)
         by_dec = connection.execute('SELECT data FROM dispatches WHERE decision_id=?', (decision_id,)).fetchone()
@@ -2572,6 +2593,8 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
             if existing_row['state'] in ACTIVE:
                 return existing_row
             decision_id = f'{surface}:{decision_id}:{uuid.uuid4().hex[:8]}'
+        if native_handover and not new_worker:
+            _supersede_native_handovers(connection, parent_id, task.get('task_id'), now)
         if canon_ws and access != 'read_only':
             holders = writers_in(connection, canon_ws, now, parent_id)
             if holders:
@@ -2593,6 +2616,10 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
             'operation': 'create',
             'agent_id': None,
             'access': access,
+            **({'native_handover': True} if native_handover else {}),
+            **({'constraint': decision['constraint']} if decision.get('constraint') else {}),
+            **({'host_session_id': task['host_session_id']} if task.get('host_session_id') else {}),
+            **({'session_ids': sids} if sids else {}),
             **({'workspace': canon_ws} if canon_ws else {}),
             **({'cwd': landing} if landing else {}),
             **({'profile': task['profile']} if isinstance(task.get('profile'), dict) else {}),
@@ -2601,6 +2628,138 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
         event(row, 'prepared', now)
         save(connection, row)
         return row
+
+
+def hand_over_native(dispatch_id, *, new_worker=False, now=None, path=None):
+    """Record a one-use `native` hand-over from an unlaunched CLI host claim when `roll.cli` hands launch to the caller."""
+    now = now or utcnow()
+    with transaction(path) as connection:
+        source = get(connection, 'dispatches', dispatch_id)
+        if source.get('launched_at'):
+            return source
+        if not new_worker:
+            _supersede_native_handovers(connection, source.get('parent_id'), source.get('task_id'), now)
+        raw_dec = str(source.get('decision_id') or f'native-{uuid.uuid4()}')
+        parts = raw_dec.split(':')
+        base_dec = parts[1] if len(parts) == 3 else raw_dec
+        row = {
+            'dispatch_id': str(uuid.uuid4()),
+            'decision_id': f'native:{base_dec}:{uuid.uuid4().hex[:8]}',
+            'dispatch_mode': 'native',
+            'native_handover': True,
+            'parent_id': source.get('parent_id'),
+            'task_id': source.get('task_id'),
+            'request': deepcopy(source.get('request') or {}),
+            'bundle': deepcopy(source.get('bundle') or {}),
+            'expected_usd': source.get('expected_usd'),
+            'usage': deepcopy(source.get('usage') or {}),
+            'created_at': stamp(now),
+            'lease_until': stamp(now + timedelta(seconds=PREPARE_LEASE)),
+            'hard_until': stamp(now + timedelta(seconds=MAX_LIFETIME)),
+            'operation': 'create',
+            'agent_id': None,
+            'access': source.get('access', 'write'),
+            **({k: deepcopy(source[k]) for k in ('constraint', 'host_session_id', 'session_ids',
+                                                 'workspace', 'cwd', 'profile', 'brief_path') if source.get(k)}),
+        }
+        event(row, 'prepared', now, 'cli_fallback_to_native')
+        save(connection, row)
+        return row
+
+
+def _handover_open(row, now):
+    """True when `row` is an unconsumed native hand-over within its 24h hard lifetime (`MAX_LIFETIME` degrade bound)."""
+    hard = _stored_time(row, 'hard_until')
+    return (isinstance(row, dict)
+            and row.get('native_handover') is True
+            and not row.get('launched_at')
+            and row.get('state') in ('prepared', 'expired')
+            and hard is not None
+            and now < hard)
+
+
+def native_handovers(now=None, *, call_id=None, path=None):
+    """Open native hand-overs (and any already claimed by `call_id` for idempotent retry), newest `created_at` first.
+    Read-only; unreadable or missing state returns `[]` so it authorizes nothing."""
+    now = now or utcnow()
+    try:
+        stored = read_dispatches(path)
+    except (OSError, ValueError, sqlite3.Error):
+        return []
+    matched = [
+        r for r in stored
+        if isinstance(r, dict) and r.get('native_handover') is True and (
+            _handover_open(r, now)
+            or (bool(call_id) and r.get('claim_id') == call_id
+                and r.get('state') not in ('canceled', 'failed', 'create_failed'))
+        )
+    ]
+    matched.sort(key=lambda r: str(r.get('created_at') or ''), reverse=True)
+    return matched
+
+
+def claim_native_handover(dispatch_ids, *, call_id=None, now=None, path=None):
+    """Consume one native hand-over atomically on the launch it authorizes; retries of `call_id` are idempotent."""
+    ids = [str(d) for d in (dispatch_ids or ()) if d]
+    if not ids:
+        return None
+    now = now or utcnow()
+    with transaction(path) as connection:
+        if call_id:
+            for did in ids:
+                found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
+                if found:
+                    existing = json.loads(found[0])
+                    if (existing.get('native_handover') is True and existing.get('claim_id') == call_id
+                            and existing.get('state') not in ('canceled', 'failed', 'create_failed')):
+                        return existing
+        for did in ids:
+            found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
+            if not found:
+                continue
+            row = json.loads(found[0])
+            if not _handover_open(row, now):
+                continue
+            hard = parse(row['hard_until'])
+            row.update(claim_id=call_id or str(uuid.uuid4()), launched_at=stamp(now),
+                       lease_until=stamp(min(now + timedelta(seconds=RUN_LEASE), hard)))
+            event(row, 'launched', now, 'native_handover_claimed')
+            save(connection, row)
+            return row
+    return None
+
+
+def roll_decision_ids(path=None):
+    """Decision IDs owned by `roll` (`from_roll` decisions and `dispatches` rows), read without creating the DB.
+    A ledger `record` row whose `decision_id` is in this set belongs to `roll`, never to a standalone `record` launch."""
+    target = Path(path or db_path())
+    if not target.exists():
+        return set()
+    owned = set()
+    try:
+        connection = _read_only(target, 0.5)
+    except (OSError, sqlite3.Error):
+        return set()
+    try:
+        for table in ('decisions', 'dispatches'):
+            try:
+                table_rows = rows(connection, table)
+            except (sqlite3.OperationalError, ValueError):
+                continue
+            for row in table_rows:
+                if not isinstance(row, dict):
+                    continue
+                did = row.get('decision_id')
+                if not isinstance(did, str) or not did:
+                    continue
+                if table == 'dispatches' or row.get('from_roll') is True:
+                    owned.add(did)
+                    parts = did.split(':')
+                    if len(parts) == 3:
+                        owned.add(parts[1])
+    finally:
+        connection.close()
+    return owned
 
 
 def host_claim_launched(dispatch_id, *, now=None, path=None):

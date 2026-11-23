@@ -277,9 +277,10 @@ def finalize(result, started, task=None, records=None, now=None):
         result.setdefault('expected_usd', expected_usd)
     listed_rows = result.pop('_listed_rows', None)
     route = result.pop('_route', None)
+    from_roll = bool(result.pop('_from_roll', False))
     if LEDGER_WRITES and result.get('stage') in LAUNCH_STAGES:
         result.update(dispatch_registry.issue(result, task, now, allocation_task=allocation_task, listed_rows=listed_rows,
-                                              route=route))
+                                              route=route, from_roll=from_roll))
     append_ledger({
         'v': 1, 'at': now.isoformat(), 'stage': result.get('stage'), 'source': result.get('source'),
         'choice': result.get('choice'), 'specialty': result.get('specialty'),

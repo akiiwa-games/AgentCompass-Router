@@ -3,8 +3,10 @@
 Supports Claude Code, Codex CLI, Antigravity IDE/CLI, and Pi hook payloads on stdin.
 
 Dispatch-labelled Paseo launches consume a task-bound, one-use durable claim.
-Non-Paseo harness launches without label support use ledger matching checks:
-an unbound ledger entry is never represented as dispatch authorization or a reservation.
+Native sub-agent launches pass only on one of two writer facts:
+1. an unconsumed `status: native` hand-over recorded by `roll` in `dispatch_registry`;
+2. a recent standalone `record` row of this session in `router-ledger.jsonl`.
+A `plan` row authorizes Paseo schedule creation/re-targeting (`create_schedule` / `update_schedule`), never a worker launch.
 """
 from __future__ import annotations
 
@@ -1250,11 +1252,11 @@ def native_own_account(name: str, target: dict, accounts: dict | None) -> str | 
 
 def native_unchecked_text(account: str, model: str, row: dict) -> str:
     """The unchecked-model refusal of a native launch: the model the launch asked for, the account it runs on, and the
-    route record it was matched against."""
+    route record or native hand-over it was matched against."""
     bundle = row.get("bundle") if isinstance(row.get("bundle"), dict) else {}
-    # The shape decision_ledger writes: the bundle carries `bundle_id`; a row for a model without a data row has none.
+    # The shape decision_ledger and dispatch_registry write: `bundle_id` when catalogued, else `model`.
     matched = bundle.get("bundle_id") or bundle.get("model")
-    kind = row.get("constraint") or row.get("stage")
+    kind = row.get("constraint") or row.get("dispatch_mode") or row.get("stage")
     return (f"[Router Gate] 拦截：原生子 agent 请求的模型 {model} 在本会话账号 {account} 上的档位都在模型管理中未勾选"
             f"（不参与自动派发）；匹配到的路由记录是 {matched}（{kind}），不是用户点名的路由。"
             "只有用户在本次请求中点名的路由（user_override 记录）可以启动它。" + DISABLED_RECOVERY)
@@ -1404,16 +1406,30 @@ def check_account_quota_exhausted(
 
 LAUNCH_STAGES = ("plan", "record")
 ROUTE_BUNDLE_FIELDS = ("provider", "account", "model")
+OWN_SESSION_ID_VARS = (
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "PI_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+)
 
 
-def carries_route(row: object) -> bool:
-    """A ledger row authorizes a launch only as a plan/record row whose bundle names what to launch."""
-    if not isinstance(row, dict) or row.get("stage") not in LAUNCH_STAGES:
+def has_route_bundle(row: object) -> bool:
+    """True when `row` carries a `bundle` dict naming non-empty `provider`, `account`, and `model`."""
+    if not isinstance(row, dict):
         return False
     bundle = row.get("bundle")
     return isinstance(bundle, dict) and all(
         isinstance(bundle.get(k), str) and bool(bundle[k].strip()) for k in ROUTE_BUNDLE_FIELDS
     )
+
+
+def carries_route(row: object) -> bool:
+    """A ledger row carries a route only as a plan/record row whose bundle names what to launch."""
+    return isinstance(row, dict) and row.get("stage") in LAUNCH_STAGES and has_route_bundle(row)
 
 
 def is_dot_route(row: dict | None) -> bool:
@@ -1514,36 +1530,68 @@ def same_launch_value(key: str, requested: str, routed: str | None) -> bool:
     return requested == routed
 
 
-def match_route(
+def _row_session_ids(row: dict, task: dict, identity: dict[str, str]) -> set[str]:
+    """Session and parent IDs recorded on a route row (`parent_id`, `host_session_id`, `session_ids`)."""
+    raw_sids = row.get("session_ids") if isinstance(row.get("session_ids"), list) else ()
+    return {
+        str(v) for v in (
+            identity.get("parent"),
+            row.get("host_session_id"),
+            task.get("host_session_id"),
+            *raw_sids,
+        ) if isinstance(v, str) and v
+    }
+
+
+def _route_label(row: dict) -> str:
+    bundle = row.get("bundle") if isinstance(row.get("bundle"), dict) else {}
+    choice = row.get("choice")
+    bid = bundle.get("bundle_id")
+    if choice and bid and choice != bid:
+        return f"{choice}/{bid}"
+    return str(choice or bid or bundle.get("model") or row.get("dispatch_id") or "")
+
+
+def matching_routes(
     rows: list[dict],
     requested: dict,
     context: dict,
     trigger: str,
     accounts: dict | None = None,
-) -> tuple[dict | None, str]:
-    """Use available correlation, then compare launch fields, without inventing IDs.
+    *,
+    identities: set[str] | None = None,
+    paseo_agents_dir: Path | None = None,
+    check_stage: bool = True,
+) -> tuple[list[dict], str]:
+    """Return `(matched_rows, diagnostic)` after correlation and launch-field comparison.
 
-    A newer decision for the *same identified request* supersedes its old one.
-    Without identity, search all compatible rows in the TTL (legacy callers).
-    Missing identity is not proof of ownership: a dispatch_id lifecycle still
-    needs caller/ledger support, launch acknowledgement and terminal release.
+    When both caller and row record session/parent IDs, they must match (`identities` / `context['parent']` against
+    `parent_id`, `host_session_id`, `session_ids`, or the Paseo agent record running that session). When one side
+    carries no session ID (a Pi `tool_call` or Antigravity `toolCall` hook payload without session env, or a CLI
+    `record` run in a bare shell), non-conflicting rows remain eligible below any session-matched candidate.
     """
+    caller_sessions = set(identities or ()) | ({context["parent"]} if context.get("parent") else set())
     candidates = []
     for row in rows:
-        if not carries_route(row):
+        if not (carries_route(row) if check_stage else has_route_bundle(row)):
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else {}
         identity = correlation_fields(row, task)
-        shared = context.keys() & identity.keys()
-        # A parent recorded from a host terminal (Orca) is the worker's reply address; the harness running in it
-        # (Claude Code) reports its own session, which roll records alongside as host_session_id.
-        host_session = row.get("host_session_id") or task.get("host_session_id")
-        if any(context[k] != identity[k] and not (k == "parent" and host_session and context[k] == host_session)
-               for k in shared):
+        row_sessions = _row_session_ids(row, task, identity)
+        session_matched = False
+        if caller_sessions and row_sessions:
+            session_matched = bool(caller_sessions & row_sessions) or any(
+                is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions
+            )
+            if not session_matched:
+                continue
+        shared = (context.keys() & identity.keys()) - {"parent"}
+        if any(context[k] != identity[k] for k in shared):
             continue
-        candidates.append((len(shared), row))
+        score = (1 if session_matched else 0) + len(shared)
+        candidates.append((score, row))
     if not candidates:
-        return None, "parent/task/target/chain 不匹配；没有本次请求的兼容记录"
+        return [], "parent/task/target/chain 不匹配；没有本次请求的兼容记录"
     strongest = max(score for score, _ in candidates)
     if strongest:
         candidates = [item for item in candidates if item[0] == strongest]
@@ -1553,6 +1601,7 @@ def match_route(
             # Parent alone may own several concurrent tasks. A task/target/chain
             # identifies a request closely enough to honor its latest decision.
             candidates = candidates[:1]
+    matched = []
     mismatches = []
     for _, row in candidates:
         chosen = route_spec(row, accounts)
@@ -1561,20 +1610,41 @@ def match_route(
         if is_dot_route(row) and trigger != "shell:run_dot_task.py":
             differences.append("dot_text requires run_dot_task.py")
         if not differences:
-            return row, ""
-        mismatches.append(f"choice={row.get('choice')!r}: " + "; ".join(differences))
-    return None, " | ".join(mismatches[:3])
+            matched.append(row)
+        else:
+            mismatches.append(f"route={_route_label(row)!r}: " + "; ".join(differences))
+    return (matched, "") if matched else ([], " | ".join(mismatches[:3]))
 
 
-def build_deny_reason(trigger: str, window_seconds: int) -> str:
+def match_route(
+    rows: list[dict],
+    requested: dict,
+    context: dict,
+    trigger: str,
+    accounts: dict | None = None,
+    *,
+    identities: set[str] | None = None,
+    paseo_agents_dir: Path | None = None,
+    check_stage: bool = True,
+) -> tuple[dict | None, str]:
+    matched, diagnostic = matching_routes(
+        rows, requested, context, trigger, accounts=accounts,
+        identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=check_stage,
+    )
+    return (matched[0] if matched else None), diagnostic
+
+
+def build_deny_reason(trigger: str, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> str:
     minutes = max(1, round(window_seconds / 60))
     return (
-        f"[Router Gate] 拦截未路由的子 agent 启动 ({trigger})："
-        f"最近 {minutes} 分钟内 ~/.agent-compass/router-ledger.jsonl 中无有效的 plan/record 记录。"
-        "把任务书写进 <task.md>，一条命令完成分类、选路与启动：\n"
+        f"[Router Gate] 拦截未授权的子 agent 启动 ({trigger})："
+        f"本会话没有尚未使用的 roll 原生派发授权（status: native），且最近 {minutes} 分钟内无有效的独立 record 记录"
+        "（plan 记录或已由 roll 直接启动的派发不授权原生子 agent 启动）。"
+        "请把任务书写进 <task.md>，一条命令完成分类、选路与启动：\n"
         f"  {ROUTER_CMD} roll --brief <task.md>\n"
-        "（用户在本次请求中点名了 model/effort 时追加 --provider <p> --account <a> --model <m> --effort <e> "
-        "--basis \"<用户原话>\"；宿主没有自动启动器时 roll 会返回 route.bundle，按它原生启动。）"
+        "（若 roll 已返回 status: launched，worker 已由 roll 启动，请勿再调用原生子 agent 工具；"
+        "宿主无自动启动器时 roll 会返回 status: native 供单次原生启动；"
+        f"仅路由无法代为启动的强制场景先运行 {ROUTER_CMD} record 记录后启动。）"
     )
 
 
@@ -1607,8 +1677,15 @@ def schedule_deny_reason(trigger: str, cause: str) -> str:
 
 def caller_identities(payload: dict, caller_id: str | None) -> set[str]:
     """IDs that name the calling session: the host's session ID and, under Paseo, the calling agent."""
-    return {str(v) for v in (payload.get("session_id"), payload.get("sessionId"), payload.get("parent_agent_id"),
-                             payload.get("callerAgentId"), caller_id) if v}
+    env_ids = (os.environ.get(var, "").strip() for var in OWN_SESSION_ID_VARS)
+    return {
+        str(v) for v in (
+            payload.get("session_id"), payload.get("sessionId"),
+            payload.get("conversation_id"), payload.get("conversationId"),
+            payload.get("parent_agent_id"), payload.get("callerAgentId"),
+            caller_id, *env_ids,
+        ) if v
+    }
 
 
 def written_by(row: dict, identities: set[str]) -> bool:
@@ -1753,6 +1830,8 @@ def decide(
     rows = None
     accounts = load_dispatch_accounts()
     upward = caller_parent_ids(caller_id, paseo_agents_dir)
+    raw_call_id = str(payload.get("tool_use_id") or payload.get("tool_call_id") or payload.get("call_id") or "").strip() or None
+    native_launch_index = 0
     for name, args, trigger in executing:
         if trigger:
             try:
@@ -1860,27 +1939,90 @@ def decide(
                 + ROUTER_CMD + ' roll --brief <task.md>; it routes and launches in one step. Or pass the returned '
                 'create_agent object with router.* labels (title/initialPrompt/workspaceId may be edited; '
                 'provider/settings/labels may not). An unbound ledger entry is not launch authorization.')
-        if rows is None:
-            rows = recent_routes(ledger, now=now, window_seconds=win)
-        if not rows:
-            return format_response(False, harness_kind, build_deny_reason(trigger, win))
+        effective_call_id = (f"{raw_call_id}:{native_launch_index}" if (raw_call_id and native_launch_index) else raw_call_id)
+        native_launch_index += 1
         requested = normalize_launch(args)
         # Only Claude accounts and Dot are filled from shell text; other CLIs name a harness, not the routed provider.
         t_prov = str(targets[0].get("provider") or "")
         if not requested.get("provider") and (t_prov in ("claude", "dot") or t_prov.startswith("claude-")):
             requested["provider"] = t_prov
         context = correlation_fields(payload, tool_input, args)
-        row, diagnostic = match_route(rows, requested, context, trigger, accounts=accounts)
+        try:
+            native_handovers, claim_native_handover, roll_decision_ids, dispatch_constraint = router_owner(
+                "dispatch_registry",
+                "native_handovers", "claim_native_handover", "roll_decision_ids", "dispatch_constraint",
+            )
+        except RouterTreeMismatch as exc:
+            return format_response(False, harness_kind,
+                f"[Router Gate] 拦截：本钩子与已加载的 agent-compass 技能目录版本不一致（{exc}）。"
+                "请运行 `agentcompass setup` 使钩子与技能目录来自同一次安装后重试。")
+        # Fact 1: an unconsumed `status: native` hand-over recorded by `roll` in `dispatch_registry` for this caller.
+        handovers = native_handovers(now=now, call_id=effective_call_id)
+        matched_handovers, handover_diag = (
+            matching_routes(
+                handovers, requested, context, trigger, accounts=accounts,
+                identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=False,
+            ) if handovers else ([], "")
+        )
+        unchecked_refusal = None
+        if matched_handovers:
+            allowed_handovers = []
+            for h_row in matched_handovers:
+                h_constraint = h_row.get("constraint") or dispatch_constraint(h_row.get("dispatch_id"))
+                if unchecked and h_constraint != "user_override":
+                    if unchecked_refusal is None:
+                        unchecked_refusal = (native_unchecked_text(*native_unchecked, h_row)
+                                             if native_unchecked else unchecked)
+                else:
+                    allowed_handovers.append(h_row)
+            if allowed_handovers:
+                try:
+                    claimed = claim_native_handover(
+                        [h["dispatch_id"] for h in allowed_handovers], call_id=effective_call_id, now=now,
+                    )
+                except (OSError, ValueError, sqlite3.Error):
+                    claimed = None
+                if claimed is not None:
+                    continue
+        # Fact 2: a recent standalone `record` row of this session (never a `plan` row, workflow record, or roll dispatch).
+        if rows is None:
+            rows = recent_routes(ledger, now=now, window_seconds=win)
+        roll_ids = roll_decision_ids()
+        record_rows = [
+            r for r in rows
+            if r.get("stage") == "record"
+            and r.get("trigger") != "workflow"
+            and r.get("constraint") != "explicit_resume"
+            and not (r.get("decision_id") and r["decision_id"] in roll_ids)
+        ]
+        row, record_diag = (
+            match_route(
+                record_rows, requested, context, trigger, accounts=accounts,
+                identities=identities, paseo_agents_dir=paseo_agents_dir,
+            ) if record_rows else (None, "")
+        )
         if row is not None and (reason := check_route_authority(row, trigger)):
             return format_response(False, harness_kind, reason)
         if row is not None and unchecked and row.get("constraint") != "user_override":
             return format_response(False, harness_kind,
                                    native_unchecked_text(*native_unchecked, row) if native_unchecked else unchecked)
-        if row is None:
-            reason = (f"[Router Gate] 启动参数与有效期内路由不匹配 ({trigger})：{diagnostic}。"
-                      "请按本次任务的 router provider/model/effort 启动，或重新运行 roll。"
-                      "台账匹配仅作兼容检查，不代表完整 dispatch 授权。")
+        if row is not None:
+            continue
+        if unchecked_refusal:
+            return format_response(False, harness_kind, unchecked_refusal)
+        mismatch_diag = next(
+            (d for d in (handover_diag, record_diag) if d and not d.startswith("parent/task/target/chain")),
+            "",
+        ) or (record_diag if record_rows else (handover_diag if handovers else ""))
+        if mismatch_diag and not mismatch_diag.startswith("parent/task/target/chain"):
+            reason = (f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。"
+                      f"请按路由返回的 provider/model/effort 启动，或重新运行 {ROUTER_CMD} roll --brief <task.md>。")
             return format_response(False, harness_kind, reason)
+        if record_rows and record_diag:
+            reason = (f"[Router Gate] 启动参数与当前会话记录不匹配 ({trigger})：{record_diag}。"
+                      f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。")
+            return format_response(False, harness_kind, reason)
+        return format_response(False, harness_kind, build_deny_reason(trigger, win))
     return format_response(True, harness_kind)
 
 

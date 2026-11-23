@@ -300,6 +300,7 @@ def record_constraint(args, task=None, classified=None):
         bundle['fast_billing'] = fast_modes.claude_billing(accounts['accounts'][args.account])
     result = {'stage': 'record', 'choice': 'constraint', 'source': 'constraint_record',
               'constraint': args.constraint, 'basis': basis, 'specialty': args.specialty,
+              **({'_from_roll': True} if getattr(args, '_from_roll', False) else {}),
               **({'trigger': args.trigger} if getattr(args, 'trigger', None) else {}),
               'reason_category': getattr(args, 'reason_category', None),
               'selected_bundle': bundle, 'observed_at': now.isoformat(), 'usage': usage}
@@ -490,11 +491,14 @@ def _record_task(args, task):
     if not task.get('parent_agent_id'):
         # The gate matches same-session rows first; a record without the session ID loses to any
         # roll this session made inside the window. Only real host IDs, never the ppid fallback.
-        from worker_context import detect_host_session
+        from worker_context import detect_host_session, harness_session
         parent = (getattr(args, 'parent_id', None) or '').strip() or detect_host_session()
         parent = parent.removeprefix('claude:')
         if parent and not parent.startswith(('claude-session-', 'codex-session-')):
             task = {**task, 'parent_agent_id': parent}
+            host_session = harness_session(parent)
+            if host_session and not task.get('host_session_id'):
+                task = {**task, 'host_session_id': host_session}
     return task
 
 
