@@ -17,7 +17,16 @@ import {execute, project, normalizeProviderModels, notificationStep, notificatio
 
 const notifier = async () => ({status: 'watching', pid: 123, state_file: 'fixture.json'});
 
-const require = createRequire(path.resolve(process.env.ROUTER_PASEO_SDK_ROOT ?? fileURLToPath(new URL('./paseo-bridge/node_modules/', import.meta.url)), '_test.cjs'));
+// The dependencies are found where the bridge's createClient finds them: beside this checkout, else under the state
+// directory an installed AgentCompass keeps them in. A worktree with no `npm --prefix setup/paseo-bridge ci` of its own
+// then tests against the installed copy instead of failing on a module it cannot find.
+const sdkCandidates = [fileURLToPath(new URL('./paseo-bridge/node_modules/', import.meta.url)),
+  ...new Set([process.env.ROUTER_STATE_DIR, path.join(os.homedir(), '.agent-compass')].filter(Boolean)
+    .map(state => path.join(state, 'paseo-bridge/node_modules')))];
+const sdkRoot = process.env.ROUTER_PASEO_SDK_ROOT ?? sdkCandidates.find(dir => fs.existsSync(dir));
+if (!sdkRoot) throw new Error('Paseo bridge dependencies are missing in ' + sdkCandidates.join(' and ') +
+  '. Run: npm --prefix setup/paseo-bridge ci, or set ROUTER_PASEO_SDK_ROOT.');
+const require = createRequire(path.join(path.resolve(sdkRoot), '_test.cjs'));
 const {SessionInboundMessageSchema} = await import(pathToFileURL(require.resolve('@getpaseo/protocol/messages')).href);
 
 test('SDK creation uses its documented fields, parentage and idempotency', async () => {
