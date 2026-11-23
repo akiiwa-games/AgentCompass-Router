@@ -7,9 +7,7 @@ Every diagnostic names the offending file and a fix that works when followed:
 Only what needs the user is listed: a cache or database the product rebuilds or skips itself is not.
 
 Runtime loaders call the same validators so an unreadable or wrong-schema file
-fails fast with the same message `agentcompass doctor` prints. A leftover meter
-on one dollar account does not fail the file and is not read: that account stays
-out of routing until setup, or one tray action on it, deletes the fields.
+fails fast with the same message `agentcompass doctor` prints.
 """
 from __future__ import annotations
 
@@ -19,10 +17,6 @@ import sqlite3
 from pathlib import Path
 
 FIX_SETUP = 're-run "agentcompass setup"'
-# Shown on the account row, in doctor, and as the routing exclusion. The fields are not applied.
-LEGACY_METER_REASON = (
-    '旧的额度字段残留。运行 agentcompass setup 清掉旧字段。'
-)
 LEGACY_SETTINGS_REASON = (
     '旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。'
 )
@@ -64,15 +58,6 @@ OBSOLETE_USAGE_CONFIG_KEYS = (
     'llm_proxy_provider_id',
     'litellm_proxies',
 )
-_RESET_METER_FIELDS = (
-    'windows',
-    'capacity_usd',
-    'burn_pct_per_worker_hour',
-    'burn_basis',
-    'budget_duration',
-    'timezone',
-)
-_OLD_PROXY_KINDS = frozenset({'litellm', 'proxy', 'api-proxy'})
 
 
 def fix_delete(path: Path | str, discards: str | None = None) -> str:
@@ -95,79 +80,6 @@ def state_dir(home: Path | None = None, environ: dict | None = None) -> Path:
         return Path(os.path.expandvars(configured)).expanduser()
     base = Path(home) if home is not None else Path.home()
     return base / '.agent-compass'
-
-
-def legacy_meter_field_names(spec) -> list[str]:
-    """Obsolete meter fields on a dollar account or an old proxy identity.
-
-    Subscription windows are not these fields. The names are an error to clean,
-    not values to read.
-    """
-    if not isinstance(spec, dict):
-        return []
-    found = [key for key in _RESET_METER_FIELDS if key in spec]
-    if isinstance(spec.get('litellm'), dict):
-        found.append('litellm')
-    kind = str(spec.get('backend_kind') or '').strip().lower()
-    if kind in _OLD_PROXY_KINDS:
-        found.append(f'backend_kind={kind}')
-    if not found:
-        return []
-    billing = str(spec.get('billing') or '').strip().lower()
-    endpoint = str(spec.get('endpoint') or '').strip()
-    api_key = spec.get('api_key')
-    has_key = isinstance(api_key, str) and bool(api_key.strip())
-    dollar = billing == 'metered' and bool(endpoint or has_key)
-    old_identity = kind in _OLD_PROXY_KINDS or isinstance(spec.get('litellm'), dict)
-    if not dollar and not old_identity:
-        return []
-    return found
-
-
-def strip_legacy_meter_fields(spec) -> list[str]:
-    """Delete leftover meter fields from one account. Returns the names removed."""
-    names = legacy_meter_field_names(spec)
-    if not isinstance(spec, dict):
-        return []
-    for name in names:
-        if name == 'litellm' or name.startswith('backend_kind'):
-            spec.pop('litellm' if name == 'litellm' else 'backend_kind', None)
-        else:
-            spec.pop(name, None)
-    return names
-
-
-def strip_legacy_meter_document(doc) -> list[str]:
-    """Delete leftover meter fields and a top-level litellm_proxies section."""
-    if not isinstance(doc, dict):
-        return []
-    removed = []
-    accounts = doc.get('accounts')
-    if isinstance(accounts, dict):
-        for name, spec in accounts.items():
-            fields = strip_legacy_meter_fields(spec)
-            if fields:
-                removed.append(f'{name}: {", ".join(fields)}')
-    if 'litellm_proxies' in doc:
-        doc.pop('litellm_proxies', None)
-        removed.append('litellm_proxies')
-    return removed
-
-
-def legacy_meter_issues(doc) -> list[str]:
-    """Doctor text for leftover meter fields. Empty when the document is clean."""
-    if not isinstance(doc, dict):
-        return []
-    issues = []
-    accounts = doc.get('accounts')
-    if isinstance(accounts, dict):
-        for name, spec in accounts.items():
-            fields = legacy_meter_field_names(spec)
-            if fields:
-                issues.append(f"account {name!r} {LEGACY_METER_REASON} ({', '.join(fields)})")
-    if 'litellm_proxies' in doc:
-        issues.append(f'older accounts-override field litellm_proxies is not read. {LEGACY_METER_REASON}')
-    return issues
 
 
 def obsolete_usage_config_keys(doc) -> list[str]:
@@ -226,17 +138,10 @@ def check_accounts_override(path: Path) -> str | None:
         return None
     import accounts_override
     try:
-        doc = accounts_override.load_override(path)
+        accounts_override.load_override(path)
     except ValueError as exc:
         return str(exc)
-    flagged = [name for name, spec in (doc.get('accounts') or {}).items() if spec.get('verified') is False]
-    leftover = legacy_meter_issues(doc)
-    problems = [f'legacy disabled flag remains for {name}' for name in flagged] + leftover
-    if not problems:
-        return None
-    # A tray toggle clears a leftover verified flag; only setup clears leftover meter fields (and both).
-    fix = FIX_SETUP if leftover else f'toggle {", ".join(flagged)} in the tray or {FIX_SETUP}'
-    return format_issue(path, '; '.join(problems), fix)
+    return None
 
 
 def host_policy_fix(path: Path | str) -> str:

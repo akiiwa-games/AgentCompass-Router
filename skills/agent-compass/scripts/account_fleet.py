@@ -119,6 +119,7 @@ def load_accounts(path=None, document=None):
         pass
     if local:
         try:
+            host_policy.upgrade_legacy_disabled(accounts)
             accounts['_host_policy_sync'] = host_policy.sync_discovered(accounts)
         except (OSError, host_policy.HostPolicyError) as exc:
             # Discovery still reports local facts; existing policy checks retain the denial.

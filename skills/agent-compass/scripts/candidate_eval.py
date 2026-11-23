@@ -227,14 +227,8 @@ def evaluate_bundle(bundle, task, ctx):
         result['excluded'].append(reason)
         result.setdefault('_five_short_reasons', []).append(reason)
 
-    legacy = spec.get('legacy_meter')
-    if isinstance(legacy, str) and legacy:
-        exclude(legacy)
-
     execution_account = accounts_override.preference_account(bundle, bundle['account'], accounts)
     cwd_spec = accounts['accounts'].get(execution_account) or spec
-    if spec.get('_legacy_disabled_flag') or cwd_spec.get('_legacy_disabled_flag'):
-        exclude('legacy disabled flag remains; toggle the account in the tray or rerun agentcompass setup')
     # A resumed worker whose directory could not be read (roll.build_task) is matched against no directory.
     if not task.get('cwd_unread') and not account_fleet.account_cwd_allowed(cwd_spec, task.get('cwd')):
         setting_exclude('cwd_regex', cwd_policy.refusal(execution_account, cwd_spec['cwd_regex'], task.get('cwd')))

@@ -210,7 +210,7 @@ class UncappedRouting(unittest.TestCase):
 
 
 class Doctor(unittest.TestCase):
-    def test_old_meter_fields_are_named_and_left_in_place(self):
+    def test_old_meter_fields_are_upgraded_on_read_and_doctor_reports_nothing(self):
         path = Path(os.environ['AGENTCOMPASS_ACCOUNTS_OVERRIDE'])
         path.parent.mkdir(parents=True, exist_ok=True)
         doc = {
@@ -232,20 +232,21 @@ class Doctor(unittest.TestCase):
         }
         path.write_text(json.dumps(doc), encoding='utf-8', newline='\n')
         before = path.read_bytes()
-        issue = state_upgrade.check_accounts_override(path)
+        self.assertIsNone(state_upgrade.check_accounts_override(path))
         self.assertEqual(path.read_bytes(), before)
+        loaded = accounts_override.load_override(path)
+        self.assertNotIn('litellm_proxies', loaded)
+        spec = loaded['accounts']['llmproxy']
         for field in ('windows', 'capacity_usd', 'burn_pct_per_worker_hour', 'burn_basis',
                       'budget_duration', 'timezone'):
-            self.assertIn(field, issue)
-        self.assertIn(state_upgrade.LEGACY_METER_REASON, issue)
-        self.assertIn(state_upgrade.FIX_SETUP, issue)
-        self.assertNotIn('re-toggle in the tray', issue)
-        self.assertNotIn('Remove those fields', issue)
+            self.assertNotIn(field, spec)
+        self.assertEqual(spec['endpoint'], 'https://proxy.example.test')
+        self.assertEqual(spec['api_key'], 'sk-team-proxy')
+
         proxies = {'schema_version': 2, 'litellm_proxies': {'old': {}}, 'accounts': {}}
         path.write_text(json.dumps(proxies), encoding='utf-8', newline='\n')
-        proxy_issue = state_upgrade.check_accounts_override(path)
-        self.assertIn('litellm_proxies', proxy_issue)
-        self.assertIn(state_upgrade.FIX_SETUP, proxy_issue)
+        self.assertIsNone(state_upgrade.check_accounts_override(path))
+        self.assertNotIn('litellm_proxies', accounts_override.load_override(path))
         self.assertEqual(path.read_text(encoding='utf-8'), json.dumps(proxies))
 
         omp = {'schema_version': 2, 'accounts': {
@@ -253,19 +254,16 @@ class Doctor(unittest.TestCase):
             'claude': {'billing': 'subscription', 'windows': {'seven_day': {'hours': 168}}},
         }}
         path.write_text(json.dumps(omp), encoding='utf-8', newline='\n')
-        accounts_override.load_override(path)   # leftover meter fields do not fail the file
-        self.assertEqual(state_upgrade.legacy_meter_field_names(omp['accounts']['omp']), [])
-        self.assertEqual(state_upgrade.legacy_meter_field_names(omp['accounts']['claude']), [])
+        self.assertEqual(accounts_override.load_override(path), omp)
+        self.assertEqual(accounts_override.legacy_meter_field_names(omp['accounts']['omp']), [])
+        self.assertEqual(accounts_override.legacy_meter_field_names(omp['accounts']['claude']), [])
 
         kind = {'schema_version': 2, 'accounts': {
             'old': {'backend_kind': 'litellm', 'endpoint': 'https://proxy.example.test', 'api_key': 'sk-team-proxy'},
         }}
         path.write_text(json.dumps(kind), encoding='utf-8', newline='\n')
-        accounts_override.load_override(path)
-        kind_issue = state_upgrade.check_accounts_override(path)
-        self.assertIn('backend_kind=litellm', kind_issue)
-        self.assertIn(state_upgrade.LEGACY_METER_REASON, kind_issue)
-        self.assertIn(state_upgrade.FIX_SETUP, kind_issue)
+        self.assertIsNone(state_upgrade.check_accounts_override(path))
+        self.assertNotIn('backend_kind', accounts_override.load_override(path)['accounts']['old'])
 
 
 class SpendRead(unittest.TestCase):
@@ -453,73 +451,28 @@ class LegacyMeterFleet(unittest.TestCase):
         path.write_text(json.dumps(doc), encoding='utf-8', newline='\n')
         return path
 
-    def test_one_dirty_account_does_not_block_the_fleet_and_stays_out_when_pinned(self):
+    def test_dirty_meter_account_is_upgraded_on_read_and_ready_without_modifying_file(self):
         path = self._write_dirty()
         before = path.read_bytes()
         loaded = accounts_override.load_override(path)
         self.assertIn('llmproxy', loaded['accounts'])
+        self.assertNotIn('windows', loaded['accounts']['llmproxy'])
         self.assertEqual(path.read_bytes(), before)
         found = provider_inventory.discover()
-        dirty = found['accounts']['llmproxy']
-        self.assertEqual(dirty['status'], 'legacy_meter')
-        self.assertIn('旧的额度字段残留', dirty['reason'])
+        upgraded = found['accounts']['llmproxy']
+        self.assertEqual(upgraded['status'], 'ready')
         self.assertEqual(found['accounts']['usd']['status'], 'ready')
-        # A native omp login is not this dollar account. Override windows on it are not a leftover meter.
-        omp = found['accounts'].get('omp') or {}
-        self.assertNotEqual(omp.get('status'), 'legacy_meter')
-        self.assertNotIn('旧的额度字段残留', str(omp.get('reason') or ''))
         with patch.object(provider_inventory, 'current', return_value=found):
             fleet = account_fleet.load_accounts()
         self.assertEqual(path.read_bytes(), before)
         self.assertIn('claude', fleet['accounts'])
         spec = fleet['accounts']['llmproxy']
-        self.assertIn('旧的额度字段残留', spec['legacy_meter'])
-        self.assertEqual(spec['windows'], {})
-        self.assertNotIn('capacity_usd', spec)
+        self.assertNotIn('legacy_meter', spec)
         self.assertNotIn('api_key', spec)
         clean = fleet['accounts']['usd']
         self.assertNotIn('legacy_meter', clean)
         self.assertIn('balance', clean['windows'])
         self.assertEqual(clean['capacity_usd']['balance'], 40)
-        spec['bundles'] = {'llmproxy_pin': {
-            'provider': 'llmproxy', 'harness': 'codex', 'model': 'gpt-6.1-sol',
-            'effort': 'high', 'draws': [], 'billing': 'metered',
-        }}
-        task = {
-            'objective': 'Fix a bug in parser.py', 'expected_hours': 1, 'profile': profile(),
-            'constraints': {'model': 'gpt-6.1-sol'},
-        }
-        plan = allocator.plan(
-            task, {'read_ok': True, 'accounts': {}}, NOW, accounts=fleet, overrides=[], records=[],
-            host_policy_config=None, read_local_state=False)
-        row = next(c for c in plan['ranking'] if c['id'] == 'llmproxy_pin')
-        self.assertTrue(any('旧的额度字段残留' in str(reason) for reason in row['excluded']))
-        self.assertNotEqual(plan.get('choice'), 'llmproxy_pin')
-        if plan.get('choice') not in (None, 'none'):
-            chosen = next(c for c in plan['ranking'] if c['id'] == plan['choice'])
-            self.assertNotEqual((chosen.get('bundle') or {}).get('account'), 'llmproxy')
-
-    def test_the_gate_names_that_account_and_does_not_allow_every_account(self):
-        import sys
-        setup = Path(__file__).resolve().parents[3] / 'setup'
-        if str(setup) not in sys.path:
-            sys.path.insert(0, str(setup))
-        import router_gate_hook
-        path = self._write_dirty()
-        before = path.read_bytes()
-        found = provider_inventory.discover()
-        with patch.object(provider_inventory, 'current', return_value=found):
-            accounts = router_gate_hook.load_dispatch_accounts()
-        self.assertIsNotNone(accounts)
-        self.assertIn('claude', accounts['accounts'])
-        self.assertIn('llmproxy', accounts['accounts'])
-        self.assertEqual(path.read_bytes(), before)
-        # Leftover meter fields are a fact: they refuse a launch and the parent's new turn to its own worker alike.
-        cause = router_gate_hook.check_target_disabled({'agent_id': 'worker-1'}, 'llmproxy', [], accounts)
-        self.assertEqual(cause[0], 'legacy')
-        self.assertIn('旧的额度字段残留', cause[1])
-        self.assertIn('旧的额度字段残留', router_gate_hook.check_own_worker_legacy({'agent_id': 'worker-1'}, 'llmproxy', accounts))
-        self.assertIsNone(router_gate_hook.check_own_worker_legacy({'agent_id': 'worker-1'}, 'claude', accounts))
 
 
 class SetupCleanup(unittest.TestCase):
@@ -552,9 +505,9 @@ class SetupCleanup(unittest.TestCase):
         before = override.read_bytes()
         dry = onboard.write_override(home, {'accounts': []}, set(), dry_run=True)
         self.assertEqual(override.read_bytes(), before)
-        self.assertTrue(dry['stripped'])
+        self.assertTrue(dry['upgraded'])
         written = onboard.write_override(home, {'accounts': []}, set(), dry_run=False)
-        self.assertTrue(written['stripped'])
+        self.assertTrue(written['upgraded'])
         saved = json.loads(override.read_text(encoding='utf-8'))
         spec = saved['accounts']['llmproxy']
         self.assertEqual(spec['endpoint'], 'https://example.test/v1')
@@ -645,8 +598,6 @@ class SetupCleanup(unittest.TestCase):
         self.assertFalse((bare_state / 'host-policy.json').exists())
         bare_spec = json.loads((bare_state / 'accounts-override.json').read_text(encoding='utf-8'))['accounts']['llmproxy']
         self.assertNotIn('windows', bare_spec)
-        self.assertIn('运行 agentcompass setup 清掉旧字段', state_upgrade.LEGACY_METER_REASON)
-        self.assertNotIn('托盘', state_upgrade.LEGACY_METER_REASON)
 
 
 class HarnessCandidates(unittest.TestCase):

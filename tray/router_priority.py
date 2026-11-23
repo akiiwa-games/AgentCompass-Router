@@ -133,7 +133,7 @@ def _is_launchable(bundle, accounts, policy):
     account, model = bundle.get('account'), bundle.get('model')
     spec = (accounts.get('accounts') or {}).get(account) or {}
     return not (not account or not model or bundle.get('disabled') or bundle.get('discovery_unavailable')
-                or spec.get('verified') is False or spec.get('_legacy_disabled_flag')
+                or spec.get('verified') is False
                 or not host_policy.account_allowed(policy, account))
 
 

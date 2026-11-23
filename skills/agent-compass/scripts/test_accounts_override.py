@@ -205,6 +205,50 @@ class AccountsOverrideKeptAcrossUpdatesTests(unittest.TestCase):
                                                                    'bundles': {'b1': {'disabled': 'off'}}}}})
         self.assertIsNone(state_upgrade.check_accounts_override(self.path))
 
+    def test_legacy_meter_fields_and_litellm_proxies_are_stripped_on_read_keeping_other_fields(self):
+        doc = {
+            'schema_version': 2,
+            'litellm_proxies': {'old': {'endpoint': 'https://old.example.test'}},
+            'accounts': {
+                'llmproxy': {
+                    'billing': 'metered',
+                    'endpoint': 'https://proxy.example.test/v1',
+                    'api_key': 'sk-team-proxy',
+                    'budget_usd': 200,
+                    'cwd_regex': '^D:/work(/|$)',
+                    'windows': {'spend': {'hours': 168}},
+                    'capacity_usd': {'spend': 200},
+                    'burn_pct_per_worker_hour': {'spend': 1},
+                    'burn_basis': 'old',
+                    'budget_duration': '7d',
+                    'timezone': 'UTC+8',
+                    'litellm': {'endpoint': 'https://old.example.test'},
+                    'backend_kind': 'litellm',
+                },
+                'omp': {'billing': 'metered', 'windows': {'week': {'hours': 168}}},
+                'claude': {'billing': 'subscription', 'windows': {'seven_day': {'hours': 168}}},
+            },
+        }
+        self.write(doc)
+        before = self.path.read_bytes()
+        loaded = accounts_override.load_override(self.path)
+        self.assertEqual(self.path.read_bytes(), before)   # read-only: never writes
+        self.assertNotIn('litellm_proxies', loaded)
+        spec = loaded['accounts']['llmproxy']
+        self.assertEqual(spec, {
+            'billing': 'metered',
+            'endpoint': 'https://proxy.example.test/v1',
+            'api_key': 'sk-team-proxy',
+            'budget_usd': 200,
+            'cwd_regex': '^D:/work(/|$)',
+        })
+        # Subscription accounts and non-endpoint metered accounts keep their windows.
+        self.assertEqual(loaded['accounts']['omp'], doc['accounts']['omp'])
+        self.assertEqual(loaded['accounts']['claude'], doc['accounts']['claude'])
+        # Idempotent and doctor reports nothing.
+        self.assertEqual(accounts_override.upgrade_document(loaded), loaded)
+        self.assertIsNone(state_upgrade.check_accounts_override(self.path))
+
 
 class StoredChoiceFollowsTheNameTests(unittest.TestCase):
     """Round 8 item 1: a stored choice applies to the bundle its model name resolves to now, resolved where the choice

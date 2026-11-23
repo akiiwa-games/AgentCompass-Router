@@ -141,6 +141,7 @@ def write_override(home: Path, detection: dict, disabled: set[str], dry_run: boo
     path = override_path(home)
     previous_state = _read_json(onboarding_path(home))
     existed = path.is_file()
+    raw_before = _read_json(path) if existed else {}
     document = (accounts_override.load_override(path) or {}) if existed else {}
     document.setdefault("schema_version", accounts_override.SCHEMA_VERSION)
     accounts = document.setdefault("accounts", {})
@@ -162,11 +163,10 @@ def write_override(home: Path, detection: dict, disabled: set[str], dry_run: boo
             enabled.append(name)
     if not accounts:
         document.pop("accounts")
-    import state_upgrade
-    stripped = state_upgrade.strip_legacy_meter_document(document)
-    changed = bool(enabled or cleaned or stripped) or not existed
+    upgraded = existed and document != raw_before
+    changed = bool(enabled or cleaned or upgraded) or not existed
     result = {"path": str(path), "created": not existed or bool(previous_state.get("override_created")),
-              "enabled": enabled, "disabled": sorted(wanted_off), "stripped": stripped, "backup": None}
+              "enabled": enabled, "disabled": sorted(wanted_off), "upgraded": upgraded, "backup": None}
     if changed and not dry_run:
         if existed:
             backup = home / ".agent-compass" / "backups" / f"onboard-{datetime.now().strftime('%Y%m%d-%H%M%S')}" / path.name
@@ -402,9 +402,18 @@ def setup_main(argv: list[str] | None = None) -> int:
                 # Only an answer the user gave re-admits an account. The non-interactive default is no choice: an
                 # account missing from host policy's allowed list is the user's deny (host_policy.sync_discovered).
                 enabled.add(row["name"])
-    override = write_override(home, detection, disabled, dry)
     import host_policy
     target_policy = host_policy.policy_path()[0] if not args.home else home / ".agent-compass" / "host-policy.json"
+    host_policy.upgrade_legacy_disabled(
+        {"accounts": {name: {} for name in dict.fromkeys([
+            *(detection.get("inventory", {}).get("accounts") or {}),
+            *(row["name"] for row in detection["accounts"]),
+        ])}},
+        override_path=override_path(home),
+        policy_file=target_policy,
+        read_only=dry,
+    )
+    override = write_override(home, detection, disabled, dry)
     policy_path = disable_in_host_policy(home, detection, disabled, dry, target_policy, enabled)
     summary["override"] = override
     summary["host_policy"] = str(policy_path)

@@ -5,7 +5,6 @@ EN = {
     "请检查订阅状态并刷新额度": "Check the subscription and refresh usage.",
     "请刷新额度并检查提供方状态": "Refresh usage and check provider status.",
     "没有可派发的模型；请刷新模型列表并检查模型设置": "No dispatchable models; refresh the model list and check model settings.",
-    "旧的关闭标记残留，已排除派发；请在托盘切换此账号，或重新运行 setup": "Legacy disabled flag remains; excluded from routing. Toggle this account in the tray or rerun setup.",
     "无法确认账号可启动，已排除派发；请登录 CLI 并刷新额度，或重新运行 setup 确认登录": "Launch readiness unverified; excluded from routing. Sign in to the CLI and refresh usage, or rerun setup to confirm sign-in.",
     '用托盘里的「更新 AgentCompass」升级': 'upgrade with "Update AgentCompass" in the tray',
     '用 uv tool upgrade agentcompass 升级，或从 {0} 下载安装器': 'upgrade with uv tool upgrade agentcompass, or download the installer from {0}',
@@ -761,8 +760,6 @@ EN = {
     '已用 {0}': 'used {0}',
     '已用 {0} / {1}': 'used {0} / {1}',
     '无查询权限': 'No permission to query usage',
-    '旧的额度字段残留。运行 agentcompass setup 清掉旧字段。':
-        'Old quota fields remain. Run agentcompass setup to clear the old fields.',
     '旧设置残留。在设置里保存一次即可清掉，或运行 agentcompass setup。':
         'Old settings remain. Save once in settings to clear them, or run agentcompass setup.',
     '{0} 小时后重置': 'resets in {0} h',

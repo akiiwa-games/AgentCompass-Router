@@ -1533,23 +1533,6 @@ def _override_meters(override_doc, cache_rows, accounts):
             continue
         ep = str(pspec.get('endpoint') or '').strip()
         key = str(pspec.get('api_key') or '').strip()
-        import state_upgrade
-        if state_upgrade.legacy_meter_field_names(pspec):
-            # The fields are not a budget and not a window. A complete account is listed so the tray can say why.
-            if ep and key:
-                pfamily = str(pspec.get('family') or pspec.get('provider') or 'codex')
-                found[pname] = {
-                    'family': pfamily,
-                    'provider': pname,
-                    'sources': ['router-override'],
-                    'status': account_state.LEGACY_METER,
-                    'reason': state_upgrade.LEGACY_METER_REASON,
-                    'plan': 'metered USD',
-                    'billing': 'metered',
-                    'backend_kind': 'metered_usd',
-                }
-                launchers[pname] = {'family': pfamily, 'status': 'paused'}
-            continue
         if not ep or not key:
             continue
         budget_usd = _override_budget(pspec, obj(cache_rows.get(pname)))
@@ -2258,14 +2241,10 @@ def _discovered_spec(name, row, templates, accounts):
             'windows': {},
             'bundles': {},  # auto_bundles derives one bundle per advertised model below
         }
-        if row.get('status') == account_state.LEGACY_METER:
-            import state_upgrade
-            spec['legacy_meter'] = row.get('reason') or state_upgrade.LEGACY_METER_REASON
-        else:
-            budget = row.get('budget_usd')
-            if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
-                spec['windows'] = {'balance': {}}
-                spec['capacity_usd'] = {'balance': float(budget)}
+        budget = row.get('budget_usd')
+        if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
+            spec['windows'] = {'balance': {}}
+            spec['capacity_usd'] = {'balance': float(budget)}
         return spec
     if family == 'pi':
         if row.get('quota_account') and row.get('quota_account') != name:
@@ -2331,14 +2310,6 @@ def _settle_metered_usd_spec(spec, row):
     row_plan = row.get('plan')
     if isinstance(row_plan, str) and row_plan.strip():
         spec['plan'] = row_plan
-    if row.get('status') == account_state.LEGACY_METER:
-        import state_upgrade
-        spec['legacy_meter'] = row.get('reason') or state_upgrade.LEGACY_METER_REASON
-        spec['windows'] = {}
-        spec.pop('capacity_usd', None)
-        spec.setdefault('bundles', {})
-        return
-    spec.pop('legacy_meter', None)
     budget = row.get('budget_usd')
     if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
         spec['windows'] = {'balance': {}}

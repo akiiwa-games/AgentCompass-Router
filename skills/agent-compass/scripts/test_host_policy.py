@@ -380,6 +380,76 @@ class HostPolicyTests(unittest.TestCase):
         self.assertEqual(host_policy.sync_discovered(accounts)['added'], ['unregistered'])
         self.assertFalse(host_policy.account_allowed(host_policy.load_policy(), 'arbitrary-request-name'))
 
+    def test_legacy_verified_false_carries_into_new_host_policy_and_preserves_other_fields(self):
+        self.path.unlink(missing_ok=True)
+        override = self.path.parent / 'accounts-override.json'
+        override.write_text(json.dumps({
+            'schema_version': 2,
+            'scoring': {'k': 1},
+            'accounts': {
+                'codex': {'verified': False, 'cwd_regex': '^D:/work(/|$)'},
+                'claude': {'verified': True},
+            },
+        }), encoding='utf-8', newline='\n')
+        accounts = self.registered(codex='ready', claude='ready')
+        # Read-only check writes neither file.
+        before_override = override.read_bytes()
+        self.assertEqual(host_policy.upgrade_legacy_disabled(
+            accounts, override_path=override, policy_file=self.path, read_only=True), ['codex'])
+        self.assertFalse(self.path.exists())
+        self.assertEqual(override.read_bytes(), before_override)
+
+        upgraded = host_policy.upgrade_legacy_disabled(accounts, override_path=override, policy_file=self.path)
+        self.assertEqual(upgraded, ['codex'])
+        policy = host_policy.load_policy()
+        self.assertEqual(policy['allowed_accounts'], ['claude'])
+        self.assertEqual(set(policy['known_accounts']), {'claude', 'codex'})
+        # sync_discovered must not re-admit the carried-over deny.
+        self.assertEqual(host_policy.sync_discovered(accounts)['added'], [])
+        self.assertFalse(host_policy.account_allowed(host_policy.load_policy(), 'codex'))
+        # Other fields in accounts-override.json stay intact.
+        saved = json.loads(override.read_text(encoding='utf-8'))
+        self.assertEqual(saved['scoring'], {'k': 1})
+        self.assertEqual(saved['accounts']['codex'], {'cwd_regex': '^D:/work(/|$)'})
+        self.assertEqual(saved['accounts']['claude'], {'verified': True})
+        # Idempotent: second call is a no-op and does not rewrite.
+        after_policy = self.path.read_bytes()
+        after_override = override.read_bytes()
+        self.assertEqual(host_policy.upgrade_legacy_disabled(accounts, override_path=override, policy_file=self.path), [])
+        self.assertEqual(self.path.read_bytes(), after_policy)
+        self.assertEqual(override.read_bytes(), after_override)
+
+    def test_legacy_verified_false_updates_existing_policy_preserving_extra_keys_and_static_mode(self):
+        override = self.path.parent / 'accounts-override.json'
+        override.write_text(json.dumps({
+            'schema_version': 2, 'accounts': {'codex': {'verified': False}},
+        }), encoding='utf-8', newline='\n')
+        self.write({'allowed_accounts': ['claude', 'codex'], 'judges': ['claude'], 'usage_providers': ['claude']})
+        # Read-only load_policy excludes codex in memory without writing either file.
+        with patch.dict(host_policy.os.environ, {'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(override)}):
+            before_pol, before_ov = self.path.read_bytes(), override.read_bytes()
+            in_memory = host_policy.load_policy()
+            self.assertEqual(in_memory['allowed_accounts'], ['claude'])
+            self.assertEqual(self.path.read_bytes(), before_pol)
+            self.assertEqual(override.read_bytes(), before_ov)
+
+        host_policy.upgrade_legacy_disabled(override_path=override, policy_file=self.path)
+        policy = json.loads(self.path.read_text(encoding='utf-8'))
+        self.assertEqual(policy, {'allowed_accounts': ['claude'], 'judges': ['claude'], 'usage_providers': ['claude']})
+        self.assertNotIn('known_accounts', policy)
+        self.assertEqual(json.loads(override.read_text(encoding='utf-8'))['accounts']['codex'], {})
+
+    def test_legacy_verified_false_is_not_dropped_if_host_policy_is_unreadable(self):
+        override = self.path.parent / 'accounts-override.json'
+        override.write_text(json.dumps({
+            'schema_version': 2, 'accounts': {'codex': {'verified': False}},
+        }), encoding='utf-8', newline='\n')
+        self.path.write_text('{bad json', encoding='utf-8')
+        before_ov = override.read_bytes()
+        with self.assertRaises(host_policy.HostPolicyError):
+            host_policy.upgrade_legacy_disabled(override_path=override, policy_file=self.path)
+        self.assertEqual(override.read_bytes(), before_ov)
+
 
 if __name__ == '__main__':
     unittest.main()

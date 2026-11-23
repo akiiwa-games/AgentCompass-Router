@@ -121,25 +121,17 @@ class ContinuationVerdictTests(VerdictTestCase):
         self.fleet['_discovery']['accounts']['acme'] = {'status': 'auth_failed', 'reason': 'credentials_rejected'}
         self.assertRoll(self.verdict(), 'not ready', 'credentials_rejected')
 
-    def test_preference_switches_do_not_refuse_a_turn_and_leftover_meter_fields_do(self):
+    def test_preference_switches_do_not_refuse_a_turn(self):
         # Continuing a worker is not choosing its account or model: an account out of automatic routing and a model
-        # unchecked since the launch neither roll the verdict nor refuse the gate's turn; leftover meter fields are a
-        # fact and do both, so the verdict and the gate agree (turn_refusal.py docstring).
-        for name, change, refused in (
-                ('out of automatic routing', lambda: setattr(self, 'policy', {'allowed_accounts': ['other']}), False),
-                ('unchecked', lambda: [b.update(disabled=True) for b in self.fleet['accounts']['acme']['bundles'].values()],
-                 False),
-                ('legacy', lambda: self.fleet['accounts']['acme'].update(legacy_meter='retired meter'), True)):
+        # unchecked since the launch neither roll the verdict nor refuse the gate's turn.
+        for name, change in (
+                ('out of automatic routing', lambda: setattr(self, 'policy', {'allowed_accounts': ['other']})),
+                ('unchecked', lambda: [b.update(disabled=True) for b in self.fleet['accounts']['acme']['bundles'].values()])):
             with self.subTest(name=name):
                 self.setUp()
                 change()
-                gate = turn_refusal.gate_refusal('worker', now=NOW)
-                if refused:
-                    self.assertRoll(self.verdict(), 'retired meter', 'agentcompass setup', 'roll the follow-up')
-                    self.assertIn('retired meter', gate)
-                else:
-                    self.assertSame(self.verdict())
-                    self.assertIsNone(gate)
+                self.assertSame(self.verdict())
+                self.assertIsNone(turn_refusal.gate_refusal('worker', now=NOW))
 
     def test_over_the_threshold_stays_a_rotate_verdict_whatever_the_account_state(self):
         for state in ('ready', 'exhausted', 'held', 'not_ready'):

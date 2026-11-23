@@ -401,21 +401,6 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertNotIn('无查询权限', tip)
         self.assertNotIn('无查询权限', card['usage_hover'])
 
-    def test_legacy_meter_badge_wins_over_manual_only(self):
-        import i18n
-        import state_upgrade
-        card = self.card(
-            self._usd_row('legacy_meter'), name='usd', spec=self._usd_spec(), allowed=False,
-        )
-        self.assertEqual(card['kind'], 'warn')
-        self.assertIn('旧的额度字段残留', card['badge'])
-        self.assertNotIn('仅手动使用', card['badge'])
-        self.assertEqual(
-            i18n.english(state_upgrade.LEGACY_METER_REASON),
-            'Old quota fields remain. Run agentcompass setup to clear the old fields.',
-        )
-        self.assertNotIn('托盘', card['badge'])
-
 
 if __name__ == '__main__':
     unittest.main()

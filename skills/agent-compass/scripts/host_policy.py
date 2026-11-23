@@ -29,8 +29,31 @@ def policy_path():
     return (Path(configured).expanduser(), True) if configured else (Path.home() / '.agent-compass/host-policy.json', False)
 
 
-def load_policy():
-    path, explicit = policy_path()
+# Named upgrade step for the v0.1.0 to v0.5.0 account-off flag (`accounts.<name>.verified == False` in
+# accounts-override.json), which v0.5.1 moved to `host-policy.json` (`allowed_accounts` + `known_accounts`).
+LEGACY_DISABLED_UPGRADE = 'accounts-override verified=false -> host-policy allowed_accounts (v0.1.0 to v0.5.0)'
+
+
+def _override_path(override_path=None):
+    if override_path is not None:
+        return Path(override_path)
+    import account_fleet
+    return account_fleet.accounts_override_path()
+
+
+def _legacy_disabled_from_override(override_path=None):
+    """Read-only: account names carrying `verified: false` in accounts-override.json, else []."""
+    path = _override_path(override_path)
+    if not path.exists():
+        return []
+    try:
+        doc = accounts_override.load_override(path)
+    except (OSError, ValueError):
+        return []
+    return accounts_override.legacy_disabled_accounts(doc)
+
+
+def _read_policy_file(path, explicit=False):
     try:
         raw = path.read_text(encoding='utf-8-sig')
     except FileNotFoundError:
@@ -58,6 +81,63 @@ def load_policy():
         return state_upgrade.validate_host_policy_doc(data, path)
     except ValueError as exc:
         raise HostPolicyError(str(exc)) from None
+
+
+def load_policy():
+    path, explicit = policy_path()
+    doc = _read_policy_file(path, explicit=explicit)
+    if doc is None:
+        return None
+    flagged = _legacy_disabled_from_override()
+    if not flagged:
+        return doc
+    result = dict(doc)
+    result['allowed_accounts'] = [name for name in result['allowed_accounts'] if name not in flagged]
+    if 'known_accounts' in result:
+        result['known_accounts'] = list(dict.fromkeys([*result['known_accounts'], *flagged]))
+    return result
+
+
+def upgrade_legacy_disabled(accounts=None, *, override_path=None, policy_file=None, read_only=False):
+    """Carry v0.1.0..v0.5.0 `accounts.<name>.verified == False` from accounts-override.json into host-policy.json
+    (`allowed_accounts` omitting `<name>`, `known_accounts` keeping `<name>` so `sync_discovered` does not re-add it),
+    then remove `verified: false` from accounts-override.json while keeping every other field.
+
+    Process-safe (locks `policy_file` then `override_path`), crash-safe (writes `host-policy.json` first), and
+    idempotent. With `read_only=True`, inspects without writing and returns the flagged names.
+    """
+    ov_path = _override_path(override_path)
+    pol_path = Path(policy_file) if policy_file is not None else policy_path()[0]
+    flagged = _legacy_disabled_from_override(ov_path)
+    if not flagged or read_only:
+        return flagged
+    with override_store.locked(pol_path), override_store.locked(ov_path):
+        override_doc = accounts_override.load_override(ov_path)
+        flagged = accounts_override.legacy_disabled_accounts(override_doc)
+        if not flagged:
+            return []
+        existing = _read_policy_file(pol_path, explicit=False) if pol_path.exists() else None
+        if existing is not None:
+            policy = dict(existing)
+            policy['allowed_accounts'] = [name for name in policy['allowed_accounts'] if name not in flagged]
+            if 'known_accounts' in policy:
+                policy['known_accounts'] = list(dict.fromkeys([*policy['known_accounts'], *flagged]))
+        else:
+            known = list(dict.fromkeys([
+                *((accounts.get('accounts') or {}) if isinstance(accounts, dict) else ()),
+                *(((accounts.get('_discovery') or {}).get('accounts') or {}) if isinstance(accounts, dict) else ()),
+                *(override_doc.get('accounts') or {}),
+            ]))
+            allowed = [name for name in known if name not in flagged]
+            policy = {'allowed_accounts': allowed, 'known_accounts': list(dict.fromkeys([*allowed, *flagged]))}
+        # Write host-policy.json first so a crash before cleaning accounts-override.json never loses the user's choice.
+        override_store.write(pol_path, policy)
+        for name in flagged:
+            entry = (override_doc.get('accounts') or {}).get(name)
+            if isinstance(entry, dict) and entry.get('verified') is False:
+                entry.pop('verified', None)
+        override_store.write(ov_path, override_doc)
+        return flagged
 
 
 def sync_discovered(accounts):

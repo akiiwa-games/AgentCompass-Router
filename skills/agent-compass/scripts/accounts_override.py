@@ -99,6 +99,76 @@ def _without_migration_record(document):
     return {key: value for key, value in document.items() if key != 'migration_ambiguous_enabled'}
 
 
+_RESET_METER_FIELDS = (
+    'windows',
+    'capacity_usd',
+    'burn_pct_per_worker_hour',
+    'burn_basis',
+    'budget_duration',
+    'timezone',
+)
+_OLD_PROXY_KINDS = frozenset({'litellm', 'proxy', 'api-proxy'})
+
+
+def legacy_meter_field_names(spec) -> list[str]:
+    """Obsolete meter fields on a dollar account or an old proxy identity (v0.1.0 to v0.5.0).
+
+    Subscription windows and non-endpoint metered accounts are not these fields.
+    """
+    if not isinstance(spec, dict):
+        return []
+    found = [key for key in _RESET_METER_FIELDS if key in spec]
+    if isinstance(spec.get('litellm'), dict):
+        found.append('litellm')
+    kind = str(spec.get('backend_kind') or '').strip().lower()
+    if kind in _OLD_PROXY_KINDS:
+        found.append(f'backend_kind={kind}')
+    if not found:
+        return []
+    billing = str(spec.get('billing') or '').strip().lower()
+    endpoint = str(spec.get('endpoint') or '').strip()
+    api_key = spec.get('api_key')
+    has_key = isinstance(api_key, str) and bool(api_key.strip())
+    dollar = billing == 'metered' and bool(endpoint or has_key)
+    old_identity = kind in _OLD_PROXY_KINDS or isinstance(spec.get('litellm'), dict)
+    if not dollar and not old_identity:
+        return []
+    return found
+
+
+def _has_legacy_meter(document):
+    if 'litellm_proxies' in document:
+        return True
+    accounts = document.get('accounts')
+    return isinstance(accounts, dict) and any(legacy_meter_field_names(spec) for spec in accounts.values())
+
+
+def _without_legacy_meter(document):
+    """Releases through v0.5.0 configured proxy/metered accounts with resetting window fields, nested `litellm`,
+    `backend_kind` of `litellm`/`proxy`/`api-proxy`, or a top-level `litellm_proxies` section. None of those fields has
+    a meaning under metered USD (endpoint + api_key + optional non-resetting budget_usd); every other field stays."""
+    result = deepcopy(document)
+    result.pop('litellm_proxies', None)
+    accounts = result.get('accounts')
+    if isinstance(accounts, dict):
+        for spec in accounts.values():
+            for name in legacy_meter_field_names(spec):
+                if name == 'litellm' or name.startswith('backend_kind'):
+                    spec.pop('litellm' if name == 'litellm' else 'backend_kind', None)
+                else:
+                    spec.pop(name, None)
+    return result
+
+
+def legacy_disabled_accounts(document) -> list[str]:
+    """Account names carrying the v0.1.0 to v0.5.0 account-off flag (`accounts.<name>.verified == False`), which v0.5.1
+    moved to `host-policy.json` (`allowed_accounts` + `known_accounts`). Carried by `host_policy.upgrade_legacy_disabled`."""
+    if not isinstance(document, dict) or not isinstance(document.get('accounts'), dict):
+        return []
+    return [name for name, spec in document['accounts'].items()
+            if isinstance(spec, dict) and spec.get('verified') is False]
+
+
 # The user's own choices are kept across updates: {the shape an earlier release wrote: (does the document have it, the
 # step that carries it into the current shape)}. A shape that cannot be carried without guessing has no step and is
 # refused by `validate_document`: a file without `schema_version` (the full copy of the shipped file that v0.1.0
@@ -108,6 +178,7 @@ LOCAL_UPGRADES = {
     'allowed_cwd (v0.1.0 to v0.5.0)': (lambda doc: bool(_allowed_cwd_accounts(doc)), _allowed_cwd_to_regex),
     'migration_ambiguous_enabled (v0.2.0 to v0.5.0)': (lambda doc: 'migration_ambiguous_enabled' in doc,
                                                         _without_migration_record),
+    'legacy meter fields (v0.1.0 to v0.5.0)': (_has_legacy_meter, _without_legacy_meter),
 }
 
 
@@ -257,8 +328,6 @@ def apply(accounts, document):
         target = (accounts.get('accounts') or {}).get(name)
         if not isinstance(spec, dict) or not isinstance(target, dict):
             continue
-        if spec.get('verified') is False:
-            target['_legacy_disabled_flag'] = True
         discovery = ((accounts.get('_discovery') or {}).get('accounts') or {}).get(name) or {}
         if (spec.get('verified') is True and target.get('discovery_status') in (None, 'ready', 'usage_failing')
               and not discovery.get('usage_excluded')):
