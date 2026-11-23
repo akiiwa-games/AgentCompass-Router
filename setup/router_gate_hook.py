@@ -1545,12 +1545,15 @@ def route_family(row: dict, accounts: dict | None = None) -> str | None:
     return router_owner("provider_inventory", "bundle_family")(_merged_route_bundle(row, accounts), accounts)
 
 
-def launch_field_hint(name: str, trigger: str) -> str:
+def launch_field_hint(name: str, trigger: str, requested: dict | None = None) -> str:
     if name in CLAUDE_NATIVE_TOOLS:
         return "传入参数 `model`（模型系列别名）指定已授权路由的模型"
     if name == "spawn_agent":
         return "传入参数 `model`（及 `reasoning_effort`）指定已授权路由的模型与档位"
     if name == "invoke_subagent":
+        if (requested or {}).get("model") == UNSPECIFIED_LAUNCH_VALUE:
+            return ("改用不带 `--parent-host native` 的 `roll` 直接启动 worker，或告知用户"
+                    "（hook 输入缺少具体的 `modelName` 字段，无法确认当前会话模型，而 `invoke_subagent` 的 `Model` 不接受具体模型 ID）")
         return ("在当前会话 `modelName` 与已授权路由一致时传入 `Model=\"inherit\"`"
                 "（`invoke_subagent` 的 `Model` 仅接受抽象档位枚举，不接受具体模型 ID；"
                 "若当前会话模型与路由不一致，请告知用户或改用不带 `--parent-host native` 的 `roll` 直接启动）")
@@ -1611,6 +1614,21 @@ def _row_session_ids(row: dict, task: dict | None = None, identity: dict[str, st
             if isinstance(v, str) and v}
 
 
+def _session_matches_row(
+    row: dict, caller_sessions: set[str], paseo_agents_dir: Path | None = None,
+    task: dict | None = None, identity: dict[str, str] | None = None,
+) -> tuple[bool, bool]:
+    """Return `(has_row_sessions, matched)` for `row` against `caller_sessions`."""
+    row_sessions = _row_session_ids(row, task, identity)
+    if not row_sessions:
+        return False, False
+    matched = bool(caller_sessions) and (
+        bool(caller_sessions & row_sessions)
+        or any(is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions)
+    )
+    return True, matched
+
+
 def _route_label(row: dict) -> str:
     bundle = row.get("bundle") if isinstance(row.get("bundle"), dict) else {}
     choice, bid = row.get("choice"), bundle.get("bundle_id")
@@ -1644,15 +1662,9 @@ def matching_routes(
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else {}
         identity = correlation_fields(row, task)
-        row_sessions = _row_session_ids(row, task, identity)
-        session_matched = False
-        if row_sessions:
-            session_matched = bool(caller_sessions) and (
-                bool(caller_sessions & row_sessions)
-                or any(is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions)
-            )
-            if not session_matched:
-                continue
+        has_sessions, session_matched = _session_matches_row(row, caller_sessions, paseo_agents_dir, task, identity)
+        if has_sessions and not session_matched:
+            continue
         shared = (context.keys() & identity.keys()) - {"parent"}
         if any(context[k] != identity[k] for k in shared):
             continue
@@ -1699,11 +1711,18 @@ def match_route(
     return (matched[0] if matched else None), diagnostic
 
 
-def build_deny_reason(trigger: str, window_seconds: int = DEFAULT_WINDOW_SECONDS) -> str:
+def build_deny_reason(
+    trigger: str, window_seconds: int = DEFAULT_WINDOW_SECONDS, *, needed: int = 1, open_count: int = 0,
+) -> str:
     minutes = max(1, round(window_seconds / 60))
+    status_clause = (
+        f"本次调用启动 {needed} 个子 agent，只有 {open_count} 个可用授权（status: native；每个子 agent 需独立授权，本次未消耗任何授权）"
+        if needed > 1 and open_count < needed
+        else "本会话没有尚未使用的 roll 原生派发授权（status: native）"
+    )
     return (
         f"[Router Gate] 拦截未授权的子 agent 启动 ({trigger})："
-        f"本会话没有尚未使用的 roll 原生派发授权（status: native），且最近 {minutes} 分钟内无有效的独立 record 记录"
+        f"{status_clause}，且最近 {minutes} 分钟内无有效的独立 record 记录"
         "（plan 记录或已由 roll 直接启动的派发不授权原生子 agent 启动；"
         "status: native 授权为单次有效，门禁放行时即已核销——即使此后宿主或权限确认拒绝/取消了该次调用，原授权也已消耗）。"
         "请把任务书写进 <task.md>（若前次放行后被宿主拒绝，重新运行 roll 获取新授权），一条命令完成分类、选路与启动：\n"
@@ -1937,6 +1956,12 @@ def _decide_checked(
     raw_call_id = str(
         payload.get("tool_use_id") or payload.get("tool_call_id") or payload.get("call_id") or tc_obj.get("id") or ""
     ).strip() or None
+    native_needed = sum(
+        1 for n, a, t in executing
+        if t and not (isinstance(a.get("labels"), dict) and any(k.startswith("router.") for k in a["labels"]))
+        and t != WORKFLOW_TRIGGER and t not in SCHEDULE_TRIGGERS
+        and n != "create_agent" and t != "shell:paseo agent create"
+    )
     native_launch_index = 0
     pending_native_claims: list[tuple[list[str], str | None, str]] = []
     reserved_handover_ids: set[str] = set()
@@ -2111,7 +2136,7 @@ def _decide_checked(
             return format_response(
                 False, harness_kind,
                 f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。"
-                f"请{launch_field_hint(name, trigger)}，或重新运行 {ROUTER_CMD} roll --brief <task.md>。",
+                f"请{launch_field_hint(name, trigger, requested)}，或重新运行 {ROUTER_CMD} roll --brief <task.md>。",
             )
         if not identities and not context.get("parent") and any(_row_session_ids(r) for r in (*handovers, *record_rows)):
             return format_response(
@@ -2126,7 +2151,11 @@ def _decide_checked(
                 f"[Router Gate] 启动参数与当前会话记录不匹配 ({trigger})：{record_diag}。"
                 f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。",
             )
-        return format_response(False, harness_kind, build_deny_reason(trigger, win))
+        caller_sessions = set(identities or ()) | ({context["parent"]} if context.get("parent") else set())
+        open_count = sum(1 for h in handovers if not h.get("launched_at")
+                         and _session_matches_row(h, caller_sessions, paseo_agents_dir)[1])
+        return format_response(False, harness_kind,
+                               build_deny_reason(trigger, win, needed=native_needed, open_count=open_count))
     if pending_native_claims and claim_native_handovers_fn is not None:
         first_trigger = pending_native_claims[0][2]
         try:

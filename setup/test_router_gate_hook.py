@@ -958,7 +958,9 @@ process.stdout.write(JSON.stringify(out));
             "tool_input": 'await spawn_agent({message: "one", model: "gpt-6-astra"}); '
                           'await spawn_agent({message: "two", model: "gpt-6-astra"})',
         }
-        self.assertEqual(gate.evaluate_payload(two_spawns, ledger_path=ledger, now=T0)["decision"], "block")
+        refused_two = gate.evaluate_payload(two_spawns, ledger_path=ledger, now=T0)
+        self.assertEqual(refused_two["decision"], "block")
+        self.assertIn("本次调用启动 2 个子 agent，只有 1 个可用授权", refused_two["reason"])
         after_refused = registry.inspect(wrap_claim["dispatch_id"])
         self.assertEqual((after_refused["state"], after_refused.get("launched_at")), ("prepared", None))
         one_spawn = {
@@ -1279,9 +1281,17 @@ process.stdout.write(JSON.stringify(out));
 
         argon_claim = self.handover("antigravity", "gemini-4-argon-high", "high", bundle_id="argon_high",
                                     parent_id="s-a1", session_ids=["s-a1"], task_id="t-f4-agy", now=T0)
-        for bad_agy in (
+        for missing_model_name in (
+            {"conversationId": "s-a1",
+             "toolCall": {"id": "a-0", "name": "invoke_subagent", "args": {"TypeName": "self", "Model": "inherit"}}},
             {"conversationId": "s-a1", "modelName": "auto",
              "toolCall": {"id": "a-1", "name": "invoke_subagent", "args": {"TypeName": "self"}}},
+        ):
+            denied_missing = gate.evaluate_payload(missing_model_name, ledger_path=missing, now=T0)
+            self.assertEqual(denied_missing["decision"], "deny", missing_model_name)
+            self.assertIn("`modelName`", denied_missing["reason"])
+            self.assertNotIn("Model=\"inherit\"", denied_missing["reason"])
+        for bad_agy in (
             {"conversationId": "s-a1", "modelName": "gemini-3.8-flash-high",
              "toolCall": {"id": "a-2", "name": "invoke_subagent", "args": {"TypeName": "self"}}},
             {"conversationId": "s-a1",
@@ -1289,7 +1299,7 @@ process.stdout.write(JSON.stringify(out));
         ):
             denied_agy = gate.evaluate_payload(bad_agy, ledger_path=missing, now=T0)
             self.assertEqual(denied_agy["decision"], "deny", bad_agy)
-            self.assertIn("`Model`", denied_agy["reason"])
+            self.assertIn("Model=\"inherit\"", denied_agy["reason"])
         self.assertIsNone(registry.inspect(argon_claim["dispatch_id"]).get("launched_at"))
         self.assertEqual(
             gate.evaluate_payload(
@@ -1312,13 +1322,15 @@ process.stdout.write(JSON.stringify(out));
         self.assertIn("target.driverKind", denied_t3["reason"])
         self.assertIn("target.model", denied_t3["reason"])
 
-        # 5. N8: Each entry of an `invoke_subagent` `Subagents` list is one launch (its own `Model` checked, one
-        #    hand-over per entry, and zero claims committed when any entry fails or fewer hand-overs exist than entries).
+        # 5. N8 & N13: Each entry of an `invoke_subagent` `Subagents` list is one launch (its own `Model` checked, one
+        #    hand-over per entry, zero claims committed when any entry fails or fewer hand-overs exist than entries,
+        #    and N13's refusal names how many sub-agents the call launches vs how many open hand-overs this session holds).
         n8_single = self.handover("antigravity-resilient", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
                                   parent_id="s-n8", session_ids=["s-n8"], task_id="t-n8-1", now=T0)
         for label, subagents in (
             ("two pro entries", [{"TypeName": "research", "Model": "pro"}, {"TypeName": "research", "Model": "pro"}]),
             ("one mismatched concrete model", [{"TypeName": "research", "Model": "gemini-4-argon-high"}]),
+            ("two inherit entries on one handover", [{"TypeName": "research"}, {"TypeName": "research"}]),
             ("three inherit entries on one handover", [{"TypeName": "research"}, {"TypeName": "research"}, {"TypeName": "research"}]),
         ):
             with self.subTest(n8=label):
@@ -1329,6 +1341,9 @@ process.stdout.write(JSON.stringify(out));
                 )
                 self.assertEqual(res_n8["decision"], "deny", (label, res_n8))
                 self.assertEqual(registry.inspect(n8_single["dispatch_id"])["state"], "prepared", label)
+                if "inherit entries on one handover" in label:
+                    self.assertIn(f"本次调用启动 {len(subagents)} 个子 agent，只有 1 个可用授权", res_n8["reason"])
+                    self.assertNotIn("本会话没有尚未使用的", res_n8["reason"])
         # Adding a second matching hand-over lets a two-entry `Subagents` call pass, claiming both idempotently:
         n8_second = self.handover("antigravity-resilient", "gemini-3.8-flash-high", "high", bundle_id="flash_high",
                                   parent_id="s-n8", session_ids=["s-n8"], task_id="t-n8-2", now=T0)
