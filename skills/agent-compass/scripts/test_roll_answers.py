@@ -115,7 +115,7 @@ class HandBuilt(unittest.TestCase):
 
 
 class BlockedAnswers(Plain):
-    """Finding 1: `none`, `ask_user` and `defer` say the fact that decided them, first, and a way out that works for it."""
+    """Finding 1: `none` and `defer` say the fact that decided them, first, and a way out that works for it."""
 
     def test_none_held_by_quota_names_the_candidate_the_window_and_the_hours_before_the_cut(self):
         # Rule (allocator.plan, quota_pools.quota_wait): an account whose windows are exhausted returns when the last of the
@@ -145,22 +145,21 @@ class BlockedHandBuilt(HandBuilt):
         self.assertEqual(code, 2)
         self.assertIn('route.reason', res['next_action'])
 
-    def test_ask_user_for_a_wait_longer_than_allowed_names_the_wait_and_the_flag(self):
-        plan = {'action': 'start', 'needs_user_decision': True, 'wait_hours': 7.5,
-                'reason': 'Nothing eligible can start within 2h; the best, x, can start in 7.5h (claude-lab\'s five_hour window resets then).'}
-        decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision=plan)
-        (res, _), _ = HandBuilt.roll(self, decision, task='x')
-        self.assertIn('five_hour', res['next_action'])
-        self.assertIn('--can-wait-hours 7.5', res['next_action'])
-
-    def test_defer_names_the_window_that_sets_the_wait_and_the_ways_out(self):
-        plan = {'action': 'defer', 'start_after_hours': 2.5, 'wait_for': {'bundle': 'lab_sonnet55_high', 'account': 'claude-lab',
-                                                                           'window': 'five_hour', 'hours': 2.5}}
-        decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision=plan)
-        (res, code), _ = HandBuilt.roll(self, decision, task='x')
-        self.assertEqual(code, 2)
-        for fact in ("claude-lab's five_hour window", '2.5h', 'without --can-wait-hours', '--basis', 'yourself'):
-            self.assertIn(fact, res['next_action'])
+    def test_defer_names_the_window_that_sets_the_wait_and_only_the_ways_out_that_work(self):
+        """Rule (`roll.defer_next`): a deferral launches nothing and names the window and the wait; rolling again without
+        `--can-wait-hours` is offered only when the plan found a candidate that can start now (`decision.starts_now`)."""
+        waiting = {'action': 'defer', 'start_after_hours': 2.5, 'wait_for': {'bundle': 'lab_sonnet55_high', 'account': 'claude-lab',
+                                                                              'window': 'five_hour', 'hours': 2.5}}
+        for label, plan in (('something starts now', dict(waiting, starts_now='lab_other')), ('nothing starts now', waiting)):
+            with self.subTest(label):
+                decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision=plan)
+                (res, code), _ = HandBuilt.roll(self, decision, task='x')
+                self.assertEqual((code, res['status']), (2, 'blocked'))
+                for fact in ("claude-lab's five_hour window", '2.5h', '--basis', 'yourself'):
+                    self.assertIn(fact, res['next_action'])
+                self.assertEqual('without --can-wait-hours' in res['next_action'], 'starts_now' in plan)
+                self.assertEqual('lab_other' in res['next_action'], 'starts_now' in plan)
+                self.setUp()
 
 
 class FlagsAreNeverDropped(Plain):

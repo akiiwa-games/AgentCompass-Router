@@ -141,7 +141,6 @@ class HostPolicyTests(unittest.TestCase):
         owner = next(c for c in result['ranking'] if c['id'] == 'opus55_high')
         self.assertIn('excluded by host policy', owner['excluded'])
         self.assertNotEqual(result['choice'], 'opus55_high')
-        self.assertFalse(result['decision']['needs_user_decision'])
 
     def record(self, constraint='user_override', model='claude-opus-5-5', usage=None):
         """record_constraint for a route on `claude`, an account outside LS (out of automatic routing)."""

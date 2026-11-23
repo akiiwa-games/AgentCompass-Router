@@ -262,7 +262,7 @@ A ledger row with no saved snapshot and no split answer cannot be replayed: its 
 
 ### No eligible bundle
 
-When nothing clears the gate, `plan` returns `choice: none` with `decision.action: none`, `needs_user_decision: true` and a `reason`. If a bundle is held back only by its own account's quota windows (`quota_pools.quota_wait`), `decision.next_reset` gives that bundle, its account, the window that returns last and the hours until then (rounded up to a tenth, `allocator.advised_hours`), and the time. The plan's other waits, `decision.start_after_hours` of a deferral, `decision.wait_for.hours` and the `decision.wait_hours` of a user decision, are rounded up the same way. The parent can wait or decide otherwise.
+When nothing clears the gate, `plan` returns `choice: none` with `decision.action: none` and a `reason`. If a bundle is held back only by its own account's quota windows (`quota_pools.quota_wait`), `decision.next_reset` gives that bundle, its account, the window that returns last and the hours until then (rounded up to a tenth, `allocator.advised_hours`), and the time. The plan's other waits, `decision.start_after_hours` of a deferral and `decision.wait_for.hours`, are rounded up the same way. When the best eligible candidate must wait for a window to reset, the plan chooses it with `decision.action: defer` and `start_after_hours`, whether the caller allowed that wait (`can_wait_hours`) or nothing can start sooner (the `reason` then says so); `decision.starts_now` names the best candidate that can start at once, when there is one. The router never leaves the choice to the user: the parent waits and rolls again, or decides otherwise.
 
 ### Calibration data
 

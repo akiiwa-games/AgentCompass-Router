@@ -141,8 +141,7 @@ class AllocatorTests(unittest.TestCase):
         short = lambda result: [r for r in result['ranking'] if r['id'] == 'sol_xhigh'][0]['excluded']
         high = self.plan(task('high'), usage)
         self.assertTrue(short(high), 'a window that covers the step but not the whole chain excludes the owner of a high-coupling chain')
-        self.assertNotEqual(high['choice'], 'sol_xhigh', 'an excluded owner is not chosen')
-        self.assertFalse(high['decision']['needs_user_decision'], 'the ranking picks the next route; nothing is left to the user')
+        self.assertNotEqual(high['choice'], 'sol_xhigh', 'an excluded owner is not chosen: the ranking picks the next route')
         medium = self.plan(task('medium'), usage)
         self.assertEqual(short(medium), [], 'the same window covers the step of a medium-coupling chain')
         self.assertEqual((medium['choice'], medium['decision']['action']), ('sol_xhigh', 'resume'))
@@ -161,14 +160,12 @@ class AllocatorTests(unittest.TestCase):
         self.assertGreater(left, chain_pct + 10, 'the whole chain of the owner must fit the full window with room for the margin')
         roomy = self.usage(codex=[('usage', left, 100)])
         resumed = self.plan(chain_task, roomy)
-        self.assertEqual((resumed['choice'], resumed['decision']['action'], resumed['decision']['needs_user_decision']),
-                         ('sol_xhigh', 'resume', False))
+        self.assertEqual((resumed['choice'], resumed['decision']['action']), ('sol_xhigh', 'resume'))
         blocked_usage = self.usage(codex=[('usage', 1, 121)])
         for coupling in ('high', 'medium', 'low'):
             with self.subTest(coupling=coupling):
                 blocked = self.plan({'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 2,
                                      'chain': self.chain(coupling=coupling)}, blocked_usage)
-                self.assertFalse(blocked['decision']['needs_user_decision'])
                 self.assertNotEqual(blocked['selected_bundle']['account'], 'codex')
 
         # 2. Whole chain must fit for high coupling, only current step for medium coupling
@@ -176,7 +173,7 @@ class AllocatorTests(unittest.TestCase):
         task = {'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 1, 'chain': self.chain(total=20)}
         tight = self.plan(task, tight_usage)
         self.assertTrue(next(c for c in tight['ranking'] if c['id'] == 'sol_xhigh')['excluded'])
-        self.assertFalse(tight['decision']['needs_user_decision'])
+        self.assertNotEqual(tight['choice'], 'sol_xhigh')
 
         # 4. Carried context (>=2M historical tokens) rotates unconditionally and unlocks re-allocation; compactions alone (<2M) still resume
         base_task = {'work_kind': 'code_implementation', 'difficulty': 'coupled', 'expected_hours': 1}
@@ -307,10 +304,17 @@ class AllocatorTests(unittest.TestCase):
         self.assertEqual(deferred['decision']['action'], 'defer')
 
         long_wait = self.usage(claude=[('five_hour', 3, 4), ('seven_day', 60, 100), ('weekly_fable', 100, 100)], codex=[('usage', 1, 121)])
-        impatient = self.plan(dict(task, can_wait_hours=1), long_wait, unavailable=['flash_high'] + no_argon)
-        self.assertTrue(impatient['decision']['needs_user_decision'])
-        patient = self.plan(dict(task, can_wait_hours=5), long_wait, unavailable=['flash_high'] + no_argon)
-        self.assertEqual((patient['decision']['needs_user_decision'], patient['decision']['action']), (False, 'defer'))
+        # Rule (`allocator.plan`): a chosen candidate that must wait is a deferral whether or not the caller allowed the wait;
+        # one longer than allowed says so in the reason, and `starts_now` names a candidate only when one starts at once.
+        for can_wait, over_limit in ((1, True), (5, False)):
+            with self.subTest(can_wait=can_wait):
+                waiting = self.plan(dict(task, can_wait_hours=can_wait), long_wait, unavailable=['flash_high'] + no_argon)
+                decision = waiting['decision']
+                self.assertEqual(decision['action'], 'defer')
+                self.assertEqual(decision['start_after_hours'], decision['wait_for']['hours'])
+                self.assertEqual('Nothing eligible can start within' in decision['reason'], over_limit)
+                ready = [c['id'] for c in waiting['ranking'] if not c['excluded'] and not c['available_in_hours']]
+                self.assertEqual(decision.get('starts_now'), ready[0] if ready else None)
 
     def test_claude_2_backup_safety_floor_and_inflight_reservation(self):
         normal_claude2 = self.usage(
@@ -697,7 +701,7 @@ class AllocatorTests(unittest.TestCase):
         self.assertAlmostEqual(window['seconds_until_reset'] / 3600, deferred['decision']['start_after_hours'], delta=0.1)
         long_wait = self.usage(claude=[('five_hour', 3, 4), ('seven_day', 60, 100), ('weekly_fable', 100, 100)], codex=[('usage', 1, 121)])
         impatient = self.plan(dict(task, can_wait_hours=1), long_wait, unavailable=['flash_high'] + no_argon)
-        self.assertTrue(impatient['decision']['needs_user_decision'])
+        self.assertEqual(impatient['decision']['action'], 'defer')
         self.assertIn(impatient['decision']['wait_for']['window'], impatient['decision']['reason'])
         self.assertIn(impatient['decision']['wait_for']['account'], impatient['decision']['reason'])
 
@@ -735,18 +739,20 @@ class AllocatorTests(unittest.TestCase):
                 self.assertEqual(dict(windows)[waiting[1]], latest)
                 self.assertEqual(waits, dict(windows))
 
-    def test_the_wait_the_answer_advises_allowing_is_accepted_when_it_is_rolled_again(self):
-        """Rule (`allocator.advised_hours`, `plan` check `available_in_hours > can_wait`): rolling again with the
-        `--can-wait-hours` the answer advised does not end in the same answer, whatever the second decimal of the wait is."""
+    def test_the_wait_a_deferral_advises_covers_the_reset_and_is_within_the_limit_when_allowed(self):
+        """Rule (`allocator.advised_hours`, `plan` check `available_in_hours > can_wait`): the wait a deferral advises is
+        rounded up, so waiting that long finds the window reset, and allowing exactly that wait is no longer over the limit,
+        whatever the second decimal of the wait is."""
         for reset in (4.04, 4.06, 0.31, 2.0, 4.99, 0.05):
             with self.subTest(reset=reset):
                 first = self.waiting_fixture(reset, 100, can_wait=0.01, seven_left=60)['decision']
-                self.assertTrue(first['needs_user_decision'])
-                advised = first['wait_hours']
+                self.assertEqual(first['action'], 'defer')
+                advised = first['start_after_hours']
                 self.assertGreaterEqual(advised, reset)                  # waiting that long finds the window reset
-                again = self.waiting_fixture(reset, 100, can_wait=advised, seven_left=60)['decision']
-                self.assertFalse(again['needs_user_decision'])
                 self.assertIn(f'{advised}h', first['reason'])            # the text carries the advised value, not another rounding
+                self.assertIn('Nothing eligible can start within', first['reason'])
+                again = self.waiting_fixture(reset, 100, can_wait=advised, seven_left=60)['decision']
+                self.assertNotIn('Nothing eligible can start within', again['reason'])
 
     def test_quota_wait_is_the_last_window_to_return_and_none_for_any_other_exclusion(self):
         """Rule (`quota_pools.quota_wait`): a candidate excluded only by its account's quota windows returns when the last of
@@ -1101,8 +1107,7 @@ class RouterIntegrationTests(unittest.TestCase):
             task.write_text(self.dumps_task({'task': {'work_kind': 'visual_analysis', 'expected_hours': 0.5, 'needs': {'visual': True},
                                                  'constraints': {'model': 'grok-4.7'}}}), encoding='utf-8')
             code, blocked = self.run_main(['plan', '--input', str(task), '--usage-cache', cache])
-            self.assertEqual(code, 2)
-            self.assertIn('needs_user_decision', [a['code'] for a in blocked['alerts']])
+            self.assertEqual((code, blocked['choice']), (2, 'none'))
 
 
 class ToolOperationAndTaxonomyR2Tests(unittest.TestCase):

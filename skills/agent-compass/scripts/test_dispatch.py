@@ -2301,7 +2301,7 @@ class RollTests(unittest.TestCase):
 
     def test_routes_that_cannot_launch_here_do_not_launch(self):
         paseo = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision={'action': 'start'})
-        cases = (('user decision', dict(paseo, decision={'action': 'start', 'needs_user_decision': True}), 'parent-a', 2),
+        cases = (('deferred', dict(paseo, decision={'action': 'defer', 'start_after_hours': 1.5}), 'parent-a', 2),
                  ('no worker', dict(stage='plan', choice='none', selected_bundle={}, decision={}), 'parent-a', 2))
         for label, decision, parent, expected in cases:
             with self.subTest(label), patch.object(flow, 'host_call', side_effect=AssertionError('must not launch')):

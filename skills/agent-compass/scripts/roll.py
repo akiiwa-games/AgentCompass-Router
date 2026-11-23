@@ -538,27 +538,17 @@ def none_next(decision):
             'or ask the user.')
 
 
-def user_decision_next(decision):
-    """What a caller reads when the router leaves the choice to the user: the plan's own reason, and the ways out of a
-    wait longer than --can-wait-hours allows."""
-    plan = decision.get('decision') or {}
-    reason = plan.get('reason') or 'no reason was recorded'
-    wait = plan.get('wait_hours')
-    if wait is not None:
-        return (f'The router needs a user decision: {reason} Ask the user: wait {wait}h and roll again, allow a longer wait '
-                f'with --can-wait-hours {wait}, name a route (--provider --account --model --basis), or do the task yourself.')
-    return f'The router needs a user decision: {reason} Show this to the user.'
-
-
 def defer_next(decision, wait):
     plan = decision.get('decision') or {}
     bundle = decision.get('selected_bundle') or {}
     wait_for = plan.get('wait_for') or {}
     window = (f"{wait_for['account']}'s {wait_for['window']} window" if wait_for.get('account') and wait_for.get('window')
               else 'its quota window')
+    # A way out is offered only when it works: rolling without the wait helps when something can start now.
+    sooner = (f"roll again without --can-wait-hours ({plan['starts_now']} can start now), " if plan.get('starts_now') else '')
     return (f"Defer {bundle.get('bundle_id') or bundle.get('id') or decision.get('choice')} for {wait}h until {window} "
-            'resets; do not launch now. To launch sooner roll again without --can-wait-hours (the best model that can start '
-            'now), name a route with --provider --account --model --basis, or do the task yourself.')
+            f'resets; do not launch now. Roll again then. To launch sooner {sooner}name a route with --provider --account '
+            '--model --basis, or do the task yourself.')
 
 
 def paseo_choice(provider, parent_host, args):
@@ -1688,11 +1678,8 @@ def _run(args, judge):
     if decision.get('choice') in (None, 'none') or not bundle:
         return dict(out, launched=False, dispatch_mode='none', caller_action='execute_self_or_ask_user',
                     next=decision.get('next') or none_next(decision)), 2
-    if (decision.get('decision') or {}).get('needs_user_decision') and not (explicit_id and bundle):
-        return dict(out, launched=False, dispatch_mode='none', caller_action='ask_user',
-                    next=user_decision_next(decision)), 2
     if (decision.get('decision') or {}).get('action') == 'defer':
-        wait = (decision.get('decision') or {}).get('start_after_hours') or (decision.get('decision') or {}).get('wait_hours')
+        wait = (decision.get('decision') or {}).get('start_after_hours')
         return dict(out, launched=False, dispatch_mode='defer', caller_action='wait_for_reset',
                     start_after_hours=wait, next=defer_next(decision, wait)), 2
     if provider in host_placement.REMOTE_SURFACES:

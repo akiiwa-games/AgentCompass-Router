@@ -914,11 +914,10 @@ class FiveAxisTests(unittest.TestCase):
                        **{**base,
                           'claude-opus-5-5': row(demand(0.733, 0.8, 0.8, 0.800), usd=22.86),
                           'gpt-6.1-sol': row(demand(0.587, 0.787, 0.787, 0.732), usd=6.12)})
-        # Without can_wait_hours: resolves to the best immediately startable candidate (never defer, never needs_user_decision).
+        # Without can_wait_hours: resolves to the best immediately startable candidate when there is one (never a deferral).
         immediate = self.plan(self.accounts, doc, state='5h-only scarce',
                               profile={'work_kind': 'architecture_reasoning', 'axis_demand': demand(3, 3, 0, 0), 'access': 'read-only'})
         self.assertEqual(immediate['decision']['action'], 'start')
-        self.assertFalse(immediate['decision']['needs_user_decision'])
         self.assertEqual(immediate['selected_bundle']['account'], 'codex')
         self.assertIn(immediate['decision']['better_if_waiting']['bundle'], ('opus55_xhigh', 'opus55_max'))
         # With can_wait_hours: defers iff the waiting candidate has strictly higher unrounded N = F - C.

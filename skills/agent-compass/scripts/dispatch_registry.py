@@ -293,8 +293,7 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
            **({'listed_rows': listed_rows} if listed_rows else {}),
            **({'route': route} if route else {}),
            'effort_override': bool(explicit and resolved and resolved['id'].startswith('user_override_')),
-           'dispatchable': not (result.get('decision') or {}).get('needs_user_decision', False)
-                           and not result.get('host_policy_violation')
+           'dispatchable': not result.get('host_policy_violation')
                            and bool(resolved)
                            and (result.get('decision') or {}).get('action') != 'defer'}
     with transaction(path) as connection:

@@ -298,7 +298,6 @@ class UserPinTests(RouterCase):
         chain = {'id': 'c', 'coupling': 'high', 'worker': {'bundle': 'opus55_high', 'compacted_tokens': 0, 'compactions': 0}}
         plan = self.plan(self.task(chain=chain, constraints={'model': 'gpt-6-astra'}))
         self.assertEqual(plan['selected_bundle']['model'], 'gpt-6-astra')
-        self.assertFalse(plan['decision']['needs_user_decision'])
         kept = self.plan(self.task(chain=chain, constraints={'model': 'claude-opus-5-5', 'effort': 'high'}))
         self.assertEqual(kept['choice'], 'opus55_high')
 

@@ -110,7 +110,7 @@ def from_ledger(path: Path, skipped: list[int] | None = None):
                          "duration_ms": r.get("duration_ms"),
                          "chain": r.get("chain"), "action": r.get("action"), "margin": r.get("margin"),
                          "hours": r.get("hours"), "agrees": r.get("agrees"), "router_choice": r.get("router_choice"),
-                         "needs_user_decision": r.get("needs_user_decision"), "reason_category": r.get("reason_category"),
+                         "reason_category": r.get("reason_category"),
                          "objective": r.get("objective") or "", "task_count": r.get("task_count"),
                          "keep_whole": r.get("keep_whole")})
     if isinstance(skipped, list):
@@ -502,10 +502,10 @@ def build_findings(ctx: dict) -> list[dict]:
         by_account = collections.defaultdict(float)
         for r in planned:
             by_account[(r.get("bundle") or {}).get("account") or "?"] += float(r.get("hours") or 0)
-        waits = sum(1 for r in planned if r.get("needs_user_decision"))
+        waits = sum(1 for r in planned if r.get("action") == "defer")
         add("info", "balance", "plan 派发的预计工时按账户分布",
             "; ".join(f"{a} {h:.1f}h" for a, h in sorted(by_account.items(), key=lambda kv: -kv[1]))
-            + f"。其中 {waits} 次需要用户决定(owner 无法继续,或要等的时间超过 can_wait)。",
+            + f"。其中 {waits} 次没有启动,要等额度窗口重置后再 roll(action=defer)。",
             "对照各账户的额度窗口(plan 结果 `decision.system.quota_windows`):长期偏向某个本会短缺的账户,说明该窗口的容量或消耗估计需要核对(见 capacity 相关发现)。")
     fixed = sum(v for k, v in kinds.items() if k not in ("open", "planned"))
     if decisions and fixed / len(decisions) >= FIXED_SHARE:

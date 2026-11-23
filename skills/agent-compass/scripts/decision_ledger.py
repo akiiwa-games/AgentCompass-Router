@@ -262,9 +262,6 @@ def finalize(result, started, task=None, records=None, now=None):
         cadence = account_cadence_alert(records, now, bundle['account'], spec)
         alerts += [cadence] if cadence else []
     decision = result.get('decision') or {}
-    if decision.get('needs_user_decision'):
-        alerts.append({'code': 'needs_user_decision', 'severity': 'warn', 'account': bundle.get('account'),
-                       'message': (decision.get('reason') or 'The allocator cannot choose without a user decision.')[:300]})
     result['alerts'] = alerts
     task = task if isinstance(task, dict) else {}
     allocation_task = result.pop('_allocation_task', task)
@@ -315,7 +312,6 @@ def finalize(result, started, task=None, records=None, now=None):
         'local_only': bool(needs_row.get('local_only')) or None,
         **({'local_only_reason': str(needs_row.get('local_only_reason'))[:200]} if needs_row.get('local_only_reason') else {}),
         **({'unavailable': list(unavailable_row)} if unavailable_row else {}),
-        'needs_user_decision': decision.get('needs_user_decision') or None,
         'router_choice': result.get('router_choice'), 'agrees': result.get('agrees'),
         **({'classifier_skipped': result['classifier_skipped']} if 'classifier_skipped' in result else {}),
         **({'data_errors': list(result['data_errors'])} if result.get('data_errors') else {}),

@@ -660,7 +660,7 @@ def scorer_unavailable_result(task, scorer, started):
         'stage': 'plan', 'status': 'blocked', 'choice': 'none', 'error': 'scorer_unavailable',
         'caller_action': 'parent_autonomous_choice',
         'scorer': scorer, 'task_profile': None, 'reason': reason,
-        'decision': {'action': 'parent_choice', 'reason': reason, 'needs_user_decision': False},
+        'decision': {'action': 'parent_choice', 'reason': reason},
         'next': SCORER_UNAVAILABLE_NEXT,
     }
     decision_ledger.append_ledger({
@@ -856,7 +856,7 @@ def plan_stage(document, args):
     if fatal_gap and not isinstance(task.get('profile'), dict):
         # No account can launch anything, so there is nothing to classify for: report that, with the way to set up.
         planned = {'stage': 'plan', 'choice': 'none', 'ranking': [], 'usage': usage, '_unavailable': unavailable,
-                   'decision': {'action': 'none', 'needs_user_decision': True}}
+                   'decision': {'action': 'none'}}
         apply_readiness_gap(planned, loaded_accounts, usage)
         return decision_ledger.finalize(planned, started, reviewed_task), 2
     if should_score:

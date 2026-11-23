@@ -163,7 +163,7 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
             key=lambda c: (len(c['excluded']), -(c['components']['fit'] if c['components'].get('fit') is not None else float('-inf'))),
         )[:2]
         named_block = named_pin_block(task, candidates)
-        decision.update({'action': 'none', 'needs_user_decision': True,
+        decision.update({'action': 'none',
                          'reason': 'No eligible bundle. Closest: ' + ' | '.join(
                              f"{c['id']}: {'; '.join(candidate_eval.said_exclusions(c))}" for c in closest)})
         kinds = [candidate_eval.local_settings(c) for c in closest]
@@ -204,20 +204,19 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
         decision['better_if_waiting'] = {'bundle': better['id'], 'hours': round(better['available_in_hours'], 1),
                                          'score_gain': round(better['score'] - top['score'], 4)}
     forced = pinned_cand is not None
-    decision.update({'action': top['action'], 'needs_user_decision': False,
+    decision.update({'action': top['action'],
                      'continuity': (f"{task['coupling']}-coupling chain stays with its owner"
                                     if (top is resume and top['action'] == 'resume' and not forced) else None)})
     if top['available_in_hours']:
         decision['wait_for'] = {'bundle': top['id'], 'account': top['bundle']['account'], 'window': top.get('waiting_on'),
                                 'hours': advised_hours(top['available_in_hours'])}
     if (top['available_in_hours'] or 0) > can_wait:
-        # can_wait_hours is a limit, not a preference: say so instead of quietly starting later than allowed
+        # can_wait_hours is a limit: the plan defers and says the wait is longer than allowed, it never starts later quietly
         after = f" ({top['bundle']['account']}'s {top['waiting_on']} window resets then)" if top.get('waiting_on') else ''
-        decision.update({'needs_user_decision': True, 'wait_hours': advised_hours(top['available_in_hours']),
-                         'reason': (f"The chain owner {top['id']} can resume in {advised_hours(top['available_in_hours'])}h{after}"
-                                    if top is resume and top['action'] == 'resume'
-                                    else f"Nothing eligible can start within {can_wait:g}h; the best, {top['id']}, can start in {advised_hours(top['available_in_hours'])}h{after}")
-                         + '. Wait, allow a longer wait, or mark it unavailable and replan.'})
+        within = f'within {can_wait:g}h' if can_wait else 'now'
+        decision['reason'] = (f"The chain owner {top['id']} can resume in {advised_hours(top['available_in_hours'])}h{after}."
+                              if top is resume and top['action'] == 'resume'
+                              else f"Nothing eligible can start {within}; the best, {top['id']}, can start in {advised_hours(top['available_in_hours'])}h{after}.")
     # The margin is to the best other model, not to another effort, harness or account of the same model.
     rival = next((c for c in pool if c is not top
                   and account_fleet.row_key(c['bundle']['model'], accounts) != account_fleet.row_key(top['bundle']['model'], accounts)), None)
@@ -244,6 +243,10 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
     result['decision']['alternatives'] = list(dict.fromkeys(c['id'] for c in pool if c['id'] != top['id']))[:3]
     if top['available_in_hours']:
         decision.update({'action': 'defer', 'start_after_hours': advised_hours(top['available_in_hours'])})
+        # What a caller that will not wait can have instead: the best candidate that starts now, when there is one.
+        ready_now = next((c for c in eligible if not c['available_in_hours']), None)
+        if ready_now is not None:
+            decision['starts_now'] = ready_now['id']
     if task.get('wants_fast') and not top['bundle'].get('fast'):
         decision['fast_not_applied'] = (top.get('fast_not_offered')
                                         or 'fast mode was priced as a candidate of its own and the plain mode ranked higher')
