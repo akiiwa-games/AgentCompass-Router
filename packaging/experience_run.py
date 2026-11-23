@@ -394,14 +394,15 @@ class Scenario:
         return self.command(op, argv, stdin=stdin, timeout=timeout, **env)
 
     def command(self, op, argv, stdin=None, timeout=COMMAND_TIMEOUT_SECONDS, **env):
-        """Run one command of the session; one that does not answer within `timeout` is ended with its children and comes
-        back as a `TimedOut` result instead of an exception (COMMAND_TIMEOUT_SECONDS)."""
+        """Run one command of the session; one that does not answer within `timeout` is ended with every process it started
+        (run_owned) and comes back as a `TimedOut` result instead of an exception (COMMAND_TIMEOUT_SECONDS)."""
+        environment = self.box.env(**self.env(**env))
         try:
-            return self.box.run_command(op, argv, cwd=self.work, stdin=stdin, timeout=timeout, **self.env(**env))
-        except subprocess.TimeoutExpired:
-            marker = command_marker(argv)
-            ended = self.end_processes(marker) if marker else []
-            return TimedOut(timeout, ended)
+            result = run_owned(argv, cwd=self.work, env=environment, stdin=stdin, timeout=timeout)
+        except CommandTimedOut as stopped:
+            return TimedOut(timeout, stopped.ended)
+        op.log(argv, ", ".join(f"{k}={environment[k]}" for k in ("HOME", "ROUTER_STATE_DIR") if k in environment), result)
+        return result
 
     # ---- accounts
     def sign_in(self, states: dict):
@@ -518,10 +519,10 @@ class Scenario:
         return next((a for a in self.accounts if a.name == name), None)
 
     # ---- processes
-    def end_processes(self, marker: str | None = None) -> list[str]:
-        """End every process whose command line names this scenario's sandbox (workers, watchers), or only those whose
-        command line also holds `marker`; returns what was found."""
-        found = sc.sandbox_processes(self.box.root) if marker is None else processes_with(self.box.root, marker)
+    def end_processes(self) -> list[str]:
+        """End every process whose command line names this scenario's sandbox (workers, watchers) at the scenario's end;
+        returns what was found."""
+        found = sc.sandbox_processes(self.box.root)
         for entry in found:
             subprocess.run(["taskkill", "/F", "/T", "/PID", entry.split(":")[0]], capture_output=True)
         return found
@@ -535,30 +536,124 @@ class TimedOut:
         self.stderr = f"the command did not answer within {seconds} s; ended: {', '.join(ended) or 'nothing left'}"
 
 
-def command_marker(argv) -> str | None:
-    """A piece of a command's own arguments no other command of the run carries: a brief's `[experience day ...]` line, or
-    a brief file's name."""
-    for value in map(str, argv):
-        found = re.search(r"\[experience day [^\]]+\]", value)
-        if found:
-            return found.group(0)
-        if value.endswith(".md"):
-            return Path(value).name
-    return None
+class CommandTimedOut(Exception):
+    """`run_owned`: the command did not answer within its limit; `ended` names the processes its tree ended with."""
+
+    def __init__(self, ended: list[str]):
+        super().__init__("timed out")
+        self.ended = ended
 
 
-def processes_with(base: Path, marker: str) -> list[str]:
-    """`pid:name` of the processes whose command line names the sandbox and holds `marker` (Windows; empty elsewhere)."""
-    if os.name != "nt":
-        return []
-    root, mark = (str(v).replace("'", "''").replace("[", "`[").replace("]", "`]") for v in (base, marker))
-    command = (f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{root}*' -and $_.CommandLine -like '*{mark}*' "
-               f"-and $_.ProcessId -ne {os.getpid()} -and $_.ProcessId -ne $PID }} | ForEach-Object {{ \"$($_.ProcessId):$($_.Name)\" }}")
+class Job:
+    """A Windows job object that holds one command and every process it starts, so a command that hangs ends with its
+    whole tree by the handle this run holds, never by a search of command lines. A process the product starts detached
+    (CREATE_BREAKAWAY_FROM_JOB: a watcher) leaves the job as it would on any machine (JOB_OBJECT_LIMIT_BREAKAWAY_OK): it is
+    the scenario's, and the scenario's end ends it (Scenario.end_processes)."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes, self.wintypes = ctypes, wintypes
+        kernel = self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.handle = kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+        limits = Extended()
+        limits.BasicLimitInformation.LimitFlags = 0x800   # JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            self.close()
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def add(self, pid: int):
+        process = self.kernel.OpenProcess(0x0100 | 0x0001, False, pid)   # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        if not process:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        try:
+            if not self.kernel.AssignProcessToJobObject(self.handle, process):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+        finally:
+            self.kernel.CloseHandle(process)
+
+    def pids(self) -> list[int]:
+        ctypes, wintypes = self.ctypes, self.wintypes
+
+        class Listing(ctypes.Structure):
+            _fields_ = [("Assigned", wintypes.DWORD), ("Listed", wintypes.DWORD), ("Ids", ctypes.c_size_t * 1024)]
+        listing = Listing()
+        if not self.kernel.QueryInformationJobObject(self.handle, 3, ctypes.byref(listing), ctypes.sizeof(listing), None):
+            return []
+        return [int(listing.Ids[i]) for i in range(listing.Listed)]
+
+    def end(self) -> list[str]:
+        ended = [str(pid) for pid in self.pids()]
+        self.kernel.TerminateJobObject(self.handle, 1)
+        return ended
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+def run_owned(argv, *, cwd, env: dict, stdin: str | None, timeout: float) -> subprocess.CompletedProcess:
+    """Run one command and capture its output; past `timeout`, end the command and every process it started that is still
+    in its tree (a Windows job object, a POSIX session), by the handles this run holds, and raise CommandTimedOut."""
+    job = Job() if os.name == "nt" else None
     try:
-        done = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return done.stdout.split()
+        process = subprocess.Popen([str(a) for a in argv], cwd=str(cwd), env=env, text=True, encoding="utf-8", errors="replace",
+                                   stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=os.name != "nt")
+        if job:
+            try:
+                job.add(process.pid)
+            except OSError:
+                process.kill()
+                process.communicate()
+                raise
+        try:
+            out, err = process.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if job:
+                ended = job.end()
+            else:
+                ended = [str(process.pid)]
+                try:
+                    os.killpg(process.pid, 9)
+                except OSError:
+                    pass
+            process.kill()
+            try:
+                process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:   # a process that broke away still holds the pipes: stop reading them
+                for stream in (process.stdout, process.stderr):
+                    if stream:
+                        stream.close()
+                process.wait()
+            raise CommandTimedOut(ended) from None
+        return subprocess.CompletedProcess(argv, process.returncode, out, err)
+    finally:
+        if job:
+            job.close()
 
 
 def find_key(document, key):

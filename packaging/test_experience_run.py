@@ -95,3 +95,37 @@ def test_a_run_directory_beside_the_repository_is_outside_it(tmp_path):
     assert xp.inside(root / "inner", root)
     assert not xp.inside(tmp_path / "repo-runs", root)
     assert not xp.inside(Path(str(root) + "-sibling"), root)
+
+
+TREE = textwrap.dedent('''
+    import subprocess, sys, time
+    from pathlib import Path
+    grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    Path(sys.argv[1]).write_text(str(grandchild.pid))
+    time.sleep(120)
+''')
+
+
+def test_a_command_past_its_limit_ends_with_every_process_it_started(tmp_path):
+    """A hung command's grandchild carries nothing that names it; it ends with the command, by the handle the run holds."""
+    import os
+    import psutil
+    noted = tmp_path / "grandchild.pid"
+    try:
+        xp.run_owned([sys.executable, "-c", TREE, str(noted)], cwd=tmp_path, env=dict(os.environ), stdin=None, timeout=5)
+    except xp.CommandTimedOut as stopped:
+        ended = stopped.ended
+    else:
+        raise AssertionError("the command answered")
+    grandchild = int(noted.read_text())
+    assert psutil.wait_procs([p for p in (psutil.Process(grandchild),) if p.is_running()] if psutil.pid_exists(grandchild) else [],
+                             timeout=10)[1] == []
+    if os.name == "nt":
+        assert str(grandchild) in ended and len(ended) == 2
+
+
+def test_a_command_inside_its_limit_answers_as_before(tmp_path):
+    import os
+    done = xp.run_owned([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], cwd=tmp_path, env=dict(os.environ),
+                        stdin="answer", timeout=60)
+    assert (done.returncode, done.stdout.strip()) == (0, "ANSWER")
