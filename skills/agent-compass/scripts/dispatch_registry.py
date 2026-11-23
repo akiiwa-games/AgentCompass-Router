@@ -2603,13 +2603,17 @@ def _supersede_native_handovers(connection, parent_id, task_id, now):
 
 
 def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None, access='write',
-                      workspace=None, cwd=None, native_handover=False, new_worker=False, now=None, path=None):
+                      workspace=None, cwd=None, native_handover=False, native_tool=None, launch_fields=None,
+                      hook_model=None, new_worker=False, now=None, path=None):
     """Record a non-Paseo host dispatch (`orca`, `t3`, `native`, `herdr`, `cli`) in `dispatches` under the same
     canonical-directory writer rule and SQLite BEGIN IMMEDIATE transaction as Paseo. The claim is `prepared`: it holds the
     workspace before the worker starts, and carries a launch time only once host_claim_launched (or claim_native_handovers
     when `native_handover` is True) says it started."""
     parent_id = task.get('parent_agent_id')
     require_parent_id(parent_id)
+    if native_handover and (not isinstance(native_tool, str) or not native_tool.strip()
+                            or not isinstance(launch_fields, dict) or not launch_fields):
+        raise ValueError('A native hand-over requires native_tool and non-empty launch_fields.')
     now = now or utcnow()
     canon_ws = canonical_dir(workspace)
     landing = canon_ws or cwd
@@ -2651,7 +2655,9 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
             'operation': 'create',
             'agent_id': None,
             'access': access,
-            **({'native_handover': True} if native_handover else {}),
+            **({'native_handover': True, 'native_tool': native_tool.strip(),
+                'launch_fields': deepcopy(launch_fields)} if native_handover else {}),
+            **({'hook_model': hook_model} if native_handover and hook_model else {}),
             **({'constraint': decision['constraint']} if decision.get('constraint') else {}),
             **({'host_session_id': task['host_session_id']} if task.get('host_session_id') else {}),
             **({'session_ids': sids} if sids else {}),
@@ -2665,8 +2671,10 @@ def record_host_claim(surface, decision, task, bundle, *, label=None, usage=None
         return row
 
 
-def hand_over_native(dispatch_id, *, new_worker=False, now=None, path=None):
+def hand_over_native(dispatch_id, *, native_tool, launch_fields, hook_model=None, new_worker=False, now=None, path=None):
     """Record a one-use `native` hand-over from an unlaunched CLI host claim when `roll.cli` hands launch to the caller."""
+    if not isinstance(native_tool, str) or not native_tool.strip() or not isinstance(launch_fields, dict) or not launch_fields:
+        raise ValueError('A native hand-over requires native_tool and non-empty launch_fields.')
     now = now or utcnow()
     with transaction(path) as connection:
         source = get(connection, 'dispatches', dispatch_id)
@@ -2682,6 +2690,9 @@ def hand_over_native(dispatch_id, *, new_worker=False, now=None, path=None):
             'decision_id': f'native:{base_dec}:{uuid.uuid4().hex[:8]}',
             'dispatch_mode': 'native',
             'native_handover': True,
+            'native_tool': native_tool.strip(),
+            'launch_fields': deepcopy(launch_fields),
+            **({'hook_model': hook_model} if hook_model else {}),
             'parent_id': source.get('parent_id'),
             'task_id': source.get('task_id'),
             'request': deepcopy(source.get('request') or {}),

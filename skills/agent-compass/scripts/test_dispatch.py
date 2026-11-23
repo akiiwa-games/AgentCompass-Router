@@ -2188,7 +2188,7 @@ class RollTests(unittest.TestCase):
                     self.assertEqual(request['settings'], {'thinkingOptionId': 'high'})
                 else:
                     (result, code), _ = self.roll(decision, task_id='second-task')  # the same task would return the first dispatch
-                    self.assertEqual((result['launched'], result['dispatch_mode'], calls), (False, 'native', []))
+                    self.assertEqual((result['launched'], result['dispatch_mode'], code, calls), (False, 'none', 2, []))
 
     FAKE_GROK = (
         "import json, os, sys\n"
@@ -2207,7 +2207,7 @@ class RollTests(unittest.TestCase):
         decision = dict(stage='plan', choice='grok47_high', selected_bundle=bundle, decision={'action': 'start'})
         inventory = {'accounts': {}, 'launchers': {'grok': {'family': 'grok', 'status': 'ready'}}}
         host = {'PASEO_HOME': str(self.root / '.paseo'), 'CLAUDECODE': '1', 'CODEX_HOME': 'C:/host/.codex-work',
-                'FAKE_GROK_RECORD': str(self.root / 'grok-record.json')}
+                'FAKE_GROK_RECORD': str(self.root / 'grok-record.json'), **(flags.pop('env', None) or {})}
         with patch.object(provider_inventory, 'current', return_value=inventory), \
                 patch.object(roll_module, 'CLI_RUNS_DIR', self.root / 'runs'), \
                 patch.object(flow, 'host_call', side_effect=AssertionError('no Paseo')), \
@@ -2248,7 +2248,7 @@ class RollTests(unittest.TestCase):
         # The worker still holds its output file until it exits; tearing the temp root down first raced it (WinError 32).
         self.assertTrue(wait_for_exit(result['worker']['pid'], 10.0), result['worker']['pid'])
 
-    def test_grok_launch_failure_reports_native_handoff_without_a_second_start(self):
+    def test_grok_launch_failure_blocks_when_inexpressible_and_hands_over_inside_orca_without_a_second_start(self):
         import roll as roll_module
         starts = []
 
@@ -2261,10 +2261,19 @@ class RollTests(unittest.TestCase):
         for label, command in (('no installed CLI', not_installed), ('executable vanished', lambda *_: ['grok-missing'])):
             with self.subTest(label), patch.object(roll_module.subprocess, 'Popen', missing):
                 result, code = self.grok_roll(command)
-            self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'native', 1))
-            self.assertIn('worker_prompt_file', result['next'])
+            self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'none', 2))
+            self.assertEqual(result['error'], 'cli_launch_failed')
         self.assertEqual(starts, [['grok-missing', '--always-approve', '-m', 'grok-4.7', '--reasoning-effort', 'high',
                                    '--cwd', str(Path.cwd()), '--prompt-file', starts[0][-1]]])
+        # Inside Orca (whose worker-start expresses grok), CLI fallback records a real one-use native hand-over:
+        with patch.object(roll_module.subprocess, 'Popen', missing):
+            orca_res, orca_code = self.grok_roll(
+                not_installed, task_id='grok-orca', env={'CLAUDECODE': '', 'ORCA_AGENT_SESSION_ID': 'orca-grok'},
+            )
+        self.assertEqual((orca_res['launched'], orca_res['dispatch_mode'], orca_code), (False, 'native', 0))
+        self.assertEqual(orca_res['native_tool'], 'shell:orca worker launch')
+        self.assertEqual(orca_res['launch_fields'], {'--agent': 'grok', '--model': 'grok-4.7', '--effort': 'high'})
+        self.assertEqual(len(registry.native_handovers()), 1)
 
     def test_grok_cli_command_uses_the_providers_configured_executable_then_discovery(self):
         import roll as roll_module
@@ -2329,27 +2338,41 @@ class RollTests(unittest.TestCase):
 
     def test_roll_inside_orca_and_t3_hands_back_the_host_command_without_paseo(self):
         decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision={'action': 'start'})
-        cases = (({'ORCA_AGENT_SESSION_ID': 'orca-sess', 'ORCA_TERMINAL_HANDLE': 'term_1'}, {}, 'orca', 'orca_session_id:orca-sess', 'worker-start'),
-                 ({'CODEX_THREAD_ID': 'thread-7'}, {'parent_host': 't3'}, 't3', 'thread-7', 'delegate_task'))
-        for env, flags, host, address, command in cases:
+        cases = (
+            ({'ORCA_AGENT_SESSION_ID': 'orca-sess', 'ORCA_TERMINAL_HANDLE': 'term_1'}, {}, 'orca',
+             'orca_session_id:orca-sess', 'worker-start',
+             {'--agent': 'claude', '--model': 'claude-sonnet-5-5', '--effort': 'high'}),
+            ({'CODEX_THREAD_ID': 'thread-7'}, {'parent_host': 't3'}, 't3', 'thread-7', 'delegate_task',
+             {'target': {'driverKind': 'claudeAgent', 'model': 'claude-sonnet-5-5', 'options': {'effort': 'high'}}}),
+        )
+        for env, flags, host, address, command, expected_fields in cases:
             with self.subTest(host=host), patch.object(flow, 'host_call', side_effect=AssertionError('must not use Paseo')):
                 (result, code), _ = self.roll(decision, parent='', env=env, reachable=True, **flags)
             self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'native', 0))
+            self.assertEqual(result['launch_fields'], expected_fields)
             self.assertEqual((result['parent_host'], result['parent_address']), (host, address))
             self.assertIn(command, result['next'])
             self.assertIn(f'Parent host: `{host}`. Parent message address: `{address}`.', self.assert_worker_prompt(result))
 
     def test_explicit_parent_and_native_address_survive_native_handoff(self):
         decision = dict(stage='plan', choice='lab_sonnet55_high', selected_bundle=self.bundle, decision={'action': 'start'})
-        with patch.object(flow, 'host_call', side_effect=AssertionError('must not switch to Paseo')):
-            (result, code), seen = self.roll(decision, parent='', parent_host='native',
-                parent_id='coordinator-session', parent_address='run:coordinator-run', reachable=True)
-        self.assertEqual((result['launched'], code), (False, 0))
+        lab_home = self.root / '.claude-lab'
+        disc_accounts = json.loads(json.dumps(self.accounts))
+        disc_accounts['_discovery'] = {'accounts': {'claude-lab': {'family': 'claude', 'status': 'ready', 'home': str(lab_home)}}}
+        with patch.object(flow, 'host_call', side_effect=AssertionError('must not switch to Paseo')), \
+                patch.object(account_fleet, 'load_accounts', return_value=disc_accounts):
+            (result, code), seen = self.roll(
+                decision, parent='', parent_host='native',
+                parent_id='coordinator-session', parent_address='run:coordinator-run', reachable=True,
+                env={'CLAUDE_SESSION_ID': 'coordinator-session', 'CLAUDE_CONFIG_DIR': str(lab_home)},
+            )
+        self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'native', 0))
+        self.assertEqual((result['native_tool'], result['launch_fields']), ('Agent', {'model': 'sonnet', 'effort': 'high'}))
         prompt = self.assert_worker_prompt(result, parent='coordinator-session')
         self.assertIn('run:coordinator-run', prompt)
         self.assertIn('request_user_input_async', prompt)
         self.assertEqual(seen['task']['parent_agent_id'], 'coordinator-session')
-        self.assertIn('--spec', result['next'])
+        self.assertIn('launch_fields', result['next'])
         with self.assertRaisesRegex(ValueError, '--parent-address'):
             self.roll(decision, parent='', parent_host='native', parent_id='coordinator-session')
         with self.assertRaisesRegex(ValueError, '--parent-id another-session differs from PASEO_AGENT_ID'):
@@ -2414,9 +2437,9 @@ class RollTests(unittest.TestCase):
                         decision={'action': 'start'})
         with patch.object(roll.subprocess, 'Popen', side_effect=AssertionError('must not launch')):
             (result, code), _ = self.roll(decision, parent='', parent_id='parent-a', parent_host='paseo', env={'PASEO_HOME': str(self.root / 'none')})
-        self.assertEqual((result['launched'], code), (False, 0))
+        self.assertEqual((result['launched'], result['dispatch_mode'], code), (False, 'none', 2))
+        self.assertEqual(result['error'], 'no_launcher_available')
         self.assertIn('no CLI', result['next'])
-        self.assertIn('worker_prompt_file', result['next'])
         self.assert_worker_prompt(result, parent='parent-a')
 
     def test_auto_environment_dispatch_and_litellm_proxy_cli_launch(self):

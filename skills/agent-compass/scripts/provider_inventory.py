@@ -1889,7 +1889,11 @@ ACCOUNT_DIR_VARIABLES = (('CLAUDE_CONFIG_DIR', '.claude'), ('CLAUDE_SECURESTORAG
 
 # The harnesses whose native sub-agents run inside the calling session, on its own account, with the variable that
 # names that account's directory and its default under the home.
-SESSION_ACCOUNT_DIRS = {'claude': ('CLAUDE_CONFIG_DIR', '.claude'), 'codex': ('CODEX_HOME', '.codex')}
+SESSION_ACCOUNT_DIRS = {
+    'claude': ('CLAUDE_CONFIG_DIR', '.claude'),
+    'codex': ('CODEX_HOME', '.codex'),
+    'antigravity': ('GEMINI_CLI_HOME', '.gemini'),
+}
 
 
 def session_account(family, inventory, environ=None, home=None):

@@ -778,11 +778,17 @@ def grok_bot(args, out, prompt_file, task, bundle, *, decision=None):
 def settle_claim(claim_row, res, refusal, *, new_worker=False):
     """A host claim after its start: stamped launched when the worker started, or may have (Herdr's uncertain send,
     `launched` None); canceled with `refusal` when nothing started (`launched` False), recording a separate one-use
-    `native` hand-over when `roll.cli` hands launch to the caller (`launch_with_native_host_tool`)."""
+    `native` hand-over when `roll.cli` hands an expressible launch to the caller (`launch_with_native_host_tool`)."""
     if res.get('launched') is False:
         registry.settle_host_claim(claim_row['dispatch_id'], 'canceled', refusal)
         if res.get('caller_action') == 'launch_with_native_host_tool':
-            registry.hand_over_native(claim_row['dispatch_id'], new_worker=new_worker)
+            registry.hand_over_native(
+                claim_row['dispatch_id'],
+                native_tool=res['native_tool'],
+                launch_fields=res['launch_fields'],
+                hook_model=res.get('hook_model'),
+                new_worker=new_worker,
+            )
     else:
         registry.host_claim_launched(claim_row['dispatch_id'])
 
@@ -1265,17 +1271,49 @@ def cli_command(family, provider):
     return subscription_cli.cli_prefix(CLI_RUNS[family][0])
 
 
-def cli(args, out, bundle, text):
+def _cli_native_or_blocked(out, bundle, workspace, cause_code, failure_prefix, *, native_spec=None, why_not_native=''):
+    """When `cli()` cannot start a process: hand over as `native` ONLY when the caller's declared host tool can express
+    `bundle` (and the caller (`_run`) will record the hand-over); otherwise return `blocked` (exit 2), never `native`."""
+    if native_spec is not None:
+        nxt = host_placement.native_next(
+            native_spec['host'], bundle, out.get('parent_address'), workspace=workspace, native_spec=native_spec,
+        )
+        return dict(
+            out,
+            launched=False,
+            dispatch_mode='native',
+            caller_action='launch_with_native_host_tool',
+            native_tool=native_spec['tool'],
+            launch_fields=native_spec['launch_fields'],
+            **({'hook_model': native_spec['hook_model']} if native_spec.get('hook_model') else {}),
+            warnings=[*out.get('warnings', []), f'{failure_prefix}; handed over to {native_spec["tool"]}.'],
+            next=nxt,
+        ), 0
+    detail = f' ({why_not_native})' if why_not_native else ''
+    return dict(
+        out,
+        launched=False,
+        dispatch_mode='none',
+        caller_action='start_daemon_or_install_cli',
+        error=cause_code,
+        next=(f'Nothing was launched: {failure_prefix}, and this session cannot launch the route natively{detail}. '
+              'Start the Paseo daemon (`paseo ls`) or install the provider CLI on PATH and roll again, '
+              'or do the task yourself or ask the user.'),
+    ), 2
+
+
+def cli(args, out, bundle, text, *, native_spec=None, why_not_native=''):
     """No Paseo here: run the routed bundle through its own CLI, on the account its provider definition selects."""
     workspace = host_placement.canonical_dir(getattr(args, 'workspace', None))
     placed = host_placement.place('cli', workspace, default_cwd=host_placement.parent_cwd())
     cwd = placed['cwd']
     family, provider_env = provider_definition(bundle['provider'], bundle=bundle)
-    ws_note = f' in directory `{workspace}`' if workspace else ''
-    native = f'; start it natively{ws_note} with exactly route.bundle and the contents of worker_prompt_file as its prompt.'
     if family not in CLI_RUNS:
-        return dict(out, launched=False, dispatch_mode='native', caller_action='launch_with_native_host_tool',
-                    next=f'No Paseo daemon and no CLI here for {bundle["provider"]!r}' + native), 0
+        return _cli_native_or_blocked(
+            out, bundle, workspace, 'no_launcher_available',
+            f'no Paseo daemon and no CLI runner here for {bundle["provider"]!r}',
+            native_spec=native_spec, why_not_native=why_not_native,
+        )
     # A value that cannot be one argument refuses this launch here, before anything is written for it.
     model = launch_values.argument('model', bundle.get('launch_model') or bundle['model'])
     effort = bundle.get('effort') and launch_values.argument('effort', bundle['effort'])
@@ -1308,8 +1346,11 @@ def cli(args, out, bundle, text):
                                        stdin=subprocess.DEVNULL if prompt_argument or family in PROMPT_FILE else brief,
                                        stdout=stdout, stderr=stderr, **options)
     except (RuntimeError, OSError, launch_values.UnreadableLauncher) as exc:
-        return dict(out, launched=False, dispatch_mode='native', caller_action='launch_with_native_host_tool',
-                    next=f'The {executable} CLI could not start ({exc})' + native), 1
+        return _cli_native_or_blocked(
+            out, bundle, workspace, 'cli_launch_failed',
+            f'the {executable} CLI could not start ({exc})',
+            native_spec=native_spec, why_not_native=why_not_native,
+        )
     worker = {'provider': bundle['provider'], 'cli': executable, 'pid': process.pid,
               'output': str(run / 'output.txt'), 'stderr': str(run / 'stderr.txt'), 'exit': None}
     return dict(out, launched=True, dispatch_mode='cli', caller_action='already_launched_do_not_respawn',
@@ -1371,10 +1412,11 @@ def compact(result, status, detail_path):
     elif status == 'pending' and argv:
         nxt = worker.get('next_action') or 'Run next_argv to observe the same operation; do not roll again.'
     elif status == 'native':
-        ws_clause = f" in directory `{result['workspace']}`" if result.get('workspace') else ''
-        nxt = (f'Launch one native worker{ws_clause} with exactly route_bundle (its modeId is the permission mode) and the full contents of '
-               'worker_prompt_file as its prompt; if the host cannot reproduce that provider/account/model/effort, tell the '
-               'user instead of substituting.')
+        nxt = (result.get('next')
+               if (result.get('native_tool') or 'worker-start' in (result.get('next') or '')
+                   or 'delegate_task' in (result.get('next') or ''))
+               else ('Launch one native sub-agent with route_bundle (including modeId) and the full contents of '
+                     'worker_prompt_file as its prompt (not the filename); keep the parent address and preamble.'))
     worker_summary = {k: bundle.get(k) for k in ('provider', 'account', 'model', 'effort') if bundle.get(k)}
     if worker.get('agent_id'):
         worker_summary['agent_id'] = worker['agent_id']
@@ -1406,6 +1448,7 @@ def compact(result, status, detail_path):
         out['worker_output'], out['worker_stderr'] = worker.get('output'), worker.get('stderr')
     if status == 'native':
         out['route_bundle'], out['worker_prompt_file'] = bundle, result.get('worker_prompt_file')
+        out['native_tool'], out['launch_fields'] = result.get('native_tool'), result.get('launch_fields')
     if status == 'split':
         out['task_count'] = result.get('task_count')
     if result.get('start_after_hours') is not None:
@@ -1529,6 +1572,11 @@ def _run(args, judge):
     if getattr(args, 'model', None) not in (None, ''):
         import model_resolution
         model_resolution.check_model_pin(args.model, '--model')
+    raw_parent_model = getattr(args, 'parent_model', None)
+    parent_model = None
+    if raw_parent_model not in (None, ''):
+        import model_resolution
+        parent_model = model_resolution.check_model_pin(raw_parent_model, '--parent-model')
     try:
         canonical_ws = host_placement.validate_workspace(getattr(args, 'workspace', None))
     except host_placement.InvalidWorkspace as exc:
@@ -1710,15 +1758,32 @@ def _run(args, judge):
         if not placed['ok']:
             return placement_refused(out, provider, placed)
     out = files_not_sent(out, args, provider)
-    use_paseo, no_paseo_because = paseo_choice(provider, parent_host, args)
+    if provider in ('dot', 'chatgpt-web', 'grok-bot'):
+        text, prompt_file = prepare_worker_prompt(text, parent, parent_host, parent_address, watched=False)
+        out['worker_prompt_file'] = str(prompt_file)
+        if provider == 'dot':
+            return dot(args, out, prompt_file, task=task, decision=decision)
+        if provider == 'chatgpt-web':
+            return consult(args, out, prompt_file, task=task, decision=decision)
+        return grok_bot(args, out, prompt_file, task, bundle, decision=decision)
+    import account_fleet
+    fleet = account_fleet.load_accounts()
+    native_spec, why_not_native = (
+        host_placement.native_handover_spec(parent_host, bundle, fleet, parent_model=parent_model)
+        if parent_host in NATIVE_HOSTS
+        else host_placement.native_handover_spec('native', bundle, fleet, parent_model=parent_model)
+    )
+    effective_host = parent_host
+    if parent_host in NATIVE_HOSTS and native_spec is None:
+        out = dict(out, warnings=[
+            *out.get('warnings', []),
+            f'Native hand-over was not used ({why_not_native}); AgentCompass is launching the routed worker directly.',
+        ])
+        effective_host = 'paseo'
+    paseo_args = argparse.Namespace(**{**vars(args), 'parent_id': args.parent_id or parent}) if effective_host != parent_host else args
+    use_paseo, no_paseo_because = paseo_choice(provider, effective_host, paseo_args)
     text, prompt_file = prepare_worker_prompt(text, parent, parent_host, parent_address, watched=bool(use_paseo))
     out['worker_prompt_file'] = str(prompt_file)
-    if provider == 'dot':
-        return dot(args, out, prompt_file, task=task, decision=decision)
-    if provider == 'chatgpt-web':
-        return consult(args, out, prompt_file, task=task, decision=decision)
-    if provider == 'grok-bot':
-        return grok_bot(args, out, prompt_file, task, bundle, decision=decision)
     decision_profile = (
         decision.get('task_profile')
         or ((decision.get('decision') or {}).get('task') or {}).get('profile')
@@ -1727,9 +1792,9 @@ def _run(args, judge):
     access = task_access(args, decision_profile if isinstance(decision_profile, dict) else None)
     if use_paseo:
         return paseo(args, out, decision, task, text, parent, usage_reading.usage_snapshot(args.usage_cache), judge=judge)
-    surface = 'herdr' if parent_host == 'herdr' else parent_host if parent_host in NATIVE_HOSTS else 'cli'
+    surface = 'herdr' if effective_host == 'herdr' else effective_host if effective_host in NATIVE_HOSTS else 'cli'
     placed = host_placement.place(surface, canonical_ws, default_cwd=host_placement.parent_cwd(),
-                                  bundle=bundle, address=parent_address)
+                                  bundle=bundle, address=parent_address, native_spec=native_spec)
     if not placed['ok']:
         return placement_refused(out, surface, placed)
     landing = placed['cwd']
@@ -1737,28 +1802,36 @@ def _run(args, judge):
         out = same_cwd_warning(out, landing, parent)
     usage = usage_reading.usage_snapshot(getattr(args, 'usage_cache', None))
     new_worker_flag = bool(getattr(args, 'new_worker', False))
+    is_handover = surface in NATIVE_HOSTS
     try:
         claim_row = registry.record_host_claim(
             surface, decision, task, bundle,
             label=getattr(args, 'title', None) or title_of(text),
             usage=usage, access=access,
             workspace=canonical_ws, cwd=landing,
-            native_handover=(surface in NATIVE_HOSTS),
+            native_handover=is_handover,
+            native_tool=native_spec['tool'] if is_handover else None,
+            launch_fields=native_spec['launch_fields'] if is_handover else None,
+            hook_model=native_spec.get('hook_model') if is_handover else None,
             new_worker=new_worker_flag,
         )
     except registry.WorkspaceBusy as busy:
         return workspace_blocked(out, busy.workspace, busy.holders,
-                                 dispatch_mode='native' if surface in NATIVE_HOSTS else surface)
+                                 dispatch_mode='native' if is_handover else surface)
     if surface == 'herdr':
         import host_herdr
         res, code = host_herdr.launch(out, bundle, prompt_file, task['task_id'],
                                       cwd=landing, dispatch_id=claim_row['dispatch_id'])
         settle_claim(claim_row, res, 'herdr_preflight_failed', new_worker=new_worker_flag)
         return res, code
-    if surface in NATIVE_HOSTS:
+    if is_handover:
         return dict(out, launched=False, dispatch_mode='native', caller_action='launch_with_native_host_tool',
+                    native_tool=native_spec['tool'], launch_fields=native_spec['launch_fields'],
+                    **({'hook_model': native_spec['hook_model']} if native_spec.get('hook_model') else {}),
                     **({'dispatch_id': claim_row['dispatch_id']} if canonical_ws else {}),
                     next=placed['next']), 0
-    res, code = cli(args, without_paseo(out, no_paseo_because) if no_paseo_because else out, bundle, text)
+    cli_out = (without_paseo(out, no_paseo_because)
+               if no_paseo_because and parent_host not in NATIVE_HOSTS else out)
+    res, code = cli(args, cli_out, bundle, text, native_spec=native_spec, why_not_native=why_not_native)
     settle_claim(claim_row, res, 'cli_not_launched', new_worker=new_worker_flag)
     return res, code

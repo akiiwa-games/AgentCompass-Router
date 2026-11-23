@@ -172,12 +172,15 @@ class RegistryLaunchRecords(unittest.TestCase):
         self.assertEqual(self.counted(), 0)
 
     def test_a_native_handover_counts_once_consumed_and_not_when_abandoned(self):
+        fields = {'model': BUNDLE['model'], **({'reasoning_effort': BUNDLE['effort']} if BUNDLE.get('effort') else {})}
         fresh = registry.record_host_claim('native', {'decision_id': 'dec-fresh'},
                                            {'parent_agent_id': 'parent-a', 'task_id': 'task-fresh'}, BUNDLE,
-                                           native_handover=True, now=NOW - timedelta(minutes=1), path=self.path)
+                                           native_handover=True, native_tool='spawn_agent', launch_fields=fields,
+                                           now=NOW - timedelta(minutes=1), path=self.path)
         abandoned = registry.record_host_claim('native', {'decision_id': 'dec-abandoned'},
                                                {'parent_agent_id': 'parent-a', 'task_id': 'task-native'}, BUNDLE,
-                                               native_handover=True, now=NOW - timedelta(minutes=20), path=self.path)
+                                               native_handover=True, native_tool='spawn_agent', launch_fields=fields,
+                                               now=NOW - timedelta(minutes=20), path=self.path)
         # Neither an in-lease unconsumed hand-over nor one past PREPARE_LEASE counts before consumption.
         self.assertEqual(self.counted(), 0)
         self.assertEqual([r['dispatch_id'] for r in registry.native_handovers(NOW, path=self.path)],

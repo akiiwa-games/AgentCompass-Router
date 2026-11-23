@@ -27,7 +27,7 @@ class StageHelpTests(unittest.TestCase):
         self.assertNotIn('--resets-in', text)
         self.assertNotIn('--constraint', text)
         for hidden in ('--dry-run', '--access', '--title', '--task-id', '--parent-host',
-                       '--parent-id', '--parent-address', '--usage-cache', '--verbose'):
+                       '--parent-id', '--parent-address', '--parent-model', '--usage-cache', '--verbose'):
             self.assertNotIn(hidden, text)
         for deleted in ('--wait', '--allow-concurrent'):
             self.assertNotIn(deleted, text)
@@ -41,7 +41,7 @@ class StageHelpTests(unittest.TestCase):
         text = run('roll', '--help-all').stdout
         for option in ('--resets-in', '--constraint', '--dispatch-action', '--task', '--can-wait-hours',
                        '--access', '--title', '--task-id', '--parent-host', '--parent-id',
-                       '--parent-address', '--usage-cache', '--verbose', '--dry-run'):
+                       '--parent-address', '--parent-model', '--usage-cache', '--verbose', '--dry-run'):
             self.assertIn(option, text)
         for deleted in ('--wait ', '--allow-concurrent'):
             self.assertNotIn(deleted, text)

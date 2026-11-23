@@ -176,7 +176,7 @@ launches. It proves nothing about the vendor's remaining quota, and a route the 
 the switches of automatic routing). A dispatch counts once, from its launch until the window has passed over that moment, whoever chose the route and whether
 or not it has ended (`quota_pools.cadence_dispatches`). The launches are the rows of `dispatch.sqlite3`
 (`dispatch_registry.launch_record`: `launched_at`, unless the host refused the create; a reservation still holding its
-lease counts from its creation). A CLI, Herdr or native-handover claim holds the workspace before its worker starts and carries
+lease counts from its creation). A CLI, Herdr or native-handover claim (`native_tool` + `launch_fields` for a route the caller's own host tool can express) holds the workspace before its worker starts and carries
 `launched_at` only once the worker started (`dispatch_registry.host_claim_launched`, or `claim_native_handovers` when the spawn gate consumes `roll`'s one-use `native` hand-over; a Herdr send whose outcome is unknown
 counts). A `--resume` turn is a row of its own and counts, as each turn is a request the vendor counts. A `record` row
 stands for its launch only when the registry holds no dispatch of its decision (a named route launched outside `roll`, which is also the only ledger row the spawn gate accepts for a native worker launch; a `plan` row authorizes only Paseo schedule creation/re-targeting). ChatGPT Web's consultation is recorded as launched when `roll` hands over its `next_argv`, the

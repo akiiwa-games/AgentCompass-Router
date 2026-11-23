@@ -74,12 +74,7 @@ DEFAULT_WINDOW_SECONDS = 900  # 15 minutes
 # re-exports another host's tools nests the prefix (`mcp__magpie__mcp__paseo__send_agent_prompt`); base_tool_name
 # strips exactly that structure before any comparison, so a prefix never changes what a call is.
 DIRECT_SUBAGENT_TOOLS = frozenset({
-    "Agent",
-    "Task",
-    "dispatch_agent",
-    "spawn_agent",
-    "invoke_subagent",
-    "create_agent",
+    "Agent", "Task", "dispatch_agent", "spawn_agent", "invoke_subagent", "create_agent",
     "delegate_task",  # T3 Code's orchestrator MCP server (`t3-code`)
     # Claude Code's Workflow runs a script whose agent() calls start sub-agents inside the runtime; those launches
     # never pass through a PreToolUse hook, so the Workflow call itself is the launch.
@@ -104,32 +99,10 @@ HOST_TOOL_AGENTS = frozenset({"web-fetch", "statusline-setup", "claude-code-guid
 # Paseo update_schedule re-targets an existing schedule's new-agent launch when it names a provider or model.
 SCHEDULE_RETARGET_TOOLS = frozenset({"update_schedule"})
 SCHEDULE_TARGET_FIELDS = ("provider", "model")
-
-PASEO_TURN_TOOLS = frozenset({
-    "send_agent_prompt",
-    "run_turn",
-    "send_message",
-})
-
-CODEMODE_TOOLS = frozenset({
-    "codemode",
-    "execute_code",
-})
-
-WORKER_QUESTION_TOOLS = frozenset({
-    'AskUserQuestion', 'ask_user_question', 'request_user_input', 'request_user_input_async',
-})
-
-SHELL_TOOLS = frozenset({
-    "Bash",
-    "bash",
-    "PowerShell",
-    "powershell",
-    "exec",
-    "exec_command",
-    "run_command",
-    "shell",
-})
+PASEO_TURN_TOOLS = frozenset({"send_agent_prompt", "run_turn", "send_message"})
+CODEMODE_TOOLS = frozenset({"codemode", "execute_code"})
+WORKER_QUESTION_TOOLS = frozenset({"AskUserQuestion", "ask_user_question", "request_user_input", "request_user_input_async"})
+SHELL_TOOLS = frozenset({"Bash", "bash", "PowerShell", "powershell", "exec", "exec_command", "run_command", "shell"})
 
 # `mcp__<server>__`, nested when a proxy re-exports another server's tools (`mcp__magpie__mcp__paseo__x`). Server
 # names are the host's normalized identifiers (letters, digits, `_`, `-`), so one may itself hold `__` or end in `_`.
@@ -313,27 +286,35 @@ def wrapped_agent_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dic
     ]
 
 
+def _target_options_dict(options_obj: object) -> dict[str, str]:
+    if isinstance(options_obj, dict):
+        return {str(k): str(v) for k, v in options_obj.items() if k and v not in (None, "")}
+    if isinstance(options_obj, list):
+        return {str(i["id"]): str(i["value"]) for i in options_obj
+                if isinstance(i, dict) and i.get("id") and i.get("value") not in (None, "")}
+    return {}
+
+
 def normalize_launch(spec: dict) -> dict[str, str]:
-    # Paseo agent records keep the launch settings under "config"; T3 delegate_task nests target.driverKind/model.
+    # Paseo agent records keep launch settings under "config"; T3 delegate_task nests target.{driverKind,model,options}.
     settings = next((v for v in (spec.get("settings"), spec.get("config")) if isinstance(v, dict)), {})
     target = spec.get("target") if isinstance(spec.get("target"), dict) else {}
-    provider = str(spec.get("provider") or target.get("provider") or target.get("driverKind") or "").strip()
+    opts = _target_options_dict(target.get("options"))
+    raw_driver = str(target.get("driverKind") or "").strip()
+    driver_prov = router_owner("account_fleet", "t3_driver_family")(raw_driver) if raw_driver else ""
+    provider = str(spec.get("provider") or target.get("provider") or driver_prov or "").strip()
     provider, sep, paired_model = provider.partition("/")
     model = str((paired_model if sep else "") or spec.get("model") or spec.get("Model")
                 or target.get("model") or settings.get("model") or "").strip()
-    # Pi's ChatGPT OAuth launch namespace is absent from the canonical ledger
-    # model. Strip only that known namespace, retaining the Pi execution owner.
     if provider == "pi" and model.startswith("openai-codex/"):
         model = model.removeprefix("openai-codex/")
     elif provider == "opencode" and model.startswith("opencode/"):
         model = model.removeprefix("opencode/")
-    effort = str(spec.get("effort") or spec.get("reasoning_effort") or
-                 spec.get("thinkingOptionId") or target.get("effort") or
-                 target.get("thinkingOptionId") or settings.get("thinkingOptionId") or "").strip()
+    effort = str(spec.get("effort") or spec.get("reasoning_effort") or spec.get("thinkingOptionId")
+                 or target.get("effort") or target.get("thinkingOptionId")
+                 or opts.get("effort") or opts.get("reasoningEffort") or settings.get("thinkingOptionId") or "").strip()
     account = str(spec.get("account") or "").strip()
-    return {key: value for key, value in {
-        "provider": provider, "model": model, "effort": effort, "account": account,
-    }.items() if value}
+    return {k: v for k, v in {"provider": provider, "model": model, "effort": effort, "account": account}.items() if v}
 
 
 # `paseo schedule create|update` options that name the launch, as the MCP tools' argument keys normalize_launch reads.
@@ -342,6 +323,11 @@ ORCA_LAUNCH_OPTIONS = {
     "--agent": "provider", "-a": "provider", "--provider": "provider",
     "--model": "model", "-m": "model",
     "--effort": "effort", "--reasoning-effort": "effort",
+}
+ORCA_RAW_FLAGS = {
+    "--agent": "--agent", "-a": "--agent", "--provider": "--agent",
+    "--model": "--model", "-m": "--model",
+    "--effort": "--effort", "--reasoning-effort": "--effort",
 }
 
 
@@ -764,7 +750,8 @@ def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
                 launch("run_dot_task.py")
         elif stem == "orca":
             if tuple(args[:2]) in ORCA_LAUNCH_COMMANDS and not HELP_FLAGS.intersection(literal_args):
-                launch("orca worker launch", cli_flag_options(args[2:], ORCA_LAUNCH_OPTIONS))
+                launch("orca worker launch", {**cli_flag_options(args[2:], ORCA_LAUNCH_OPTIONS),
+                                              "orca_flags": cli_flag_options(args[2:], ORCA_RAW_FLAGS)})
         elif stem in SHELL_PROGRAMS:
             dialect = CMD if stem == "cmd" else POWERSHELL if stem in ("pwsh", "powershell") else POSIX
             flags = [i for i, w in enumerate(words) if isinstance(w, str) and (
@@ -996,8 +983,8 @@ def custom_agent_names(cwd: object) -> set[str]:
     return set().union(*(defined_agent_names(directory) for directory in _claude_agent_directories(cwd)))
 
 
-def custom_agent_model(subagent_type: str, cwd: object) -> str | None:
-    """Explicit non-`inherit` `model` declared by the first matching `.claude/agents/*.md` definition, else None."""
+def custom_agent_field(subagent_type: str, field: str, cwd: object) -> str | None:
+    """Explicit non-`inherit` `field` (`model` or `effort`) declared by the first matching `.claude/agents/*.md`, else None."""
     folded = subagent_type.strip().casefold()
     if not folded:
         return None
@@ -1009,7 +996,7 @@ def custom_agent_model(subagent_type: str, cwd: object) -> str | None:
         for file in files:
             meta = _agent_frontmatter(file)
             if (meta.get("name") or file.stem).casefold() == folded:
-                declared = str(meta.get("model") or "").strip()
+                declared = str(meta.get(field) or "").strip()
                 return declared if declared and declared.lower() != "inherit" else None
     return None
 
@@ -1517,15 +1504,15 @@ def correlation_fields(*sources: dict) -> dict[str, str]:
 
 
 def _merged_route_bundle(row: dict, accounts: dict | None = None) -> dict:
-    raw_bundle = row.get("bundle")
-    if not isinstance(raw_bundle, dict):
+    raw = row.get("bundle")
+    if not isinstance(raw, dict):
         return {}
-    bid = raw_bundle.get("bundle_id")
+    bid = raw.get("bundle_id")
     if isinstance(bid, str) and bid and isinstance(accounts, dict):
         acct, matches = resolve_target({"bundle_id": bid}, accounts)
         if matches:
-            return {**matches[0], **({"account": acct} if acct and not matches[0].get("account") else {}), **raw_bundle}
-    return dict(raw_bundle)
+            return {**matches[0], **({"account": acct} if acct and not matches[0].get("account") else {}), **raw}
+    return dict(raw)
 
 
 def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
@@ -1535,66 +1522,81 @@ def route_spec(row: dict, accounts: dict | None = None) -> dict[str, str]:
     return normalize_launch(merged)
 
 
-def same_launch_value(key: str, requested: str, routed: str | None, *, accounts: dict | None = None, allow_line: bool = False) -> bool:
-    """Compare what will run: exact wire value, or (for Claude native tools) a declared `families` `line`."""
-    return (allow_line and key == "model" and model_line_matches(requested, routed, accounts)) or requested == routed
-
-
 def route_family(row: dict, accounts: dict | None = None) -> str | None:
     """Product/execution family of a routed bundle via `provider_inventory.bundle_family`."""
     return router_owner("provider_inventory", "bundle_family")(_merged_route_bundle(row, accounts), accounts)
 
 
-def launch_field_hint(name: str, trigger: str, requested: dict | None = None) -> str:
+def launch_field_hint(name: str, trigger: str, requested: dict | None = None, *, missing_agy_model: bool = False) -> str:
     if name in CLAUDE_NATIVE_TOOLS:
-        return "传入参数 `model`（模型系列别名）指定已授权路由的模型"
+        return "传入参数 `model`（模型系列别名，及 `effort`）指定已授权路由的模型与档位"
     if name == "spawn_agent":
         return "传入参数 `model`（及 `reasoning_effort`）指定已授权路由的模型与档位"
     if name == "invoke_subagent":
-        if (requested or {}).get("model") == UNSPECIFIED_LAUNCH_VALUE:
+        if missing_agy_model or (requested or {}).get("model") == UNSPECIFIED_LAUNCH_VALUE:
             return ("改用不带 `--parent-host native` 的 `roll` 直接启动 worker，或告知用户"
                     "（hook 输入缺少具体的 `modelName` 字段，无法确认当前会话模型，而 `invoke_subagent` 的 `Model` 不接受具体模型 ID）")
         return ("在当前会话 `modelName` 与已授权路由一致时传入 `Model=\"inherit\"`"
                 "（`invoke_subagent` 的 `Model` 仅接受抽象档位枚举，不接受具体模型 ID；"
                 "若当前会话模型与路由不一致，请告知用户或改用不带 `--parent-host native` 的 `roll` 直接启动）")
     if name == "delegate_task":
-        return "传入 `target.driverKind`、`target.model`（及 `target.effort`）"
+        return "传入 `target.driverKind`、`target.model`（及 `target.options`）"
     if trigger == "shell:orca worker launch":
         return "传入 `--agent`、`--model`（及 `--effort`）"
     return "显式传入与已授权路由一致的 `provider`/`model`/`effort`"
 
 
+def _call_host_fields(name: str, args: dict, trigger: str, payload: dict) -> tuple[str, dict, str]:
+    """Extract `(call_tool, actual_fields, concrete_agy_model)` in the host tool's own vocabulary."""
+    call_tool = "Agent" if name in CLAUDE_NATIVE_TOOLS else (trigger if name == SHELL_LAUNCH else name)
+    if call_tool == "Agent":
+        sub_type = str(args.get("subagent_type") or "").strip()
+        raw_m, raw_e = str(args.get("model") or "").strip(), str(args.get("effort") or "").strip()
+        sm = str(payload.get("model") or "").strip()
+        m_val = (raw_m if raw_m and raw_m.lower() != "inherit"
+                 else (custom_agent_field(sub_type, "model", payload.get("cwd")) if sub_type else None)
+                 or (sm if sm and sm.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE))
+        e_val = (raw_e if raw_e and raw_e.lower() != "inherit"
+                 else (custom_agent_field(sub_type, "effort", payload.get("cwd")) if sub_type else None))
+        return call_tool, {"model": m_val, **({"effort": e_val} if e_val else {})}, ""
+    if call_tool == "spawn_agent":
+        raw_m, raw_e = str(args.get("model") or "").strip(), str(args.get("reasoning_effort") or "").strip()
+        sm = str(payload.get("model") or "").strip()
+        return call_tool, {"model": raw_m or (sm if sm and sm.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE),
+                           **({"reasoning_effort": raw_e} if raw_e else {})}, ""
+    if call_tool == "invoke_subagent":
+        raw_m = str(args.get("Model") or args.get("model") or "").strip() or "inherit"
+        sm = str(payload.get("modelName") or payload.get("model") or "").strip()
+        return call_tool, {"Model": raw_m}, (sm if sm and sm.lower() not in ("auto", "inherit") else UNSPECIFIED_LAUNCH_VALUE)
+    if call_tool == "delegate_task":
+        raw_t = args.get("target") if isinstance(args.get("target"), dict) else {}
+        opts = _target_options_dict(raw_t.get("options"))
+        return call_tool, {"target": {"driverKind": str(raw_t.get("driverKind") or "").strip() or UNSPECIFIED_LAUNCH_VALUE,
+                                      "model": str(raw_t.get("model") or "").strip() or UNSPECIFIED_LAUNCH_VALUE,
+                                      **({"options": opts} if opts else {})}}, ""
+    if call_tool == "shell:orca worker launch":
+        flags = dict(args.get("orca_flags") or {})
+        return call_tool, {"--agent": flags.get("--agent") or UNSPECIFIED_LAUNCH_VALUE,
+                           "--model": flags.get("--model") or UNSPECIFIED_LAUNCH_VALUE,
+                           **({"--effort": flags["--effort"]} if flags.get("--effort") else {})}, ""
+    return call_tool, {}, ""
+
+
 def native_launch_spec(
     name: str, args: dict, trigger: str, payload: dict, accounts: dict | None,
 ) -> tuple[dict[str, str], str | None]:
-    """Resolve `(requested, required_family)` per host from the call's own facts and declared data; never guess."""
+    """Resolve `(requested, required_family)` for standalone `record` rows from the call's facts and declared data."""
     requested = normalize_launch(args)
-    if name in CLAUDE_NATIVE_TOOLS:
+    call_tool, actual, concrete_sm = _call_host_fields(name, args, trigger, payload)
+    if call_tool in ("Agent", "spawn_agent"):
         if (own := native_own_account(name, {}, accounts)) and not requested.get("account"):
             requested["account"] = own
-        raw_model = str(args.get("model") or "").strip()
-        if not raw_model or raw_model.lower() == "inherit":
-            sub_type = str(args.get("subagent_type") or "").strip()
-            declared = custom_agent_model(sub_type, payload.get("cwd")) if sub_type else None
-            session_model = str(payload.get("model") or "").strip()
-            requested["model"] = (declared or (session_model if session_model and session_model.lower() != "inherit"
-                                               else UNSPECIFIED_LAUNCH_VALUE))
-        return requested, "claude"
-    if name == "spawn_agent":
-        if (own := native_own_account("spawn_agent", {}, accounts)) and not requested.get("account"):
-            requested["account"] = own
-        if not requested.get("model"):
-            session_model = str(payload.get("model") or "").strip()
-            requested["model"] = session_model if session_model and session_model.lower() != "inherit" else UNSPECIFIED_LAUNCH_VALUE
-        return requested, "codex"
-    if name == "invoke_subagent":
-        raw_model = str(args.get("Model") or args.get("model") or "").strip()
-        if not raw_model or raw_model.lower() == "inherit":
-            session_model = str(payload.get("modelName") or payload.get("model") or "").strip()
-            requested["model"] = (session_model if session_model and session_model.lower() not in ("auto", "inherit")
-                                  else UNSPECIFIED_LAUNCH_VALUE)
-        else:
-            requested["model"] = raw_model
+        requested["model"] = actual["model"]
+        if call_tool == "Agent" and actual.get("effort") and not requested.get("effort"):
+            requested["effort"] = actual["effort"]
+        return requested, ("claude" if call_tool == "Agent" else "codex")
+    if call_tool == "invoke_subagent":
+        requested["model"] = concrete_sm if actual["Model"].lower() == "inherit" else actual["Model"]
         return requested, "antigravity"
     if trigger == "shell:run_dot_task.py":
         for k in ("provider", "account", "model"):
@@ -1623,8 +1625,7 @@ def _session_matches_row(
     if not row_sessions:
         return False, False
     matched = bool(caller_sessions) and (
-        bool(caller_sessions & row_sessions)
-        or any(is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions)
+        bool(caller_sessions & row_sessions) or any(is_caller(rid, caller_sessions, paseo_agents_dir) for rid in row_sessions)
     )
     return True, matched
 
@@ -1635,31 +1636,13 @@ def _route_label(row: dict) -> str:
     return f"{choice}/{bid}" if choice and bid and choice != bid else str(choice or bid or bundle.get("model") or row.get("dispatch_id") or "")
 
 
-def matching_routes(
-    rows: list[dict],
-    requested: dict,
-    context: dict,
-    trigger: str,
-    accounts: dict | None = None,
-    *,
-    identities: set[str] | None = None,
-    paseo_agents_dir: Path | None = None,
-    check_stage: bool = True,
-    required_family: str | None = None,
-    allow_line: bool = False,
-) -> tuple[list[dict], str]:
-    """Return `(matched_rows, diagnostic)` after session/correlation and launch-field comparison.
-
-    One session rule governs both hand-overs and `record` rows: a row or hand-over that names a session (`row_sessions`
-    non-empty) is matched only by a call that names the same session; a call that names none matches only what names
-    none (such as a bare-shell `record` row, scored below any session-matched candidate).
-    """
-    row_predicate = router_owner("decision_ledger", "carries_route" if check_stage else "has_route_bundle")
+def _session_candidates(
+    rows: list[dict], context: dict, identities: set[str] | None, paseo_agents_dir: Path | None,
+) -> list[dict]:
+    """Rows matching this caller's session and correlation fields (one rule for hand-overs and `record` rows)."""
     caller_sessions = set(identities or ()) | ({context["parent"]} if context.get("parent") else set())
-    candidates = []
+    scored = []
     for row in rows:
-        if not row_predicate(row):
-            continue
         task = row.get("task") if isinstance(row.get("task"), dict) else {}
         identity = correlation_fields(row, task)
         has_sessions, session_matched = _session_matches_row(row, caller_sessions, paseo_agents_dir, task, identity)
@@ -1668,47 +1651,79 @@ def matching_routes(
         shared = (context.keys() & identity.keys()) - {"parent"}
         if any(context[k] != identity[k] for k in shared):
             continue
-        candidates.append(((1 if session_matched else 0) + len(shared), row))
-    if not candidates:
-        return [], "parent/task/target/chain 不匹配；没有本次请求的兼容记录"
-    strongest = max(score for score, _ in candidates)
+        scored.append(((1 if session_matched else 0) + len(shared), row))
+    if not scored:
+        return []
+    strongest = max(s for s, _ in scored)
     if strongest:
-        candidates = [item for item in candidates if item[0] == strongest]
-        latest = candidates[0][1]
-        latest_identity = correlation_fields(latest, latest.get("task") if isinstance(latest.get("task"), dict) else {})
-        if (context.keys() & latest_identity.keys()) - {"parent"}:
-            candidates = candidates[:1]
+        scored = [item for item in scored if item[0] == strongest]
+        latest_t = scored[0][1].get("task") if isinstance(scored[0][1].get("task"), dict) else {}
+        if (context.keys() & correlation_fields(scored[0][1], latest_t).keys()) - {"parent"}:
+            scored = scored[:1]
+    return [row for _, row in scored]
+
+
+def matching_handovers(
+    handovers: list[dict], name: str, args: dict, trigger: str, payload: dict, context: dict,
+    identities: set[str] | None = None, paseo_agents_dir: Path | None = None,
+) -> tuple[list[dict], str, bool]:
+    """Compare a native launch directly against open hand-overs' `native_tool` and `launch_fields` in the host's own fields."""
+    candidates = _session_candidates(handovers, context, identities, paseo_agents_dir)
+    if not candidates:
+        return [], "parent/task/target/chain 不匹配；没有本次请求的兼容记录", False
+    call_tool, actual, concrete_sm = _call_host_fields(name, args, trigger, payload)
+    missing_agy = call_tool == "invoke_subagent" and actual["Model"] == "inherit" and concrete_sm == UNSPECIFIED_LAUNCH_VALUE
     matched, mismatches = [], []
-    for _, row in candidates:
-        chosen = route_spec(row, accounts)
-        differences = []
-        if required_family and (routed_fam := route_family(row, accounts)) != required_family:
-            differences.append(f"provider: requested={required_family!r}, routed={chosen.get('provider') or routed_fam!r}")
-        differences.extend(
-            f"{key}: requested={value!r}, routed={chosen.get(key)!r}"
-            for key, value in requested.items()
-            if not same_launch_value(key, value, chosen.get(key), accounts=accounts, allow_line=allow_line)
-        )
-        if is_dot_route(row) and trigger != "shell:run_dot_task.py":
-            differences.append("dot_text requires run_dot_task.py")
-        if not differences:
-            matched.append(row)
+    for h_row in candidates:
+        exp_tool = h_row.get("native_tool")
+        exp_fields = h_row.get("launch_fields") if isinstance(h_row.get("launch_fields"), dict) else {}
+        diffs = []
+        if call_tool != exp_tool:
+            diffs.append(f"tool: requested={call_tool!r}, routed={exp_tool!r}")
+        elif call_tool == "delegate_task":
+            exp_t = exp_fields.get("target") if isinstance(exp_fields.get("target"), dict) else {}
+            act_t = actual.get("target") or {}
+            diffs.extend(f"target.{k}: requested={act_t.get(k, UNSPECIFIED_LAUNCH_VALUE if k != 'options' else {})!r}, routed={exp_t.get(k)!r}"
+                         for k in dict.fromkeys([*exp_t, *act_t])
+                         if act_t.get(k, UNSPECIFIED_LAUNCH_VALUE if k != "options" else {}) != exp_t.get(k))
         else:
-            mismatches.append(f"route={_route_label(row)!r}: " + "; ".join(differences))
-    return (matched, "") if matched else ([], " | ".join(mismatches[:3]))
+            diffs.extend(f"{k}: requested={actual.get(k, UNSPECIFIED_LAUNCH_VALUE)!r}, routed={exp_fields.get(k)!r}"
+                         for k in dict.fromkeys([*exp_fields, *actual])
+                         if actual.get(k, UNSPECIFIED_LAUNCH_VALUE) != exp_fields.get(k))
+            if call_tool == "invoke_subagent" and h_row.get("hook_model") and concrete_sm != h_row["hook_model"]:
+                diffs.append(f"modelName: requested={concrete_sm!r}, routed={h_row['hook_model']!r}")
+        if not diffs:
+            matched.append(h_row)
+        else:
+            mismatches.append(f"route={_route_label(h_row)!r}: " + "; ".join(diffs))
+    return (matched, "", missing_agy) if matched else ([], " | ".join(mismatches[:3]), missing_agy)
 
 
 def match_route(
     rows: list[dict], requested: dict, context: dict, trigger: str, accounts: dict | None = None, *,
     identities: set[str] | None = None, paseo_agents_dir: Path | None = None,
-    check_stage: bool = True, required_family: str | None = None, allow_line: bool = False,
+    required_family: str | None = None, allow_line: bool = False,
 ) -> tuple[dict | None, str]:
-    matched, diagnostic = matching_routes(
-        rows, requested, context, trigger, accounts=accounts,
-        identities=identities, paseo_agents_dir=paseo_agents_dir,
-        check_stage=check_stage, required_family=required_family, allow_line=allow_line,
-    )
-    return (matched[0] if matched else None), diagnostic
+    carries_route = router_owner("decision_ledger", "carries_route")
+    candidates = _session_candidates([r for r in rows if carries_route(r)], context, identities, paseo_agents_dir)
+    if not candidates:
+        return None, "parent/task/target/chain 不匹配；没有本次请求的兼容记录"
+    mismatches = []
+    for row in candidates:
+        chosen = route_spec(row, accounts)
+        diffs = []
+        if required_family and (routed_fam := route_family(row, accounts)) != required_family:
+            diffs.append(f"provider: requested={required_family!r}, routed={chosen.get('provider') or routed_fam!r}")
+        diffs.extend(
+            f"{k}: requested={v!r}, routed={chosen.get(k)!r}" for k, v in requested.items()
+            if not ((allow_line and k == "model" and model_line_matches(v, chosen.get(k), accounts)) or v == chosen.get(k))
+        )
+        if is_dot_route(row) and trigger != "shell:run_dot_task.py":
+            diffs.append("dot_text requires run_dot_task.py")
+        if not diffs:
+            return row, ""
+        mismatches.append(f"route={_route_label(row)!r}: " + "; ".join(diffs))
+    return None, " | ".join(mismatches[:3])
 
 
 def build_deny_reason(
@@ -1847,12 +1862,8 @@ def format_response(allowed: bool, harness_kind: str, reason: str = "") -> dict:
 
 
 def evaluate_payload(
-    payload: dict,
-    ledger_path: Path | None = None,
-    now: dt.datetime | None = None,
-    window_seconds: int | None = None,
-    usage_cache_path: Path | None = None,
-    paseo_agents_dir: Path | None = None,
+    payload: dict, ledger_path: Path | None = None, now: dt.datetime | None = None,
+    window_seconds: int | None = None, usage_cache_path: Path | None = None, paseo_agents_dir: Path | None = None,
 ) -> dict:
     """The hook's answer to one payload (`decide`). The one place a failure inside the decision is caught: the call is
     allowed, as every unmade check is, and the answer names the failure's type (`format_response`)."""
@@ -1865,12 +1876,8 @@ def evaluate_payload(
 
 
 def decide(
-    payload: dict,
-    ledger_path: Path | None,
-    now: dt.datetime | None,
-    window_seconds: int | None,
-    usage_cache_path: Path | None,
-    paseo_agents_dir: Path | None,
+    payload: dict, ledger_path: Path | None, now: dt.datetime | None,
+    window_seconds: int | None, usage_cache_path: Path | None, paseo_agents_dir: Path | None,
 ) -> dict:
     tool_name, tool_input, harness_kind = extract_tool_call(payload)
     tool_name = base_tool_name(tool_name)
@@ -1945,22 +1952,16 @@ def _decide_checked(
         return format_response(True, harness_kind)
 
     ledger = ledger_path or Path(os.environ.get("ROUTER_LEDGER", DEFAULT_LEDGER))
-    win = window_seconds if window_seconds is not None else int(
-        os.environ.get("ROUTER_GATE_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS)
-    )
-    rows = None
-    roll_ids = None
+    win = window_seconds if window_seconds is not None else int(os.environ.get("ROUTER_GATE_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS))
+    rows, roll_ids = None, None
     accounts = load_dispatch_accounts()
     upward = caller_parent_ids(caller_id, paseo_agents_dir)
     tc_obj = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
-    raw_call_id = str(
-        payload.get("tool_use_id") or payload.get("tool_call_id") or payload.get("call_id") or tc_obj.get("id") or ""
-    ).strip() or None
+    raw_call_id = str(payload.get("tool_use_id") or payload.get("tool_call_id") or payload.get("call_id") or tc_obj.get("id") or "").strip() or None
     native_needed = sum(
         1 for n, a, t in executing
         if t and not (isinstance(a.get("labels"), dict) and any(k.startswith("router.") for k in a["labels"]))
-        and t != WORKFLOW_TRIGGER and t not in SCHEDULE_TRIGGERS
-        and n != "create_agent" and t != "shell:paseo agent create"
+        and t != WORKFLOW_TRIGGER and t not in SCHEDULE_TRIGGERS and n != "create_agent" and t != "shell:paseo agent create"
     )
     native_launch_index = 0
     pending_native_claims: list[tuple[list[str], str | None, str]] = []
@@ -1968,10 +1969,8 @@ def _decide_checked(
     claim_native_handovers_fn = None
     for name, args, trigger in executing:
         if trigger:
-            malformed = launch_model_problem(args)
-            if malformed:
-                return format_response(False, harness_kind,
-                    f"[Router Gate] 拦截格式错误的模型参数 ({trigger})：{malformed}")
+            if malformed := launch_model_problem(args):
+                return format_response(False, harness_kind, f"[Router Gate] 拦截格式错误的模型参数 ({trigger})：{malformed}")
             targets = [launch_target(name, args, trigger, tool_input)]
         else:
             # The gate governs dispatch, not communication. A turn is dispatch only when it hands more work to the
@@ -2004,33 +2003,22 @@ def _decide_checked(
                     if found and found[0] == "bundles":
                         unchecked, native_unchecked = found[1], (own, target["model"])
                 reason = (
-                    (disabled[1] if disabled else None if trigger
-                     else check_own_worker_legacy(target, account, accounts))
+                    (disabled[1] if disabled else None if trigger else check_own_worker_legacy(target, account, accounts))
                     or check_account_quota_exhausted(
-                        account or target.get("provider"),
-                        usage_cache_path=usage_cache_path,
-                        now=now,
-                        accounts=accounts,
-                        windows=target_windows(candidates, accounts),
-                        bundles=candidates,
-                        model=target.get("model"),
-                        exclude_dispatch_id=dispatch_id or target.get("dispatch_id"),
-                        exclude_agent_id=target.get("agent_id"),
+                        account or target.get("provider"), usage_cache_path=usage_cache_path, now=now, accounts=accounts,
+                        windows=target_windows(candidates, accounts), bundles=candidates, model=target.get("model"),
+                        exclude_dispatch_id=dispatch_id or target.get("dispatch_id"), exclude_agent_id=target.get("agent_id"),
                     )
                 )
             except ValueError as exc:
                 if str(exc).startswith("invalid_model_pin:"):
-                    return format_response(False, harness_kind,
-                        f"[Router Gate] 拦截格式错误的模型参数 ({trigger or name})：{exc}")
+                    return format_response(False, harness_kind, f"[Router Gate] 拦截格式错误的模型参数 ({trigger or name})：{exc}")
                 raise
             if reason:
                 return format_response(False, harness_kind, reason)
         if not trigger:
             for agent_id in agent_ids:
-                compaction_reason = check_worker_compaction_limit(
-                    agent_id, paseo_agents_dir=paseo_agents_dir, identities=identities
-                )
-                if compaction_reason:
+                if compaction_reason := check_worker_compaction_limit(agent_id, paseo_agents_dir=paseo_agents_dir, identities=identities):
                     return format_response(False, harness_kind, compaction_reason)
             continue
         labels = args.get('labels')
@@ -2050,10 +2038,8 @@ def _decide_checked(
         if trigger == WORKFLOW_TRIGGER or trigger in SCHEDULE_TRIGGERS:
             if rows is None:
                 rows = recent_routes(ledger, now=now, window_seconds=win)
-            reason = (check_workflow_record(rows, identities)
-                      if trigger == WORKFLOW_TRIGGER else
-                      check_schedule_plan(rows, args, correlation_fields(payload, tool_input, args), trigger, accounts,
-                                          identities))
+            reason = (check_workflow_record(rows, identities) if trigger == WORKFLOW_TRIGGER else
+                      check_schedule_plan(rows, args, correlation_fields(payload, tool_input, args), trigger, accounts, identities))
             if reason:
                 return format_response(False, harness_kind, reason)
             continue
@@ -2063,32 +2049,24 @@ def _decide_checked(
                 + ROUTER_CMD + ' roll --brief <task.md>; it routes and launches in one step. Or pass the returned '
                 'create_agent object with router.* labels (title/initialPrompt/workspaceId may be edited; '
                 'provider/settings/labels may not). An unbound ledger entry is not launch authorization.')
-        effective_call_id = (f"{raw_call_id}:{native_launch_index}" if (raw_call_id and native_launch_index) else raw_call_id)
+        effective_call_id = f"{raw_call_id}:{native_launch_index}" if (raw_call_id and native_launch_index) else raw_call_id
         native_launch_index += 1
-        requested, required_family = native_launch_spec(name, args, trigger, payload, accounts)
-        allow_line = name in CLAUDE_NATIVE_TOOLS
         context = correlation_fields(payload, tool_input, args)
         native_handovers, claim_native_handovers_fn, roll_decision_ids = router_owner(
-            "dispatch_registry",
-            "native_handovers", "claim_native_handovers", "roll_decision_ids",
+            "dispatch_registry", "native_handovers", "claim_native_handovers", "roll_decision_ids",
         )
-        standalone_record_rows = router_owner("decision_ledger", "standalone_record_rows")
-        # Fact 1: an unconsumed `status: native` hand-over recorded by `roll` in `dispatch_registry` for this caller.
+        # Fact 1: an unconsumed `status: native` hand-over recorded by `roll`, matched directly on `launch_fields`.
         try:
             handovers = native_handovers(now=now, call_id=effective_call_id, timeout=0.5)
         except (OSError, ValueError, sqlite3.Error) as exc:
             return format_response(False, harness_kind, registry_unreadable_deny_reason(trigger, exc))
         available_handovers = [
             h for h in handovers
-            if h.get("dispatch_id") not in reserved_handover_ids
-            or (bool(effective_call_id) and h.get("claim_id") == effective_call_id)
+            if h.get("dispatch_id") not in reserved_handover_ids or (bool(effective_call_id) and h.get("claim_id") == effective_call_id)
         ]
-        matched_handovers, handover_diag = (
-            matching_routes(
-                available_handovers, requested, context, trigger, accounts=accounts,
-                identities=identities, paseo_agents_dir=paseo_agents_dir, check_stage=False,
-                required_family=required_family, allow_line=allow_line,
-            ) if available_handovers else ([], "")
+        matched_handovers, handover_diag, missing_agy = (
+            matching_handovers(available_handovers, name, args, trigger, payload, context, identities, paseo_agents_dir)
+            if available_handovers else ([], "", False)
         )
         unchecked_refusal = None
         if matched_handovers:
@@ -2096,8 +2074,7 @@ def _decide_checked(
             for h_row in matched_handovers:
                 if unchecked and h_row.get("constraint") != "user_override":
                     if unchecked_refusal is None:
-                        unchecked_refusal = (native_unchecked_text(*native_unchecked, h_row)
-                                             if native_unchecked else unchecked)
+                        unchecked_refusal = native_unchecked_text(*native_unchecked, h_row) if native_unchecked else unchecked
                 else:
                     allowed_handovers.append(h_row)
             if allowed_handovers:
@@ -2112,56 +2089,41 @@ def _decide_checked(
                 roll_ids = roll_decision_ids(timeout=0.5)
             except (OSError, ValueError, sqlite3.Error) as exc:
                 return format_response(False, harness_kind, registry_unreadable_deny_reason(trigger, exc))
-        record_rows = standalone_record_rows(rows, roll_ids)
+        record_rows = router_owner("decision_ledger", "standalone_record_rows")(rows, roll_ids)
+        requested, required_family = native_launch_spec(name, args, trigger, payload, accounts)
         row, record_diag = (
-            match_route(
-                record_rows, requested, context, trigger, accounts=accounts,
-                identities=identities, paseo_agents_dir=paseo_agents_dir,
-                required_family=required_family, allow_line=allow_line,
-            ) if record_rows else (None, "")
+            match_route(record_rows, requested, context, trigger, accounts=accounts, identities=identities,
+                        paseo_agents_dir=paseo_agents_dir, required_family=required_family, allow_line=name in CLAUDE_NATIVE_TOOLS)
+            if record_rows else (None, "")
         )
         if row is not None and (reason := check_route_authority(row, trigger)):
             return format_response(False, harness_kind, reason)
         if row is not None and unchecked and row.get("constraint") != "user_override":
-            return format_response(False, harness_kind,
-                                   native_unchecked_text(*native_unchecked, row) if native_unchecked else unchecked)
+            return format_response(False, harness_kind, native_unchecked_text(*native_unchecked, row) if native_unchecked else unchecked)
         if row is not None:
             continue
         if unchecked_refusal:
             return format_response(False, harness_kind, unchecked_refusal)
-        mismatch_diag = next(
-            (d for d in (handover_diag, record_diag) if d and not d.startswith("parent/task/target/chain")), "",
-        )
-        if mismatch_diag:
-            return format_response(
-                False, harness_kind,
-                f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。"
-                f"请{launch_field_hint(name, trigger, requested)}，或重新运行 {ROUTER_CMD} roll --brief <task.md>。",
-            )
+        if mismatch_diag := next((d for d in (handover_diag, record_diag) if d and not d.startswith("parent/task/target/chain")), ""):
+            hint = launch_field_hint(name, trigger, requested, missing_agy_model=missing_agy)
+            return format_response(False, harness_kind,
+                f"[Router Gate] 启动参数与已授权路由不匹配 ({trigger})：{mismatch_diag}。请{hint}，或重新运行 {ROUTER_CMD} roll --brief <task.md>。")
         if not identities and not context.get("parent") and any(_row_session_ids(r) for r in (*handovers, *record_rows)):
-            return format_response(
-                False, harness_kind,
+            return format_response(False, harness_kind,
                 f"[Router Gate] 拦截子 agent 启动 ({trigger})：检测到带会话身份的路由授权（status: native 或会话 record），"
                 "但本次 hook 输入与环境变量均未携带会话 ID，无法匹配任何命名会话的授权。"
-                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，并重启当前宿主会话（如更新前已启动的 Pi 会话）使新钩子生效。",
-            )
+                f"请运行 `{ROUTER_CMD} setup` 更新宿主钩子配置，并重启当前宿主会话（如更新前已启动的 Pi 会话）使新钩子生效。")
         if record_rows and record_diag:
-            return format_response(
-                False, harness_kind,
+            return format_response(False, harness_kind,
                 f"[Router Gate] 启动参数与当前会话记录不匹配 ({trigger})：{record_diag}。"
-                f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。",
-            )
+                f"请在本会话运行 {ROUTER_CMD} roll --brief <task.md>（或强制场景运行 {ROUTER_CMD} record）。")
         caller_sessions = set(identities or ()) | ({context["parent"]} if context.get("parent") else set())
-        open_count = sum(1 for h in handovers if not h.get("launched_at")
-                         and _session_matches_row(h, caller_sessions, paseo_agents_dir)[1])
-        return format_response(False, harness_kind,
-                               build_deny_reason(trigger, win, needed=native_needed, open_count=open_count))
+        open_count = sum(1 for h in handovers if not h.get("launched_at") and _session_matches_row(h, caller_sessions, paseo_agents_dir)[1])
+        return format_response(False, harness_kind, build_deny_reason(trigger, win, needed=native_needed, open_count=open_count))
     if pending_native_claims and claim_native_handovers_fn is not None:
         first_trigger = pending_native_claims[0][2]
         try:
-            claimed = claim_native_handovers_fn(
-                [(ids, cid) for ids, cid, _ in pending_native_claims], now=now, timeout=0.5,
-            )
+            claimed = claim_native_handovers_fn([(ids, cid) for ids, cid, _ in pending_native_claims], now=now, timeout=0.5)
         except (OSError, ValueError, sqlite3.Error) as exc:
             return format_response(False, harness_kind, registry_unreadable_deny_reason(first_trigger, exc))
         if claimed is None:

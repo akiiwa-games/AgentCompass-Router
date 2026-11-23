@@ -614,12 +614,157 @@ def unaccepted_effort(harness, model, effort, accepted):
     return f"{effort} is not an effort {harness}/{model} accepts ({', '.join(listed) or 'it takes none'})"
 
 
+# Native sub-agent launch tools per caller host/harness, declared once from fetched vendor documentation (as of 2026-11-24).
+# `tool=None` means the host has no gated native sub-agent tool `roll` can hand over to.
+NATIVE_HOST_TOOLS = {
+    'claude': {
+        # Anthropic Claude Code docs (fetched 2026-11-24):
+        # - https://code.claude.com/docs/en/sub-agents.md ("Choose a model", "Choose an effort level"):
+        #   "On an Agent tool call, the parameter takes a model alias, not a full model ID or `inherit`"
+        #   (aliases `sonnet`, `opus`, `haiku`, `fable`), plus per-invocation `effort` (v2.1.292+).
+        # - https://code.claude.com/docs/en/model-config.md ("Model aliases", "Adjust effort level"):
+        #   each alias points to the current generation of its line (`families` row `models[0]`), or the parent's own
+        #   version when in the same family; runs on the calling session's own Claude account.
+        'tool': 'Agent',
+        'account_scope': 'own_session',
+        'session_family': 'claude',
+        'harness': 'claude',
+        'model_mode': 'line_target',
+        'model_field': 'model',
+        'effort_field': 'effort',
+        'as_of': '2026-11-24',
+        'sources': (
+            'https://code.claude.com/docs/en/sub-agents.md',
+            'https://code.claude.com/docs/en/model-config.md',
+            'https://code.claude.com/docs/en/hooks.md',
+        ),
+    },
+    'codex': {
+        # OpenAI Codex CLI source & docs (fetched 2026-11-24):
+        # - https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+        #   (`SpawnAgentArgs`: `model: Option<String>`, `reasoning_effort: Option<ReasoningEffort>`)
+        # - https://developers.openai.com/codex/multi-agent/
+        #   Spawns a Codex child agent inside the calling Codex session's own account and `codex` harness.
+        'tool': 'spawn_agent',
+        'account_scope': 'own_session',
+        'session_family': 'codex',
+        'harness': 'codex',
+        'model_mode': 'wire_id',
+        'model_field': 'model',
+        'effort_field': 'reasoning_effort',
+        'as_of': '2026-11-24',
+        'sources': (
+            'https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs',
+            'https://developers.openai.com/codex/multi-agent/',
+        ),
+    },
+    'antigravity-resilient': {
+        # Google Antigravity docs & live tool schema (fetched 2026-11-24):
+        # - https://antigravity.google/docs/subagents.md
+        # - https://antigravity.google/docs/hooks.md (`modelName` on PreToolUse payload)
+        #   `invoke_subagent` `Model` accepts only `inherit` / `flash_lite` / `flash` / `pro` with no published model+effort
+        #   mapping for the abstract tiers; only `Model: "inherit"` expresses a concrete route, when the caller's own active
+        #   model is known (`--parent-model`) and equals the bundle's wire `launch_model`. Effort is in the model ID.
+        'tool': 'invoke_subagent',
+        'account_scope': 'own_session',
+        'session_family': 'antigravity',
+        'harness': 'antigravity-resilient',
+        'model_mode': 'caller_own_model',
+        'model_field': 'Model',
+        'effort_field': None,
+        'as_of': '2026-11-24',
+        'sources': (
+            'https://antigravity.google/docs/subagents.md',
+            'https://antigravity.google/docs/hooks.md',
+        ),
+    },
+    'orca': {
+        # Orca CLI orchestration docs (fetched 2026-11-24):
+        # - https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx
+        #   `orca orchestration worker-start --agent <agent-id> --model <opaque-model-id> [--effort <level>]` supports
+        #   configured local CLI agents (`claude`, `codex`, `antigravity`, `grok`, `pi`, `opencode`).
+        'tool': 'shell:orca worker launch',
+        'account_scope': 'multi_provider',
+        'harnesses': ('claude', 'codex', 'antigravity-resilient', 'pi', 'opencode', 'grok'),
+        'agent_names': {'antigravity-resilient': 'antigravity'},
+        'model_mode': 'wire_id',
+        'agent_field': '--agent',
+        'model_field': '--model',
+        'effort_field': '--effort',
+        'as_of': '2026-11-24',
+        'sources': ('https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx',),
+    },
+    't3': {
+        # T3 Code Orchestrator MCP contracts & drivers (fetched 2026-11-24):
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/contracts/src/orchestratorMcp.ts
+        #   (`OrchestratorMcpDelegateTaskInput`, `OrchestratorMcpTarget`: `{driverKind, model, options}`)
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/builtInDrivers.ts
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+        # - https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+        'tool': 'delegate_task',
+        'account_scope': 'multi_provider',
+        'drivers': {
+            'claude': 'claudeAgent',
+            'codex': 'codex',
+            'antigravity-resilient': 'antigravity',
+            'pi': 'pi',
+            'opencode': 'opencode',
+            'grok': 'grok',
+        },
+        'option_effort_ids': {'codex': 'reasoningEffort', 'claude': 'effort'},
+        'model_mode': 'wire_id',
+        'as_of': '2026-11-24',
+        'sources': (
+            'https://raw.githubusercontent.com/pingdotgg/t3code/main/packages/contracts/src/orchestratorMcp.ts',
+            'https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/builtInDrivers.ts',
+        ),
+    },
+    'pi': {
+        # Pi coding-agent README (fetched 2026-11-24):
+        # - https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/README.md
+        #   "Pi ships with powerful defaults but skips features like sub-agents and plan mode." Bare Pi has no sub-agent tool.
+        'tool': None,
+        'as_of': '2026-11-24',
+        'sources': ('https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/README.md',),
+    },
+    'opencode': {
+        # OpenCode agents docs (fetched 2026-11-24):
+        # - https://opencode.ai/docs/agents/
+        #   OpenCode exposes no PreToolUse spawn gate hook (`sync_host_globals.py`) or per-call model/account sub-agent tool.
+        'tool': None,
+        'as_of': '2026-11-24',
+        'sources': ('https://opencode.ai/docs/agents/',),
+    },
+    'herdr': {
+        # Herdr core skill docs (cited in references/herdr.md):
+        # - https://github.com/herdrdev/herdr-core/blob/e07c2a1bedd62cf4787ee026ee23ee79c7d95491/crates/herdr-core/src/SKILL.md
+        #   `roll` launches an owned child terminal itself (`hc run --bg --parent`), never handing over as `status: native`.
+        'tool': None,
+        'as_of': '2026-11-24',
+        'sources': (
+            'https://github.com/herdrdev/herdr-core/blob/e07c2a1bedd62cf4787ee026ee23ee79c7d95491/crates/herdr-core/src/SKILL.md',
+        ),
+    },
+}
+
+
+def t3_driver_family(driver_kind):
+    """Map a T3 `target.driverKind` (`claudeAgent`, `antigravity`, ...) back to its provider family via `NATIVE_HOST_TOOLS`."""
+    drivers = (NATIVE_HOST_TOOLS.get('t3') or {}).get('drivers') or {}
+    reverse = {v: ('antigravity' if k == 'antigravity-resilient' else k) for k, v in drivers.items()}
+    return reverse.get(driver_kind, driver_kind)
+
 HARNESS_CAPABILITIES = {
+    'claude': {'native_tool': NATIVE_HOST_TOOLS['claude']},
+    'codex': {'native_tool': NATIVE_HOST_TOOLS['codex']},
     'antigravity-resilient': {
         # No prompt image attachments; but the CLI's own read_file tool shows local image files to multimodal models.
         'accepts_image_input': False,
         'reads_image_files': True,
+        'native_tool': NATIVE_HOST_TOOLS['antigravity-resilient'],
     },
+    'pi': {'native_tool': NATIVE_HOST_TOOLS['pi']},
+    'opencode': {'native_tool': NATIVE_HOST_TOOLS['opencode']},
     'grok-bot': {
         # Remote web bot transport takes prompt text and images on the web channel, but cannot transfer or apply local files.
         'transfers_local_files': False,

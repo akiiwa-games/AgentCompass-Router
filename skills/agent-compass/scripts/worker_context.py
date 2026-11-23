@@ -90,11 +90,40 @@ def require_parent_id(value):
 
 HOSTS = ('paseo', 'native', 'orca', 't3', 'herdr')
 NATIVE_HOSTS = ('native', 'orca', 't3')
+# Environment facts that identify the caller's own harness under `--parent-host native` (never guessed from a name).
+CALLER_HARNESS_ENV = (
+    ('claude', ('CLAUDE_SESSION_ID', 'CLAUDE_CODE_SESSION_ID'), ('CLAUDECODE', '1')),
+    ('codex', ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_SANDBOX', 'CODEX_CI'), None),
+    ('antigravity-resilient', ('ANTIGRAVITY_CONVERSATION_ID',), None),
+    ('pi', ('PI_SESSION_ID',), None),
+    ('opencode', ('OPENCODE_SESSION_ID',), None),
+)
 # Orca's own mailbox spelling (src/shared/orca-session-address-prefix.ts, structured-worker-handle.ts).
 ORCA_SESSION_ADDRESS_PREFIX = 'orca_session_id:'
 ORCA_WORKER_HANDLE_PREFIX = 'structworker_'
 # T3 Code injects these only into its Pi provider; Claude and Codex threads reach its MCP tools without any env marker.
 T3_MCP_ENV = ('T3_MCP_URL', 'T3_MCP_BEARER_TOKEN')
+
+
+def caller_native_host(parent_host, environ=None):
+    """Which host/harness owns the caller's native launch surface, from environment/flag facts only; None when unknown
+    or when `parent_host` is not a native surface (`paseo`, `herdr`). Conflicting harness session markers yield None."""
+    if parent_host in ('orca', 't3'):
+        return parent_host
+    if parent_host != 'native':
+        return None
+    env = os.environ if environ is None else environ
+    if (env.get('ORCA_AGENT_SESSION_ID') or '').strip() or (env.get('ORCA_TERMINAL_HANDLE') or '').strip():
+        return 'orca'
+    if all((env.get(name) or '').strip() for name in T3_MCP_ENV):
+        return 't3'
+    matched = []
+    for harness, non_empty_vars, exact_pair in CALLER_HARNESS_ENV:
+        has_var = any((env.get(var) or '').strip() for var in non_empty_vars)
+        has_exact = bool(exact_pair and (env.get(exact_pair[0]) or '').strip() == exact_pair[1])
+        if has_var or has_exact:
+            matched.append(harness)
+    return matched[0] if len(matched) == 1 else None
 
 
 def orca_address(session_id='', handle=''):

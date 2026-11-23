@@ -49,7 +49,8 @@ STAGES = {
 # Options a stage reads that its help does not show: placement, addressing and tooling a delegating caller rarely sets.
 UNLISTED = {
     'roll': ('access', 'title', 'task_id', 'verbose', 'dry_run', 'no_score', 'score', 'score_timeout', 'usage_cache',
-             'reason_category', 'specialty', 'trigger', 'accounts', 'parent_id', 'parent_host', 'parent_address'),
+             'reason_category', 'specialty', 'trigger', 'accounts', 'parent_id', 'parent_host', 'parent_address',
+             'parent_model'),
 }
 
 

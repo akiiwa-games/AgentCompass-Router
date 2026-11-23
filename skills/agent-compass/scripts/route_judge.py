@@ -1079,6 +1079,7 @@ def build_parser():
                         'record: detected from the host session).')
     parser.add_argument('--parent-host', choices=('auto', 'paseo', 'native', 'orca', 't3', 'herdr'), help='roll: host owning the parent session (default: auto-detected from environment)')
     parser.add_argument('--parent-address', help='roll: native host coordinator inbox address')
+    parser.add_argument('--parent-model', help='roll: the calling session\'s own active model id, for native tools that only inherit the caller\'s model.')
     parser.add_argument('--watch-seconds', type=float, default=3600)
     parser.add_argument('--poll-seconds', type=float, default=5)
     parser.add_argument('--usage-cache', type=Path, help='Read only this usage cache file (overrides ROUTER_USAGE_CACHE and the default locations).')

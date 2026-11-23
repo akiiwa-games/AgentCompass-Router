@@ -467,7 +467,7 @@ def scenario_clean_install(ctx):
 # Commands the documentation tells an agent to run, each with the document that has to contain it verbatim. The sandbox runs
 # them as written (placeholders filled with fixture values) from a directory that is not the repository.
 TASK_TEXT = "Rename foo to bar in util.py"
-NATIVE = ["--parent-host", "native", "--parent-id", "sandbox-parent", "--parent-address", "sandbox-inbox"]
+NATIVE = ["--parent-host", "orca", "--parent-id", "sandbox-parent"]
 DOC_RUNS = [
     ("README.md", "agentcompass plan --demo --dry-run", []),
     ("README.md", "agentcompass doctor", []),

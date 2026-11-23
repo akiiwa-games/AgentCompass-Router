@@ -1303,12 +1303,12 @@ class PhrasingInvarianceAndBlockedFallbackTests(unittest.TestCase):
                     parent_id='parent-a', parent_host='antigravity', parent_address='parent-a',
                     provider=None, account=None, model=None, effort=None, basis=None,
                     usage_cache=cache, dry_run=False, verbose=True, fast=False,
-                    resume=None, new_worker=False, no_score=False, score=True, score_timeout=5,
+                    resume=None, new_worker=True, no_score=False, score=True, score_timeout=5,
                 )
                 with patch.object(scorer_client, 'score_task', return_value=(scored_prof, {'source': 'system_one', 'model': 'm'})), \
                         patch.object(decision_ledger, 'read_ledger', return_value=[]), \
                         patch.object(decision_ledger, 'append_ledger'), \
-                        patch.object(roll, 'resolve_parent', return_value=('parent-a', 'native', 'parent-a')), \
+                        patch.object(roll, 'resolve_parent', return_value=('parent-a', 'orca', 'orca_session_id:parent-a')), \
                         patch.object(registry, 'pending', return_value=[]), \
                         patch.object(registry, 'reusable_workers', return_value=[idle_worker]), \
                         patch.object(roll, 'WORKER_PROMPTS_DIR', root / 'wp'), \

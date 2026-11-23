@@ -432,9 +432,45 @@ process.stdout.write(JSON.stringify(out));
             "task_id": task_id,
             **({"host_session_id": host_session_id} if host_session_id else {}),
         }
+        accounts_doc = gate.load_dispatch_accounts() or gate.router_module("account_fleet").load_accounts(
+            gate.router_module("account_fleet").reference_fleet_path()
+        )
+        wire_model = bundle.get("launch_model") or resolved_model
+        if provider == "pi" and not str(wire_model).startswith("openai-codex/"):
+            wire_model = f"openai-codex/{wire_model}"
+        elif provider == "opencode" and not str(wire_model).startswith("opencode/"):
+            wire_model = f"opencode/{wire_model}"
+        eff = None if provider.startswith("antigravity") else resolved_effort
+        hook_model = None
+        if surface == "orca":
+            native_tool = "shell:orca worker launch"
+            ag = "antigravity" if provider.startswith("antigravity") else ("claude" if provider.startswith("claude") else provider)
+            launch_fields = {"--agent": ag, "--model": wire_model, **({"--effort": eff} if eff else {})}
+        elif surface == "t3":
+            native_tool = "delegate_task"
+            drv = ("claudeAgent" if provider.startswith("claude")
+                   else "antigravity" if provider.startswith("antigravity") else provider)
+            opt_key = "reasoningEffort" if drv == "codex" else ("effort" if drv == "claudeAgent" else None)
+            launch_fields = {"target": {"driverKind": drv, "model": wire_model,
+                                        **({"options": {opt_key: eff}} if opt_key and eff else {})}}
+        elif provider.startswith("claude"):
+            native_tool = "Agent"
+            fams = gate.router_module("model_resolution").family_patterns(accounts_doc)
+            hit = gate.router_module("model_resolution").family_row(wire_model, fams)
+            line = hit["line"] if isinstance(hit, dict) and hit.get("line") else wire_model
+            launch_fields = {"model": line, **({"effort": eff} if eff else {})}
+        elif provider.startswith("antigravity"):
+            native_tool = "invoke_subagent"
+            launch_fields = {"Model": "inherit"}
+            hook_model = wire_model
+        else:
+            native_tool = "spawn_agent"
+            launch_fields = {"model": wire_model, **({"reasoning_effort": eff} if eff else {})}
         with mock.patch.object(registry, "own_session_ids", return_value=list(session_ids or ())):
             return registry.record_host_claim(
-                surface, decision, task, bundle, native_handover=True, new_worker=new_worker, now=now,
+                surface, decision, task, bundle, native_handover=True,
+                native_tool=native_tool, launch_fields=launch_fields, hook_model=hook_model,
+                new_worker=new_worker, now=now,
             )
 
     def test_worker_questions_are_blocked_but_main_questions_and_messages_pass(self):
@@ -755,13 +791,13 @@ process.stdout.write(JSON.stringify(out));
                                   parent_id="sess-native", session_ids=["sess-native"], now=T0)
             at_min_16 = T0 + dt.timedelta(minutes=16)
             call_1 = {"session_id": "sess-native", "tool_use_id": "tu-1", "tool_name": "spawn_agent",
-                      "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"}}
+                      "tool_input": {"message": "work", "model": "gpt-6.1-sol", "reasoning_effort": "high"}}
             # Another session cannot consume it
             other_sess = dict(call_1, session_id="sess-stranger", tool_use_id="tu-stranger")
             self.assertEqual(gate.evaluate_payload(other_sess, ledger_path=missing, now=at_min_16)["decision"], "block")
             # Wrong model does not consume the hand-over
             wrong_model = dict(call_1, tool_use_id="tu-wrong",
-                               tool_input={"message": "work", "model": "gpt-6-astra", "effort": "high"})
+                               tool_input={"message": "work", "model": "gpt-6-astra", "reasoning_effort": "high"})
             wrong_res = gate.evaluate_payload(wrong_model, ledger_path=missing, now=at_min_16)
             self.assertEqual(wrong_res["decision"], "block")
             self.assertIn("model: requested='gpt-6-astra'", wrong_res["reason"])
@@ -780,7 +816,7 @@ process.stdout.write(JSON.stringify(out));
                                         parent_id="sess-stale", session_ids=["sess-stale"], task_id="task-stale", now=T0)
             after_24h = T0 + dt.timedelta(seconds=registry.MAX_LIFETIME + 1)
             stale_call = {"session_id": "sess-stale", "tool_use_id": "tu-stale", "tool_name": "spawn_agent",
-                          "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"}}
+                          "tool_input": {"message": "work", "model": "gpt-6.1-sol", "reasoning_effort": "high"}}
             self.assertEqual(gate.evaluate_payload(stale_call, ledger_path=missing, now=after_24h)["decision"], "block")
             self.assertIsNone(registry.inspect(stale_claim["dispatch_id"]).get("launched_at"))
 
@@ -842,14 +878,22 @@ process.stdout.write(JSON.stringify(out));
 
         original_build_task = roll_mod.build_task
 
+        lab_home = self.state / ".claude-lab"
+        lab_home.mkdir(parents=True, exist_ok=True)
+        disc_payload = {
+            "accounts": {"claude-lab": {"family": "claude", "status": "ready", "home": str(lab_home)}},
+            "launchers": {"claude-lab": {"family": "claude", "status": "ready"}},
+        }
+        accounts["_discovery"] = disc_payload
+
         def run_real_roll(*argv, env=None, host_fn=fake_paseo_host, current_accounts=None):
             args = route_judge.build_parser().parse_args(["roll", "--brief", str(brief), *argv])
             args.brief = args.brief[0]
             active_accounts = current_accounts or accounts
+            active_accounts.setdefault("_discovery", disc_payload)
             with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "parent-a", **(env or {})}), \
                     mock.patch.object(account_fleet, "load_accounts", return_value=active_accounts), \
-                    mock.patch.object(registry.provider_inventory, "current", return_value={
-                        "accounts": {}, "launchers": {"claude-lab": {"family": "claude", "status": "ready"}}}), \
+                    mock.patch.object(registry.provider_inventory, "current", return_value=disc_payload), \
                     mock.patch.object(usage_reading, "usage_snapshot", side_effect=lambda *_, **__: usage), \
                     mock.patch.object(subscription_cli, "subscription_env", side_effect=lambda account=None: dict(os.environ)), \
                     mock.patch.object(subscription_cli, "cli_prefix", side_effect=lambda name: [name]), \
@@ -899,16 +943,36 @@ process.stdout.write(JSON.stringify(out));
             )
         self.assertEqual(denied_def["decision"], "block")
 
-        # (c) All three `dispatch_mode == 'native'` paths of `roll` authorize one native launch and block the second:
-        #   c1: `surface in NATIVE_HOSTS` (`orca` terminal with inner Claude session)
+        # (c) All `dispatch_mode == 'native'` paths of `roll` authorize one native launch and block the second:
+        #   c0: `--parent-host native` inside Claude Code (`Agent` with `launch_fields`)
+        res_c0, code_c0 = run_real_roll(
+            "--task-id", "t-native-0", "--parent-host", "native", "--parent-id", "claude-s0",
+            "--parent-address", "inbox:s0", "--new-worker",
+            env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "claude-s0", "CLAUDE_CONFIG_DIR": str(lab_home)},
+        )
+        self.assertEqual((code_c0, res_c0["status"], res_c0["native_tool"], res_c0["launch_fields"]),
+                         (0, "native", "Agent", {"model": "sonnet", "effort": "high"}))
+        c0_payload = {"session_id": "claude-s0", "tool_use_id": "c0-a", "tool_name": "Agent",
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", **res_c0["launch_fields"]}}
+        self.assertEqual(gate.evaluate_payload(c0_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
+        self.assertEqual(
+            gate.evaluate_payload(dict(c0_payload, tool_use_id="c0-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
+            "block",
+        )
+
+        #   c1: `surface in NATIVE_HOSTS` (`orca` terminal with inner Claude session -> `orca orchestration worker-start`)
         res_c1, code_c1 = run_real_roll(
             "--task-id", "t-native-1", "--new-worker",
             env={"PASEO_AGENT_ID": "", "ORCA_AGENT_SESSION_ID": "orca-s1",
-                 "ORCA_TERMINAL_HANDLE": "term_1", "CLAUDE_CODE_SESSION_ID": "claude-s1"},
+                 "ORCA_TERMINAL_HANDLE": "term_1", "CLAUDE_CODE_SESSION_ID": "claude-s1",
+                 "CLAUDE_CONFIG_DIR": str(lab_home)},
         )
-        self.assertEqual((code_c1, res_c1["status"]), (0, "native"))
-        c1_payload = {"session_id": "claude-s1", "tool_use_id": "c1-a", "tool_name": "Agent",
-                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+        self.assertEqual((code_c1, res_c1["status"], res_c1["native_tool"]),
+                         (0, "native", "shell:orca worker launch"))
+        c1_payload = {
+            "session_id": "claude-s1", "tool_use_id": "c1-a", "tool_name": "Bash",
+            "tool_input": {"command": 'orca orchestration worker-start --spec "x" --agent claude --model claude-sonnet-5-5 --effort high --json'},
+        }
         self.assertEqual(gate.evaluate_payload(c1_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
         self.assertEqual(
             gate.evaluate_payload(dict(c1_payload, tool_use_id="c1-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
@@ -920,29 +984,29 @@ process.stdout.write(JSON.stringify(out));
                 mock.patch.object(roll_mod, "provider_definition", return_value=("custom-no-cli", {})):
             res_c2, code_c2 = run_real_roll(
                 "--task-id", "t-native-2", "--parent-id", "sess-c2", "--new-worker",
-                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c2"},
+                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c2", "CLAUDE_CONFIG_DIR": str(lab_home)},
             )
         self.assertEqual((code_c2, res_c2["status"]), (0, "native"))
         c2_payload = {"session_id": "sess-c2", "tool_use_id": "c2-a", "tool_name": "Agent",
-                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", **res_c2["launch_fields"]}}
         self.assertEqual(gate.evaluate_payload(c2_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
         self.assertEqual(
             gate.evaluate_payload(dict(c2_payload, tool_use_id="c2-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
             "block",
         )
 
-        #   c3: `roll.cli` when `subprocess.Popen` raises OSError (`CLI could not start ... start it natively`)
+        #   c3: `roll.cli` when `subprocess.Popen` raises OSError (`CLI could not start; handed over to Agent`)
         with mock.patch.object(flow, "paseo_reachable", return_value=False), \
                 mock.patch.object(roll_mod, "provider_definition", return_value=("claude", {})), \
                 mock.patch.object(roll_mod.subprocess, "Popen", side_effect=OSError("missing binary")):
             res_c3, code_c3 = run_real_roll(
                 "--task-id", "t-native-3", "--parent-id", "sess-c3", "--new-worker", "--verbose",
-                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c3"},
+                env={"PASEO_AGENT_ID": "", "CLAUDE_SESSION_ID": "sess-c3", "CLAUDE_CONFIG_DIR": str(lab_home)},
             )
         self.assertEqual((code_c3, res_c3["dispatch_mode"], res_c3["caller_action"]),
-                         (1, "native", "launch_with_native_host_tool"))
+                         (0, "native", "launch_with_native_host_tool"))
         c3_payload = {"session_id": "sess-c3", "tool_use_id": "c3-a", "tool_name": "Agent",
-                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", "model": "sonnet"}}
+                      "tool_input": {"subagent_type": "general-purpose", "prompt": "work", **res_c3["launch_fields"]}}
         self.assertEqual(gate.evaluate_payload(c3_payload, ledger_path=ledger, now=dt.datetime.now(UTC)), {})
         self.assertEqual(
             gate.evaluate_payload(dict(c3_payload, tool_use_id="c3-b"), ledger_path=ledger, now=dt.datetime.now(UTC))["decision"],
@@ -955,8 +1019,8 @@ process.stdout.write(JSON.stringify(out));
                                    task_id="t-wrap", now=T0)
         two_spawns = {
             "session_id": "sess-wrap", "tool_use_id": "wrap-1", "tool_name": "exec",
-            "tool_input": 'await spawn_agent({message: "one", model: "gpt-6-astra"}); '
-                          'await spawn_agent({message: "two", model: "gpt-6-astra"})',
+            "tool_input": 'await spawn_agent({message: "one", model: "gpt-6-astra", reasoning_effort: "high"}); '
+                          'await spawn_agent({message: "two", model: "gpt-6-astra", reasoning_effort: "high"})',
         }
         refused_two = gate.evaluate_payload(two_spawns, ledger_path=ledger, now=T0)
         self.assertEqual(refused_two["decision"], "block")
@@ -965,7 +1029,7 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual((after_refused["state"], after_refused.get("launched_at")), ("prepared", None))
         one_spawn = {
             "session_id": "sess-wrap", "tool_use_id": "wrap-single", "tool_name": "spawn_agent",
-            "tool_input": {"message": "one", "model": "gpt-6-astra"},
+            "tool_input": {"message": "one", "model": "gpt-6-astra", "reasoning_effort": "high"},
         }
         self.assertEqual(gate.evaluate_payload(one_spawn, ledger_path=ledger, now=T0), {})
         self.assertEqual(registry.inspect(wrap_claim["dispatch_id"])["state"], "launched")
@@ -988,7 +1052,7 @@ process.stdout.write(JSON.stringify(out));
         ])
         native_call = {
             "session_id": "s-f1", "tool_use_id": "tu-f1", "tool_name": "spawn_agent",
-            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"},
+            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "reasoning_effort": "high"},
         }
         # 1. Corrupt `dispatch.sqlite3` denies native launches even when a ledger `record` row exists:
         db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1037,7 +1101,7 @@ process.stdout.write(JSON.stringify(out));
                               task_id="t-f2", now=T0)
         mixed_call = {
             "session_id": "s-f2", "tool_use_id": "tu-f2-mixed", "tool_name": "exec",
-            "tool_input": 'await spawn_agent({message: "ok", model: "gpt-6-astra"}); '
+            "tool_input": 'await spawn_agent({message: "ok", model: "gpt-6-astra", reasoning_effort: "high"}); '
                           'await paseo.create_agent({provider: "codex/gpt-6-astra"})',
         }
         res = gate.evaluate_payload(mixed_call, ledger_path=missing, now=T0)
@@ -1060,7 +1124,7 @@ process.stdout.write(JSON.stringify(out));
                                   parent_id="s-n6-seq", session_ids=["s-n6-seq"], task_id="t-n6-seq", now=T0)
         seq_call = {
             "session_id": "s-n6-seq", "tool_use_id": "tu-n6-1", "tool_name": "spawn_agent",
-            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"},
+            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "reasoning_effort": "high"},
         }
         self.assertEqual(gate.evaluate_payload(seq_call, ledger_path=missing, now=T0), {})
         second_seq = gate.evaluate_payload(dict(seq_call, tool_use_id="tu-n6-2"), ledger_path=missing, now=T0)
@@ -1081,7 +1145,7 @@ process.stdout.write(JSON.stringify(out));
 
         race_base = {
             "session_id": "s-n6-race", "tool_name": "spawn_agent",
-            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "effort": "high"},
+            "tool_input": {"message": "work", "model": "gpt-6.1-sol", "reasoning_effort": "high"},
         }
         with mock.patch.object(registry, "native_handovers", side_effect=synced_handovers):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -1209,7 +1273,7 @@ process.stdout.write(JSON.stringify(out));
             )
             self.assertEqual(denied_haiku["decision"], "block", sub_name)
             self.assertIn("`model`", denied_haiku["reason"])
-            self.assertNotIn("`effort`", denied_haiku["reason"])
+            self.assertIn("`effort`", denied_haiku["reason"])
         self.assertIsNone(registry.inspect(haiku_claim["dispatch_id"]).get("launched_at"))
 
         opus_claim = self.handover("claude", "claude-opus-5-5", "high", bundle_id="opus55_high",
@@ -1228,7 +1292,9 @@ process.stdout.write(JSON.stringify(out));
         self.assertIsNone(registry.inspect(opus_claim["dispatch_id"]).get("launched_at"))
         project = self.state / "proj-f4"
         (project / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
-        (project / ".claude" / "agents" / "rev.md").write_text("---\nname: rev\nmodel: opus\n---\nReview\n", encoding="utf-8")
+        (project / ".claude" / "agents" / "rev.md").write_text(
+            "---\nname: rev\nmodel: opus\neffort: high\n---\nReview\n", encoding="utf-8",
+        )
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-c2", "cwd": str(project), "tool_use_id": "tu-rev",
@@ -1258,7 +1324,7 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-x1", "model": "gpt-6.1-sol", "tool_use_id": "tu-sol",
-                 "tool_name": "spawn_agent", "tool_input": {"message": "x"}},
+                 "tool_name": "spawn_agent", "tool_input": {"message": "x", "reasoning_effort": "high"}},
                 ledger_path=missing, now=T0,
             ),
             {},
@@ -1388,7 +1454,8 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(
             gate.evaluate_payload(
                 {"session_id": "s-t3", "tool_use_id": "tu-t3-ok", "tool_name": "delegate_task",
-                 "tool_input": {"task": "work", "target": {"driverKind": "codex", "model": "gpt-6.1-sol", "effort": "high"}}},
+                 "tool_input": {"task": "work", "target": {"driverKind": "codex", "model": "gpt-6.1-sol",
+                                                           "options": {"reasoningEffort": "high"}}}},
                 ledger_path=missing, now=T0,
             ),
             {},
@@ -1713,7 +1780,8 @@ process.stdout.write(JSON.stringify(out));
             )):
                 args["settings"] = {"thinkingOptionId": "high"}
                 host_launch = {"session_id": "s1", "tool_use_id": f"pi-{prov}-{idx}",
-                               "tool_name": "delegate_task", "tool_input": args}
+                               "tool_name": "delegate_task",
+                               "tool_input": {"task": "work", "target": {"driverKind": prov, "model": launch_model}}}
                 schedule = {"tool_name": "mcp__paseo__create_schedule", "session_id": "s1",
                             "tool_input": dict(args, prompt="work", cron="7 * * * *")}
                 # Plan row authorizes schedule only, not native delegate_task; native handover authorizes delegate_task.
@@ -1745,9 +1813,10 @@ process.stdout.write(JSON.stringify(out));
                     ledger_path=plan_ledger, now=T0), {})
                 self.handover(provider, model, "high", surface="t3", parent_id="s1", session_ids=["s1"],
                               task_id=f"t-{provider}-{model}", now=T0)
-                self.assertEqual(gate.evaluate_payload({"session_id": "s1", "tool_name": "delegate_task",
-                                                       "tool_input": args},
-                                                       ledger_path=plan_ledger, now=T0), {})
+                self.assertEqual(gate.evaluate_payload(
+                    {"session_id": "s1", "tool_name": "delegate_task",
+                     "tool_input": {"task": "work", "target": {"driverKind": "antigravity", "model": model}}},
+                    ledger_path=plan_ledger, now=T0), {})
 
     def test_quota_never_blocks_inspection_even_with_provider_or_agent_id(self):
         self.exhausted_cache()
@@ -1890,7 +1959,7 @@ process.stdout.write(JSON.stringify(out));
 
         # A native launch names a model only; it resolves to an account when one account offers it.
         native = {"tool_name": "Agent", "tool_input": {"subagent_type": "general-purpose", "prompt": "work",
-                                                         "model": "claude-sonnet-5-5"}}
+                                                         "model": "sonnet", "effort": "high"}}
         real_accounts = gate.load_dispatch_accounts
 
         def claude_only():
@@ -1931,11 +2000,11 @@ process.stdout.write(JSON.stringify(out));
         # not recorded, or the launch names no model, nothing is guessed. Quota, window and floor checks resolve the
         # launch as it is written, so the own account's exhausted window does not refuse it.
         native = {"tool_name": "Agent", "tool_input": {"subagent_type": "general-purpose", "prompt": "work",
-                                                         "model": "opus"}}
+                                                         "model": "opus", "effort": "high"}}
         proj_agents = self.state / "proj-own-acct"
         (proj_agents / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
         (proj_agents / ".claude" / "agents" / "quick-find.md").write_text(
-            "---\nname: quick-find\nmodel: haiku\n---\nFind\n", encoding="utf-8"
+            "---\nname: quick-find\nmodel: haiku\neffort: high\n---\nFind\n", encoding="utf-8"
         )
         custom_no_raw_model = {"cwd": str(proj_agents), "tool_name": "Agent",
                                "tool_input": {"subagent_type": "quick-find", "prompt": "work"}}
@@ -2538,10 +2607,11 @@ process.stdout.write(JSON.stringify(out));
         registry = gate.router_module("dispatch_registry")
         self.assertEqual(registry.inspect(first_claim["dispatch_id"])["state"], "canceled")
         handover_res = gate.evaluate_payload({"session_id": "parent-a", "tool_name": "delegate_task", "tool_input": {
-            "provider": "codex/gpt-6-astra", "settings": {"thinkingOptionId": "high"}}},
+            "task": "work",
+            "target": {"driverKind": "codex", "model": "gpt-6-astra", "options": {"reasoningEffort": "high"}}}},
             ledger_path=missing, now=T0 + dt.timedelta(seconds=10))
         self.assertEqual(handover_res["decision"], "block")
-        self.assertIn("provider: requested='codex', routed='pi'", handover_res["reason"])
+        self.assertIn("target.driverKind: requested='codex', routed='pi'", handover_res["reason"])
         self.assertIn("pi_astra_high", handover_res["reason"])
         self.assertNotIn("兼容检查", handover_res["reason"])
 
@@ -2562,15 +2632,19 @@ process.stdout.write(JSON.stringify(out));
     def test_parent_alone_does_not_collapse_concurrent_tasks(self):
         missing = self.state / "missing.jsonl"
         self.handover("codex", "gpt-6-astra", "high", surface="t3", parent_id="a", session_ids=["a"], task_id="t1", now=T0)
-        self.handover("dot", surface="t3", parent_id="a", session_ids=["a"], task_id="t2", now=T0 + dt.timedelta(seconds=1))
+        self.handover("pi", "gpt-6-astra", "high", surface="t3", bundle_id="pi_astra_high",
+                      parent_id="a", session_ids=["a"], task_id="t2", now=T0 + dt.timedelta(seconds=1))
         self.assertEqual(gate.evaluate_payload({"session_id": "a", "tool_name": "delegate_task", "tool_input": {
-            "provider": "codex/gpt-6-astra"}}, ledger_path=missing, now=T0 + dt.timedelta(seconds=2)), {})
+            "task": "work",
+            "target": {"driverKind": "codex", "model": "gpt-6-astra", "options": {"reasoningEffort": "high"}}}},
+            ledger_path=missing, now=T0 + dt.timedelta(seconds=2)), {})
 
     def test_a_host_terminal_parent_matches_the_harness_session_it_runs(self):
         # Issue #2: roll inside an Orca terminal records the Orca session as the parent (the worker's reply
         # address) and the Claude Code session it runs in; Claude's hook payload carries only the latter.
         missing = self.state / "missing.jsonl"
-        launch = {"tool_name": "delegate_task", "tool_input": {"provider": "codex/gpt-6-astra"}}
+        launch = {"tool_name": "Bash", "tool_input": {
+            "command": 'orca orchestration worker-start --spec "x" --agent codex --model gpt-6-astra --effort high --json'}}
         self.handover("codex", "gpt-6-astra", "high", surface="orca",
                       parent_id="orca-sess", host_session_id="claude-uuid", task_id="t-orca-1", now=T0)
         self.assertEqual(gate.evaluate_payload(dict(launch, session_id="other-claude"), ledger_path=missing, now=T0)["decision"],
@@ -3705,19 +3779,23 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
                 "t3", {"decision_id": f"dec-wire-{p_idx}", "choice": bid},
                 {"parent_agent_id": f"s-wire-{p_idx}", "task_id": f"t-wire-{p_idx}"},
                 {"provider": "codex", "account": "codex", "model": row_model, "effort": "high", "bundle_id": bid},
-                native_handover=True, now=T0,
+                native_handover=True, native_tool="delegate_task",
+                launch_fields={"target": {"driverKind": "codex", "model": own_wire, "options": {"reasoningEffort": "high"}}},
+                now=T0,
             )
         for wrong in rival_wires:
             denied = gate.evaluate_payload({
                 "session_id": f"s-wire-{p_idx}",
                 "tool_name": "delegate_task",
-                "tool_input": {"provider": f"codex/{wrong}", "settings": {"thinkingOptionId": "high"}},
+                "tool_input": {"task": "w", "target": {"driverKind": "codex", "model": wrong,
+                                                       "options": {"reasoningEffort": "high"}}},
             }, ledger_path=missing_ledger, now=T0)
             assert "model:" in denied.get("reason", ""), (bid, "handover", wrong, denied)
         ok_handover = gate.evaluate_payload({
             "session_id": f"s-wire-{p_idx}",
             "tool_name": "delegate_task",
-            "tool_input": {"provider": f"codex/{own_wire}", "settings": {"thinkingOptionId": "high"}},
+            "tool_input": {"task": "w", "target": {"driverKind": "codex", "model": own_wire,
+                                                   "options": {"reasoningEffort": "high"}}},
         }, ledger_path=missing_ledger, now=T0)
         assert ok_handover == {}, (bid, "handover", ok_handover)
 
@@ -3758,12 +3836,16 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
             "t3", {"decision_id": "dec-m12c", "choice": "b_va_high@medium"},
             {"parent_agent_id": "s-m12c", "task_id": "t-m12c"},
             {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured", "effort": "medium"},
-            native_handover=True, now=T0,
+            native_handover=True, native_tool="delegate_task",
+            launch_fields={"target": {"driverKind": "codex", "model": "vendor-a/novel-unmeasured",
+                                      "options": {"reasoningEffort": "medium"}}},
+            now=T0,
         )
     res_m12c = gate.evaluate_payload({
         "session_id": "s-m12c",
         "tool_name": "delegate_task",
-        "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "medium"}},
+        "tool_input": {"task": "w", "target": {"driverKind": "codex", "model": "vendor-a/novel-unmeasured",
+                                               "options": {"reasoningEffort": "medium"}}},
     }, ledger_path=missing_ledger, now=T0)
     assert res_m12c == {}, res_m12c
 
@@ -3785,12 +3867,16 @@ def test_gate_matches_bundle_wire_launch_model_without_crossing_provider_identit
             {"parent_agent_id": "s-a2-auto", "task_id": "t-a2-auto"},
             {"provider": "codex", "account": "codex", "model": "vendor-a/novel-unmeasured", "effort": "high",
              "bundle_id": "b_va_high"},
-            native_handover=True, now=T0,
+            native_handover=True, native_tool="delegate_task",
+            launch_fields={"target": {"driverKind": "codex", "model": "vendor-a/novel-unmeasured",
+                                      "options": {"reasoningEffort": "high"}}},
+            now=T0,
         )
     verdict_auto = gate.evaluate_payload({
         "session_id": "s-a2-auto",
         "tool_name": "delegate_task",
-        "tool_input": {"provider": "codex/vendor-a/novel-unmeasured", "settings": {"thinkingOptionId": "high"}},
+        "tool_input": {"task": "w", "target": {"driverKind": "codex", "model": "vendor-a/novel-unmeasured",
+                                               "options": {"reasoningEffort": "high"}}},
     }, ledger_path=missing_ledger, now=T0)
     assert verdict_auto.get("decision") == "block", verdict_auto
     for extra, should_allow in (
