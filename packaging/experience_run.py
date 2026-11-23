@@ -1102,8 +1102,11 @@ def main(argv=None) -> int:
                 futures = [pool.submit(run_scenario, world, spec, i + 1, scenarios_doc["usage_states"], corpus, briefs_doc["day"],
                                        args.days or int(spec.get("days", 1)), stop) for i, spec in enumerate(selected)]
                 try:
-                    for future in concurrent.futures.as_completed(futures):
-                        results.append(future.result())
+                    # Wait in short slices: a signal handler runs only between them (a blocked wait on Windows never runs it).
+                    pending = set(futures)
+                    while pending:
+                        done, pending = concurrent.futures.wait(pending, timeout=1.0)
+                        results.extend(future.result() for future in done)
                 except KeyboardInterrupt:
                     stop.set()
                     meta["interrupted"] = True
