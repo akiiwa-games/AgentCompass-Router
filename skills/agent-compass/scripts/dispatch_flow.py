@@ -608,7 +608,7 @@ def workspace_holders(directory, parent_id, host=None, path=None):
     return holders, None, probe
 
 
-def deliver_end_notices(now=None, path=None, host=None):
+def deliver_end_notices(now=None, path=None, host=None, *, timeout=10):
     """Send each due end notice once. Without an explicit daemon, and without an injected host, send nothing.
 
     A failed send leaves the notice due so the next read retries it. The bridge computes the message id, the same
@@ -628,7 +628,7 @@ def deliver_end_notices(now=None, path=None, host=None):
         return []
     sender = host or host_call
     sent = []
-    for notice in registry.due_end_notices(path, now=now):
+    for notice in registry.due_end_notices(path, now=now, timeout=timeout):
         dispatch_id = notice['dispatch_id']
         try:
             response = sender({'operation': 'notify_end', 'dispatch_id': dispatch_id,

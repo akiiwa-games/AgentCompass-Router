@@ -177,6 +177,34 @@ class CalibrationReportTests(unittest.TestCase):
         self.assertEqual((cell["end_unknown"], cell["other_terminal"], cell["open"]), (2, 1, 0))
         self.assertIn("*end_unknown*", report.render(out))
 
+    def test_native_handovers_and_unstarted_cli_claims_are_counted_once_on_base_decision(self):
+        # CLI fallback writes an unstarted `cli` claim (`launched_at` absent, state `canceled`) plus a wrapped
+        # `native:<decision_id>:<suffix>` hand-over. Only a claimed hand-over (`launched_at` present) counts as a
+        # dispatch (`end_unknown` when in `launched`/`expired`), joined to its base `decision_id`; an unconsumed
+        # hand-over (`launched_at` absent) counts as 0 dispatches and leaves its ledger decision unlaunched.
+        rows = [
+            dispatch(1, decision="dec-paseo", state="completed"),
+            dispatch(2, decision="cli:dec-fallback:11111111", dispatch_mode="cli", state="canceled", active=None),
+            dispatch(3, decision="native:dec-fallback:22222222", dispatch_mode="native", native_handover=True,
+                     launched_at=STAMP, state="expired", active=None),
+            dispatch(4, decision="native:dec-abandoned:33333333", dispatch_mode="native", native_handover=True,
+                     state="expired", active=None),
+        ]
+        ledger = [
+            {"stage": "plan", "decision_id": "dec-paseo", "choice": "m1", "at": STAMP},
+            {"stage": "plan", "decision_id": "dec-fallback", "choice": "m1", "keep_whole": "coupled", "at": STAMP},
+            {"stage": "plan", "decision_id": "dec-abandoned", "choice": "m1", "at": STAMP},
+        ]
+        write_state(self.root, rows, ledger=ledger)
+        out = build(self.root)
+        cov = out["coverage"]
+        self.assertEqual(cov["dispatches"], 2)
+        self.assertEqual((cov["completed"], cov["failed_or_canceled"]), (1, 0))
+        self.assertEqual((cov["ledger_decisions"], cov["ledger_decisions_without_dispatch"]), (3, 1))
+        self.assertEqual({g: out["groups"][g] for g in report.GROUPS}, {"routed": 1, "pinned": 0, "keep_whole": 1})
+        self.assertEqual(out["own_groups"]["keep_whole"]["endings"]["end_unknown"], 1)
+        self.assertIn("claimed native hand-over", report.render(out))
+
     def test_the_rotated_away_worker_is_counted_as_rotated(self):
         old = dispatch(1, agent_id="worn", created="2026-11-04T10:00:00+00:00")
         new = dispatch(2, decision="rot")

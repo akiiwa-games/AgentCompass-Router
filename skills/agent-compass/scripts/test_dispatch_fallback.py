@@ -616,6 +616,33 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(len(retried), 1)
         self.assertEqual(registry.decision_record(retried[0]).get('route'), {'unclassified': 'fixture'})
 
+    def test_an_owner_named_retry_whose_prepare_raises_is_still_marked_from_roll_and_cannot_authorize_native_launch(self):
+        # Unproven item 1: `Chain.same_bundle` issues its retry `record` decision with `from_roll=True`, so even if
+        # `registry.prepare` raises before inserting a `dispatches` row, the ledger `record` row belongs to `roll`
+        # (`roll_decision_ids`) and never authorizes a native launch in the parent session.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'setup'))
+        import router_gate_hook as gate
+        task = dict(self.task, can_wait_hours=1, parent_agent_id='parent-a')
+        root = self.transient_root(task=task, decision=self.owner_named(task))
+        self.assertEqual(self.handle(root['dispatch_id'])['action'], 'scheduled')
+        with self.at(minutes=3), patch.object(registry, 'prepare', side_effect=ValueError('Workspace busy')):
+            out = self.handle(root['dispatch_id'])
+        self.assertEqual(out['action'], 'final')
+        retry_rows = [e for e in self.ledger if e.get('source') == 'fallback_retry']
+        self.assertEqual(len(retry_rows), 1)
+        retry_did = retry_rows[0]['decision_id']
+        self.assertIn(retry_did, registry.roll_decision_ids())
+        self.assertEqual(decision_ledger.standalone_record_rows(self.ledger, registry.roll_decision_ids()), [])
+        ledger_file = self.root / 'retry-gate-ledger.jsonl'
+        ledger_file.write_bytes(''.join(json.dumps(e) + '\n' for e in self.ledger).encode('utf-8'))
+        with patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a', 'ROUTER_DISPATCH_DB': str(registry.db_path())}):
+            verdict = gate.evaluate_payload(
+                {'session_id': 'parent-a', 'tool_name': 'Agent',
+                 'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'work', 'model': 'sonnet'}},
+                ledger_path=ledger_file, now=registry.utcnow() + timedelta(minutes=3),
+            )
+        self.assertEqual(verdict['decision'], 'block')
+
     def test_an_owner_named_model_waits_only_what_the_task_allows(self):
         """Review F2: the owner's model follows can_wait_hours too; a backoff past it reports to the parent."""
         for name, task, minutes in (('no wait given', dict(self.task, task_id='owner-a'), None),

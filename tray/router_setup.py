@@ -142,7 +142,7 @@ def main() -> int:
     ttk.Label(root, text=_tr("AgentCompass 将把 router 技能链接到各 agent、写入全局 agent 规则（受管块，你自己的内容保留）。"
                             "下面是将要改动的文件，确认后才会写入；所有改动都有备份，可用 agentcompass uninstall 撤销。"),
               wraplength=720, justify="left").pack(fill="x", padx=12, pady=(12, 6))
-    ttk.Checkbutton(root, variable=hooks, text=_tr("安装 router 门禁 hook（拦截 15 分钟内没有 roll 记录的子 agent 启动；可随时撤销）")).pack(
+    ttk.Checkbutton(root, variable=hooks, text=_tr("安装 router 门禁 hook（拦截未经 roll 原生移交或本会话 record 授权的子 agent 启动；可随时撤销）")).pack(
         anchor="w", padx=12)
     text = tk.Text(root, wrap="word", height=22)
     text.pack(fill="both", expand=True, padx=12, pady=6)

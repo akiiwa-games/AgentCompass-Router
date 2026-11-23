@@ -32,7 +32,78 @@ LEDGER_WRITES = True    # `plan --dry-run` turns this off so a trial run leaves 
 
 
 LAUNCH_STAGES = ('plan', 'record')
+ROUTE_BUNDLE_FIELDS = ('provider', 'account', 'model')
+PASEO_SPAWN_KINDS = ('paseo', 'pi->paseo', None)
 BASIS_LIMIT = 400      # characters of a record's --basis a row keeps; `record` refuses a longer quote instead of cutting it
+
+
+def _parse_audit_ts(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def has_route_bundle(row):
+    """True when `row` carries a `bundle` dict naming non-empty `provider`, `account`, and `model`."""
+    if not isinstance(row, dict):
+        return False
+    bundle = row.get('bundle')
+    return isinstance(bundle, dict) and all(
+        isinstance(bundle.get(k), str) and bool(bundle[k].strip()) for k in ROUTE_BUNDLE_FIELDS
+    )
+
+
+def carries_route(row):
+    """A ledger row carries a route only as a plan/record row whose bundle names what to launch."""
+    return isinstance(row, dict) and row.get('stage') in LAUNCH_STAGES and has_route_bundle(row)
+
+
+def standalone_record_rows(rows, roll_ids=()):
+    """Standalone `record` rows carrying a route bundle (excluding `workflow`, `explicit_resume`, and `roll`-owned decisions).
+    Shared by the spawn gate (Fact 2) and the daily compliance audit so both read the same rule."""
+    owned = set(roll_ids or ())
+    return [
+        r for r in (rows or ())
+        if carries_route(r)
+        and r.get('stage') == 'record'
+        and r.get('trigger') != 'workflow'
+        and r.get('constraint') != 'explicit_resume'
+        and not (r.get('decision_id') and r['decision_id'] in owned)
+    ]
+
+
+def spawn_is_authorized(spawn, rows, *, dispatches=(), roll_ids=(), window_seconds=900):
+    """Whether `spawn` had launch authority under the same two native facts (claimed `native_handover` or standalone
+    `record` row within `window_seconds`) or, for a Paseo creation/schedule spawn, a claimed Paseo dispatch or route row."""
+    t = _parse_audit_ts(spawn.get('at')) if isinstance(spawn, dict) else None
+    if t is None:
+        return False
+
+    def within(raw):
+        ts = _parse_audit_ts(raw)
+        return ts is not None and -60 <= (t - ts).total_seconds() <= window_seconds
+
+    if spawn.get('kind') in PASEO_SPAWN_KINDS:
+        if any(isinstance(d, dict) and d.get('dispatch_mode', 'paseo') == 'paseo'
+               and d.get('launched_at') and d.get('state') != 'create_failed' and within(d.get('launched_at'))
+               for d in (dispatches or ())):
+            return True
+        return any(carries_route(r) and r.get('action') != 'defer'
+                   and not isinstance(r.get('host_policy_violation'), dict) and within(r.get('at'))
+                   for r in (rows or ()))
+    if any(isinstance(d, dict) and d.get('native_handover') is True
+           and d.get('launched_at') and d.get('state') not in ('canceled', 'create_failed')
+           and within(d.get('launched_at'))
+           for d in (dispatches or ())):
+        return True
+    return any(not isinstance(r.get('host_policy_violation'), dict) and within(r.get('at'))
+               for r in standalone_record_rows(rows, roll_ids))
 
 
 # The constraints of a row the user named: a named route (`record`/`roll`) and an explicit `--resume`.

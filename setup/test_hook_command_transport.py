@@ -64,8 +64,8 @@ class HookCommandTransportTests(unittest.TestCase):
                             ledger.write_text(json.dumps({'at':datetime.now(timezone.utc).isoformat(),
                                 'stage':'record','choice':'constraint','source':'constraint_record',
                                 'constraint':'user_override','basis':'transport fixture',
-                                'bundle':{'provider':'codex','account':'codex','model':'gpt-6.1-sol',
-                                          'effort':'high','bundle_id':'sol_high'}})+'\n',encoding='utf-8')
+                                'bundle':{'provider':'claude','account':'claude','model':'claude-haiku-5-5',
+                                          'effort':'high'}})+'\n',encoding='utf-8')
                         else:ledger.unlink(missing_ok=True)
                         result=subprocess.run([str(shell),*flags,command],input=json.dumps(payload),env=env,
                             capture_output=True,text=True,encoding='utf-8',timeout=30)

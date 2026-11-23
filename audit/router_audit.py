@@ -28,6 +28,7 @@ from agentcompass import locations
 HOME = Path.home()
 SKILL_SCRIPTS = locations.skill_root() / "agent-compass" / "scripts"
 LEDGER = Path(os.environ.get("ROUTER_LEDGER", HOME / ".agent-compass" / "router-ledger.jsonl"))
+DISPATCH_DB = Path(os.environ.get("ROUTER_DISPATCH_DB", HOME / ".agent-compass" / "dispatch.sqlite3"))
 DOT_DB = HOME / ".dot2api" / "data" / "dot2api.sqlite3"
 REPORT_DIR = Path(__file__).resolve().parent / "reports"
 UTC = dt.timezone.utc
@@ -71,6 +72,25 @@ def load_usage_reading():
     return usage_reading
 
 
+def load_decision_ledger():
+    if str(SKILL_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SKILL_SCRIPTS))
+    import decision_ledger
+    return decision_ledger
+
+
+def load_audit_registry(path: Path | None = None) -> tuple[list[dict], set[str]]:
+    """Read `(dispatches, roll_decision_ids)` read-only from `dispatch.sqlite3`; `([], set())` when absent or unreadable."""
+    target = path or Path(os.environ.get("ROUTER_DISPATCH_DB") or DISPATCH_DB)
+    if str(SKILL_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SKILL_SCRIPTS))
+    import dispatch_registry
+    try:
+        return dispatch_registry.read_dispatches(target), dispatch_registry.roll_decision_ids(target)
+    except (OSError, ValueError, sqlite3.Error):
+        return [], set()
+
+
 # ---------------------------------------------------------------- decisions
 
 def usage_points(usage: dict) -> dict:
@@ -105,6 +125,8 @@ def from_ledger(path: Path, skipped: list[int] | None = None):
         at = parse_ts(r.get("at"))
         if at:
             rows.append({"at": at, "stage": r.get("stage"), "choice": r.get("choice"), "specialty": r.get("specialty"),
+                         "decision_id": r.get("decision_id"), "trigger": r.get("trigger"),
+                         "host_policy_violation": r.get("host_policy_violation"),
                          "source": r.get("source"), "constraint": r.get("constraint"), "bundle": r.get("bundle"), "reason": r.get("reason") or "",
                          "usage": r.get("usage") or {}, "alerts": r.get("alerts") or [], "origin": "ledger",
                          "duration_ms": r.get("duration_ms"),
@@ -372,21 +394,20 @@ def scan_subagent_spawns(paseo_files, claude_subagent_files, codex_sessions, sin
     return sorted(spawns, key=lambda x: x["at"])
 
 
-def find_unrouted_spawns(spawns: list[dict], rows: list[dict], window_seconds: int = UNROUTED_WINDOW_SECONDS) -> list[dict]:
-    """Return child-agent spawns that had no plan/record decision within window_seconds prior."""
-    valid_routes = [
-        r["at"] for r in rows
-        if r.get("stage") in DECISION_STAGES
-        and r.get("choice") not in (None, "", "none")
-        and r.get("at") is not None
+def find_unrouted_spawns(
+    spawns: list[dict],
+    rows: list[dict],
+    window_seconds: int = UNROUTED_WINDOW_SECONDS,
+    *,
+    dispatches=(),
+    roll_ids=(),
+) -> list[dict]:
+    """Return child-agent spawns without gate-equivalent launch authority (`decision_ledger.spawn_is_authorized`)."""
+    spawn_is_authorized = load_decision_ledger().spawn_is_authorized
+    return [
+        sp for sp in spawns
+        if not spawn_is_authorized(sp, rows, dispatches=dispatches, roll_ids=roll_ids, window_seconds=window_seconds)
     ]
-    unrouted = []
-    for sp in spawns:
-        t = sp["at"]
-        matched = any(-60 <= (t - r_at).total_seconds() <= window_seconds for r_at in valid_routes)
-        if not matched:
-            unrouted.append(sp)
-    return unrouted
 
 
 # ---------------------------------------------------------------- findings
@@ -578,11 +599,14 @@ def build_findings(ctx: dict) -> list[dict]:
     if "capacity" in ctx:
         for finding in capacity_findings(ctx["capacity"], ctx["now"], ctx.get("agent_days")):
             add(*finding)
-    unrouted = find_unrouted_spawns(ctx.get("spawns") or [], rows)
+    unrouted = find_unrouted_spawns(
+        ctx.get("spawns") or [], rows,
+        dispatches=ctx.get("dispatches") or (), roll_ids=ctx.get("roll_ids") or (),
+    )
     if unrouted:
         samples = "; ".join(f"{local(u['at']):%m-%d %H:%M} {u['label']}" for u in unrouted[-5:])
         add("warn", "unrouted", f"检测到 {len(unrouted)} 次未过 router 的子 agent 启动",
-            f"启动前 15 分钟内无 plan/record 账本记录。最近样本:{samples}。",
+            f"无已消费的 roll 派发记录或启动前 15 分钟内的有效独立授权记录。最近样本:{samples}。",
             "检查对应宿主是否已挂载 PreToolUse router_gate_hook.py 与全局 AGENTS.md/CLAUDE.md/GEMINI.md。")
     remote = ctx.get("remote_triggers") or []
     if remote:
@@ -753,7 +777,9 @@ def main() -> int:
                 heavy_detail[day].append(f"{s['model']}/{s['effort']}×{n}")
     usage_now = usage_reading.usage_snapshot()
     now_row = {"usage": usage_points(usage_now)}
+    dispatches, roll_ids = load_audit_registry()
     ctx = {"now": now, "rows": rows, "ledger_rows": ledger_rows, "ledger_skipped": skipped_ledger[0] if skipped_ledger else 0,
+           "dispatches": dispatches, "roll_ids": roll_ids,
            "usage_reading": usage_reading,
            "usage_now": usage_now, "now_row": now_row, "sessions": sessions, "spawns": spawns,
            "codex_days": {d: v for d, v in codex_days.items() if d >= since_day}, "claude_days": scan_claude(claude_files, since_day),

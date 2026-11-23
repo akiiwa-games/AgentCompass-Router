@@ -42,8 +42,28 @@ ROUTED, PINNED, KEPT_WHOLE = "routed", "pinned", "keep_whole"
 GROUPS = (ROUTED, PINNED, KEPT_WHOLE)
 OPEN_STATES = ("prepared", "launching", "launched", "started")
 ENDINGS = ("completed", "failed", "relaunched", "canceled", "other_terminal", "open", "end_unknown")
-# An external runner's dispatch (Dot, Grok Bot, ChatGPT Web) whose end its runner never reported: not an ending.
+# An external runner's dispatch (Dot, Grok Bot, ChatGPT Web) or a consumed native hand-over whose end its host never
+# reports back to dispatch_registry: not an ending.
 END_UNKNOWN_STATES = ("external_launched",)
+WRAPPED_DECISION_SURFACES = frozenset({"native", "cli", "orca", "t3", "herdr"})
+
+
+def _base_decision_id(decision_id):
+    if not isinstance(decision_id, str) or not decision_id:
+        return decision_id
+    parts = decision_id.split(":")
+    return parts[1] if len(parts) == 3 and parts[0] in WRAPPED_DECISION_SURFACES else decision_id
+
+
+def _counted_dispatch(row):
+    """True when `row` represents an actual dispatch attempt rather than an unconsumed hand-over or unstarted CLI claim."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("native_handover") is True and not row.get("launched_at"):
+        return False
+    if row.get("dispatch_mode") == "cli" and not row.get("launched_at"):
+        return False
+    return True
 USER_PIN = "user_override"
 NON_DISPATCH_CHOICES = (None, "none", "split")   # a decision that deliberately starts no worker
 DECISION_STAGES = ("plan", "record")
@@ -199,6 +219,8 @@ def ending(row, successors):
         return "relaunched" if row.get("dispatch_id") in successors else "failed"
     if state == "canceled":
         return "canceled"
+    if row.get("native_handover") is True and row.get("launched_at") and state in ("launched", "expired"):
+        return "end_unknown"
     if state in OPEN_STATES:
         return "open"
     if state in END_UNKNOWN_STATES:
@@ -211,9 +233,11 @@ def rotated_away(rows, decisions, ledger):
     decision continued. Returns (ids, rotations whose replaced worker could not be found)."""
     away, unlinked = set(), 0
     for row in rows:
-        if (ledger.get(row.get("decision_id")) or {}).get("action") != "rotate":
+        raw_id = row.get("decision_id")
+        base_id = _base_decision_id(raw_id)
+        if ((ledger.get(raw_id) or ledger.get(base_id) or {})).get("action") != "rotate":
             continue
-        worker = (decisions.get(row.get("decision_id")) or {}).get("worker")
+        worker = ((decisions.get(raw_id) or decisions.get(base_id) or {})).get("worker")
         created = parse_ts(row.get("created_at"))
         earlier = [r for r in rows if worker and r.get("agent_id") == worker and r is not row and created is not None
                    and (t := parse_ts(r.get("created_at"))) is not None and t < created]
@@ -233,10 +257,12 @@ def normalize(rows, decisions, ledger, pricing, since, until, away):
         if day is None or not since <= day <= until:
             continue
         decision_id = row.get("decision_id")
-        line = ledger.get(decision_id) or {}
+        base_id = _base_decision_id(decision_id)
+        line = ledger.get(decision_id) or ledger.get(base_id) or {}
+        dec_meta = decisions.get(decision_id) or decisions.get(base_id) or {}
         profile = row.get("profile") if isinstance(row.get("profile"), dict) else {}
         bundle = row.get("bundle") if isinstance(row.get("bundle"), dict) else {}
-        pinned = USER_PIN in ((decisions.get(decision_id) or {}).get("constraint"), line.get("constraint"))
+        pinned = USER_PIN in (dec_meta.get("constraint"), line.get("constraint"), row.get("constraint"))
         kept = bool(line.get("keep_whole"))
         active = number(row.get("active_seconds"))
         price = (pricing(bundle) if pricing else None) or {}
@@ -361,11 +387,12 @@ def section(records, key, builder):
     return {name: builder(rows) for name, rows in cell(records, key).items()}
 
 
-def coverage(records, ledger_lines, all_rows, since, until, skipped, ledger_skipped, unlinked_rotations):
+def coverage(records, ledger_lines, counted_rows, all_rows, since, until, skipped, ledger_skipped, unlinked_rotations):
     """Where a dispatch left no measurement, by dispatch path, and which inputs could not be read."""
     done = [r for r in records if r["ending"] == "completed"]
     by_path = collections.Counter(f"{r['mode']}/{r['harness'] or 'no telemetry harness'}" for r in done)
-    launched = {r.get("decision_id") for r in all_rows}
+    launched = ({r.get("decision_id") for r in counted_rows}
+                | {_base_decision_id(r.get("decision_id")) for r in counted_rows})
     planned = {}
     for line in ledger_lines:
         if line.get("decision_id") and line.get("stage") in DECISION_STAGES:
@@ -404,14 +431,15 @@ def coverage(records, ledger_lines, all_rows, since, until, skipped, ledger_skip
 
 def build(db, ledger_path, since, until, pricing):
     all_rows, decisions, skipped = read_dispatches(db)
+    counted_rows = [r for r in all_rows if _counted_dispatch(r)]
     ledger, lines, ledger_skipped = read_ledger(ledger_path)
-    away, unlinked = rotated_away(all_rows, decisions, ledger)
-    records = normalize(all_rows, decisions, ledger, pricing, since, until, away)
+    away, unlinked = rotated_away(counted_rows, decisions, ledger)
+    records = normalize(counted_rows, decisions, ledger, pricing, since, until, away)
     routed = [r for r in records if r["group"] == ROUTED]
     return {
         "range": {"since": since.isoformat(), "until": until.isoformat()},
         "min_cell": MIN_CELL,
-        "coverage": coverage(records, lines, all_rows, since, until, skipped, ledger_skipped, unlinked),
+        "coverage": coverage(records, lines, counted_rows, all_rows, since, until, skipped, ledger_skipped, unlinked),
         "groups": {g: sum(1 for r in records if r["group"] == g) for g in GROUPS}
                   | {"pinned_and_kept_whole": sum(1 for r in records if r["pinned_and_kept"])},
         "hours": {"by_work_kind": section(routed, lambda r: r["work_kind"], hours_cell),
@@ -558,7 +586,8 @@ def render(report):
     end_head = ["cell", "n"] + list(ENDINGS) + ["started by rotation", "rotated away"]
     out += ["Rotation is not an ending: the worker a rotation replaced shows as completed and is counted in *rotated away*; "
             "the fresh worker that continued the work is counted in *started by rotation*. *end_unknown* is not an ending "
-            "either: an external runner's dispatch (Dot, Grok Bot, ChatGPT Web) whose end its runner never reported.", ""]
+            "either: an external runner's dispatch (Dot, Grok Bot, ChatGPT Web) or a claimed native hand-over whose end its "
+            "host never reports.", ""]
     for title, block in (("Endings by model and effort", report["endings"]["by_model_effort"]),
                          ("Endings by work kind", report["endings"]["by_work_kind"])):
         out += [f"## {title}", ""] + table(end_head, [[k, mark(c)] + [c[e] for e in ENDINGS]

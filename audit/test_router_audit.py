@@ -191,8 +191,65 @@ class FindingTests(unittest.TestCase):
         self.assertIn("unrouted", found)
         self.assertIn("paseo:codex/gpt-5.4-mini", found["unrouted"]["evidence"])
 
-        routed = [row(5 * 1440 + 5, "plan", choice="sol_high", source="deterministic_allocator")]
+        routed = [row(5 * 1440 + 5, "plan", choice="sol_high", source="deterministic_allocator",
+                      bundle={"provider": "codex", "account": "codex", "model": "gpt-6.1-sol"})]
         self.assertNotIn("unrouted", self.keys(context(routed, spawns=spawns)))
+
+    def test_find_unrouted_spawns_reads_gate_authority_from_single_owner(self):
+        """F5: native sub-agent spawns require a claimed native hand-over (even >15m after roll) or a standalone
+        `record` row within 15m from the same owner (`decision_ledger.spawn_is_authorized`); Paseo-launched rolls,
+        unconsumed hand-overs, `plan` rows, and `host_policy_violation` records never authorize native spawns."""
+        codex_bundle = {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol", "effort": "high"}
+        claude_bundle = {"provider": "claude", "account": "claude", "model": "claude-sonnet-5-5", "effort": "high"}
+        native_spawn_20m = [{
+            "at": T0 + dt.timedelta(minutes=20, seconds=3),
+            "kind": "codex-subagent",
+            "label": "codex-subagent/gpt-6.1-sol/high",
+            "cwd": "/workspace/demo",
+        }]
+        plan_at_t0 = [row(0, "plan", choice="sol_high", source="deterministic_allocator",
+                          decision_id="dec-native-1", bundle=codex_bundle)]
+        # 1. Unconsumed native hand-over (`launched_at` absent) does not count as routed:
+        unconsumed = [{"dispatch_id": "nh-1", "decision_id": "native:dec-native-1:aaaa1111",
+                       "native_handover": True, "state": "prepared", "bundle": codex_bundle}]
+        self.assertEqual(
+            len(audit.find_unrouted_spawns(native_spawn_20m, plan_at_t0,
+                                           dispatches=unconsumed, roll_ids={"dec-native-1"})),
+            1,
+        )
+        # 2. Claimed native hand-over at T0 + 20m authorizes the spawn at T0 + 20m + 3s (past the 15-min ledger window):
+        claimed = [dict(unconsumed[0], state="launched",
+                        launched_at=(T0 + dt.timedelta(minutes=20)).isoformat())]
+        self.assertEqual(
+            audit.find_unrouted_spawns(native_spawn_20m, plan_at_t0,
+                                       dispatches=claimed, roll_ids={"dec-native-1"}),
+            [],
+        )
+        # 3. Native spawn 2m after a `plan` row or a Paseo-launched `roll` (`record` in `roll_ids`) IS unrouted:
+        native_spawn_2m = [{
+            "at": T0 + dt.timedelta(minutes=2),
+            "kind": "claude-subagent",
+            "label": "claude-subagent/claude-sonnet-5-5",
+            "cwd": "demo",
+        }]
+        paseo_roll_record = [row(0, "record", choice="constraint", source="constraint_record",
+                                 constraint="user_override", decision_id="dec-paseo-pin", bundle=claude_bundle)]
+        self.assertEqual(len(audit.find_unrouted_spawns(native_spawn_2m, plan_at_t0)), 1)
+        self.assertEqual(
+            len(audit.find_unrouted_spawns(native_spawn_2m, paseo_roll_record, roll_ids={"dec-paseo-pin"})),
+            1,
+        )
+        # 4. Standalone `record` row (not in `roll_ids`, no `host_policy_violation`) within 15m IS routed;
+        #    `host_policy_violation`, `workflow`, and `explicit_resume` records are NOT:
+        standalone = [row(0, "record", choice="constraint", source="constraint_record",
+                          constraint="hard_constraint", decision_id="dec-standalone", bundle=claude_bundle)]
+        self.assertEqual(audit.find_unrouted_spawns(native_spawn_2m, standalone, roll_ids={"dec-paseo-pin"}), [])
+        for rejected in (
+            dict(standalone[0], host_policy_violation={"reason": "blocked"}),
+            dict(standalone[0], trigger="workflow"),
+            dict(standalone[0], constraint="explicit_resume"),
+        ):
+            self.assertEqual(len(audit.find_unrouted_spawns(native_spawn_2m, [rejected])), 1)
 
     def test_old_shape_ledger_rows_are_skipped_with_count_in_report(self):
         import json
@@ -276,7 +333,8 @@ class FindingTests(unittest.TestCase):
             {"at": T0.isoformat(), "stage": "delegate", "choice": "delegate", "source": "subscription_model_judgment",
              "judge": "claude-sonnet-5", "usage": usage},
             {"at": (T0 + dt.timedelta(minutes=1)).isoformat(), "stage": "plan", "choice": "sol_high",
-             "source": "deterministic_allocator", "bundle": {"account": "codex"}},
+             "source": "deterministic_allocator",
+             "bundle": {"provider": "codex", "account": "codex", "model": "gpt-6.1-sol"}},
         ]
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "router-ledger.jsonl"

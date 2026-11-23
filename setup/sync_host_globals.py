@@ -85,10 +85,16 @@ export default function (pi: any) {
       return undefined;
     }
     try {
+      const sessionId = typeof ctx?.sessionManager?.getSessionId === "function"
+        ? String(ctx.sessionManager.getSessionId() || "").trim()
+        : "";
+      const toolCallId = String(event?.toolCallId || "").trim();
       const payload = JSON.stringify({
         toolName,
         input: event?.input || {},
         cwd: process.cwd(),
+        ...(sessionId ? { sessionId } : {}),
+        ...(toolCallId ? { tool_call_id: toolCallId } : {}),
       });
       const res = spawnSync(HOOK_ARGV[0], HOOK_ARGV.slice(1), {
         input: payload,

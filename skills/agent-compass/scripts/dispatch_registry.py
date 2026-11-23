@@ -103,14 +103,14 @@ def db_path():
 
 
 @contextmanager
-def transaction(path=None, upkeep=False):
+def transaction(path=None, upkeep=False, *, timeout=10):
     """One immediate transaction. A committed change is an effect of this call (public_data.effect: a reservation, a
     decision or dispatch row, a launch record), after which a fall-back never re-runs; ``upkeep`` marks a write that only
     brings recorded state in step with what happened on its own (a lease that ran out, a worker that ended, a side effect,
     ground truth or end notice an earlier dispatch owes), which is not."""
     path = Path(path or db_path())
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10, isolation_level=None)
+    connection = sqlite3.connect(path, timeout=timeout, isolation_level=None)
     try:
         connection.execute('PRAGMA synchronous=FULL')
         connection.execute('BEGIN IMMEDIATE')
@@ -408,24 +408,24 @@ def read_dispatches(path=None, timeout=0.5):
         connection.close()
 
 
-def reservations(now=None, path=None, read_only=False):
+def reservations(now=None, path=None, read_only=False, *, timeout=5.0):
     target = Path(path or db_path())
     if not target.exists():
         return []
     now = now or utcnow()
     if read_only:
-        ended, pending = _reservation_maintenance(target, now)
+        ended, pending = _reservation_maintenance(target, now, timeout=timeout)
         if not ended:
             # A dry read stays byte-identical unless a local agent record shows a worker already ended.
             if pending:
                 _finish_pending_side_effects(path, now)
                 _record_pending_ground_truth(path, now)
-            connection = _read_only(target)
+            connection = _read_only(target, timeout)
             try:
                 return active_records(connection, now)
             finally:
                 connection.close()
-    with transaction(path, upkeep=True) as connection:
+    with transaction(path, upkeep=True, timeout=timeout) as connection:
         if read_only:
             settle_ended_workers(connection, now)
             refresh_live_rounds(connection, now)
@@ -1077,7 +1077,7 @@ def _due(row):
     return row.get('state') in _END_NOTICE_STATES and isinstance(notice, dict) and notice.get('state') == 'due'
 
 
-def due_end_notices(path=None, now=None):
+def due_end_notices(path=None, now=None, *, timeout=10):
     """Terminal rows whose one end notice can be sent now. An open row is not due, even if an older flag remains.
 
     One brief gets one end notice, when its chain is final (`_chain_hold`): while an attempt's retry or relaunch may still
@@ -1093,8 +1093,18 @@ def due_end_notices(path=None, now=None):
     target = Path(path or db_path())
     if not target.exists():
         return []
+    probe = _read_only(target, min(timeout, 0.5))
+    try:
+        if not any(_due(row) for row in rows(probe, 'dispatches')):
+            return []
+    except sqlite3.OperationalError as exc:
+        if 'no such table' in str(exc):
+            return []
+        raise
+    finally:
+        probe.close()
     now = now or utcnow()
-    with transaction(path, upkeep=True) as connection:
+    with transaction(path, upkeep=True, timeout=timeout) as connection:
         found = []
         all_rows = rows(connection, 'dispatches')
         by_id = {row['dispatch_id']: row for row in all_rows}
@@ -1246,9 +1256,9 @@ def settle_ended_workers(connection, now):
             apply_ending(connection, row, now)
 
 
-def _reservation_maintenance(path, now):
+def _reservation_maintenance(path, now, *, timeout=5.0):
     """Whether a read must write: an ending to record, a follow-up to count again, or effects still owed."""
-    connection = _read_only(path)
+    connection = _read_only(path, timeout)
     try:
         ended = pending = False
         stored = rows(connection, 'dispatches')
@@ -1874,16 +1884,41 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
 
 def dispatch_constraint(dispatch_id, path=None):
     """The constraint of the decision a dispatch launches (`user_override`, `explicit_resume`, ...), else None. The spawn
-    gate reads it to admit a bound launch on an unchecked model only when the user named that route."""
+    gate reads it read-only without taking a write lock to admit a bound launch on an unchecked model only when the user
+    named that route."""
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return None
+    target = Path(path or db_path())
+    if not target.exists():
+        return None
+    connection = _read_only(target, 0.5)
     try:
-        row = inspect(dispatch_id, path)
+        try:
+            row = get(connection, 'dispatches', dispatch_id)
+        except sqlite3.OperationalError as exc:
+            if 'no such table' in str(exc):
+                return None
+            raise
+        except ValueError:
+            return None
         if row.get('constraint'):
             return row['constraint']
-        did = str(row['decision_id'])
+        did = str(row.get('decision_id') or '')
+        if not did:
+            return None
         parts = did.split(':')
-        return decision_record(parts[1] if len(parts) == 3 else did, path).get('constraint')
-    except (KeyError, TypeError, ValueError):
-        return None
+        base_id = parts[1] if len(parts) == 3 else did
+        try:
+            dec = get(connection, 'decisions', base_id)
+        except sqlite3.OperationalError as exc:
+            if 'no such table' in str(exc):
+                return None
+            raise
+        except ValueError:
+            return None
+        return dec.get('constraint')
+    finally:
+        connection.close()
 
 
 def named_resume(row, path=None):
@@ -2678,14 +2713,12 @@ def _handover_open(row, now):
             and now < hard)
 
 
-def native_handovers(now=None, *, call_id=None, path=None):
+def native_handovers(now=None, *, call_id=None, path=None, timeout=0.5):
     """Open native hand-overs (and any already claimed by `call_id` for idempotent retry), newest `created_at` first.
-    Read-only; unreadable or missing state returns `[]` so it authorizes nothing."""
+    Read-only: returns `[]` when no registry exists yet, and raises `(OSError, ValueError, sqlite3.Error)` when the
+    registry is unreadable or locked so the gate denies."""
     now = now or utcnow()
-    try:
-        stored = read_dispatches(path)
-    except (OSError, ValueError, sqlite3.Error):
-        return []
+    stored = read_dispatches(path, timeout=timeout)
     matched = [
         r for r in stored
         if isinstance(r, dict) and r.get('native_handover') is True and (
@@ -2698,54 +2731,85 @@ def native_handovers(now=None, *, call_id=None, path=None):
     return matched
 
 
-def claim_native_handover(dispatch_ids, *, call_id=None, now=None, path=None):
+def claim_native_handovers(requests, *, now=None, path=None, timeout=0.5):
+    """Consume all requested `(dispatch_ids, call_id)` native hand-overs atomically in one transaction.
+    If any item has no open (or `call_id`-matching) hand-over, none is consumed and `None` is returned."""
+    items = [(list(dict.fromkeys(str(d) for d in (ids or ()) if d)), cid) for ids, cid in (requests or ())]
+    if not items:
+        return []
+    if any(not ids for ids, _ in items):
+        return None
+    now = now or utcnow()
+    with transaction(path, timeout=timeout) as connection:
+        claimed_ids = set()
+        to_save = []
+        claimed_rows = []
+        for ids, call_id in items:
+            matched_row = None
+            if call_id:
+                for did in ids:
+                    if did in claimed_ids:
+                        continue
+                    found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
+                    if found:
+                        existing = json.loads(found[0])
+                        if (existing.get('native_handover') is True and existing.get('claim_id') == call_id
+                                and existing.get('state') not in ('canceled', 'failed', 'create_failed')):
+                            matched_row = existing
+                            claimed_ids.add(did)
+                            break
+            if matched_row is None:
+                for did in ids:
+                    if did in claimed_ids:
+                        continue
+                    found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
+                    if not found:
+                        continue
+                    row = json.loads(found[0])
+                    if not _handover_open(row, now):
+                        continue
+                    hard = parse(row['hard_until'])
+                    row.update(claim_id=call_id or str(uuid.uuid4()), launched_at=stamp(now),
+                               lease_until=stamp(min(now + timedelta(seconds=RUN_LEASE), hard)))
+                    event(row, 'launched', now, 'native_handover_claimed')
+                    matched_row = row
+                    claimed_ids.add(did)
+                    to_save.append(row)
+                    break
+            if matched_row is None:
+                return None
+            claimed_rows.append(matched_row)
+        for row in to_save:
+            save(connection, row)
+        return claimed_rows
+
+
+def claim_native_handover(dispatch_ids, *, call_id=None, now=None, path=None, timeout=0.5):
     """Consume one native hand-over atomically on the launch it authorizes; retries of `call_id` are idempotent."""
     ids = [str(d) for d in (dispatch_ids or ()) if d]
     if not ids:
         return None
-    now = now or utcnow()
-    with transaction(path) as connection:
-        if call_id:
-            for did in ids:
-                found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
-                if found:
-                    existing = json.loads(found[0])
-                    if (existing.get('native_handover') is True and existing.get('claim_id') == call_id
-                            and existing.get('state') not in ('canceled', 'failed', 'create_failed')):
-                        return existing
-        for did in ids:
-            found = connection.execute('SELECT data FROM dispatches WHERE id=?', (did,)).fetchone()
-            if not found:
-                continue
-            row = json.loads(found[0])
-            if not _handover_open(row, now):
-                continue
-            hard = parse(row['hard_until'])
-            row.update(claim_id=call_id or str(uuid.uuid4()), launched_at=stamp(now),
-                       lease_until=stamp(min(now + timedelta(seconds=RUN_LEASE), hard)))
-            event(row, 'launched', now, 'native_handover_claimed')
-            save(connection, row)
-            return row
-    return None
+    claimed = claim_native_handovers([(ids, call_id)], now=now, path=path, timeout=timeout)
+    return claimed[0] if claimed else None
 
 
-def roll_decision_ids(path=None):
+def roll_decision_ids(path=None, *, timeout=0.5):
     """Decision IDs owned by `roll` (`from_roll` decisions and `dispatches` rows), read without creating the DB.
-    A ledger `record` row whose `decision_id` is in this set belongs to `roll`, never to a standalone `record` launch."""
+    A ledger `record` row whose `decision_id` is in this set belongs to `roll`, never to a standalone `record` launch.
+    Raises `(OSError, ValueError, sqlite3.Error)` when an existing database cannot be read."""
     target = Path(path or db_path())
     if not target.exists():
         return set()
     owned = set()
-    try:
-        connection = _read_only(target, 0.5)
-    except (OSError, sqlite3.Error):
-        return set()
+    connection = _read_only(target, timeout)
     try:
         for table in ('decisions', 'dispatches'):
             try:
                 table_rows = rows(connection, table)
-            except (sqlite3.OperationalError, ValueError):
-                continue
+            except sqlite3.OperationalError as exc:
+                if 'no such table' in str(exc):
+                    continue
+                raise
             for row in table_rows:
                 if not isinstance(row, dict):
                     continue

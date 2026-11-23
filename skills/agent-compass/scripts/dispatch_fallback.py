@@ -666,7 +666,7 @@ class Chain:
                      if self.forced_by else
                      {'basis': f'AgentCompass transient retry of dispatch {self.root_id} on its routed bundle'})}
         issued = registry.issue(result, self.task, allocation_task=failed_decision.get('allocation_task') or self.task,
-                                listed_rows=listed, route=failed_decision.get('route'))
+                                listed_rows=listed, route=failed_decision.get('route'), from_roll=True)
         decision = {**result, **issued}
         try:
             decision_ledger.append_ledger({

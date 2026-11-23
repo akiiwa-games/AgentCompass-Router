@@ -48,6 +48,29 @@ class RouterSetupOfferTests(unittest.TestCase):
         self.assertEqual(calls, [["agentcompass.exe", "setup", "--yes", "--no-hooks", "--dry-run"],
                                  ["agentcompass.exe", "setup", "--yes", "--hooks"]])
 
+    def test_setup_dialog_strings_are_translated_and_name_native_handover_and_record(self):
+        import ast
+        import i18n_catalog
+
+        source = Path(router_setup.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("15 分钟内没有 roll 记录", source)
+        self.assertNotIn("15 分钟内没有 roll 记录", "\n".join(i18n_catalog.EN))
+        literals = [
+            node.args[0].value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_tr"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ]
+        for key in literals:
+            self.assertIn(key, i18n_catalog.EN)
+        hook_key = next(k for k in literals if "门禁 hook" in k)
+        self.assertIn("roll 原生移交", hook_key)
+        self.assertIn("native hand-over", i18n_catalog.EN[hook_key])
+
 
 class InstallerOnlyVersionDisplayTests(unittest.TestCase):
     def _installed(self, base: Path) -> tuple[Path, Path]:
