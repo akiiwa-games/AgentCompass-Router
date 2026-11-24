@@ -82,23 +82,43 @@ def merged_state(used, hours, k):
     return {**one, 'full': 100.0 * k, 'remaining': one['remaining'] * k, 'target_remaining': one['target_remaining'] * k}
 
 
-def economy(spend_max=60.0, lump=30.0):
+LADDERS = {}
+
+
+def substitute_ladder(substitutes):
+    """The fixture ladder with the other members as outside alternatives at its own best fit: what
+    FiveAxisEconomy.ladder adds, since five_axis_outside_value of k alternatives at the best fit is that fit times
+    the chance one has room (fleet_fixture.ladder_for's `with_outside`)."""
+    none_open = 1.0
+    for a in substitutes:
+        none_open *= 1.0 - a
+    key = round(1.0 - none_open, 12)
+    if key not in LADDERS:
+        LADDERS[key] = fleet_fixture.ladder_for(with_outside=key) if key else LADDER
+    return LADDERS[key]
+
+
+def economy(spend_max=60.0, lump=30.0, substitutes=True):
     """The economy's window pricing with the ladder and the burst size held fixed (they come from the account's own
-    candidates, which these tests do not vary)."""
+    candidates, which these tests do not vary). `substitutes=False`: the by-room split alone, each member priced on the
+    account's ladder without the other members as its substitutes (the rule as committed before review round 3)."""
     econ = object.__new__(quota_economy.FiveAxisEconomy)
     econ._tables = {}
     econ.spend_max = {W: spend_max}
     econ.lump = lambda wkey, reset_hours=None: lump
-    econ.ladder = lambda wkey: LADDER
+    econ.ladder = ((lambda wkey, subs=(): substitute_ladder(subs)) if substitutes
+                   else (lambda wkey, subs=(): LADDER))
     return econ
 
 
 def term(state, spend=40.0, hours=2.0, econ=None):
     """(cost, price, need) of `spend` on a window state, as apply_five_axis_economy's eval_windows composes them: each
-    serving window's own cost at its share, summed; price and need weighted by the shares (R3)."""
+    serving window's own cost at its share on its ladder with the other members as substitutes, summed; price and need
+    weighted by the shares (R3)."""
     econ = econ or economy()
     recs = econ.member_records(W, state, CAP, spend)
-    gots = [econ.window_cost(W, rec, spend * share, hours, share=share) for _, rec, share in recs]
+    gots = [econ.window_cost(W, rec, spend * share, hours, share=share, substitutes=subs)
+            for (_, rec, share), subs in zip(recs, econ.substitutes(recs, spend))]
     return (sum(g['cost'] for g in gots), sum(g['lambda_start'] * r[2] for g, r in zip(gots, recs)),
             sum(g['need_start'] * r[2] for g, r in zip(gots, recs)))
 
@@ -153,16 +173,37 @@ def rows_of(decision, account):
 
 class InStepTests(unittest.TestCase):
     CASES = ((20.0, 100.0, 2), (31.0, 30.0, 2), (0.0, 150.0, 3), (97.0, 40.0, 2), (100.0, 20.0, 3))
+    NO_SLACK = ((99.0, 40.0, 2), (99.5, 10.0, 3), (100.0, 20.0, 3))     # no member has room beyond its share of $40
+    SLACK = ((20.0, 100.0, 2), (31.0, 30.0, 2), (0.0, 150.0, 3), (60.0, 60.0, 2), (97.0, 40.0, 2))
 
-    def test_members_in_step_price_as_the_merged_window(self):
-        # R3/R4: members with the same used share and reset give the merged window's term (same total C, same price,
-        # same need): capacity, use and burst all scale by the share.
-        for used, hours, k in self.CASES:
+    def slacks(self, state, spend=40.0):
+        recs = economy().member_records(W, state, CAP, spend)
+        return [a for subs in economy().substitutes(recs, spend) for a in subs]
+
+    def test_members_in_step_with_no_slack_price_as_the_merged_window(self):
+        # R3/R4 and review round 3 (2): with no room in any other member (substitute slack 0) a member's ladder is the
+        # account's own, and members in step give the merged window's term: capacity, use and burst scale by the share.
+        for used, hours, k in self.NO_SLACK:
             with self.subTest(used=used, hours=hours, k=k):
-                pooled = term(pool_state([(used, hours)] * k))
-                merged = term(merged_state(used, hours, k), econ=economy())
-                for a, b in zip(pooled, merged):
+                state = pool_state([(used, hours)] * k)
+                self.assertEqual(set(self.slacks(state)), {0.0})
+                for a, b in zip(term(state), term(merged_state(used, hours, k), econ=economy())):
                     self.assertAlmostEqual(a, b, places=9)
+
+    def test_members_in_step_with_slack_price_at_most_the_merged_window_and_not_below_zero(self):
+        # Review round 3 (3): another member with room is an outside alternative of each member's dollars at the
+        # account's own best fit (FiveAxisEconomy.substitutes, ladder), which raises the outside value and lowers the
+        # ladder; the merged window had no such alternative. So the pool's cost and price are in [0, merged].
+        for used, hours, k in self.SLACK:
+            with self.subTest(used=used, hours=hours, k=k):
+                state = pool_state([(used, hours)] * k)
+                self.assertTrue(any(a > 0 for a in self.slacks(state)))      # not the no-slack case
+                cost, price, _ = term(state)
+                merged_cost, merged_price, _ = term(merged_state(used, hours, k), econ=economy())
+                self.assertGreaterEqual(cost, 0.0)
+                self.assertGreaterEqual(price, 0.0)
+                self.assertLessEqual(cost, merged_cost + 1e-12)
+                self.assertLessEqual(price, merged_price + 1e-12)
 
     def test_members_in_step_gate_as_the_merged_window(self):
         # R4: each gate gives today's figure for members in step: full capacity, what is left, reset, hours before the
@@ -206,20 +247,33 @@ class OrderTests(unittest.TestCase):
 
 class MonotoneTests(unittest.TestCase):
     SPEND = 40.0        # $40 of a $1000 window: an equal share is 2% of one account
+    USED = [*range(0, 98, 2), 98, 98.5, 99, 99.5, 99.9, 99.99, 100]
+    OTHERS = ((0.0, 146.0), (40.0, 60.0), (90.0, 30.0), (99.0, 100.0), (100.0, 146.0))
 
-    def test_cost_is_non_decreasing_in_a_members_used_share_while_it_has_room_for_its_equal_share(self):
-        # Quota cost non-decreasing in used share (AGENTS.md), member by member, the others fixed, (a) for as long as
-        # the member has room for its equal share of the work (quota_pools.shares: by room). Past that point the pool
-        # draws less of that member (its last dollars) and more of the others, so the pool's cost may fall: the owner's
-        # open question (report Round 2), not asserted either way.
+    def test_cost_is_non_decreasing_in_each_members_used_share_while_it_has_room_for_its_equal_share(self):
+        # Quota cost non-decreasing in used share (AGENTS.md), member by member, the other fixed, for several states of
+        # the other member and several resets (review round 3 (4)), for as long as the member has room for its equal
+        # share of the work (quota_pools.shares: by room). Past that point it carries only its last dollars, and each
+        # member's need is read from its own window, not from the pool's demand the split moves onto the others, so
+        # the cost may fall (router-internals.md, Account pools: the limit the owner left open, report Round 3).
         equal_share_pct = 100.0 * self.SPEND / CAP / 2
-        for other in ((40.0, 60.0), (0.0, 146.0)):
-            for hours in (30.0, 146.0):
+        used = [u for u in self.USED if u <= 100.0 - equal_share_pct]
+        for other in self.OTHERS:
+            for hours in (10.0, 30.0, 146.0):
                 with self.subTest(other=other, hours=hours):
-                    used = [*range(0, int(100 - equal_share_pct)), 100 - equal_share_pct - 0.5, 100 - equal_share_pct]
                     costs = [term(pool_state([(u, hours), other]), self.SPEND)[0] for u in used]
                     for low, high in zip(costs, costs[1:]):
                         self.assertGreaterEqual(high, low - 1e-12)
+
+    def test_substitutes_never_raise_the_cost_of_the_by_room_split(self):
+        # Review round 3 (6): another member's room only adds an outside alternative, so a member's scarcity is never
+        # higher with it: the pool's cost is at most what the by-room split alone gives for the same reading.
+        by_room = economy(substitutes=False)
+        for other in self.OTHERS:
+            for used in (0.0, 50.0, 90.0, 98.0, 99.5, 100.0):
+                with self.subTest(other=other, used=used):
+                    state = pool_state([(used, 30.0), other])
+                    self.assertLessEqual(term(state, self.SPEND)[0], term(state, self.SPEND, econ=by_room)[0] + 1e-12)
 
     def test_a_member_at_100_percent_is_the_limit_of_one_near_it_and_takes_no_share(self):
         # (b) no jump at 100%: as a member's room shrinks to 0 it carries only that room, so the pool's term tends to
