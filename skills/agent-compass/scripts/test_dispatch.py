@@ -95,14 +95,20 @@ def test_host_bridge_does_not_open_a_console():
 
 class DispatchTests(unittest.TestCase):
     def test_fast_opt_out_after_record_is_rechecked_at_prepare(self):
-        # Rule (fast-modes.md): fast runs only on a verified contract (the Codex service tier here); a contract withdrawn
-        # after the record is refused at prepare and at the claim, never launched fast.
-        decision = self.override_decision(effort='high', selected_bundle={
-            'provider': 'codex', 'account': 'codex', 'model': 'gpt-6-astra', 'effort': 'high', 'fast': True})
+        # Rule (fast-modes.md): fast runs only on a verified contract (the Codex service tier here). A contract withdrawn
+        # after the record makes prepare launch the decision plain with the note; one withdrawn after prepare is
+        # refused at the claim. Neither is launched fast.
+        import fast_modes
+        selected = {'provider': 'codex', 'account': 'codex', 'model': 'gpt-6-astra', 'effort': 'high', 'fast': True}
+        recorded = self.override_decision(effort='high', selected_bundle=selected)
         self.accounts['models']['gpt-6-astra']['fast_capable'] = False
-        with self.assertRaisesRegex(ValueError, 'has no verified fast mode on codex'):
-            self.prepare(decision)
+        plain = self.prepare(recorded)
+        self.assertFalse(plain['bundle'].get('fast'))
+        self.assertEqual(plain['request']['settings']['features'], {'service_tier': 'default'})
+        self.assertIn(fast_modes.not_applied('gpt-6-astra has no verified fast mode on codex'), plain['warnings'])
         self.accounts['models']['gpt-6-astra']['fast_capable'] = True
+        self.task = dict(self.task, task_id='test-task-claim')
+        decision = self.override_decision(effort='high', selected_bundle=selected)
         row = self.prepare(decision)
         self.assertTrue(row['bundle']['fast'])
         self.assertEqual(row['request']['settings']['features'], {'service_tier': 'priority'})
