@@ -143,7 +143,7 @@ class FastModesTests(unittest.TestCase):
         self.assertTrue(claude_models)
         for model in claude_models:
             accounts['models'][model]['fast_capable'] = True
-        usage = usage_windows(now, {'claude': [('five_hour', 10, 3), ('seven_day', 10, 100)]})
+        usage = usage_windows(now, {'claude': [('five_hour', 95, 3), ('seven_day', 95, 100)]})     # ample: fast would fit
         task = dict(work_kind='code_audit', difficulty='routine', expected_hours=0.01,
                     needs={'local_only': True, 'fast': True})
         with cited_fast(*claude_models):
