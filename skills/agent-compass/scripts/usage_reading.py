@@ -156,14 +156,19 @@ def claude_session_limit(account, home_dir, now, inventory=None):
 def pooled_reading(window_id, members, models=None):
     """One pooled window reading built from its members' own readings (each `window_state` of one account's window),
     by these rules: what is left is the sum over the members whose share is read, in percent of one account (two fresh
-    accounts are 200%; a member not read adds nothing, None when none is read); the used share shown is the mean of the
+    accounts are 200%; a member with no reset yet adds what it shows left; a member not read, or whose reset has passed
+    since its reading, adds nothing; None when none is read); the used share shown is the mean of the
     read ones; the reset is the next partial refill, the soonest reset still ahead of a member that has
     spent some (else the soonest one ahead); the reset has passed only when every member's has. The members travel with it, so
     routing prices and gates each on its own window (quota_pools.window_state). None for no member."""
     if not members:
         return None
     left = [m['observed_remaining_pct'] for m in members if m['observed_remaining_pct'] is not None]
-    before = [m['remaining_pct_before_reset'] for m in members if m['remaining_pct_before_reset'] is not None]
+    # A member whose window reports no reset yet (an idle account) counts with what it shows left, as one account's
+    # such window is read (quota_pools.window_state: no remaining-before-reset -> the observed remaining).
+    before = [b for m in members if (b := m['remaining_pct_before_reset'] if m['remaining_pct_before_reset'] is not None
+                                     else m['observed_remaining_pct'] if m['reset_time_passed'] is None else None)
+              is not None]
     used = [m['used_pct'] for m in members if m['used_pct'] is not None]
     active = [m for m in members if m['reset_time_passed'] is False]
     spent = [m for m in active if (m['used_pct'] or 0) > 0]

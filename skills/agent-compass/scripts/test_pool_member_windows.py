@@ -262,6 +262,33 @@ class UnknownAndEmptyMemberTests(unittest.TestCase):
                 self.assertEqual(pool_state(members)['remaining'] <= 0, empty)
 
 
+class IdleMemberTests(unittest.TestCase):
+    """R5 (brief): a member whose window reports no reset yet (an idle account) is treated exactly as one account's
+    window with no reset is today: it counts with what it shows left, in every gate."""
+    FIVE = {'id': 'five_hour', 'hours': 5.0, 'launch_min_remaining_pct': 25}
+
+    def test_a_spent_member_beside_an_idle_one_passes_the_launch_gate_as_the_idle_account_does(self):
+        row = {'status': 'fresh', 'fetched_at': NOW.isoformat()}
+        idle = usage_reading.window_state({'id': 'five_hour', 'used_pct': 0.0, 'resets_at': None}, NOW)
+        pool = usage_reading.window_state(raw_pool([(100.0, 2.0), (0.0, None)], 'five_hour'), NOW)
+        self.assertEqual(quota_pools.below_launch_floor(self.FIVE, pool, row, NOW),
+                         quota_pools.below_launch_floor(self.FIVE, idle, row, NOW))
+        self.assertEqual(pool['remaining_pct_before_reset'], idle['observed_remaining_pct'])
+        both = usage_reading.window_state(raw_pool([(0.0, None), (0.0, None)], 'five_hour'), NOW)
+        self.assertEqual(both['remaining_pct_before_reset'], 2 * idle['observed_remaining_pct'])
+        state = pool_state([(100.0, 2.0), (0.0, None)], self.FIVE)
+        self.assertEqual(state['remaining'], quota_pools.window_state('five_hour', self.FIVE, idle, {}, NOW, 24)['remaining'])
+
+    def test_end_to_end_a_pool_with_an_exhausted_and_an_idle_member_starts_as_the_idle_account(self):
+        week = {'id': 'seven_day', 'used_pct': 20.0, 'resets_at': at(100.0)}
+        def waits(five):
+            rows = rows_of(plan_with(week, five), 'claude-2')
+            self.assertTrue(rows)
+            return {(r[2], any('five_hour' in e for e in r[1] or ())) for r in rows}
+        idle = waits({'id': 'five_hour', 'used_pct': 0.0, 'resets_at': None})
+        self.assertEqual(waits(raw_pool([(100.0, 2.0), (0.0, None)], 'five_hour')), idle)
+
+
 class WaitTests(unittest.TestCase):
     def test_the_wait_is_the_earliest_member_reset_that_restores_capacity_for_the_work(self):
         # R4: an exhausted pool renews member by member; its wait is the soonest reset that gives quota back, and with
