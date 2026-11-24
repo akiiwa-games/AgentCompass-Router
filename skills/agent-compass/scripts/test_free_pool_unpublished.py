@@ -261,22 +261,51 @@ class UnpublishedFreePoolTests(unittest.TestCase):
     def test_an_observed_capacity_replaces_a_missing_one_only_for_that_account(self):
         """Rule (axis_scores.free_allowance_period, sources 1 and 2): the account's own observation gives its C (the
         spend from the stated reset less the stated period to the error); another account of the same plan keeps its
-        own source: the shipped measurement when one ships, else none."""
+        own source: the shipped measurement when one ships, else none. The measurement here is below the observation,
+        so the observation is the larger lower bound and is read (B1)."""
+        below = {**MEASURED, 'capacity_usd': 5.0}
         bare = copy.deepcopy(self.bare)
         bare['accounts']['opencode-b'] = {**copy.deepcopy(bare['accounts'][POOL]), 'family': 'opencode'}
         self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.now.isoformat()))
         seen = quota_exhaustion.observation(POOL)
         calls = []
         with patch.object(axis_scores, 'opencode_local_spend', spend_of(12.5, calls=calls)):
-            plain, measured = self.overlay(bare)['accounts'], self.overlay(self.with_measured(bare))['accounts']
+            plain, measured = self.overlay(bare)['accounts'], self.overlay(self.with_measured(bare, below))['accounts']
         self.assertIn((seen['resets_at'] - timedelta(hours=24), seen['observed_at']), calls)
         for accounts in (plain, measured):
             self.assertEqual(accounts[POOL]['capacity_usd'], {'allowance': 12.5})
             self.assertEqual(accounts[POOL]['capacity_source']['allowance']['status'], 'observed')
             self.assertFalse(accounts[POOL].get('capacity_unknown'))
         self.assertTrue(plain['opencode-b'].get('capacity_unknown'))
-        self.assertEqual(measured['opencode-b']['capacity_usd'], {'allowance': MEASURED['capacity_usd']})
+        self.assertEqual(measured['opencode-b']['capacity_usd'], {'allowance': below['capacity_usd']})
         self.assertEqual(measured['opencode-b']['capacity_source']['allowance']['status'], 'maintainer')
+
+    def test_an_observation_and_the_shipped_measurement_are_lower_bounds_of_one_quantity_so_c_is_the_larger(self):
+        """Rule (axis_scores.free_allowance_period, addendum 3 B1): the observation prices only what this machine's
+        opencode.db holds, and the measurement states its own bound; both bound the same capacity from below, so where
+        both exist C is the larger and the source shown is the one read. C is never below the shipped measurement,
+        whatever the observation; swapping the two values gives the same C; with no measurement the observation is
+        read as it is."""
+        self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.now.isoformat()))
+        values = (0.0001, 0.0072, 0.135, 12.5, 50.0)
+
+        def read(observed, shipped):
+            acc = self.only(POOL, acc=self.bare) if shipped is None else self.with_measured(
+                self.only(POOL, acc=self.bare), {**MEASURED, 'capacity_usd': shipped})
+            with patch.object(axis_scores, 'opencode_local_spend', spend_of(observed)):
+                spec = self.overlay(acc)['accounts'][POOL]
+            return spec['capacity_usd'][axis_scores.FREE_WINDOW], spec['capacity_source'][axis_scores.FREE_WINDOW]['status']
+
+        for observed in values:
+            self.assertEqual(read(observed, None), (observed, 'observed'))
+            for shipped in values:
+                with self.subTest(observed=observed, shipped=shipped):
+                    capacity, status = read(observed, shipped)
+                    self.assertGreaterEqual(capacity, shipped)
+                    self.assertEqual(capacity, max(observed, shipped))
+                    self.assertEqual(capacity, read(shipped, observed)[0])
+                    if observed != shipped:
+                        self.assertEqual(status, 'observed' if observed > shipped else 'maintainer')
 
     def test_an_observation_with_no_stated_period_reads_the_period_of_the_shipped_measurement(self):
         """Rule (free_allowance_period): the period of an observed reset is the error's own, else the shipped
@@ -290,8 +319,10 @@ class UnpublishedFreePoolTests(unittest.TestCase):
             plain = self.overlay(self.only(POOL, acc=self.bare))['accounts'][POOL]
         period = timedelta(hours=MEASURED['period_hours'])
         self.assertIn((given - period, self.now), calls)
+        # The observed C is below the measurement, so the measurement is read (B1); the observed reset still fixes the
+        # period's boundary.
         self.assertEqual((measured['capacity_usd'], measured['capacity_source']['allowance']['status']),
-                         ({'allowance': 0.25}, 'observed'))
+                         ({'allowance': MEASURED['capacity_usd']}, 'maintainer'))
         self.assertEqual(measured['local_period']['boundary'], 'observed')
         self.assertEqual(datetime.fromisoformat(measured['local_period']['resets_at']), given)
         self.assertTrue(plain.get('capacity_unknown'))

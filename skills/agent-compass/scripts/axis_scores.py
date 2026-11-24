@@ -390,8 +390,15 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
     1. this account's own observation at its limit error (quota_exhaustion.observation, local state): the pool was at 0
        then, so its spend since the period began (the stated reset less the stated period) is C, and the stated reset
        fixes the period's boundary;
-    2. else the maintainer's shipped measurement (plan-templates `capacity_measured`, over the period it was measured);
-    3. else None: no capacity, and the pool stays mode B (`capacity_unknown`).
+    2. the maintainer's shipped measurement (plan-templates `capacity_measured`, over the period it was measured);
+    3. with neither, None: no capacity, and the pool stays mode B (`capacity_unknown`).
+
+    The observation prices only what this machine's opencode.db holds, and the measurement states its own bound: both
+    bound the same capacity from below, so where both exist C is the larger, and the source given is the one read
+    (addendum 3 B1). A tiny or pruned observation never pushes the pool below the shipped figure. With no measurement
+    the observation is the pool's only figure and stands until the next one replaces it; when it is too small for any
+    work the full-capacity rule leaves the pool out of automatic routing and usable by name, and a named run that
+    reaches the limit observes again.
 
     Spend is opencode.db token counts at public list price (`opencode_local_spend` bounded by time). An observed period
     in which a model with no list price spent gives no C (a surfaced gap, never $0). The reading's used share is U / C,
@@ -434,10 +441,16 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
                              f"{obs['resets_at'].isoformat()}; a {period:g} h period "
                              f"({'stated by the error' if obs.get('period_hours') else 'of the shipped measurement'})")},
                      period)
-    if found is None and measured:
-        found = (float(measured['capacity_usd']), {
+    if measured:
+        shipped = (float(measured['capacity_usd']), {
             'status': 'maintainer', 'as_of': measured['as_of'], 'period_hours': float(measured['period_hours']),
             'bound': measured['bound'], 'evidence': str(measured['statement'])}, float(measured['period_hours']))
+        if found is not None and found[0] < shipped[0]:
+            # Two lower bounds of one capacity: the larger is read; the smaller observation is said beside it.
+            shipped[1]['evidence'] += (f"; this account's observation (${found[0]:.4f}, {found[1]['as_of']}) is below it, "
+                                       'and both are lower bounds, so the larger is read')
+        if found is None or found[0] < shipped[0]:
+            found = shipped
     if found is None:
         return {'gap': gap_reason} if gap_reason else None
     capacity, source, period = found
@@ -650,7 +663,9 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
                 cap_sources[wid] = {'status': 'explicit', 'as_of': None, 'plan': plan or None}
         if (free_period or {}).get('capacity_usd') and FREE_WINDOW in spec['windows'] and (
                 free_period['source']['status'] == 'observed' or FREE_WINDOW not in caps):
-            # This account's own observation beats any figure; the shipped measurement fills only a missing one.
+            # The free pool's C (free_allowance_period: the larger of its observation and the shipped measurement)
+            # beats a figure stated elsewhere when it comes from the account's own observation; the shipped measurement
+            # fills only a missing one.
             caps[FREE_WINDOW] = free_period['capacity_usd']
             cap_sources[FREE_WINDOW] = {**free_period['source'], 'plan': plan or None}
         spec['capacity_usd'] = caps
