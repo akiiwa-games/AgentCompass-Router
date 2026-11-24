@@ -314,7 +314,8 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
     if spec.get('unmetered'):
         return []       # a purpose-limited channel never blocks a launch
     if spec.get('five_axis_free_pool'):
-        # A free allowance has no reading to refuse on: only its confirmed exhaustion stops a launch, until it is due.
+        # A free allowance's only reading is its local spend, a lower bound (axis_scores.free_allowance_period): only its
+        # confirmed exhaustion stops a launch, until it is due.
         latched = latched_windows(accounts, bundle['account']) if latched is None else set(latched)
         return [(wid, latched_wait_text(accounts, bundle['account'], wid) or f'{wid} has 0 left until it is re-probed')
                 for wid in bundle_pools(bundle, accounts) if wid in latched]

@@ -527,7 +527,7 @@ def evaluate_bundle(bundle, task, ctx):
         acct_stale = acct_usage.get('status') == 'stale' or acct_usage.get('stale') is True
         latched = quota_pools.latched_windows(accounts, bundle['account'])
         latched_reset = quota_pools.latched_reset(accounts, bundle['account'])
-        unpaid = quota_economy.unpaid_allowance(spec)
+        latched_long = False        # a long window at 0 until its latch ends: read, waited on, not unread
         named = not pool and (pin_hit or task.get('pinned_bundle') == bundle['id'])
         for wid, wspec, observed in quota_pools.applicable_windows(spec, model, acct_usage, bundle, accounts):
             result.setdefault('_five_axis_windows', []).append(wid)
@@ -538,6 +538,7 @@ def evaluate_bundle(bundle, task, ctx):
                 # 0 left until the latch ends by itself (the reset the provider's error stated, else its re-probe
                 # time): a quota wait like any window used up with a known reset (the merged quota-wait rule).
                 result['_five_long_wait'] = True
+                latched_long = latched_long or not is_short
                 if not pool:
                     wait = (latched_reset - now).total_seconds() / 3600
                     available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
@@ -555,12 +556,6 @@ def evaluate_bundle(bundle, task, ctx):
                                  account_stale=acct_stale, expected_reset_at=expected)
             unit = quota_economy.unit_rate(spec, wid, model, info)
             cap_usd_w = quota_economy.capacity_usd(spec, wid)
-            if cap_usd_w is None and unpaid:
-                # The vendor publishes no capacity for this allowance (plan-templates `capacity_unpublished`): nothing to
-                # read, price, reserve against or floor. It is used until its limit error latches it (quota_exhaustion).
-                result['notes'].append(f"{wid}: the vendor publishes no capacity ({unpaid.get('url')}, read "
-                                       f"{unpaid.get('as_of')}); used until its limit error, then held until the stated reset")
-                continue
             if cap_usd_w is None:
                 if floor_refusal:
                     (short_exclude if is_short else exclude)(floor_refusal)
@@ -697,9 +692,7 @@ def evaluate_bundle(bundle, task, ctx):
                 exclude(f'data error: {err}{plan_suffix} (out of automatic routing; name the model to dispatch it)')
         if quota_pools.metered_usd_uncapped(spec):
             pass  # no budget: not a window, not excluded for exhaustion, still a metered last resort
-        elif unpaid and long_applicable:
-            pass  # it draws an allowance with no published capacity: nothing about it is unread
-        elif (not spec.get('unlimited') and not account_out and not result.get('data_errors')
+        elif (not spec.get('unlimited') and not account_out and not result.get('data_errors') and not latched_long
                 and not any(not st.get('short') for _, st, _, _ in five_window_states.values())):
             # Priced on the weekly window or not at all (round 15): a candidate with no long reset-period window in its
             # state cannot be priced and cannot stand in for another account's work, so it leaves automatic routing as
@@ -720,7 +713,7 @@ def evaluate_bundle(bundle, task, ctx):
         result['_five_econ_hours'] = econ_hours
         result['_five_chain_hours'] = econ_chain_hours
         result['_five_context_burn'] = context_burn
-        if not five_window_states and not result['excluded'] and not result.get('data_errors') and not (unpaid and long_applicable):
+        if not five_window_states and not result['excluded'] and not result.get('data_errors') and not latched_long:
             result['notes'].append('no current capacity observation; unknown is not exhausted')
     # A declared dispatch cadence holds every account to it. It is priced only where it is the account's whole quota (an
     # unmetered account); beside quota windows it is a gate, and those windows price the task as they do without it.

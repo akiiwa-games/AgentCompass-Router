@@ -35,25 +35,6 @@ def unit_rate(spec, wid, model, info=None):
     return 0.0 if usd_unpriced(model, info) else None
 
 
-def unpaid_allowance(spec):
-    """The vendor's dated declaration when the account's allowance costs nothing and publishes no capacity
-    (axis_scores.unpublished_capacity, read onto the account by the five-axis overlay), else None. Such an allowance has
-    no capacity a spend could be a share of and nothing is paid for it, so its quota term is 0; the task's list-price
-    spend (`bundle_task_usd`) is still what the work is worth."""
-    declared = (spec or {}).get('capacity_unpublished')
-    return declared if isinstance(declared, dict) else None
-
-
-def unpaid_cost_basis(spec):
-    """Why the quota term of an unpaid allowance is 0, for the plan and its snapshot; None for any other account."""
-    declared = unpaid_allowance(spec)
-    if declared is None:
-        return None
-    return (f"0: the {declared.get('plan') or 'free'} plan's allowance costs $0 and publishes no capacity "
-            f"({declared.get('url')}, read {declared.get('as_of')}), so a spend is no share of any quota; it is used until the "
-            "vendor's limit error, then held until the reset that error states")
-
-
 def bundle_task_usd(spec, model, hours, info=None, context_burn=1.0):
     """Expected API-equivalent task budget in USD for `hours` active worker-hours (`hours * usd_per_hour * context_burn`)."""
     if spec.get('unlimited') or spec.get('unmetered'):
@@ -634,11 +615,6 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
             c['expected_pct'] = round(binding['step_pct'], 2)
             c['chain_pct'] = round(binding['chain_pct'], 2)
         cost = float(summary['cost'])
-        spec = (accounts.get('accounts') or {}).get(c['bundle']['account']) or {}
-        drawn = set(c.get('_five_axis_windows') or ()) - set(spec.get('capacity_usd') or {})
-        basis = unpaid_cost_basis(spec) if drawn else None      # only a candidate that draws the unpriced allowance
-        if basis:
-            summary['cost_basis'] = basis
         c['economy'] = summary
         c['components']['opportunity_cost'] = cost
         c['components']['quota_price'] = binding.get('quota_price', 0.0) if binding and binding['priced'] else 0.0

@@ -3,9 +3,11 @@
 import copy
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import account_state
+import quota_exhaustion
 import model_resolution
 import provider_inventory
 import public_data
@@ -130,16 +132,22 @@ def opencode_token_usd(price, tok_in, tok_out, tok_cache_read, tok_cache_write):
             + float(tok_out or 0) * value['output']) / 1e6
 
 
-def opencode_local_spend(models_table, discovery=None, *, read_local_db=True):
+def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, since=None, until=None):
     """(spend, unpriced): lower-bound USD per model from local `opencode.db` token counts at the model's public list
     price, and the sorted ids of models with tokens but no list price in the data (round 12 S6). A model id matches a
     table name or alias exactly; there is no prefix guessing and no invented price, so a model without a cited price is
     a surfaced gap (mode B), never a $0 or a borrowed rate. When `read_local_db=False` (fresh/public evaluation),
-    no machine-local `opencode.db` is read."""
+    no machine-local `opencode.db` is read.
+
+    `since` / `until` (aware datetimes) bound the read by time: only messages the database stamps (`time_created`, ms)
+    at or after `since` and before `until`. Discovery's token totals carry no time, so a bounded read is the database's
+    alone."""
     import sqlite3
     prices = opencode_list_prices(models_table)
     readings = []       # (source, model id, input, output + reasoning, cache read, cache write)
-    disc_models = (((discovery or {}).get('accounts') or {}).get('opencode') or {}).get('usage', {}).get('models') or {}
+    bounded = since is not None or until is not None
+    disc_models = {} if bounded else (
+        (((discovery or {}).get('accounts') or {}).get('opencode') or {}).get('usage', {}).get('models') or {})
     for model_id, m_row in disc_models.items():
         if isinstance(m_row, dict):
             readings.append(('discovery', model_id, m_row.get('input'),
@@ -159,7 +167,10 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True):
                     "SUM(COALESCE(json_extract(data, '$.tokens.cache.read'), 0)), "
                     "SUM(COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) "
                     "FROM message WHERE json_extract(data, '$.role') = 'assistant' "
-                    "GROUP BY json_extract(data, '$.modelID')"
+                    + ("AND time_created >= ? AND time_created < ? " if bounded else "")
+                    + "GROUP BY json_extract(data, '$.modelID')",
+                    (int(since.timestamp() * 1000) if since is not None else -2 ** 62,
+                     int(until.timestamp() * 1000) if until is not None else 2 ** 62) if bounded else ()
                 ).fetchall()
             finally:
                 conn.close()
@@ -306,10 +317,112 @@ def unpublished_capacity(accounts, family, plan, shipped=None):
     if not isinstance(declared, dict):
         return None
     prefix = template.get('allowance_launch_prefix')
-    return {**declared, 'plan': resolved, **({'allowance_launch_prefix': prefix} if isinstance(prefix, str) and prefix else {})}
+    measured = template.get('capacity_measured')
+    return {**declared, 'plan': resolved, **({'allowance_launch_prefix': prefix} if isinstance(prefix, str) and prefix else {}),
+            **({'measured': dict(measured)} if reference_provenance.valid_measured_capacity(measured) else {})}
 
 
-def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scores=None, local_scores=None):
+FREE_WINDOW = 'allowance'       # the one window of a free pool (five_axis_overlay)
+
+
+def _allowance_spend(spec, spend, family, accounts):
+    """USD the free pool's allowance spent, from per-model `spend`: the models of the account's bundles that draw it,
+    else, on OpenCode, whose own usage record opencode.db is, all of it."""
+    total, seen = 0.0, set()
+    for b in (spec.get('bundles') or {}).values():
+        if not isinstance(b, dict) or b.get('draws') == []:
+            continue
+        m_key = account_fleet.canonical(b.get('model') or '', accounts)
+        if m_key in spend and m_key not in seen:
+            seen.add(m_key)
+            total += spend[m_key]
+    if total == 0.0 and family == 'opencode':
+        total = sum(spend.values())
+    return total
+
+
+def free_allowance_period(name, spec, family, unpublished, accounts, *, read_local_state, now):
+    """The capacity C, the period T and the current reading of a free allowance the vendor sizes nowhere
+    (`unpublished`), from these sources in this order (owner, 2026-11-24):
+
+    1. this account's own observation at its limit error (quota_exhaustion.observation, local state): the pool was at 0
+       then, so its spend since the period began (the stated reset less the stated period) is C, and the stated reset
+       fixes the period's boundary;
+    2. else the maintainer's shipped measurement (plan-templates `capacity_measured`, over the period it was measured);
+    3. else None: no capacity, and the pool stays mode B (`capacity_unknown`).
+
+    Spend is opencode.db token counts at public list price (`opencode_local_spend` bounded by time). An observed period
+    in which a model with no list price spent gives no C (a surfaced gap, never $0). The reading's used share is U / C,
+    U the spend since the current period began. With no observed boundary the reading is the conservative one: U is the
+    spend of the last T hours (the most any period that contains now can hold) and the reset is T hours away (the
+    longest it can take), so the pool reads at least as full, and its recovery at least as late, as under any true
+    boundary.
+
+    Returns {'capacity_usd', 'source', 'period_hours', 'reading'}, {'gap': reason}, or None."""
+    def spent(since, until):
+        spend, gap = opencode_local_spend(accounts.get('models') or {}, accounts.get('_discovery'),
+                                          read_local_db=bool(read_local_state), since=since, until=until)
+        return _allowance_spend(spec, spend, family, accounts), list(gap)
+    obs = quota_exhaustion.observation(name) if read_local_state else None
+    measured = (unpublished or {}).get('measured')
+    found, gap_reason = None, None
+    if obs:
+        period = obs['period_hours']
+        start = obs['resets_at'] - timedelta(hours=period)
+        used, gap = spent(start, obs['observed_at'])
+        if gap:
+            gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} ended a period in which models with no "
+                          f"list price spent ({', '.join(gap)}): its capacity cannot be priced")
+        elif used <= 0:
+            gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} ended a period with no priced spend in "
+                          'opencode.db: no capacity to read from it')
+        else:
+            found = (round(used, 4), {
+                'status': 'observed', 'as_of': obs['observed_at'].isoformat(), 'period_hours': period,
+                'evidence': (f"spent ${used:.4f} at public list price (opencode.db) from {start.isoformat()} to the "
+                             f"limit error at {obs['observed_at'].isoformat()}; the error stated the reset "
+                             f"{obs['resets_at'].isoformat()} of a {period:g} h allowance")}, period)
+    if found is None and measured:
+        found = (float(measured['capacity_usd']), {
+            'status': 'maintainer', 'as_of': measured['as_of'], 'period_hours': float(measured['period_hours']),
+            'bound': measured['bound'], 'evidence': str(measured['statement'])}, float(measured['period_hours']))
+    if found is None:
+        return {'gap': gap_reason} if gap_reason else None
+    capacity, source, period = found
+    if obs and obs['period_hours'] == period:
+        resets = obs['resets_at']
+        if resets <= now:
+            resets += timedelta(hours=period) * (int((now - resets) / timedelta(hours=period)) + 1)
+        start, boundary = resets - timedelta(hours=period), 'observed'
+    else:
+        resets, start, boundary = now + timedelta(hours=period), now - timedelta(hours=period), 'assumed'
+    used, gap = spent(start, now)
+    return {'capacity_usd': capacity, 'source': source, 'period_hours': period,
+            'reading': {'window': FREE_WINDOW, 'used_usd': round(used, 4), 'period_start': start.isoformat(),
+                        'resets_at': resets.isoformat(), 'boundary': boundary, **({'gap': gap} if gap else {})}}
+
+
+def with_local_readings(usage, accounts, now):
+    """`usage` plus, for each free pool whose allowance has a capacity and a period (five_axis_overlay `local_period`)
+    and no reading of its own, the reading of its current period from local spend: used share U / C, reset at the
+    period's end. A copy; `usage` is not changed."""
+    import usage_reading
+    out = {**(usage or {}), 'accounts': dict((usage or {}).get('accounts') or {})}
+    for name, spec in ((accounts or {}).get('accounts') or {}).items():
+        period = spec.get('local_period') if isinstance(spec, dict) else None
+        cap = (spec.get('capacity_usd') or {}).get(FREE_WINDOW) if period else None
+        row = out['accounts'].get(name) or {}
+        if not cap or any(isinstance(w, dict) and w.get('id') == FREE_WINDOW for w in row.get('windows') or ()):
+            continue
+        window = usage_reading.window_state({'id': FREE_WINDOW, 'used_pct': 100.0 * period['used_usd'] / cap,
+                                             'resets_at': period['resets_at']}, now)
+        out['accounts'][name] = {**row, 'status': 'fresh', 'available': True, 'fetched_at': now.isoformat(),
+                                 'source': 'opencode.db spend at public list price (lower bound)',
+                                 'windows': [*(row.get('windows') or ()), window]}
+    return out
+
+
+def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scores=None, local_scores=None, now=None):
     """A copy of `accounts` carrying the scoring data of references/five-axis-scores.json plus manual scores
     (`references/user-scores.json` maintainer layer, then local `user-scores.json` when `read_local_state=True`).
 
@@ -320,10 +433,12 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
     merged cited value (an unsourced usd is removed, not defaulted). Each windowed account's capacity is the
     data's community real-usage figure for its plan and window (round 4), replacing the packaged figure and any dated
     change; a window without one is marked unknown, with no template fallback. Free pools are ordinary quota pools with
-    C/U/t0/T (round 11): when capacity is unreadable, they enter mode B (`capacity_unknown`), out of automatic routing,
-    unless their plan carries the vendor's dated declaration that it publishes none (`capacity_unpublished`): then the
-    allowance is `unpublished`, not unknown, and the pool routes until its limit is observed (owner, 2026-11-24)."""
+    C/U/t0/T (round 11): when capacity is unreadable, they enter mode B (`capacity_unknown`), out of automatic routing.
+    A plan whose vendor sizes the allowance nowhere (`capacity_unpublished`) reads C and T from `free_allowance_period`
+    (this account's observation at its limit error, else the maintainer's shipped measurement) and is priced like any
+    window; with neither it is mode B too (owner, 2026-11-24). `now` dates that period."""
     explicit_data = data is not None
+    now = now or datetime.now(timezone.utc)
     cfg_path = five_axis_config(accounts.get('scoring')).get('path')
     data = data if explicit_data else load_five_axis(cfg_path)
     out = copy.deepcopy(accounts)
@@ -378,9 +493,10 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
         is_free_pool = bool(spec.get('free_allowance') or str(spec.get('plan') or '') == 'free')
         family = families_by_account[name]
         # A free pool whose plan the vendor sizes nowhere (plan-templates `capacity_unpublished`, a dated vendor
-        # declaration) has no capacity to read: it is used until the vendor's limit error, which latches it until the
-        # reset that error states (quota_exhaustion). Without the declaration it stays mode B (owner, 2026-11-24).
+        # declaration) reads its capacity from `free_allowance_period`; with none it stays mode B (owner, 2026-11-24).
         spec.pop('capacity_unpublished', None)
+        spec.pop('local_period', None)
+        free_period = None
         unpublished = (unpublished_capacity(out, family, spec.get('plan'), shipped=shipped_templates)
                        if is_free_pool and spec.get('billing') != 'metered' else None)
         if unpublished:
@@ -394,9 +510,8 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             if not spec.get('windows'):
                 spec['windows'] = {'allowance': {'hours': None}}
                 spec['capacity_usd'] = {}
-                if not unpublished:
-                    spec['capacity_unknown'] = True
-                    spec['capacity_source'] = {'allowance': {'status': 'missing', 'plan': spec.get('plan') or 'free'}}
+                spec['capacity_unknown'] = True
+                spec['capacity_source'] = {'allowance': {'status': 'missing', 'plan': spec.get('plan') or 'free'}}
                 # Auto bundles were derived while this account declared no window, so they carry an explicit empty `draws`
                 # (authoritative): every model of a free pool spends the one allowance, so they draw it (round 15). A plan
                 # that names the provider prefix its free models launch under (`allowance_launch_prefix`) scopes it: a
@@ -411,17 +526,14 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
                         b['draws'] = []
                     elif b.get('draws') == [] or prefix:
                         b['draws'] = ['allowance']
-            acct_spend = 0.0
-            seen_models = set()
-            for b in (spec.get('bundles') or {}).values():
-                if not isinstance(b, dict):
-                    continue
-                m_key = account_fleet.canonical(b.get('model') or '', out)
-                if m_key in local_spend and m_key not in seen_models:
-                    seen_models.add(m_key)
-                    acct_spend += local_spend[m_key]
-            if acct_spend == 0.0 and family == 'opencode':      # opencode.db is this family's own usage record
-                acct_spend = sum(local_spend.values())
+                if unpublished:
+                    free_period = free_allowance_period(name, spec, family, unpublished, out,
+                                                        read_local_state=read_local_state, now=now)
+                    if (free_period or {}).get('capacity_usd'):
+                        # A capacity and a period: an ordinary periodic window, read from the period's local spend.
+                        spec['windows'] = {FREE_WINDOW: {'hours': free_period['period_hours']}}
+                        spec['local_period'] = free_period['reading']
+            acct_spend = _allowance_spend(spec, local_spend, family, out)
             if acct_spend > 0:
                 spec['local_spend_usd'] = round(acct_spend, 4)
                 spec['local_spend_source'] = 'opencode.db token counts x public list price (lower bound)'
@@ -484,13 +596,19 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
                     if wid in spec['windows'] and isinstance(v, (int, float)) and v > 0}
             for wid in caps:
                 cap_sources[wid] = {'status': 'explicit', 'as_of': None, 'plan': plan or None}
+        if (free_period or {}).get('capacity_usd') and FREE_WINDOW in spec['windows'] and (
+                free_period['source']['status'] == 'observed' or FREE_WINDOW not in caps):
+            # This account's own observation beats any figure; the shipped measurement fills only a missing one.
+            caps[FREE_WINDOW] = free_period['capacity_usd']
+            cap_sources[FREE_WINDOW] = {**free_period['source'], 'plan': plan or None}
         spec['capacity_usd'] = caps
         if unpublished:
             for wid in spec['windows']:
                 if wid not in caps:
                     cap_sources[wid] = {'status': 'unpublished', 'as_of': unpublished.get('as_of'),
-                                        'plan': unpublished.get('plan'), 'source': unpublished.get('url')}
-        unknown = [wid for wid in spec['windows'] if wid not in caps and not unpublished]
+                                        'plan': unpublished.get('plan'), 'source': unpublished.get('url'),
+                                        **({'reason': free_period['gap']} if (free_period or {}).get('gap') else {})}
+        unknown = [wid for wid in spec['windows'] if wid not in caps]
         if (unknown and not plan_unknown_reason and not is_free_pool
                 and spec.get('billing') != 'metered' and not src_spec.get('plan_priced_as')):
             table = provider_inventory.plan_table(out, cap_family, shipped=shipped_templates)

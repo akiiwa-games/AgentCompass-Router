@@ -893,9 +893,10 @@ def account_cards() -> list[dict]:
                 **({"metered_usd": True, "spent_text": spent_text} if metered_usd else {}),
                 "stale": reset_passed or usage_row.get("status") != "fresh" or reading_failed})
         if spec.get("capacity_unpublished"):
-            # A free allowance the vendor sizes nowhere: no reading, so its one state is whether its limit error latched
-            # it (0 left until the stated reset). The details are hover text, not card prose.
-            usage_hover = _tr("供应商未公布额度上限：用到供应商的限额报错为止，之后等到报错给出的重置时间")
+            # A free allowance the vendor sizes nowhere: its capacity is this machine's observation, else the shipped
+            # measurement, else unknown (axis_scores.free_allowance_period); a latch shows as the window at 0 until its
+            # end. The details are hover text, not card prose.
+            usage_hover = _tr("供应商未公布额度上限：上限取本机最近一次限额报错前的花费，否则取出厂实测值；两者都没有时不参与自动路由，点名可用")
             reset_at = quota_pools.parse_time((row or {}).get("exhausted_resets_at"))
             for wid in sorted(latched - {w["id"] for w in windows}):
                 windows.append({

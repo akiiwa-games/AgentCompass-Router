@@ -444,11 +444,11 @@ class FiveAxisTests(unittest.TestCase):
         # Antigravity has no community source: every window unknown.
         self.assertEqual(out['accounts']['antigravity']['capacity_usd'], {})
         self.assertTrue(out['accounts']['antigravity']['capacity_unknown'])
-        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag. Its vendor
-        # declares that it publishes no capacity (plan-templates `capacity_unpublished`), so it is not mode B.
+        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag, capacity_unknown.
+        # Its vendor's declaration that it publishes no capacity (plan-templates `capacity_unpublished`) ships no figure.
         self.assertFalse(out['accounts']['opencode'].get('unmetered'))
         self.assertFalse(out['accounts']['opencode'].get('unlimited'))
-        self.assertFalse(out['accounts']['opencode'].get('capacity_unknown'))
+        self.assertTrue(out['accounts']['opencode']['capacity_unknown'])
         self.assertEqual(out['accounts']['opencode']['capacity_unpublished']['kind'], 'vendor')
 
     def test_tie_break_order_net_score_then_wait_then_faster_then_fewer_usd_then_level(self):
@@ -724,8 +724,6 @@ class FiveAxisTests(unittest.TestCase):
             sys.path.insert(0, tray_dir)
         doc = document(self.accounts['models'], **{'glm-5.3-flash-free': row(0.75, usd=1.50, image_input='no')})
         acc = copy.deepcopy(self.accounts)
-        # The free plan without the vendor's declaration that it publishes no capacity (capacity_unpublished): mode B.
-        acc['plan_templates'] = {'opencode': {'free': {'provenance': 'vendor', 'price_usd_per_month': 0}}}
         acc['accounts']['opencode']['bundles'] = {
             'glm53_free': {'provider': 'opencode', 'harness': 'opencode', 'account': 'opencode', 'model': 'glm-5.3-flash-free'}
         }

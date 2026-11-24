@@ -367,7 +367,7 @@
       },
       "allowance_launch_prefix": "opencode",
       "windows": {},
-      "basis": "OpenCode's free models need no sign-in and draw one allowance whose size the vendor does not publish (`capacity_unpublished`). The router uses it until the vendor's limit error is observed and then holds the allowance until the reset that error states (quota_exhaustion). No window is declared here: the allowance window is the free pool's own (axis_scores.five_axis_overlay). `allowance_launch_prefix`: the free models are OpenCode's own provider `opencode` (launch ids `opencode/<model>`, models.dev catalog `opencode`); OpenCode Go models connected on the same account launch as `opencode-go/<model>`, a paid subscription, and do not draw the free allowance."
+      "basis": "OpenCode's free models need no sign-in and draw one allowance whose size the vendor does not publish (`capacity_unpublished`). Its capacity is this account's spend in the period its limit error ends (quota_exhaustion.observation), else a dated maintainer measurement shipped here as `capacity_measured`, else unknown and out of automatic routing (axis_scores.free_allowance_period); the limit error holds the allowance until the reset it states. No window is declared here: the allowance window is the free pool's own (axis_scores.five_axis_overlay). `allowance_launch_prefix`: the free models are OpenCode's own provider `opencode` (launch ids `opencode/<model>`, models.dev catalog `opencode`); OpenCode Go models connected on the same account launch as `opencode-go/<model>`, a paid subscription, and do not draw the free allowance."
     }
   }
 }

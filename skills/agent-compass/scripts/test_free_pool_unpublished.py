@@ -1,14 +1,17 @@
-"""A free pool whose vendor publishes no capacity (owner, 2026-11-24).
+"""A free pool whose vendor publishes no capacity: an ordinary quota pool (owner, 2026-11-24, addendum 2).
 
 Rules under test (skills/agent-compass/references/router-internals.md, section 2, free pools):
-  - the declaration is data: a plan's `capacity_unpublished` in plan-templates.json, a dated vendor citation; a free pool
-    with it is an ordinary candidate of automatic routing, without it (and any subscription whose plan is unknown) it
-    stays in mode B, whatever the family is called;
-  - its quota term is 0 because nothing is paid (quota_economy.unpaid_allowance), and the plan's snapshot says why;
+  - the vendor's declaration is data (plan-templates `capacity_unpublished`, a dated vendor citation); it ships no C;
+  - C comes from this account's own observation at its limit error (quota_exhaustion.observation: the spend of the
+    period that error ended), else the maintainer's shipped measurement (`capacity_measured`), else none: mode B
+    (`capacity_unknown`), out of automatic routing, as on main; an observed C is that account's alone;
+  - with C the pool is priced by the same function as any window from C, U, t0 and T: equal inputs give an equal
+    term, the term is non-decreasing in the used share, and a pool that never resets (T = inf) has a recovery line of 0;
+  - with no observed boundary the reading is the conservative one (U over the last T hours, the reset T hours away);
   - the vendor's limit error, recorded by the real writer (provider_retry.record -> quota_exhaustion.record), is the
     exhaustion of the allowance window with the reset the error states; held until that reset, a quota wait like any
     used-up window; eligible again after it; a sentence with no readable reset falls to the latches' re-probe period.
-No winner, share or score is asserted.
+The measured figure here is a fixture value, not shipped data. No winner, share or score is asserted.
 """
 import copy
 from datetime import datetime, timedelta, timezone
@@ -38,6 +41,21 @@ CLOCK = "You've used today's free messages. They reset at 11:59 PM"
 DATE = "You've used today's free messages. They reset at {date}"
 COUNTDOWN = 'Free usage exceeded, subscribe to Go reintentando en 74000s - intento n.º 1'
 UNREADABLE = "You've used today's free messages. They reset at tomorrow morning"
+# The shape of a shipped measurement (reference_provenance.valid_measured_capacity), with a test value.
+MEASURED = {'kind': 'maintainer', 'as_of': '2026-11-24', 'capacity_usd': 50.0, 'period_hours': 24, 'bound': 'lower_bound',
+            'model': 'deepseek-v4.1-flash-free', 'requests': 100,
+            'statement': 'fixture measurement for tests; not shipped data'}
+FREE_MODEL = 'deepseek-v4.1-flash-free'
+
+
+def spend_of(usd, gap=(), calls=None):
+    """A stand-in for opencode.db: `usd` spent on the free model in any time-bounded read (the period reads), nothing
+    unbounded; `calls` collects the bounds of the bounded reads."""
+    def read(models, discovery=None, *, read_local_db=True, since=None, until=None):
+        if calls is not None and since is not None:
+            calls.append((since, until))
+        return ({FREE_MODEL: usd} if usd else {}, list(gap)) if since is not None else ({}, [])
+    return read
 
 
 def setUpModule():
@@ -47,9 +65,16 @@ def setUpModule():
 class UnpublishedFreePoolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.accounts = sim.fresh_accounts(shipped_template(), snapshot())
-        cls.doc = tf.document(cls.accounts['models'])
+        cls.bare = sim.fresh_accounts(shipped_template(), snapshot())
+        cls.doc = tf.document(cls.bare['models'])
         cls.declaration = copy.deepcopy(provider_inventory.shipped_plan_templates()['opencode']['free'])
+        cls.accounts = cls.with_measured(cls.bare)      # a pool with a capacity, for the latch tests
+
+    @classmethod
+    def with_measured(cls, acc, measured=MEASURED, family='opencode'):
+        acc = copy.deepcopy(acc)
+        acc['plan_templates'] = {family: {'free': {**copy.deepcopy(cls.declaration), 'capacity_measured': dict(measured)}}}
+        return acc
 
     def setUp(self):
         self.state = Path(tempfile.mkdtemp(prefix='free-pool-'))
@@ -67,13 +92,18 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         acc['accounts'] = {n: s for n, s in acc['accounts'].items() if n in names}
         return acc
 
-    def plan(self, acc, now=None, **task):
+    def plan(self, acc, now=None, usage_extra=None, **task):
         now = now or self.now
         acc = copy.deepcopy(acc)
         with tf._synthetic_doc_ctx(self.doc):
             usage = sim.snapshot(sim.synthetic_document(acc, now, sim.STATES['ample']), acc, now)
+            usage.setdefault('accounts', {}).update(usage_extra or {})
             return allocator.plan({'objective': 't', 'profile': dict(tf.PROFILE), **task}, usage, now, accounts=acc,
                                   overrides=[], records=[], host_policy_config={'allowed_accounts': list(acc['accounts'])})
+
+    def overlay(self, acc, now=None):
+        with tf._synthetic_doc_ctx(self.doc):
+            return axis_scores.five_axis_overlay(copy.deepcopy(acc), now=now or self.now)
 
     def rows(self, decision, account=POOL):
         return [c for c in decision['ranking'] if c['bundle']['account'] == account]
@@ -101,57 +131,37 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertTrue(declared['url'].startswith('https://') and declared['as_of'] and declared['statement'])
         self.assertEqual(self.declaration['price_usd_per_month'], 0)
 
-    def test_a_declared_pool_is_eligible_and_its_quota_term_is_zero_with_the_reason_recorded(self):
-        decision = self.plan(self.accounts)
-        rows = self.rows(decision)
-        self.assertTrue(rows)
-        for c in rows:
-            self.assertFalse([e for e in c['excluded'] if 'capacity_unknown' in e or 'quota reading unavailable' in e],
-                             c['excluded'])
-        eligible = [c for c in rows if not c['excluded']]
-        self.assertTrue(eligible, [c['excluded'] for c in rows])
-        for c in eligible:
-            self.assertEqual(c['components']['opportunity_cost'], 0.0)
-            self.assertTrue(c['economy']['cost_basis'].startswith('0: '))
-        # The snapshot keeps the reason on every eligible row it records (the pool alone, so no row depends on its rank).
-        alone = self.plan(self.only(POOL))
-        snap = ledger_snapshot.decision_snapshot(alone)
-        kept = [r for r in snap['ranking'] if not r['excluded']]
-        self.assertTrue(kept and all(r['economy'].get('cost_basis', '').startswith('0: ') for r in kept), kept)
-
-    def test_the_same_pool_without_the_declaration_stays_in_mode_b(self):
-        acc = copy.deepcopy(self.accounts)
-        acc['plan_templates'] = {'opencode': {'free': {k: v for k, v in self.declaration.items()
-                                                       if k != 'capacity_unpublished'}}}
-        rows = self.rows(self.plan(acc))
+    def test_with_no_capacity_the_declared_pool_is_excluded_as_on_main(self):
+        """Rule (axis_scores.free_allowance_period, source 3): no observation and no shipped measurement is no C, so the
+        pool is mode B (`capacity_unknown`), out of automatic routing, as on main. An observation whose period a model
+        with no list price spent in gives no C either: the gap is surfaced on the window's source."""
+        rows = self.rows(self.plan(self.bare))
         self.assertTrue(rows)
         self.assertTrue(all(any('capacity_unknown (quota unknown, spend unpriced)' in e for e in c['excluded'])
-                            for c in rows))
-
-    def test_a_subscription_whose_plan_is_unknown_stays_in_mode_b(self):
-        acc = copy.deepcopy(self.accounts)
-        acc['accounts']['grok']['plan'] = 'a-plan-no-template-names'
-        with tf._synthetic_doc_ctx(self.doc):
-            spec = axis_scores.five_axis_overlay(copy.deepcopy(acc))['accounts']['grok']
+                            for c in rows), [c['excluded'] for c in rows])
+        self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.now.isoformat()))
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(3.0, gap=('big-pickle',))):
+            spec = self.overlay(self.bare)['accounts'][POOL]
+            rows = self.rows(self.plan(self.bare))
         self.assertTrue(spec.get('capacity_unknown'))
-        self.assertNotIn('capacity_unpublished', spec)
+        self.assertIn('big-pickle', spec['capacity_source']['allowance']['reason'])
+        self.assertTrue(all(any('capacity_unknown' in e for e in c['excluded']) for c in rows))
 
     def test_the_rule_is_the_declaration_not_the_family_name(self):
-        acc = copy.deepcopy(self.accounts)
+        acc = copy.deepcopy(self.bare)
         acc['accounts']['acme-free'] = {**copy.deepcopy(acc['accounts'][POOL]), 'family': 'acme'}
         del acc['accounts'][POOL]
-        acc['plan_templates'] = {'acme': {'free': copy.deepcopy(self.declaration)}}
-        rows = self.rows(self.plan(acc), 'acme-free')
-        eligible = [c for c in rows if not c['excluded']]
-        self.assertTrue(eligible, [c['excluded'] for c in rows])
-        self.assertTrue(all(c['components']['opportunity_cost'] == 0.0 for c in eligible))
-        del acc['plan_templates']       # the same account with no declaration for its family: mode B
+        declared = self.with_measured(acc, family='acme')
+        spec = self.overlay(declared)['accounts']['acme-free']
+        self.assertFalse(spec.get('capacity_unknown'), spec.get('capacity_source'))
+        self.assertEqual(spec['capacity_source']['allowance']['status'], 'maintainer')
+        # The same account with no declaration for its family: no measurement is read, mode B.
         self.assertTrue(all(any('capacity_unknown' in e for e in c['excluded'])
                             for c in self.rows(self.plan(acc), 'acme-free')))
 
     def test_a_model_launched_under_another_prefix_of_the_account_draws_nothing_of_the_free_allowance(self):
         # Rule: the plan's `allowance_launch_prefix` scopes the allowance; OpenCode Go connected on the same account
-        # (`opencode-go/...`, a paid product) is neither free nor held by the free allowance's limit.
+        # (`opencode-go/...`, a paid product) is not drawn from the free allowance.
         import auto_bundles
         from router_test_support import fleet_with_derived_bundles
         zen, go = 'opencode/deepseek-v4.1-flash-free', 'opencode-go/glm-5.3'
@@ -159,14 +169,126 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         catalog = {'providers': {POOL: {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
                                         'models': [{'id': zen}, {'id': go}]}}}
         acc = fleet_with_derived_bundles(acc, auto_bundles.derive(acc, catalog, 2))
-        with tf._synthetic_doc_ctx(self.doc):
-            spec = axis_scores.five_axis_overlay(copy.deepcopy(acc))['accounts'][POOL]
+        spec = self.overlay(acc)['accounts'][POOL]
         draws = {b['launch_model']: b['draws'] for b in spec['bundles'].values() if b.get('launch_model') in (zen, go)}
         self.assertEqual(draws, {zen: ['allowance'], go: []})
         rows = {c['bundle'].get('launch_model'): c for c in self.rows(self.plan(acc))}
         self.assertFalse(rows[zen]['excluded'], rows[zen]['excluded'])
         self.assertTrue(rows[go]['excluded'])
-        self.assertNotIn('cost_basis', rows[go].get('economy') or {})
+
+    # -- an ordinary quota pool ------------------------------------------------------------------------------------------
+
+    def twin(self, acc, cap, used_usd, resets):
+        """A paid window with the same C, U and reset as the pool: a metered account with its own budget (the one kind
+        whose capacity the account states itself), the pool's models under other bundle ids, and its reading."""
+        acc = copy.deepcopy(acc)
+        pool = acc['accounts'][POOL]
+        acc['accounts'] = {'twin': {'billing': 'metered', 'verified': True, 'windows': {'allowance': {'hours': 24}},
+                                    'capacity_usd': {'allowance': cap},
+                                    'bundles': {f'twin_{k}': copy.deepcopy(v) for k, v in pool['bundles'].items()}}}
+        import usage_reading
+        reading = {'status': 'fresh', 'available': True, 'fetched_at': self.now.isoformat(),
+                   'windows': [usage_reading.window_state({'id': 'allowance', 'used_pct': 100 * used_usd / cap,
+                                                           'resets_at': resets.isoformat()}, self.now)]}
+        return acc, {'twin': reading}
+
+    def terms(self, decision):
+        return {c['bundle']['model']: c['components']['opportunity_cost'] for c in decision['ranking']
+                if not c['excluded']}
+
+    def test_equal_capacity_use_and_reset_give_the_paid_windows_quota_term(self):
+        """Rule (round 11, addendum 2): a free pool's quota term comes out of the same function as a paid window's: for
+        equal C, U, t0 and T the term is equal. Each is planned alone, so neither is the other's alternative."""
+        acc = self.only(POOL, acc=self.accounts)
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(20.0)):
+            pool = self.plan(acc, metered_ok=True)
+            twin, reading = self.twin(acc, MEASURED['capacity_usd'], 20.0,
+                                      self.now + timedelta(hours=MEASURED['period_hours']))
+            paid = self.plan(twin, usage_extra=reading, metered_ok=True)
+        econ = [c['economy']['windows'][0] for c in self.rows(pool) if not c['excluded']]
+        self.assertTrue(econ and all(w['used_usd'] == 20.0 and w['capacity_usd'] == MEASURED['capacity_usd'] for w in econ))
+        self.assertTrue(self.terms(pool))
+        self.assertEqual(self.terms(pool), self.terms(paid))
+
+    def test_the_quota_term_is_non_decreasing_in_the_used_share(self):
+        acc = self.only(POOL, acc=self.accounts)
+        seen = {}
+        for used in (0.0, 10.0, 20.0, 30.0, 40.0):
+            with patch.object(axis_scores, 'opencode_local_spend', spend_of(used)):
+                for model, term in self.terms(self.plan(acc)).items():
+                    seen.setdefault(model, []).append(term)
+        self.assertTrue(seen and all(len(terms) >= 3 for terms in seen.values()), seen)
+        for model, terms in seen.items():
+            self.assertEqual(terms, sorted(terms), model)
+
+    def test_a_pool_that_never_resets_has_a_recovery_line_of_zero(self):
+        """Rule (quota_economy.five_axis_window_recovery): T = inf (an allowance whose window has no period) does not run
+        its clock: elapsed 0 and recovery line 0 at any use."""
+        import quota_economy
+        import quota_pools
+        acc = self.only(POOL, acc=self.bare)
+        acc['accounts'][POOL].update(windows={'allowance': {'hours': None}}, capacity_usd={'allowance': 50.0})
+        spec = self.overlay(acc)['accounts'][POOL]
+        self.assertEqual(spec['capacity_usd'], {'allowance': 50.0})
+        for used in (0.0, 12.5, 49.0):
+            state = quota_pools.window_state('allowance', spec['windows']['allowance'], None,
+                                             {**spec, 'local_spend_usd': used}, self.now, 24)
+            rec = quota_economy.five_axis_window_recovery(state, 50.0)
+            self.assertEqual((rec['elapsed_frac'], rec['line_now_usd'], rec['reset_hours']), (0.0, 0.0, float('inf')))
+            self.assertAlmostEqual(rec['used_usd'], used)
+
+    def test_an_observed_capacity_replaces_a_missing_one_only_for_that_account(self):
+        """Rule (axis_scores.free_allowance_period, sources 1 and 2): the account's own observation gives its C (the
+        spend from the stated reset less the stated period to the error); another account of the same plan keeps its
+        own source: the shipped measurement when one ships, else none."""
+        bare = copy.deepcopy(self.bare)
+        bare['accounts']['opencode-b'] = {**copy.deepcopy(bare['accounts'][POOL]), 'family': 'opencode'}
+        self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.now.isoformat()))
+        seen = quota_exhaustion.observation(POOL)
+        calls = []
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(12.5, calls=calls)):
+            plain, measured = self.overlay(bare)['accounts'], self.overlay(self.with_measured(bare))['accounts']
+        self.assertIn((seen['resets_at'] - timedelta(hours=24), seen['observed_at']), calls)
+        for accounts in (plain, measured):
+            self.assertEqual(accounts[POOL]['capacity_usd'], {'allowance': 12.5})
+            self.assertEqual(accounts[POOL]['capacity_source']['allowance']['status'], 'observed')
+            self.assertFalse(accounts[POOL].get('capacity_unknown'))
+        self.assertTrue(plain['opencode-b'].get('capacity_unknown'))
+        self.assertEqual(measured['opencode-b']['capacity_usd'], {'allowance': MEASURED['capacity_usd']})
+        self.assertEqual(measured['opencode-b']['capacity_source']['allowance']['status'], 'maintainer')
+
+    def test_without_an_observed_boundary_the_reading_is_the_conservative_one(self):
+        """Rule (free_allowance_period): with no observed reset, U is the spend of the last T hours and the reset is T
+        hours away; with one, the period runs from the observed reset (rolled forward by T) less T."""
+        calls = []
+        acc = self.only(POOL, acc=self.accounts)
+        period = timedelta(hours=MEASURED['period_hours'])
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(5.0, calls=calls)):
+            reading = self.overlay(acc)['accounts'][POOL]['local_period']
+        self.assertEqual(calls, [(self.now - period, self.now)])
+        self.assertEqual((reading['boundary'], datetime.fromisoformat(reading['resets_at'])), ('assumed', self.now + period))
+        self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.now.isoformat()))
+        reset = quota_exhaustion.observation(POOL)['resets_at']
+        later = reset + period + timedelta(hours=1)        # two resets after the observed one: rolled forward by T
+        calls.clear()
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(0.0, calls=calls)):
+            reading = self.overlay(acc, now=later)['accounts'][POOL]['local_period']
+        self.assertEqual(reading['boundary'], 'observed')
+        self.assertEqual(datetime.fromisoformat(reading['resets_at']), reset + 2 * period)
+        self.assertEqual(calls[-1], (reset + period, later))
+
+    def test_the_period_reading_is_what_the_window_is_priced_from(self):
+        """The overlay's period reading enters the plan as the window's reading (axis_scores.with_local_readings): used
+        share U / C, its reset; a reading of its own is not replaced."""
+        acc = self.only(POOL, acc=self.accounts)
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(10.0)):
+            overlaid = self.overlay(acc)
+        usage = axis_scores.with_local_readings({'accounts': {}}, overlaid, self.now)
+        window = usage['accounts'][POOL]['windows'][0]
+        self.assertEqual((window['id'], window['used_pct']), ('allowance', 100 * 10.0 / MEASURED['capacity_usd']))
+        self.assertEqual(window['resets_at'], overlaid['accounts'][POOL]['local_period']['resets_at'])
+        own = {'accounts': {POOL: {'status': 'fresh', 'windows': [{'id': 'allowance', 'used_pct': 1.0}]}}}
+        self.assertEqual(axis_scores.with_local_readings(own, overlaid, self.now)['accounts'], own['accounts'])
 
     # -- who decides, and what a quota message latches -----------------------------------------------------------------
 
@@ -434,6 +556,71 @@ class StatedResetParseTests(unittest.TestCase):
             self.assertTrue(quota_exhaustion.confirmed(text), text)
         for text in ('HTTP 429: temporary rate limit', 'Network timeout', 'fixture worker failure'):
             self.assertFalse(quota_exhaustion.confirmed(text), text)
+
+
+class ObservationStoreTests(unittest.TestCase):
+    """The account's observation at its limit error (quota_exhaustion.record / observation): local state, kept apart
+    from the latch, replaced by the next observation; written only when the sentence states both its reset and its
+    period."""
+
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp(prefix='observation-')) / 'quota-exhaustion.json'
+        self.addCleanup(shutil.rmtree, self.path.parent, ignore_errors=True)
+        self.at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def test_a_sentence_stating_reset_and_period_is_an_observation_and_survives_the_latch(self):
+        self.assertEqual(quota_exhaustion.stated_period(CLOCK), 24.0)
+        self.assertTrue(quota_exhaustion.record(POOL, CLOCK, windows=['allowance'], at=self.at.isoformat(), path=self.path))
+        seen = quota_exhaustion.observation(POOL, path=self.path)
+        self.assertEqual((seen['observed_at'], seen['resets_at'], seen['period_hours']),
+                         (self.at, quota_exhaustion.stated_reset(CLOCK, self.at), 24.0))
+        quota_exhaustion.clear(POOL, path=self.path)
+        self.assertEqual(quota_exhaustion.observation(POOL, path=self.path), seen)
+        self.assertIsNone(quota_exhaustion.observation('another', path=self.path))
+
+    def test_a_sentence_without_reset_or_period_observes_nothing_and_the_next_observation_replaces_the_last(self):
+        for n, text in enumerate((LIMIT, COUNTDOWN, UNREADABLE)):
+            self.assertTrue(quota_exhaustion.record(POOL, text, at=(self.at + timedelta(minutes=n)).isoformat(),
+                                                    path=self.path), text)
+            self.assertIsNone(quota_exhaustion.observation(POOL, path=self.path), text)
+        first, second = self.at + timedelta(hours=1), self.at + timedelta(hours=2)
+        quota_exhaustion.record(POOL, CLOCK, at=first.isoformat(), path=self.path)
+        quota_exhaustion.record(POOL, CLOCK, at=second.isoformat(), path=self.path)
+        self.assertEqual(quota_exhaustion.observation(POOL, path=self.path)['observed_at'], second)
+
+
+class BoundedSpendTests(unittest.TestCase):
+    """axis_scores.opencode_local_spend bounded by time: only the messages opencode.db stamps (`time_created`, ms) at or
+    after `since` and before `until`, at the model's list price; discovery's totals carry no time and are left out."""
+
+    def test_a_bounded_read_sums_only_the_messages_inside_the_period(self):
+        import json
+        import sqlite3
+        root = Path(tempfile.mkdtemp(prefix='opencode-db-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        db = root / 'opencode.db'
+        until = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+        since = until - timedelta(hours=24)
+        tokens = {'input': 1000, 'output': 400, 'reasoning': 100, 'cache': {'read': 50, 'write': 0}}
+        stamps = {'before': since - timedelta(hours=1), 'at_start': since, 'inside': until - timedelta(hours=1),
+                  'at_end': until}
+        conn = sqlite3.connect(db)
+        conn.execute('CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)')
+        for key, stamp in stamps.items():
+            conn.execute('INSERT INTO message VALUES (?, ?, ?)', (key, int(stamp.timestamp() * 1000), json.dumps(
+                {'role': 'assistant', 'modelID': FREE_MODEL, 'providerID': 'opencode', 'tokens': tokens})))
+        conn.commit()
+        conn.close()
+        accounts = sim.fresh_accounts(shipped_template(), snapshot())
+        models = axis_scores.five_axis_overlay(copy.deepcopy(accounts), read_local_state=False)['models']
+        name, price = axis_scores.opencode_list_prices(models)[FREE_MODEL]
+        one = axis_scores.opencode_token_usd(price, 1000, 500, 50, 0)
+        discovery = {'accounts': {'opencode': {'usage': {'models': {FREE_MODEL: {'input': 10 ** 9, 'output': 0}}}}}}
+        with patch.dict(os.environ, {'OPENCODE_DB_PATH': str(db)}):
+            bounded, _ = axis_scores.opencode_local_spend(models, discovery, since=since, until=until)
+            unbounded, _ = axis_scores.opencode_local_spend(models, None)
+        self.assertAlmostEqual(bounded[name], round(2 * one, 4))           # at_start and inside; not before, not at_end
+        self.assertAlmostEqual(unbounded[name], round(4 * one, 4))
 
 
 if __name__ == '__main__':

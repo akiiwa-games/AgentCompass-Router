@@ -1313,8 +1313,6 @@ class WeeklyWindowTests(unittest.TestCase):
                                                                          'model': 'glm-5.3-flash-free', 'draws': [], 'auto': True},
                                                'named': {'provider': 'opencode', 'harness': 'opencode', 'model': 'glm-5.3-flash-free',
                                                          'draws': ['elsewhere']}}}
-        # A free plan that declares no unpublished capacity (the shipped OpenCode plan declares one: test_free_pool_unpublished.py).
-        acc['plan_templates'] = {'opencode': {'free': {'provenance': 'vendor', 'price_usd_per_month': 0}}}
         out = axis_scores.five_axis_overlay(acc)['accounts']['pool']
         self.assertEqual(list(out['windows']), ['allowance'])
         self.assertEqual(out['bundles']['auto:pool:opencode:x']['draws'], ['allowance'])

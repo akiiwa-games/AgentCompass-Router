@@ -48,6 +48,26 @@ def valid_vendor_price_source(entry):
     return url.startswith('https://') and bool(_ISO_DATE.match(as_of))
 
 
+MEASURED_BOUNDS = ('measurement', 'lower_bound')
+
+
+def valid_measured_capacity(entry):
+    """True for a plan's `capacity_measured`: the maintainer's dated measurement of an allowance the vendor sizes nowhere
+    (kind maintainer, ISO as_of, a statement), in USD at public list price (`capacity_usd` > 0), over the period it was
+    measured (`period_hours` > 0), saying whether it is the measurement or a lower bound (`bound`, MEASURED_BOUNDS), and
+    the model and request count it rests on."""
+    if not valid_public_declaration(entry) or entry.get('kind') != 'maintainer':
+        return False
+    def positive(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+    requests = entry.get('requests')
+    return (positive(entry.get('capacity_usd')) and positive(entry.get('period_hours'))
+            and entry.get('bound') in MEASURED_BOUNDS
+            and isinstance(entry.get('model'), str) and bool(entry['model'].strip())
+            and isinstance(requests, int) and not isinstance(requests, bool) and requests > 0
+            and bool(str(entry.get('statement') or '').strip()))
+
+
 def validate_plan_templates_provenance(doc):
     """Ensure every `price_source` declared in plan-templates.json is a dated vendor https citation."""
     if not isinstance(doc, dict):
@@ -60,8 +80,11 @@ def validate_plan_templates_provenance(doc):
                 continue
             if 'price_source' in tpl and not valid_vendor_price_source(tpl.get('price_source')):
                 raise ValueError(f'plan-templates[{family!r}][{plan!r}].price_source requires kind="vendor", https url and ISO as_of')
+            if 'capacity_measured' in tpl and 'capacity_unpublished' not in tpl:
+                raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_measured stands only beside the '
+                                 "vendor's capacity_unpublished citation (anywhere else it is a bare figure)")
             if 'capacity_unpublished' in tpl:
-                # The route reads it as an allowance that costs nothing and has no capacity to read: both are vendor facts.
+                # The vendor sizes the allowance nowhere and charges nothing for it: both are vendor facts.
                 if not (valid_vendor_price_source(tpl['capacity_unpublished'])
                         and str(tpl['capacity_unpublished'].get('statement') or '').strip()):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_unpublished requires kind="vendor", '
@@ -73,6 +96,12 @@ def validate_plan_templates_provenance(doc):
                 if 'capacity_usd' in tpl or tpl.get('windows'):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}] declares capacity_unpublished beside a '
                                      'capacity figure or a window (the allowance window is the free pool\'s own)')
+                # The one figure that may stand beside it: the maintainer's own dated measurement (the vendor publishes
+                # none, the maintainer measured one; both are true).
+                if 'capacity_measured' in tpl and not valid_measured_capacity(tpl['capacity_measured']):
+                    raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_measured requires kind="maintainer", '
+                                     'ISO as_of, a statement, capacity_usd > 0 at list price, period_hours > 0, bound '
+                                     f'{" or ".join(MEASURED_BOUNDS)}, and the model and request count it rests on')
                 prefix = tpl.get('allowance_launch_prefix', None)
                 if prefix is not None and not (isinstance(prefix, str) and prefix.strip()):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}].allowance_launch_prefix must be the provider '

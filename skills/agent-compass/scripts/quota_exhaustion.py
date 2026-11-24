@@ -12,6 +12,10 @@ states (`stated_reset`, the one parse of a vendor's sentence; an allowance with 
 reader is held exactly until then), else the latches' shared re-probe period
 (account_state.LATCH_RETRY_HOURS) counted from the observation, which is not a guess at
 recovery. No remote error text is stored.
+
+An error that states both its reset and its period ("today's free messages ... reset at") is also an observation of
+the allowance's size (`observation`): kept apart from the latch, so a release or a clear keeps it, and replaced by the
+next one; axis_scores.free_allowance_period reads the period's spend from it.
 """
 import json
 import os
@@ -90,6 +94,18 @@ def _stated_zone(error, end):
     if int(hours) > 14 or int(minutes) > 59:
         return _UNKNOWN_ZONE
     return timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
+
+
+# The period a limit error names, in the vendor's own words: "You've used today's free messages" is a day's allowance
+# (anomalyco/opencode#59387, read 2026-11-24). A sentence that names none gives no period, never a guess.
+_PERIODS = ((re.compile(r"\btoday['’]s\b", re.I), 24.0),)
+
+
+def stated_period(error):
+    """The length in hours of the allowance period a limit error names (`_PERIODS`), else None."""
+    if not isinstance(error, str):
+        return None
+    return next((hours for pattern, hours in _PERIODS if pattern.search(error)), None)
 
 
 def longest_reset_hours():
@@ -191,8 +207,31 @@ def record(account, error, *, windows=None, at=None, source=None, path=None):
         if windows and not (previous.get('blocked') and not previous.get('windows')):
             entry['windows'] = sorted(set(windows) | set(previous.get('windows') or [] if previous.get('blocked') else []))
         doc['accounts'][account] = entry
+        period = stated_period(error)
+        if resets and period and resets - timedelta(hours=period) <= _time(at):
+            # The pool was at 0 at `at`: what it spent since the period began (the stated reset less the period) is
+            # this account's observed capacity, read by `observation`. Kept apart from the latch, so a release or a
+            # clear keeps it; the next such observation replaces it.
+            doc.setdefault('observations', {})[account] = {
+                'observed_at': at, 'resets_at': resets.isoformat(), 'period_hours': period,
+                **({'windows': sorted(set(windows))} if windows else {})}
         override_store.write(path, doc)
     return True
+
+
+def observation(account, *, path=None):
+    """The account's latest observation of a used-up allowance whose error stated both its reset and its period:
+    {'observed_at', 'resets_at' (aware datetimes), 'period_hours', 'windows'?}, else None. Local state of this machine,
+    like a usage reading: never public data and never a setting."""
+    row = (_read(path or store_path()).get('observations') or {}).get(account)
+    if not isinstance(row, dict):
+        return None
+    observed, resets, period = _time(row.get('observed_at')), _time(row.get('resets_at')), row.get('period_hours')
+    if (observed is None or resets is None or isinstance(period, bool) or not isinstance(period, (int, float))
+            or period <= 0 or not resets - timedelta(hours=period) <= observed < resets):
+        return None
+    return {'observed_at': observed, 'resets_at': resets, 'period_hours': float(period),
+            **({'windows': list(row['windows'])} if isinstance(row.get('windows'), list) else {})}
 
 
 ALL = '*'

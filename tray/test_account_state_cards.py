@@ -281,12 +281,20 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertIn('$1.85', card['usage_note'])
 
     def test_a_free_pool_with_no_published_capacity_is_a_state_with_its_details_in_the_hover(self):
-        # Owner, 2026-11-24: used until the vendor's limit error, then 0 left until the reset that error states. The card
-        # shows the latched allowance as a window (a state), the explanation only in the hover.
+        # Owner, 2026-11-24 (addendum 2): an ordinary quota pool. With no capacity (never observed, nothing shipped) it is
+        # out of automatic routing as on main; with one it is a state like any pool; a latch shows the allowance as a
+        # window at 0 until its end. The explanation is only in the hover.
         from datetime import datetime, timedelta, timezone
-        spec = {'five_axis_free_pool': True, 'windows': {'allowance': {'hours': None}}, 'bundles': {},
-                'capacity_unpublished': {'kind': 'vendor', 'url': 'https://example.invalid/free', 'as_of': '2026-11-24',
-                                         'statement': 'no limit published', 'plan': 'free'}}
+        declared = {'kind': 'vendor', 'url': 'https://example.invalid/free', 'as_of': '2026-11-24',
+                    'statement': 'no limit published', 'plan': 'free'}
+        unknown = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={
+            'five_axis_free_pool': True, 'windows': {'allowance': {'hours': None}}, 'bundles': {}, 'capacity_usd': {},
+            'capacity_unknown': True, 'capacity_unpublished': declared})
+        self.assertEqual(unknown['kind'], 'warn')
+        self.assertIn('不参与自动路由', unknown['badge'])
+        self.assertIn('供应商未公布额度上限', unknown['usage_hover'])
+        spec = {'five_axis_free_pool': True, 'windows': {'allowance': {'hours': 24}}, 'bundles': {},
+                'capacity_usd': {'allowance': 2.5}, 'capacity_unpublished': declared}
         free = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec=spec)
         self.assertEqual((free['kind'], free['windows']), ('ok', []))
         self.assertNotIn('不参与自动路由', free['badge'])

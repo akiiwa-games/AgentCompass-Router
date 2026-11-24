@@ -97,7 +97,8 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
     usage = provider_inventory.merge_usage(usage, accounts, now)
     active_overrides = (quota_overrides.load_overrides(now) if read_local_state else []) if overrides is None else overrides
     usage, accounts, applied = quota_overrides.apply_overrides(active_overrides, usage, accounts, now)
-    accounts = axis_scores.five_axis_overlay(accounts, read_local_state=read_local_state)
+    accounts = axis_scores.five_axis_overlay(accounts, read_local_state=read_local_state, now=now)
+    usage = axis_scores.with_local_readings(usage, accounts, now)      # a free allowance's period, read from local spend
     policy = accounts['scoring']
     task = task_intake.normalize_task(raw_task, policy, capabilities, accounts, route=route)
     if task['worker'] is None and task['chain_id'] and records:

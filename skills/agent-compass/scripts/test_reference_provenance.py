@@ -230,6 +230,40 @@ class ProvenanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "plan-templates\\['opencode'\\]\\['free'\\]"):
                     reference_provenance.validate_plan_templates_provenance(doc)
 
+    def test_a_measured_capacity_stands_only_as_a_dated_maintainer_measurement_beside_the_vendors_declaration(self):
+        """Rule (reference_provenance.valid_measured_capacity): the vendor publishes no capacity and the maintainer measured
+        one; both are true, so `capacity_measured` may stand beside `capacity_unpublished` with its full provenance (dated
+        maintainer statement, USD at list price, period, measurement or lower bound, model and request count) and
+        nowhere else; a bare figure is still refused. The value below is a fixture, not shipped data."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        measured = {'kind': 'maintainer', 'as_of': '2026-11-24', 'capacity_usd': 2.5, 'period_hours': 24,
+                    'bound': 'lower_bound', 'model': 'example-free-model', 'requests': 100, 'statement': 'fixture'}
+        accepted = json.loads(json.dumps(shipped))
+        accepted['opencode']['free']['capacity_measured'] = dict(measured)
+        reference_provenance.validate_plan_templates_provenance(accepted)
+        drop = object()
+        for label, field, value in (
+                ('a vendor kind', 'kind', 'vendor'), ('no date', 'as_of', drop), ('no statement', 'statement', ''),
+                ('no figure', 'capacity_usd', drop), ('a zero figure', 'capacity_usd', 0), ('a text figure', 'capacity_usd', '2.5'),
+                ('no period', 'period_hours', drop), ('an unknown bound', 'bound', 'estimate'), ('no model', 'model', ''),
+                ('no request count', 'requests', drop), ('a fractional request count', 'requests', 1.5)):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(accepted))
+                entry = doc['opencode']['free']['capacity_measured']
+                entry.pop(field) if value is drop else entry.update({field: value})
+                with self.assertRaisesRegex(ValueError, 'capacity_measured'):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+        with self.subTest('beside no vendor declaration'):
+            doc = json.loads(json.dumps(accepted))
+            del doc['opencode']['free']['capacity_unpublished']
+            with self.assertRaisesRegex(ValueError, 'capacity_measured stands only beside'):
+                reference_provenance.validate_plan_templates_provenance(doc)
+        with self.subTest('a bare figure beside the declaration'):
+            doc = json.loads(json.dumps(accepted))
+            doc['opencode']['free']['capacity_usd'] = {'allowance': 2.5}
+            with self.assertRaises(ValueError):
+                reference_provenance.validate_plan_templates_provenance(doc)
+
     def test_public_user_scores_reject_a_local_kind(self):
         write_json(self.folder / 'user-scores.json', {
             'schema_version': user_scores.SCHEMA_VERSION,
