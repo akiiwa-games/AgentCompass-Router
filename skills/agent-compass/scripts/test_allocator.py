@@ -106,6 +106,11 @@ class AllocatorTests(unittest.TestCase):
         accounts['accounts'].pop(account)
         return accounts
 
+    def free_pool(self):
+        """The bundles of the free OpenCode pool. Its vendor publishes no capacity and it is an ordinary candidate with a
+        zero quota term (test_free_pool_unpublished.py), so a scenario that leaves only quota-held candidates sets it aside."""
+        return [b for b, v in account_fleet.bundles(account_fleet.load_accounts()).items() if v['account'] == 'opencode']
+
     def codex_bundles(self):
         return [b for b, v in account_fleet.bundles(account_fleet.load_accounts()).items() if v['account'] == 'codex']
 
@@ -290,7 +295,7 @@ class AllocatorTests(unittest.TestCase):
     def test_short_window_deferral_and_wait_limits(self):
         usage = self.usage(claude=[('five_hour', 3, 1.0), ('seven_day', 60, 100), ('weekly_fable', 100, 100)], codex=[('usage', 1, 121)])
         task = {'work_kind': 'visual_analysis', 'difficulty': 'routine', 'expected_hours': 1, 'needs': {'visual': True}}
-        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))]
+        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))] + self.free_pool()
         # The cheapest sufficient candidate sits behind Claude's short five-hour window: a task that can wait waits for the reset.
         deferred = self.plan(dict(task, can_wait_hours=2), usage, unavailable=no_argon)
         self.assertEqual(deferred['decision']['action'], 'defer')
@@ -324,7 +329,7 @@ class AllocatorTests(unittest.TestCase):
         # Rule (`candidate_eval.evaluate_bundle`, `allocator.plan`): exhausted windows with a known reset hold their
         # candidates in `available_in_hours` rather than `excluded`, while with `can_wait_hours == 0` only ready-now
         # candidates (`claude-lab`) compete to start immediately.
-        empty_plan = self.plan({'work_kind': 'exploration_forensics'}, all_big_empty)
+        empty_plan = self.plan({'work_kind': 'exploration_forensics'}, all_big_empty, unavailable=self.free_pool())
         ready_rows = [c for c in empty_plan['ranking'] if not c['excluded'] and not c['available_in_hours']]
         self.assertTrue(ready_rows)
         self.assertEqual({c['bundle']['account'] for c in ready_rows}, {'claude-lab'}, [c['id'] for c in ready_rows])
@@ -692,7 +697,7 @@ class AllocatorTests(unittest.TestCase):
         holds the candidate back, and the decision names that window (`wait_for`)."""
         usage = self.usage(claude=[('five_hour', 3, 1.0), ('seven_day', 60, 100), ('weekly_fable', 100, 100)], codex=[('usage', 1, 121)])
         task = {'work_kind': 'visual_analysis', 'difficulty': 'routine', 'expected_hours': 1, 'needs': {'visual': True}}
-        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))]
+        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))] + self.free_pool()
         deferred = self.plan(dict(task, can_wait_hours=2), usage, unavailable=no_argon)
         wait_for = deferred['decision']['wait_for']
         window = next(w for w in usage['accounts'][wait_for['account']]['windows'] if w['id'] == wait_for['window'])
@@ -708,7 +713,7 @@ class AllocatorTests(unittest.TestCase):
                            codex=[('usage', 1, 121)])
         task = {'work_kind': 'visual_analysis', 'difficulty': 'routine', 'expected_hours': 1, 'needs': {'visual': True},
                 'can_wait_hours': can_wait}
-        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))]
+        no_argon = ['argon_high'] + [b for b in account_fleet.bundles(account_fleet.load_accounts()) if b.startswith(('agy_opus', 'agy_sonnet'))] + self.free_pool()
         return self.plan(task, usage, unavailable=['flash_high'] + no_argon)
 
     def test_two_windows_that_both_defer_name_the_one_that_sets_the_wait(self):

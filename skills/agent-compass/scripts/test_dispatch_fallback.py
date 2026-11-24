@@ -259,7 +259,7 @@ class FallbackTests(unittest.TestCase):
         self.scopes = ['account']
         root = self.first()
         self.host.end(root['dispatch_id'], 'error', terminal={
-            'reason': 'error', 'failure_code': 'provider_turn_failed', 'provider_message': '429 quota exhausted'})
+            'reason': 'error', 'failure_code': 'provider_turn_failed', 'provider_message': '503 provider overloaded'})
         out = self.handle(root['dispatch_id'])
         self.assertEqual(out['action'], 'relaunched')
         self.assertIn('claude-lab', provider_retry.active())    # the account, as the classifier scoped it

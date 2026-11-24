@@ -20,7 +20,8 @@ import provider_inventory as real_inventory
 import usage_reading
 import provider_retry
 
-MESSAGE = 'Free usage exceeded, subscribe to Go'
+# Not a quota: a confirmed used-up quota is a quota latch (tray/test_quota_latch_cards.py), not a provider hold.
+MESSAGE = 'Provider overloaded: this model is temporarily unavailable'
 
 
 class ProviderRetryCardTests(unittest.TestCase):

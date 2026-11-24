@@ -444,10 +444,12 @@ class FiveAxisTests(unittest.TestCase):
         # Antigravity has no community source: every window unknown.
         self.assertEqual(out['accounts']['antigravity']['capacity_usd'], {})
         self.assertTrue(out['accounts']['antigravity']['capacity_unknown'])
-        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag, capacity_unknown.
+        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag. Its vendor
+        # declares that it publishes no capacity (plan-templates `capacity_unpublished`), so it is not mode B.
         self.assertFalse(out['accounts']['opencode'].get('unmetered'))
         self.assertFalse(out['accounts']['opencode'].get('unlimited'))
-        self.assertTrue(out['accounts']['opencode']['capacity_unknown'])
+        self.assertFalse(out['accounts']['opencode'].get('capacity_unknown'))
+        self.assertEqual(out['accounts']['opencode']['capacity_unpublished']['kind'], 'vendor')
 
     def test_tie_break_order_net_score_then_wait_then_faster_then_fewer_usd_then_level(self):
         """Quota economy v3 + R2-F4: N = F - C is never rounded; C carries billed vs free, pool used share, and +fast burn.
