@@ -378,23 +378,36 @@ def unpublished_capacity(accounts, family, plan, shipped=None):
 FREE_WINDOW = 'allowance'       # the one window of a free pool (five_axis_overlay)
 
 
-def _allowance_spend(spec, spend, family, accounts):
-    """USD the free pool's allowance spent, from per-model `spend`: the models of the account's bundles that draw it,
-    else, on OpenCode, whose own usage record opencode.db is, all of it."""
-    total, seen = 0.0, set()
+def _allowance_models(spec, accounts, drawing=True):
+    """The names of the models of the account's bundles that draw the free allowance (declared data: a bundle's
+    `draws`, set from the plan's `allowance_launch_prefix`), or with `drawing=False` of those declared to draw nothing
+    of it (`draws == []`), in the spellings a spend read may use: the row key, the bundle's model and its launch id
+    without the provider prefix."""
+    names = set()
     for b in (spec.get('bundles') or {}).values():
-        if not isinstance(b, dict) or b.get('draws') == []:
+        if not isinstance(b, dict) or (b.get('draws') == []) == drawing:
             continue
-        m_key = account_fleet.canonical(b.get('model') or '', accounts)
-        if m_key in spend and m_key not in seen:
-            seen.add(m_key)
-            total += spend[m_key]
-    if total == 0.0 and family == 'opencode':
-        total = sum(spend.values())
-    return total
+        model = str(b.get('model') or '')
+        names |= {account_fleet.canonical(model, accounts), model,
+                  str(b.get('launch_model') or model).rpartition('/')[2]} - {''}
+    return names
 
 
-def free_allowance_period(name, spec, family, unpublished, accounts, *, read_local_state, now):
+def _allowance_spend(spec, spend, accounts):
+    """USD the free pool's allowance spent, from per-model `spend`: the models of the bundles that draw it, and nothing
+    else (review round 3 S2): a model that draws nothing of it, or one of no bundle, adds nothing."""
+    drawing = _allowance_models(spec, accounts)
+    return sum(usd for name, usd in spend.items() if name in drawing)
+
+
+def _allowance_gap(spec, unpriced, accounts):
+    """The unpriced models whose spend the allowance may hold: all but those a bundle declares to draw nothing of it
+    (a model of no bundle, run outside the router, may still have spent it, so its missing price stays a gap)."""
+    elsewhere = _allowance_models(spec, accounts, drawing=False) - _allowance_models(spec, accounts)
+    return [m for m in unpriced if m not in elsewhere]
+
+
+def free_allowance_period(name, spec, unpublished, accounts, *, read_local_state, now):
     """The capacity C, the period T and the current reading of a free allowance the vendor sizes nowhere
     (`unpublished`), from these sources in this order (owner, 2026-11-24):
 
@@ -422,7 +435,7 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
     def spent(since, until):
         spend, gap, unreadable = opencode_local_spend(accounts.get('models') or {}, accounts.get('_discovery'),
                                                       read_local_db=bool(read_local_state), since=since, until=until)
-        return _allowance_spend(spec, spend, family, accounts), list(gap), unreadable
+        return _allowance_spend(spec, spend, accounts), _allowance_gap(spec, gap, accounts), unreadable
     obs = quota_exhaustion.observation(name) if read_local_state else None
     measured = (unpublished or {}).get('measured')
     found, gap_reason = None, None
@@ -609,13 +622,13 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
                     elif b.get('draws') == [] or prefix:
                         b['draws'] = ['allowance']
                 if unpublished:
-                    free_period = free_allowance_period(name, spec, family, unpublished, out,
+                    free_period = free_allowance_period(name, spec, unpublished, out,
                                                         read_local_state=read_local_state, now=now)
                     if (free_period or {}).get('capacity_usd'):
                         # A capacity and a period: an ordinary periodic window, read from the period's local spend.
                         spec['windows'] = {FREE_WINDOW: {'hours': free_period['period_hours']}}
                         spec['local_period'] = free_period['reading']
-            acct_spend = _allowance_spend(spec, local_spend, family, out)
+            acct_spend = _allowance_spend(spec, local_spend, out)
             if acct_spend > 0:
                 spec['local_spend_usd'] = round(acct_spend, 4)
                 spec['local_spend_source'] = 'opencode.db token counts x public list price (lower bound)'
@@ -623,9 +636,10 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             if unreadable:
                 # A read failure of the store this pool's spend comes from, carried where an unpriced model is.
                 spec['local_spend_unreadable'] = unreadable
-            if family == 'opencode' and local_unpriced:
+            unpriced = _allowance_gap(spec, local_unpriced, out)
+            if unpriced:
                 # no cited list price for these models: their spend is a surfaced gap, not $0 and not a borrowed rate
-                spec['local_spend_gap'] = list(local_unpriced)
+                spec['local_spend_gap'] = unpriced
         cap_family = family
         raw_plan = spec.get('plan')
         src_spec = spec

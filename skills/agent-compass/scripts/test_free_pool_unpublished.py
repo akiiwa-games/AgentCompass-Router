@@ -427,6 +427,34 @@ class UnpublishedFreePoolTests(unittest.TestCase):
             self.assertEqual(quota_pools.launch_blockers(self.bundle_of(acc, self.GO), held, {'accounts': {}}, self.now), [])
             self.assertTrue(quota_pools.launch_blockers(self.bundle_of(acc, self.ZEN), held, {'accounts': {}}, self.now))
 
+    def test_spend_of_a_model_that_draws_nothing_of_the_allowance_leaves_its_u_unchanged(self):
+        """Rule (axis_scores._allowance_spend, review round 3 S2): the pool's U sums only the models of the bundles that
+        draw the allowance (declared data: `draws`, `allowance_launch_prefix`). An OpenCode Go model on the same account,
+        or a model of no bundle, adds nothing, whatever it spent, also when the free models spent nothing; no family
+        name decides it."""
+        import account_fleet
+        acc = self.with_go()
+        go = next(b for b in acc['accounts'][POOL]['bundles'].values() if b.get('launch_model') == self.GO)
+        others = (account_fleet.canonical(go['model'], acc), 'gpt-6.1-sol')
+        for free in (0.0, 1.0):
+            for other in (0.0, 7.0):
+                with self.subTest(free=free, other=other):
+                    spend = {**({FREE_MODEL: free} if free else {}), **({m: other for m in others} if other else {})}
+                    def read(models, discovery=None, *, read_local_db=True, since=None, until=None, spend=spend):
+                        return dict(spend), [], None
+                    with patch.object(axis_scores, 'opencode_local_spend', read):
+                        spec = self.overlay(acc)['accounts'][POOL]
+                    self.assertEqual(spec['local_period']['used_usd'], free)
+                    self.assertEqual(spec.get('local_spend_usd', 0.0), free)
+        # The same declared data scopes the gap (axis_scores._allowance_gap): a missing price of a model declared to
+        # draw nothing of the allowance is no gap of it; one of a model of no bundle stays one.
+        def unpriced(models, discovery=None, *, read_local_db=True, since=None, until=None):
+            return {}, sorted(others), None
+        with patch.object(axis_scores, 'opencode_local_spend', unpriced):
+            spec = self.overlay(acc)['accounts'][POOL]
+        self.assertEqual(spec['local_spend_gap'], ['gpt-6.1-sol'])
+        self.assertEqual(spec['local_period']['gap'], ['gpt-6.1-sol'])
+
     def test_an_account_that_declares_no_window_latches_as_a_whole(self):
         """Where the failing bundle's windows are unknown because its account declares no quota window at all, the
         whole account is the smallest true scope (dispatch_registry.quota_latch); where the account declares windows
