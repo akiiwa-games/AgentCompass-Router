@@ -1529,9 +1529,7 @@ def route_family(row: dict, accounts: dict | None = None) -> str | None:
 
 def launch_field_hint(name: str, trigger: str, requested: dict | None = None, *, missing_agy_model: bool = False) -> str:
     if name in CLAUDE_NATIVE_TOOLS:
-        return ("传入参数 `model`（模型系列别名）与 `effort` 指定已授权路由的模型与档位"
-                "（`Agent` 单次调用 `effort` 需 Claude Code v2.1.292+；若当前版本无 `effort` 参数，切勿省略 `effort`，"
-                f"请改用不带 `--parent-host native` 的 `{ROUTER_CMD} roll --brief <task.md>` 由路由直接启动，或告知用户）")
+        return f"传入参数 `model`（模型系列别名）与 `effort` 指定已授权路由的模型与档位（{router_owner('host_placement', 'claude_agent_effort_note')()}）"
     if name == "spawn_agent":
         return "传入参数 `model`（及 `reasoning_effort`）指定已授权路由的模型与档位"
     if name == "invoke_subagent":

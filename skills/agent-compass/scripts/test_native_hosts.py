@@ -339,15 +339,21 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         pi_astra = dict(bundles['pi_astra_high'], bundle_id='pi_astra_high', account='pi')
 
         cases = (
-            ('claude-same-family-same-row', fable51,
+            ('claude-same-row-sonnet', sonnet,
+             ['--parent-host', 'native', '--parent-id', 'c-0', '--parent-address', 'inbox:c0',
+              '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'tc-0'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-0'},
+             lambda lf: {'session_id': 'c-0', 'tool_use_id': 'u-c0', 'tool_name': 'Agent',
+                         'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', **lf}}),
+            ('claude-same-row-fable51', fable51,
              ['--parent-host', 'native', '--parent-id', 'c-1', '--parent-address', 'inbox:c1',
               '--parent-model', 'claude-fable-5-1', '--new-worker', '--task-id', 'tc-1'],
              {'CLAUDE_CODE_SESSION_ID': 'c-1'},
              lambda lf: {'session_id': 'c-1', 'tool_use_id': 'u-c1', 'tool_name': 'Agent',
                          'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', **lf}}),
-            ('claude-other-family-target-row', fable52,
+            ('claude-same-row-fable52', fable52,
              ['--parent-host', 'native', '--parent-id', 'c-2', '--parent-address', 'inbox:c2',
-              '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'tc-2'],
+              '--parent-model', 'claude-fable-5-2', '--new-worker', '--task-id', 'tc-2'],
              {'CLAUDE_CODE_SESSION_ID': 'c-2'},
              lambda lf: {'session_id': 'c-2', 'tool_use_id': 'u-c2', 'tool_name': 'Agent',
                          'tool_input': {'subagent_type': 'general-purpose', 'prompt': 'go', **lf}}),
@@ -399,6 +405,8 @@ class NativeExpressibilityContractTests(unittest.TestCase):
     def test_inexpressible_route_never_answers_native_and_launches_or_blocks(self):
         bundles = self.account_fleet.bundles(self.accounts)
         sonnet = dict(bundles['sonnet55_high'], bundle_id='sonnet55_high', account='claude')
+        opus = dict(bundles['opus55_high'], bundle_id='opus55_high', account='claude')
+        haiku = {'provider': 'claude', 'account': 'claude', 'model': 'claude-haiku-5-5', 'effort': 'high', 'bundle_id': 'haiku55_high'}
         sonnet_lab = dict(bundles['lab_sonnet55_high'], bundle_id='lab_sonnet55_high', account='claude-lab')
         fable_target = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-2', 'effort': 'high', 'bundle_id': 'fable52_high'}
         fable_older = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high', 'bundle_id': 'fable51_high'}
@@ -409,16 +417,31 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         custom_unlaunchable = {'provider': 'acp', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high'}
 
         inexpressible_cases = (
-            # B1 rule cases for Claude line alias:
+            # B1 / N1 rule cases for Claude line alias (only concrete same-row `--parent-model` is version/login-independent):
             ('claude-unknown-parent-model', sonnet,
              ['--parent-host', 'native', '--parent-id', 'c0', '--parent-address', 'in:c0'],
              {'CLAUDE_CODE_SESSION_ID': 'c0'}),
+            ('claude-bare-alias-parent-model', fable_target,
+             ['--parent-host', 'native', '--parent-id', 'c-ba', '--parent-address', 'in:cba', '--parent-model', 'fable'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-ba'}),
             ('claude-same-family-older-parent-newer-route', fable_target,
              ['--parent-host', 'native', '--parent-id', 'c-sf1', '--parent-address', 'in:csf1', '--parent-model', 'claude-fable-5-1'],
              {'CLAUDE_CODE_SESSION_ID': 'c-sf1'}),
             ('claude-same-family-newer-parent-older-route', fable_older,
              ['--parent-host', 'native', '--parent-id', 'c-sf2', '--parent-address', 'in:csf2', '--parent-model', 'claude-fable-5-2'],
              {'CLAUDE_CODE_SESSION_ID': 'c-sf2'}),
+            ('claude-cross-family-opus-target', opus,
+             ['--parent-host', 'native', '--parent-id', 'c-cf-op', '--parent-address', 'in:ccfop', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-cf-op'}),
+            ('claude-cross-family-sonnet-target', sonnet,
+             ['--parent-host', 'native', '--parent-id', 'c-cf-so', '--parent-address', 'in:ccfso', '--parent-model', 'claude-opus-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-cf-so'}),
+            ('claude-cross-family-haiku-target', haiku,
+             ['--parent-host', 'native', '--parent-id', 'c-cf-ha', '--parent-address', 'in:ccfha', '--parent-model', 'claude-sonnet-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-cf-ha'}),
+            ('claude-cross-family-fable-target', fable_target,
+             ['--parent-host', 'native', '--parent-id', 'c-cf-fa', '--parent-address', 'in:ccffa', '--parent-model', 'claude-opus-5-5'],
+             {'CLAUDE_CODE_SESSION_ID': 'c-cf-fa'}),
             ('claude-other-family-non-target-route', fable_older,
              ['--parent-host', 'native', '--parent-id', 'c-of', '--parent-address', 'in:cof', '--parent-model', 'claude-sonnet-5-5'],
              {'CLAUDE_CODE_SESSION_ID': 'c-of'}),
@@ -426,7 +449,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
              ['--parent-host', 'native', '--parent-id', 'c-uf', '--parent-address', 'in:cuf', '--parent-model', 'custom-bedrock-model-v1'],
              {'CLAUDE_CODE_SESSION_ID': 'c-uf'}),
             ('claude-env-default-line-model', fable_target,
-             ['--parent-host', 'native', '--parent-id', 'c-env1', '--parent-address', 'in:ce1', '--parent-model', 'claude-sonnet-5-5'],
+             ['--parent-host', 'native', '--parent-id', 'c-env1', '--parent-address', 'in:ce1', '--parent-model', 'claude-fable-5-2'],
              {'CLAUDE_CODE_SESSION_ID': 'c-env1', 'ANTHROPIC_DEFAULT_FABLE_MODEL': 'claude-fable-5-1'}),
             ('claude-env-subagent-model', sonnet,
              ['--parent-host', 'native', '--parent-id', 'c-env2', '--parent-address', 'in:ce2', '--parent-model', 'claude-sonnet-5-5'],
@@ -492,20 +515,64 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         self.assertEqual((code_u, res_u['status']), (2, 'blocked'))
         self.assertEqual(self.registry.native_handovers(path=self.db_path), [])
 
+    def test_claude_gateway_and_cross_family_sessions_never_hand_over_alias_while_same_row_does(self):
+        """N1 (`_gw`): cross-family alias resolution depends on Claude Code version and login kind (`forceLoginMethod: gateway`
+        resolves `fable` to Fable 5, pre-v2.1.321 to Fable 5.1, etc.), which the host never exposes; only concrete same-row
+        `--parent-model` is expressible."""
+        import json
+        fable52 = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-2', 'effort': 'high', 'bundle_id': 'fable52_high'}
+        gw_settings = self.home / '.claude' / 'settings.json'
+        gw_settings.write_text(
+            json.dumps({'forceLoginMethod': 'gateway', 'forceLoginGatewayUrl': 'https://claude-gateway.internal.example.com'}),
+            encoding='utf-8',
+        )
+        try:
+            res_gw_blk, code_gw_blk = self._run_roll(
+                ['--parent-host', 'native', '--parent-id', 'c-gw', '--parent-address', 'in:cgw',
+                 '--parent-model', 'claude-opus-5-5', '--new-worker', '--task-id', 'n1-gw-blk'],
+                env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-gw'},
+                selected_bundle=fable52, cli_ok=False, paseo_ok=False,
+            )
+            self.assertEqual((code_gw_blk, res_gw_blk['status']), (2, 'blocked'), res_gw_blk)
+            res_gw_cli, code_gw_cli = self._run_roll(
+                ['--parent-host', 'native', '--parent-id', 'c-gw', '--parent-address', 'in:cgw',
+                 '--parent-model', 'claude-opus-5-5', '--new-worker', '--task-id', 'n1-gw-cli'],
+                env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-gw'},
+                selected_bundle=fable52, cli_ok=True, paseo_ok=False,
+            )
+            self.assertEqual((code_gw_cli, res_gw_cli['status']), (0, 'launched'), res_gw_cli)
+            # Same concrete row (`/model claude-fable-5-2`) runs the parent's own version via Claude's same-family rule:
+            res_same, code_same = self._run_roll(
+                ['--parent-host', 'native', '--parent-id', 'c-gw', '--parent-address', 'in:cgw',
+                 '--parent-model', 'claude-fable-5-2', '--new-worker', '--task-id', 'n1-gw-same'],
+                env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-gw'},
+                selected_bundle=fable52, cli_ok=False, paseo_ok=False,
+            )
+            self.assertEqual((code_same, res_same['status'], res_same['launch_fields']),
+                             (0, 'native', {'model': 'fable', 'effort': 'high'}))
+        finally:
+            gw_settings.unlink(missing_ok=True)
+
     def test_claude_older_version_without_effort_is_refused_with_non_native_roll_way_out(self):
-        """B3: `Agent` without `effort` is never accepted silently; both `next_action` and the gate denial name v2.1.292+
-        and tell an older Claude Code session to re-run `roll` without `--parent-host native`."""
+        """B3: `Agent` without `effort` is never accepted silently; `host_placement.claude_agent_effort_note()` is the one
+        owner in both `next_action` and the gate's `launch_field_hint`, and following it literally (dropping both
+        `--parent-host native` and `--parent-model`) launches via CLI or answers `blocked` (never another `native` loop)."""
+        import host_placement
         sonnet = dict(self.account_fleet.bundles(self.accounts)['sonnet55_high'], bundle_id='sonnet55_high', account='claude')
+        shared_note = host_placement.claude_agent_effort_note()
+        self.assertIn('v2.1.292+', shared_note)
+        self.assertIn('without `--parent-host native` and without `--parent-model`', shared_note)
+        self.assertIn('tell the user', shared_note)
         res_n, code_n = self._run_roll(
             ['--parent-host', 'native', '--parent-id', 'c-old', '--parent-address', 'in:cold',
              '--parent-model', 'claude-sonnet-5-5', '--new-worker', '--task-id', 'b3-task'],
-            env={'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet,
+            env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet,
         )
         self.assertEqual((code_n, res_n['status']), (0, 'native'))
-        self.assertIn('v2.1.292', res_n['next_action'])
-        self.assertIn('without `--parent-host native`', res_n['next_action'])
+        self.assertIn(shared_note, res_n['next_action'])
         with patch.dict(os.environ, {'ROUTER_DISPATCH_DB': str(self.db_path), 'ROUTER_STATE_DIR': str(self.state),
-                                     'ROUTER_PROVIDER_HOME': str(self.home), 'CLAUDE_CODE_SESSION_ID': 'c-old'}), \
+                                     'ROUTER_PROVIDER_HOME': str(self.home),
+                                     'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-old'}), \
                 patch.object(self.gate, 'load_dispatch_accounts', return_value=self.accounts):
             denied = self.gate.evaluate_payload(
                 {'session_id': 'c-old', 'tool_use_id': 'u-old', 'tool_name': 'Agent',
@@ -513,15 +580,26 @@ class NativeExpressibilityContractTests(unittest.TestCase):
                 ledger_path=self.ledger,
             )
         self.assertEqual(denied['decision'], 'block')
-        self.assertIn('v2.1.292', denied['reason'])
-        self.assertIn('--parent-host native', denied['reason'])
-        # Hand-over stays unconsumed, and following the instruction (`roll` without `--parent-host native`) launches via CLI:
-        self.assertEqual(len([h for h in self.registry.native_handovers(path=self.db_path) if not h.get('launched_at')]), 1)
+        self.assertIn(shared_note, denied['reason'])
+        # Hand-over stays unconsumed; following the hint literally (without `--parent-host native` and without
+        # `--parent-model`, while Claude session markers stay in `os.environ`) launches via CLI when present and returns
+        # `blocked` (never another `native` hand-over) when neither Paseo nor the CLI can launch:
+        open_before = [h for h in self.registry.native_handovers(path=self.db_path) if not h.get('launched_at')]
+        self.assertEqual(len(open_before), 1)
         res_cli, code_cli = self._run_roll(
             ['--new-worker', '--task-id', 'b3-task-cli'],
-            env={'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet, cli_ok=True,
+            env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet, cli_ok=True,
         )
         self.assertEqual((code_cli, res_cli['status']), (0, 'launched'))
+        res_blk, code_blk = self._run_roll(
+            ['--new-worker', '--task-id', 'b3-task-blk'],
+            env={'CLAUDECODE': '1', 'CLAUDE_CODE_SESSION_ID': 'c-old'}, selected_bundle=sonnet,
+            cli_ok=False, paseo_ok=False,
+        )
+        self.assertEqual((code_blk, res_blk['status']), (2, 'blocked'), res_blk)
+        self.assertIn('ask the user', res_blk['next_action'])
+        open_after = [h for h in self.registry.native_handovers(path=self.db_path) if not h.get('launched_at')]
+        self.assertEqual(len(open_after), 1)
 
     def test_cli_launch_for_native_caller_writes_cli_footer_without_unreachable_inbox_on_both_paths(self):
         """B4: both CLI launch paths (no Paseo, and Paseo `parent_agent_not_found` fallback) share one owner and write

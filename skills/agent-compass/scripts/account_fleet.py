@@ -624,18 +624,23 @@ NATIVE_HOST_TOOLS = {
         #   "On an Agent tool call, the parameter takes a model alias, not a full model ID or `inherit`"
         #   (aliases `sonnet`, `opus`, `haiku`, `fable`), plus per-invocation `effort` (requires Claude Code v2.1.292+;
         #   overridden by `CLAUDE_CODE_EFFORT_LEVEL`).
-        #   "By default, a subagent with a model alias runs on the version the alias points to. With a family alias such as
-        #   `opus` in the `model` field or per-invocation parameter, the subagent runs on its parent conversation's model in
-        #   two cases: Same family ... Unknown family ..."
-        # - https://code.claude.com/docs/en/model-config.md ("Model aliases", "Environment variables"):
-        #   on the first-party Anthropic API without `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL`, each alias
-        #   resolves to its newest Anthropic version (`families` row `models[0]`) when the parent is in another known family.
-        # - https://code.claude.com/docs/en/env-vars.md (subprocess environment variables; no session model or version env var).
+        #   "With a family alias such as `opus` in the `model` field or per-invocation parameter, the subagent runs on its
+        #   parent conversation's model in two cases: Same family: for example, if your main conversation runs on
+        #   `claude-opus-4-7`, a subagent with `model: opus` runs on that version too."
+        # - https://code.claude.com/docs/en/model-config.md ("Model aliases", "Version history", "Environment variables")
+        #   & https://code.claude.com/docs/en/claude-apps-gateway.md:
+        #   cross-family alias targets moved across releases for every line (`opus` at v2.1.154/v2.1.219/v2.1.280, `sonnet`
+        #   at v2.1.197/v2.1.284, `haiku` at v2.1.293, `fable` at v2.1.257/v2.1.321) and `fable` resolves to Fable 5 in
+        #   Claude apps gateway sessions vs Fable 5.2 elsewhere.
+        # - https://code.claude.com/docs/en/env-vars.md, https://code.claude.com/docs/en/hooks.md,
+        #   https://code.claude.com/docs/en/claude-directory.md, https://code.claude.com/docs/en/authentication.md:
+        #   Claude Code exposes neither its client version nor its login kind in tool subprocess env vars, PreToolUse stdin,
+        #   or session-owned files, so only a concrete same-row `--parent-model` (`model_mode: 'caller_own_line'`) is expressible.
         'tool': 'Agent',
         'account_scope': 'own_session',
         'session_family': 'claude',
         'harness': 'claude',
-        'model_mode': 'line_target',
+        'model_mode': 'caller_own_line',
         'known_lines': ('opus', 'sonnet', 'haiku', 'fable'),
         'model_field': 'model',
         'effort_field': 'effort',
@@ -644,8 +649,11 @@ NATIVE_HOST_TOOLS = {
         'sources': (
             'https://code.claude.com/docs/en/sub-agents.md',
             'https://code.claude.com/docs/en/model-config.md',
+            'https://code.claude.com/docs/en/claude-apps-gateway.md',
             'https://code.claude.com/docs/en/env-vars.md',
             'https://code.claude.com/docs/en/hooks.md',
+            'https://code.claude.com/docs/en/claude-directory.md',
+            'https://code.claude.com/docs/en/authentication.md',
         ),
     },
     'codex': {

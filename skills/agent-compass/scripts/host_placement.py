@@ -120,44 +120,28 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
         if account != own_account:
             return None, f"{tool} runs only on the caller's own account {own_account!r}, not {account!r}"
         mode = decl.get('model_mode')
-        if mode == 'line_target':
+        if mode == 'caller_own_line':
             if env_override := _claude_alias_env_override(env, effort):
                 return None, f'{tool} alias cannot guarantee routed {wire_model!r}: {env_override}'
             given = str(parent_model or '').strip()
             if not given:
                 return None, (
-                    f"{tool} accepts only model line aliases whose resolved version depends on the caller's active model "
-                    '(--parent-model was not given)'
+                    f"{tool} accepts only model line aliases whose cross-family target depends on the caller's "
+                    'Claude Code version and login kind (--parent-model was not given)'
                 )
             families = model_resolution.family_patterns(accounts)
             hit = model_resolution.family_row(wire_model, families)
-            parent_hit = model_resolution.family_row(given, families)
             known_lines = decl.get('known_lines') or ()
             line = hit.get('line') if isinstance(hit, dict) else None
             if line not in known_lines:
                 return None, f'{tool} has no model line alias for {wire_model!r}'
-            if not (isinstance(parent_hit, dict) and parent_hit.get('maker') == 'anthropic'
-                    and parent_hit.get('line') in known_lines):
-                return None, (
-                    f'{tool} runs parent model {given!r} when the parent family is unknown to Claude Code, '
-                    f'so alias {line!r} cannot select {wire_model!r}'
-                )
             bundle_rk = account_fleet.row_key(bundle.get('model') or wire_model, accounts)
             parent_rk = account_fleet.row_key(given, accounts)
-            if parent_hit is hit:
-                if parent_rk != bundle_rk:
-                    return None, (
-                        f'{tool} alias {line!r} inherits same-family parent model {given!r} ({parent_rk}), '
-                        f'not routed {wire_model!r} ({bundle_rk})'
-                    )
-            else:
-                target = (hit.get('models') or [None])[0]
-                target_rk = account_fleet.row_key(target, accounts) if target else None
-                if not target_rk or bundle_rk != target_rk:
-                    return None, (
-                        f'{tool} alias {line!r} from parent {given!r} resolves to {target or "none"!r}, '
-                        f'not routed {wire_model!r}'
-                    )
+            if model_resolution.family_row(given, families) is not hit or parent_rk != bundle_rk:
+                return None, (
+                    f'{tool} alias {line!r} guarantees {wire_model!r} ({bundle_rk}) across Claude Code versions and '
+                    f'login kinds only when the caller already runs that row, not {given!r} ({parent_rk})'
+                )
             fields = {decl['model_field']: line}
             if decl.get('effort_field') and effort:
                 fields[decl['effort_field']] = effort
@@ -294,6 +278,18 @@ def validate_workspace(raw_dir):
     return canonical_dir(candidate)
 
 
+def claude_agent_effort_note():
+    """Single owner for the Claude Code `Agent` per-invocation `effort` version requirement and loop-free exit."""
+    import account_fleet
+    min_ver = (account_fleet.NATIVE_HOST_TOOLS.get('claude') or {}).get('effort_min_version', 'v2.1.292')
+    return (
+        f'Per-invocation `effort` on `Agent` requires Claude Code {min_ver}+; on an older version whose `Agent` '
+        'schema lacks `effort`, do not omit `effort`—re-run `roll` without `--parent-host native` and without '
+        '`--parent-model` so AgentCompass launches the worker directly (or if that answers `blocked` because '
+        'neither Paseo nor the CLI can launch, tell the user and do not re-add `--parent-model`).'
+    )
+
+
 def native_next(host, bundle, address, workspace=None, *, native_spec=None):
     """What the calling session does to start the routed worker with its own host's native tool and `launch_fields`."""
     import account_fleet
@@ -326,12 +322,7 @@ def native_next(host, bundle, address, workspace=None, *, native_spec=None):
     mode_note = f' (and permission `modeId` `{bundle["modeId"]}` from `route_bundle` when supported)' if bundle.get('modeId') else ' (including `route_bundle.modeId` when supported)'
     if tool and fields:
         fields_json = json.dumps(fields, ensure_ascii=False)
-        version_note = (
-            ' Per-invocation `effort` on `Agent` requires Claude Code v2.1.292+; on an older version whose `Agent` schema '
-            'lacks `effort`, do not omit `effort`—re-run `roll` without `--parent-host native` so AgentCompass launches '
-            'the worker directly, or ask the user.'
-            if tool == 'Agent' and 'effort' in fields else ''
-        )
+        version_note = f' {claude_agent_effort_note()}' if tool == 'Agent' and 'effort' in fields else ''
         return (f'Launch one native sub-agent with `{tool}`{where}, passing `launch_fields` `{fields_json}`{mode_note} '
                 'and the full contents of `worker_prompt_file` as its prompt (not the filename). '
                 f'Preserve parent address `{address}` and the injected worker preamble; do not launch a second worker on this hand-over.{version_note}')
