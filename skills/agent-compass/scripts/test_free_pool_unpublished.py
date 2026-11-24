@@ -59,7 +59,7 @@ def spend_of(usd, gap=(), calls=None):
     def read(models, discovery=None, *, read_local_db=True, since=None, until=None):
         if calls is not None and since is not None:
             calls.append((since, until))
-        return ({FREE_MODEL: usd} if usd else {}, list(gap)) if since is not None else ({}, [])
+        return ({FREE_MODEL: usd} if usd else {}, list(gap), None) if since is not None else ({}, [], None)
     return read
 
 
@@ -306,6 +306,26 @@ class UnpublishedFreePoolTests(unittest.TestCase):
                     self.assertEqual(capacity, read(shipped, observed)[0])
                     if observed != shipped:
                         self.assertEqual(status, 'observed' if observed > shipped else 'maintainer')
+
+    def test_an_unreadable_store_is_a_surfaced_gap_of_the_reading_and_the_pool_still_routes_on_the_lower_bound(self):
+        """Rule (axis_scores.free_allowance_period, review round 3 S1): a read failure of opencode.db is carried where an
+        unpriced model is (the period reading's `gap`, the account's spend fields, the plan's account warnings); the
+        pool still routes on the lower bound, as with an unpriced model: no exclusion follows from it."""
+        import account_state
+        failure = 'OperationalError: database is locked'
+        def read(models, discovery=None, *, read_local_db=True, since=None, until=None):
+            return {}, [], failure
+        acc = self.with_measured(self.only(POOL, acc=self.bare))
+        with patch.object(axis_scores, 'opencode_local_spend', read):
+            spec = self.overlay(acc)['accounts'][POOL]
+            decision = self.plan(acc)
+        self.assertEqual(spec['capacity_usd'], {'allowance': MEASURED['capacity_usd']})
+        self.assertFalse(spec.get('capacity_unknown'))
+        self.assertEqual(spec['local_spend_unreadable'], failure)
+        self.assertTrue([g for g in spec['local_period']['gap'] if failure in g], spec['local_period'])
+        self.assertTrue([w for w in account_state.warnings(None, {POOL: spec}) if failure in w])
+        for c in self.rows(decision):
+            self.assertFalse([e for e in c['excluded'] if failure in e], c['excluded'])
 
     def test_an_observation_with_no_stated_period_reads_the_period_of_the_shipped_measurement(self):
         """Rule (free_allowance_period): the period of an observed reset is the error's own, else the shipped
@@ -876,10 +896,63 @@ class BoundedSpendTests(unittest.TestCase):
         one = axis_scores.opencode_token_usd(price, 1000, 500, 50, 0)
         discovery = {'accounts': {'opencode': {'usage': {'models': {FREE_MODEL: {'input': 10 ** 9, 'output': 0}}}}}}
         with patch.dict(os.environ, {'OPENCODE_DB_PATH': str(db)}):
-            bounded, _ = axis_scores.opencode_local_spend(models, discovery, since=since, until=until)
-            unbounded, _ = axis_scores.opencode_local_spend(models, None)
+            bounded, _, _ = axis_scores.opencode_local_spend(models, discovery, since=since, until=until)
+            unbounded, _, _ = axis_scores.opencode_local_spend(models, None)
         self.assertAlmostEqual(bounded[name], round(2 * one, 4))           # at_start and inside; not before, not at_end
         self.assertAlmostEqual(unbounded[name], round(4 * one, 4))
+
+
+class UnreadableStoreTests(unittest.TestCase):
+    """Review round 3 S1. Rule (axis_scores.opencode_local_spend): only an absent opencode.db is zero spend; a locked,
+    corrupt or differently shaped one is a read failure, returned beside the spend and never read as 0 silently."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix='opencode-unreadable-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.db = root / 'opencode.db'
+        env = patch.dict(os.environ, {'OPENCODE_DB_PATH': str(self.db)})
+        env.start()
+        self.addCleanup(env.stop)
+        accounts = sim.fresh_accounts(shipped_template(), snapshot())
+        self.models = axis_scores.five_axis_overlay(copy.deepcopy(accounts), read_local_state=False)['models']
+        self.until = datetime.now(timezone.utc)
+
+    def healthy(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute('CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)')
+        conn.execute('INSERT INTO message VALUES (?, ?, ?)', ('m', int((self.until - timedelta(hours=1)).timestamp() * 1000),
+                     json.dumps({'role': 'assistant', 'modelID': FREE_MODEL, 'tokens': {'input': 1000, 'output': 100}})))
+        conn.commit()
+        conn.close()
+
+    def read(self):
+        return axis_scores.opencode_local_spend(self.models, None, since=self.until - timedelta(hours=24), until=self.until)
+
+    def test_only_an_absent_store_is_zero_spend(self):
+        self.assertEqual(self.read(), ({}, [], None))
+        self.healthy()
+        spend, unpriced, unreadable = self.read()
+        self.assertTrue(spend and unreadable is None, (spend, unreadable))
+        holder = sqlite3.connect(self.db, isolation_level=None)
+        holder.execute('BEGIN EXCLUSIVE')
+        try:
+            locked = self.read()
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+        self.db.unlink()
+        conn = sqlite3.connect(self.db)
+        conn.execute('CREATE TABLE session (id TEXT)')
+        conn.commit()
+        conn.close()
+        other_shape = self.read()
+        self.db.write_bytes(b'not a database at all ' * 64)
+        corrupt = self.read()
+        for label, (spend, unpriced, unreadable) in (('locked', locked), ('other shape', other_shape),
+                                                     ('corrupt', corrupt)):
+            with self.subTest(label):
+                self.assertEqual(spend, {})
+                self.assertTrue(isinstance(unreadable, str) and unreadable, unreadable)
 
 
 if __name__ == '__main__':

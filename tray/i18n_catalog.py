@@ -856,6 +856,8 @@ EN = {
     '套餐读取失败，不参与自动路由：{0}': 'Plan reading failed, out of automatic routing: {0}',
     '套餐无额度数据，不参与自动路由：{0}': 'No capacity data for this plan, out of automatic routing: {0}',
     '额度上限未知（不参与自动路由）': 'Quota limit unknown (out of automatic routing)',
+    '本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由':
+        "opencode.db could not be read ({0}): this period's spend is a lower bound and the pool still routes",
     '供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用':
         ("The vendor publishes no quota limit: the limit is the larger of this machine's spend before its latest limit "
          "error and the shipped measurement (both lower bounds); with neither it is out of automatic routing and usable "

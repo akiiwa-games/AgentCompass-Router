@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import router_data
 import panel_quota
+import i18n_catalog
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'agent-compass' / 'scripts'))
 import account_fleet
@@ -305,6 +306,14 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertEqual([(w['id'], w['remaining_pct']) for w in read['windows']], [('allowance', 100 - 100 * 1.0 / 2.5)])
         self.assertIn('供应商未公布额度上限', free['usage_hover'])
         self.assertNotIn('capacity_unknown', free)
+        # Review round 3 S1: a failed read of opencode.db is carried to the hover; the card stays a priced, routable one.
+        unread = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode',
+                           spec={**spec, 'local_spend_unreadable': 'OperationalError: database is locked'})
+        failed = router_data._tr('本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由').format('OperationalError: database is locked')
+        self.assertIn('本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由', i18n_catalog.EN)
+        self.assertIn(failed, unread['usage_hover'])
+        self.assertNotIn(failed, free['usage_hover'])
+        self.assertEqual(unread['kind'], free['kind'])
         reset = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         held = self.card({'family': 'opencode', 'status': 'ready', 'exhausted_windows': ['allowance'],
                           'exhausted_resets_at': reset.isoformat(), 'exhausted_reset_stated': True},

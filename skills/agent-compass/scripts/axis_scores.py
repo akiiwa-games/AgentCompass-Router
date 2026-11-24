@@ -177,7 +177,7 @@ def opencode_failure_reset(message, at, *, cut_at=None, read_local_db=True):
 
 
 def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, since=None, until=None):
-    """(spend, unpriced): lower-bound USD per model from local `opencode.db` token counts at the model's public list
+    """(spend, unpriced, unreadable): lower-bound USD per model from local `opencode.db` token counts at the model's public list
     price, and the sorted ids of models with tokens but no list price in the data (round 12 S6). A model id matches a
     table name or alias exactly; there is no prefix guessing and no invented price, so a model without a cited price is
     a surfaced gap (mode B), never a $0 or a borrowed rate. When `read_local_db=False` (fresh/public evaluation),
@@ -185,7 +185,11 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, si
 
     `since` / `until` (aware datetimes) bound the read by time: only messages the database stamps (`time_created`, ms)
     at or after `since` and before `until`. Discovery's token totals carry no time, so a bounded read is the database's
-    alone."""
+    alone.
+
+    Only an absent opencode.db is zero spend. A database that cannot be read (locked, corrupt, or not in the shape read
+    here: sqlite3.Error, OSError) is a read failure, returned as `unreadable` (its error, else None), never 0 spend
+    silently; what was read is still a lower bound (review round 3 S1)."""
     import sqlite3
     prices = opencode_list_prices(models_table)
     readings = []       # (source, model id, input, output + reasoning, cache read, cache write)
@@ -198,6 +202,7 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, si
                              float(m_row.get('output') or 0) + float(m_row.get('reasoning') or 0),
                              m_row.get('cache_read'), m_row.get('cache_write')))
     db_path = opencode_db_path() if read_local_db else None
+    unreadable = None
     if db_path is not None and db_path.exists():
         try:
             conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=1.0)
@@ -216,8 +221,8 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, si
                 ).fetchall()
             finally:
                 conn.close()
-        except Exception:
-            rows = []
+        except (sqlite3.Error, OSError) as exc:
+            rows, unreadable = [], f'{type(exc).__name__}: {exc}'
         readings += [('db', *row) for row in rows if row[0]]
     by_source = {'discovery': {}, 'db': {}}
     unpriced = set()
@@ -235,7 +240,13 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, si
         usd = max(by_source['discovery'].get(name, 0.0), by_source['db'].get(name, 0.0))
         if usd > 0:
             spend[name] = round(usd, 4)
-    return spend, sorted(unpriced)
+    return spend, sorted(unpriced), unreadable
+
+
+def unreadable_gap(unreadable):
+    """The gap entry of a spend read that failed: what failed, and that the pool still routes on the lower bound."""
+    return (f'opencode.db could not be read ({unreadable}): the spend read is a lower bound and the pool routes on it, '
+            'as with an unpriced model')
 
 
 def _capacity_rules(accounts):
@@ -409,9 +420,9 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
 
     Returns {'capacity_usd', 'source', 'period_hours', 'reading'}, {'gap': reason}, or None."""
     def spent(since, until):
-        spend, gap = opencode_local_spend(accounts.get('models') or {}, accounts.get('_discovery'),
-                                          read_local_db=bool(read_local_state), since=since, until=until)
-        return _allowance_spend(spec, spend, family, accounts), list(gap)
+        spend, gap, unreadable = opencode_local_spend(accounts.get('models') or {}, accounts.get('_discovery'),
+                                                      read_local_db=bool(read_local_state), since=since, until=until)
+        return _allowance_spend(spec, spend, family, accounts), list(gap), unreadable
     obs = quota_exhaustion.observation(name) if read_local_state else None
     measured = (unpublished or {}).get('measured')
     found, gap_reason = None, None
@@ -423,8 +434,11 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
     elif obs:
         period = obs_period
         start = obs['resets_at'] - timedelta(hours=period)
-        used, gap = (None, ()) if start > obs['observed_at'] else spent(start, obs['observed_at'])
-        if used is None:
+        used, gap, unreadable = (None, (), None) if start > obs['observed_at'] else spent(start, obs['observed_at'])
+        if unreadable:
+            gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} ended a period whose spend could not be "
+                          f'read ({unreadable}): no capacity to read from it')
+        elif used is None:
             gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} gave a reset more than {period:g} h "
                           'away: it does not end a period of that length')
         elif gap:
@@ -461,8 +475,10 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
         start, boundary = resets - timedelta(hours=period), 'observed'
     else:
         resets, start, boundary = now + timedelta(hours=period), now - timedelta(hours=period), 'assumed'
-    used, gap = spent(start, now)
+    used, gap, unreadable = spent(start, now)
+    gap = [*gap, *([unreadable_gap(unreadable)] if unreadable else [])]
     return {'capacity_usd': capacity, 'source': source, 'period_hours': period,
+            **({'unreadable': unreadable} if unreadable else {}),
             'reading': {'window': FREE_WINDOW, 'used_usd': round(used, 4), 'period_start': start.isoformat(),
                         'resets_at': resets.isoformat(), 'boundary': boundary, **({'gap': gap} if gap else {})}}
 
@@ -535,7 +551,7 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             info['usd_per_hour'] = usd
         else:
             info.pop('usd_per_hour', None)
-    local_spend, local_unpriced = opencode_local_spend(
+    local_spend, local_unpriced, local_unreadable = opencode_local_spend(
         out.get('models') or {}, out.get('_discovery'), read_local_db=bool(read_local_state))
     community = data.get('capacity') or {}
     cap_rules = _capacity_rules(out)
@@ -561,6 +577,7 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
         # declaration) reads its capacity from `free_allowance_period`; with none it stays mode B (owner, 2026-11-24).
         spec.pop('capacity_unpublished', None)
         spec.pop('local_period', None)
+        spec.pop('local_spend_unreadable', None)
         free_period = None
         unpublished = (unpublished_capacity(out, family, spec.get('plan'), shipped=shipped_templates)
                        if is_free_pool and spec.get('billing') != 'metered' else None)
@@ -602,6 +619,10 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             if acct_spend > 0:
                 spec['local_spend_usd'] = round(acct_spend, 4)
                 spec['local_spend_source'] = 'opencode.db token counts x public list price (lower bound)'
+            unreadable = local_unreadable or (free_period or {}).get('unreadable')
+            if unreadable:
+                # A read failure of the store this pool's spend comes from, carried where an unpriced model is.
+                spec['local_spend_unreadable'] = unreadable
             if family == 'opencode' and local_unpriced:
                 # no cited list price for these models: their spend is a surfaced gap, not $0 and not a borrowed rate
                 spec['local_spend_gap'] = list(local_unpriced)

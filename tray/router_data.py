@@ -899,6 +899,9 @@ def account_cards() -> list[dict]:
             # shipped measurement (both lower bounds), either alone, else unknown (axis_scores.free_allowance_period); a latch shows as the window at 0 until its
             # end. The details are hover text, not card prose.
             usage_hover = _tr("供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用")
+            if spec.get("local_spend_unreadable"):
+                # The store its spend is read from failed: the reading is a lower bound and the pool still routes on it.
+                usage_hover += "\n" + _tr("本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由").format(spec["local_spend_unreadable"])
             reset_at = quota_pools.parse_time((row or {}).get("exhausted_resets_at"))
             for wid in sorted(latched - {w["id"] for w in windows}):
                 windows.append({

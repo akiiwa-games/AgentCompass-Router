@@ -182,8 +182,13 @@ def warning(name, row):
 
 
 def _free_pool_warning(name, spec):
-    if not isinstance(spec, dict) or not (spec.get('capacity_unknown') and spec.get('five_axis_free_pool')):
+    if not isinstance(spec, dict) or not spec.get('five_axis_free_pool'):
         return None
+    unreadable = spec.get('local_spend_unreadable')
+    if not spec.get('capacity_unknown'):
+        # A priced pool: only a failed read of its spend is worth a word (its used share is then a lower bound).
+        return (f'{name}: opencode.db could not be read ({unreadable}); its spend is read as a lower bound and the pool '
+                'routes on it') if unreadable else None
     local = spec.get('local_spend_usd')
     if isinstance(local, dict) and local.get('used_usd') is not None:
         spend_note = f"; local lower-bound spend U >= ${local['used_usd']:.2f} ({local['tokens']:,} tokens from {local['source']})"
@@ -195,6 +200,8 @@ def _free_pool_warning(name, spec):
     if gap:
         shown = ', '.join(str(m) for m in gap[:5]) + (f' and {len(gap) - 5} more' if len(gap) > 5 else '')
         spend_note += f"; no public list price for {shown}, so their local spend is not counted"
+    if unreadable:
+        spend_note += f"; opencode.db could not be read ({unreadable}), so its spend is not counted"
     return f"{name}: capacity_unknown — quota unknown, spend unpriced{spend_note}; out of automatic routing (use --model to run)"
 
 
