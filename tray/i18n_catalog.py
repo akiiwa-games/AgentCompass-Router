@@ -856,9 +856,10 @@ EN = {
     '套餐读取失败，不参与自动路由：{0}': 'Plan reading failed, out of automatic routing: {0}',
     '套餐无额度数据，不参与自动路由：{0}': 'No capacity data for this plan, out of automatic routing: {0}',
     '额度上限未知（不参与自动路由）': 'Quota limit unknown (out of automatic routing)',
-    '供应商未公布额度上限：上限取本机最近一次限额报错前的花费，否则取出厂实测值；两者都没有时不参与自动路由，点名可用':
-        ("The vendor publishes no quota limit: the limit is this machine's spend before its latest limit error, else the "
-         "shipped measurement; with neither it is out of automatic routing and usable by name"),
+    '供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用':
+        ("The vendor publishes no quota limit: the limit is the larger of this machine's spend before its latest limit "
+         "error and the shipped measurement (both lower bounds); with neither it is out of automatic routing and usable "
+         "by name"),
     '额度上限未知，不参与自动路由': 'Quota limit unknown, out of automatic routing',
     '额度上限未知，不参与自动路由；本地累计消耗下界 U ≥ ${0:.2f}（{1:,} tokens，{2}）':
         'Quota limit unknown, out of automatic routing; local spend so far at least ${0:.2f} ({1:,} tokens, {2})',
