@@ -211,7 +211,7 @@ def latched_wait_text(accounts, account, wid):
     stated = ((((accounts.get('_discovery') or {}).get('accounts') or {}).get(account) or {})
               .get('exhausted_reset_stated'))
     return (f'{wid} has 0 left until {quota_exhaustion.moment_text(reset)} '
-            f"({'the reset the provider stated' if stated else 'when it is re-probed'}); start after it")
+            f'({quota_exhaustion.end_kind(stated)}); start after it')
 
 
 def cycle_observation(window, observed, usage_row, now, read_failed_ok=False):

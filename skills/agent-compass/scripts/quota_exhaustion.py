@@ -287,6 +287,12 @@ def moment_text(moment):
     return moment.astimezone().isoformat(timespec='minutes') if moment else 'the next roll'
 
 
+def end_kind(stated):
+    """How every text names a latch's end: the reset the provider stated, else the time its quota is re-probed, which is
+    never called a reset."""
+    return 'the reset the provider stated' if stated else 'when it is re-probed'
+
+
 def ends(account, *, path=None):
     """(when the account's latch ends by itself, whether that is the reset its error stated), or None when it has no
     latch. The one answer every text about a latch gives (`due_at`)."""
@@ -303,8 +309,8 @@ def end_text(account, *, path=None):
     if found is None:
         return None
     due, stated = found
-    return (f'0 left until {moment_text(due)} (the reset the provider stated)' if stated
-            else f'0 left until {moment_text(due)}, when it is re-probed')
+    return (f'0 left until {moment_text(due)} ({end_kind(True)})' if stated
+            else f'0 left until {moment_text(due)}, {end_kind(False)}')
 
 
 def exhausted_windows(account, usage=None, *, path=None, now=None, read_only=False):
