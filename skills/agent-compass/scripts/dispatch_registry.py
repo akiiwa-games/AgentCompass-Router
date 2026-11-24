@@ -615,7 +615,7 @@ def launch_request(bundle, launch):
     if family == 'codex':
         settings['features'] = {'service_tier': 'priority' if bundle.get('fast') else 'default'}
     elif family == 'claude':
-        settings['features'] = {'fast_mode': bool(bundle.get('fast'))}
+        settings['features'] = {'fast_mode': False}     # no Claude fast contract (fast_modes.HARNESSES): always off
     return canonical_request(dict(launch, provider=provider + '/' + model, settings=settings))
 
 
@@ -1958,6 +1958,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
         launch = dict(launch, cwd=canon_ws)
     import account_fleet
     import dispatch_ground_truth
+    import fast_modes
     import quota_pools
     import task_intake
     now = now or utcnow()
@@ -1980,6 +1981,15 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             bundle.setdefault('bundle_id', bundle.get('id'))
         else:
             bundle = decision['bundle']
+        fast_note = None
+        if resume_bundle is None and bundle.get('fast'):
+            # A stored fast route whose harness has no fast contract now launches a new worker in its plain mode, as a
+            # route named with --fast that cannot run fast does (route_judge.record_constraint), with the same note.
+            model = account_fleet.canonical(bundle.get('model'), accounts)
+            if lacks := fast_modes.refusal(account_fleet.bundle_harness(bundle, bundle.get('account')), model,
+                                           account_fleet.row_spec(accounts, model)):
+                bundle = {k: v for k, v in bundle.items() if k != 'fast'}
+                fast_note = fast_modes.not_applied(lacks)
         request = launch_request(bundle, launch)
         if cwd is None and request.get('cwd'):
             cwd = request['cwd']
@@ -2127,10 +2137,12 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                **({'chain_id': chain_id} if chain_id else {}),
                **({k: attempt[k] for k in ('attempt_of', 'attempt', 'previous_attempt') if attempt.get(k) is not None}
                   if attempt else {}),
-               # A route the user named launches past the full-capacity rule, and past a free allowance's local
-               # estimate, with its warning (candidate_eval).
-               **({'warnings': warned} if (warned := [candidate[k] for k in ('capacity_warning', 'estimate_warning')
-                                                       if candidate.get(k)]) else {})}
+               # A route the user named launches past the full-capacity rule, past a free allowance's local
+               # estimate, and with --fast past the fast burn estimate, with its warning (candidate_eval).
+               **({'warnings': warned} if (warned := [*([fast_note] if fast_note else []),
+                                                       *(candidate[k] for k in ('capacity_warning', 'estimate_warning',
+                                                                                'fast_estimate_warning')
+                                                         if candidate.get(k))]) else {})}
         event(row, 'prepared', now)
         save(connection, row)
         return row

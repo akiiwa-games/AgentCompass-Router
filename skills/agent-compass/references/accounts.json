@@ -1934,7 +1934,6 @@
   },
   "claude-fable-5-2": {
    "label": "Fable 5.2",
-   "fast_capable": true,
    "api_family": "claude",
    "image_input_source": {
     "kind": "maintainer",
@@ -1944,24 +1943,6 @@
    "listed_as": {
     "arena": "Claude Fable 5.2",
     "aa": "Claude Fable 5.2"
-   },
-   "vendor_fast_mode": {
-    "price_multiplier": 2.0,
-    "speed_multiplier": 2.5,
-    "fast_price": {
-     "input": 16.0,
-     "output": 80.0,
-     "cache_read": 0.4
-    },
-    "standard_price": {
-     "input": 8.0,
-     "output": 40.0,
-     "cache_read": 0.2
-    },
-    "as_of": "2026-11-10",
-    "url": "https://code.claude.com/docs/en/fast-mode",
-    "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "statement": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Fable 5.2 fast mode is $16/$80 per MTok (2x standard $8/$40, cache read $0.20) with up to 2.5x output tokens per second."
    },
    "list_price": {
     "input": 8.0,
@@ -1979,29 +1960,10 @@
   },
   "claude-opus-5-5": {
    "label": "Opus 5.5",
-   "fast_capable": true,
    "api_family": "claude",
    "listed_as": {
     "arena": "Claude Opus 5.5",
     "aa": "Claude Opus 5.5"
-   },
-   "vendor_fast_mode": {
-    "price_multiplier": 2.0,
-    "speed_multiplier": 2.5,
-    "fast_price": {
-     "input": 8.0,
-     "output": 40.0,
-     "cache_read": 0.4
-    },
-    "standard_price": {
-     "input": 4.0,
-     "output": 20.0,
-     "cache_read": 0.2
-    },
-    "as_of": "2026-11-10",
-    "url": "https://code.claude.com/docs/en/fast-mode",
-    "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "statement": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Opus 5.5 fast mode is $8/$40 per MTok (2x standard $4/$20, cache read $0.20) with up to 2.5x output tokens per second."
    },
    "list_price": {
     "input": 4.0,
@@ -2493,7 +2455,6 @@
   },
   "claude-opus-4-8": {
    "label": "Opus 4.8",
-   "fast_capable": true,
    "api_family": "claude",
    "listed_as": {
     "arena": "Claude Opus 4.8"

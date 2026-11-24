@@ -972,30 +972,29 @@ class Builder:
             for _, c in sorted(pages.items())]
 
     def fast_mode(self):
-        """Cited vendor fast-mode price and speed multipliers and vendor API pricing (round 11, user 2026-11-10): the
-        accounts.json `models[m].vendor_fast_mode` declarations. Only a model with a cited vendor price and speed multiplier
-        gets a fast_mode measurement; other fast-capable models have no public multiplier (a surfaced gap)."""
+        """Cited vendor fast-mode price and speed multipliers and the vendor's standard price (round 11, user 2026-11-10):
+        the accounts.json `models[m].vendor_fast_mode` declarations, each citing its own vendor pages (`url`,
+        `pricing_url`, `as_of`). Only a model with a cited vendor price and speed multiplier gets a fast_mode measurement;
+        other fast-capable models have no public multiplier (a surfaced gap). No declaration, no source rows."""
         fast = {m: info['vendor_fast_mode'] for m, info in self.models.items() if info.get('vendor_fast_mode')}
-        self.source_rows['vendor.fast_mode'] = {
-            'file': None, 'url': 'https://code.claude.com/docs/en/fast-mode', 'fetched_at': None, 'sha256': None,
-            'as_of': '2026-11-10', 'as_of_kind': 'data date',
-            'method': 'Anthropic Claude Code fast-mode and API pricing documentation (read 2026-11-10)',
-            'models_listed': len(fast), 'kind': 'vendor',
-            'pricing_url': 'https://platform.claude.com/docs/en/about-claude/pricing',
-        }
-        self.source_rows['vendor.price'] = {
-            'file': None, 'url': 'https://platform.claude.com/docs/en/about-claude/pricing', 'fetched_at': None, 'sha256': None,
-            'as_of': '2026-11-10', 'as_of_kind': 'data date',
-            'method': 'Anthropic API pricing documentation (read 2026-11-10): USD per million tokens',
-            'models_listed': len(fast), 'kind': 'vendor',
-        }
+        if not fast:
+            return
+        latest = max(fast.values(), key=lambda spec: spec['as_of'])
+        for source, url, method in (('vendor.fast_mode', latest['url'], 'vendor fast-mode documentation'),
+                                    ('vendor.price', latest['pricing_url'], 'vendor API pricing documentation')):
+            self.source_rows[source] = {
+                'file': None, 'url': url, 'fetched_at': None, 'sha256': None, 'as_of': latest['as_of'],
+                'as_of_kind': 'data date', 'models_listed': len(fast), 'kind': 'vendor',
+                'method': f"{method} cited by each accounts.json vendor_fast_mode declaration (each entry keeps its own url)",
+            }
         for model, spec in fast.items():
             self.add(model, 'fast_mode', 'vendor.fast_mode',
                      {'price_multiplier': spec['price_multiplier'], 'speed_multiplier': spec['speed_multiplier']},
                      spec['statement'], fast_price=spec['fast_price'], standard_price=spec['standard_price'],
-                     pricing_url=spec['pricing_url'])
+                     pricing_url=spec['pricing_url'], url=spec['url'], as_of=spec['as_of'])
             self.add(model, 'price', 'vendor.price', dict(spec['standard_price']),
-                     'USD per million tokens (Anthropic API pricing documentation)', listed_as=model)
+                     'USD per million tokens (vendor API pricing documentation)', listed_as=model,
+                     url=spec['pricing_url'], as_of=spec['as_of'])
 
     def build(self):
         self.release_gaps()

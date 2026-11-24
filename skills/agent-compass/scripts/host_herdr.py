@@ -114,7 +114,7 @@ def interactive(bundle):
     if family == 'claude':
         flags = ['--model', model, '--permission-mode', 'bypassPermissions',
                  *(['--effort', effort] if effort else []),
-                 '--settings', json.dumps({'fastMode': bool(bundle.get('fast'))})]
+                 '--settings', json.dumps({'fastMode': False})]     # no Claude fast contract (fast_modes.HARNESSES)
     elif family == 'codex':
         flags = ['--no-daemon', '-m', model, '--dangerously-bypass-approvals-and-sandbox',
                  *(['-c', 'model_reasoning_effort=' + launch_values.toml_string(effort)] if effort else []),

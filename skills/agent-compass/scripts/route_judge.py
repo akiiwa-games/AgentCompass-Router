@@ -276,19 +276,22 @@ def record_constraint(args, task=None, classified=None):
                                                              or classified.get('unclassified')))
     # A preview (`--dry-run`) classifies nothing: with no profile and no --hours there is no plan to read, and a launch
     # fact keeps allocator.refusal_schedule's time; with a plan row the time is the row's, as at `prepare`.
+    c_model = account_fleet.canonical(row_model, accounts)
+    # A route with no fast mode its harness can launch is launched as if --fast had not been given, with the note why
+    # (owner, 2026-11-24): nothing is refused for it.
+    fast_not_applied = fast_modes.refusal(
+        account_fleet.bundle_harness(discovered or sibling or {'provider': args.provider}, args.account),
+        c_model, account_fleet.row_spec(accounts, c_model)) if getattr(args, 'fast', False) else None
+    fast_requested = bool(getattr(args, 'fast', False)) and not fast_not_applied
     fact = _check_record_launch(args, pin, quota_bundle, accounts, usage, now, timed_by_plan=planned)
     if planned:
-        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, bool(getattr(args, 'fast', False)),
-                              fact=fact)
+        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast_requested, fact=fact)
     unobserved = quota_unobserved(accounts, usage, quota_bundle)
     # A model the user names on a held account or model is the probe that can lift the hold: it goes, with a warning.
     retrying = provider_retry.reason(quota_bundle, provider_retry.active(now=now))
-    c_model = account_fleet.canonical(row_model, accounts)
-    fast_requested = bool(getattr(args, 'fast', False))
-    if fast_requested:
-        fast_modes.validate(account_fleet.bundle_harness(discovered or sibling or {'provider': args.provider}, args.account),
-                                      c_model, account_fleet.row_spec(accounts, c_model))
     warnings = []
+    if fast_not_applied and not getattr(args, '_from_roll', False):
+        warnings.append(fast_modes.not_applied(fast_not_applied))      # roll says it once among its own notes
     if unobserved:
         warnings.append(unobserved)
     if args.effort and raw_effort and raw_effort != args.effort:
@@ -315,14 +318,13 @@ def record_constraint(args, task=None, classified=None):
     bundle['harness'] = account_fleet.bundle_harness(bundle, args.account, chosen)
     if 'modeId' not in bundle and bundle['harness'] in auto_bundles.HARNESS_MODE:
         bundle['modeId'] = auto_bundles.HARNESS_MODE[bundle['harness']]
-    if fast_requested and bundle['harness'] == 'claude':
-        bundle['fast_billing'] = fast_modes.claude_billing(accounts['accounts'][args.account])
     result = {'stage': 'record', 'choice': 'constraint', 'source': 'constraint_record',
               'constraint': args.constraint, 'basis': basis, 'specialty': args.specialty,
               **({'_from_roll': True} if getattr(args, '_from_roll', False) else {}),
               **({'trigger': args.trigger} if getattr(args, 'trigger', None) else {}),
               'reason_category': getattr(args, 'reason_category', None),
-              'selected_bundle': bundle, 'observed_at': now.isoformat(), 'usage': usage}
+              'selected_bundle': bundle, 'observed_at': now.isoformat(), 'usage': usage,
+              **({'fast_not_applied': fast_not_applied} if fast_not_applied else {})}
     overlaid_accounts = axis_scores.five_axis_overlay(accounts)
     overlaid_spec = (overlaid_accounts.get('accounts') or {}).get(args.account) or {}
     if overlaid_spec.get('capacity_unknown') and overlaid_spec.get('five_axis_free_pool'):

@@ -18,6 +18,7 @@ import uuid
 import dispatch_fallback
 import dispatch_flow
 import entry
+import fast_modes
 import dispatch_registry as registry
 import host_placement
 import host_policy
@@ -47,9 +48,11 @@ WORKER_COMMUNICATION = SKILLS / 'agent-compass' / 'references' / 'worker-communi
 # executable and flags for (model, effort, cwd). agy takes its prompt only as the argument after --print; the
 # others read it from stdin; grok reads neither (headless ignores stdin) and takes --prompt-file.
 CLI_RUNS = {
+    # Claude has no fast contract (fast_modes.HARNESSES): fastMode is always passed off, so a saved preference never
+    # spends paid usage credits.
     'claude': ('claude', lambda model, effort, cwd, fast=False: ['-p', '--model', model, *(['--effort', effort] if effort else []),
                                                                  '--permission-mode', 'bypassPermissions',
-                                                                 '--settings', json.dumps({'fastMode': bool(fast)})]),
+                                                                 '--settings', json.dumps({'fastMode': False})]),
     'codex': ('codex', lambda model, effort, cwd, fast=False: ['exec', '-m', model,
                                                                *(['-c', 'model_reasoning_effort=' + launch_values.toml_string(effort)] if effort else []),
                                                                '-c', 'features.fast_mode=' + str(bool(fast)).lower(),
@@ -212,7 +215,8 @@ def named_route_conflict(args, bundle, accounts=None):
     the turn is the explicit resume), else the error text. --resume names the worker, and its route is the worker's
     own; a different named route contradicts it, so neither is chosen for the caller. Fast mode is part of the route:
     --fast on a worker that runs without it is such a contradiction (the entry cannot tell an absent --fast from a plain
-    mode asked for, so only a given --fast is compared)."""
+    mode asked for, so only a given --fast is compared), unless the worker's route has no fast mode at all: then --fast
+    is read as absent, as for a named route (owner, 2026-11-24)."""
     import account_fleet
     import model_resolution
     if accounts is None:
@@ -238,7 +242,9 @@ def named_route_conflict(args, bundle, accounts=None):
         ('--account', args.account and args.account != bundle.get('account')),
         ('--model', model and not account_fleet.pin_names_bundle(args.model, bundle, accounts, pool=pool)),
         ('--effort' if args.effort else '--model', effort and effort != bundle.get('effort')),
-        ('--fast', getattr(args, 'fast', False) and not bundle.get('fast'))) if differs]
+        # --fast on a worker whose route has no fast mode is read as absent (fast_route_lacks), as for a named route.
+        ('--fast', getattr(args, 'fast', False) and not bundle.get('fast') and not fast_route_lacks(bundle, accounts)))
+        if differs]
     if not conflicting:
         return None
     own = f"{bundle.get('account')}/{bundle.get('model')}:{bundle.get('effort')}{', fast' if bundle.get('fast') else ''}"
@@ -332,6 +338,8 @@ def _auto_resumable(worker, policy, usage_cache_path=None, accounts=None):
     bundle = _resolve_worker_bundle(worker, accounts)
     if bundle is None or not host_policy.account_allowed(policy, bundle.get('account')):
         return False
+    if fast_session_refusal(worker, accounts):
+        return False
     _, cwd_spec = worker_cwd_spec(worker, accounts)
     if cwd_spec.get('cwd_regex'):
         own = host_placement.worker_directory(None, worker)
@@ -359,6 +367,18 @@ def _not_reusable_text(explicit_id, parent, excluded):
                or registry.Refusal('it is not an idle worker of this parent', 'Roll without --resume to start a fresh worker.'))
     return (f'Nothing was launched: worker {explicit_id!r} cannot be resumed by parent {parent!r}: {refusal.reason}. '
             f'{refusal.remedy}')
+
+
+def fast_session_refusal(worker, accounts=None):
+    """Why `worker` cannot take a resumed turn as its plain route, else None: it was started fast on a route that has no
+    fast contract now (fast_route_lacks). A resumed turn keeps the session's own fast setting (the host relabels the
+    worker and sends the prompt; it changes no feature, fast-modes.md), so the turn would still run fast."""
+    bundle = _resolve_worker_bundle(worker, accounts) or {}
+    if bundle.get('fast') and (reason := fast_route_lacks(bundle, accounts)):
+        return (f'Nothing was launched: worker {worker.get("agent_id")!r} was started in fast mode and {reason}; a resumed '
+                'turn keeps its session\'s fast mode, so it cannot run as the plain route. Write a handoff brief and omit '
+                '--resume to start a fresh worker in the plain mode.')
+    return None
 
 
 def _resume_refusal(out, explicit_id, error, next_text, code=2):
@@ -448,7 +468,7 @@ def model_comparison(fleet):
 def summary(decision):
     bundle = decision.get('selected_bundle') or {}
     out = {'choice': decision.get('choice'),
-           'bundle': {k: bundle[k] for k in ('provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast', 'fast_billing') if bundle.get(k)},
+           'bundle': {k: bundle[k] for k in ('provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast') if bundle.get(k)},
            'reason': ((decision.get('decision') or {}).get('reason') or '')[:300] or None,
            'alerts': [a['message'] for a in decision.get('alerts') or [] if a.get('severity') == 'warn'],
            **({'warnings': warnings} if (warnings := decision.get('warnings') or (decision.get('decision') or {}).get('warnings')) else {})}
@@ -502,9 +522,22 @@ def ignored_flag_notes(args, decision, explicit_id):
         notes.append('--basis names no route by itself and was ignored: it only quotes the user for --provider, --account, '
                      '--model or --effort.')
     if getattr(args, 'fast', False) and bundle and not bundle.get('fast'):
-        notes.append('--fast was not applied (it is a preference): '
+        # A named route with no fast mode its harness can launch runs as if --fast had not been given (the record's
+        # `fast_not_applied`, as for a resume); for the router's choice --fast is a preference.
+        own = decision.get('fast_not_applied') or (fast_route_lacks(bundle) if explicit_id else None)
+        notes.append(fast_modes.not_applied(own) if own else '--fast was not applied (it is a preference): '
                      + ((decision.get('decision') or {}).get('fast_not_applied') or 'the chosen route runs in its plain mode') + '.')
     return notes
+
+
+def fast_route_lacks(bundle, accounts=None):
+    """Why `bundle`'s route has no fast mode its harness can launch (fast_modes.refusal), else None."""
+    import account_fleet
+    if accounts is None:
+        accounts = account_fleet.load_accounts()
+    model = account_fleet.canonical(bundle.get('model'), accounts)
+    return fast_modes.refusal(account_fleet.bundle_harness(bundle, bundle.get('account')), model,
+                              account_fleet.row_spec(accounts, model))
 
 
 def files_not_sent(out, args, provider):
@@ -1739,6 +1772,8 @@ def _run(args, judge):
                     f'Nothing was launched: worker {explicit_id!r} reached the context rotation limit and cannot be resumed. '
                     'Write a handoff brief and omit --resume to start a fresh worker.',
                 )
+            if fast_refused := fast_session_refusal(explicit_worker):
+                return _resume_refusal(base_out, explicit_id, 'resume_worker_fast_mode', fast_refused)
             if gate_reason := _worker_gate_refusal(explicit_worker, usage_cache_path=usage_cache_path):
                 return _resume_refusal(base_out, explicit_id, 'resume_worker_gated',
                                        gate_refusal_text(explicit_id, gate_reason))

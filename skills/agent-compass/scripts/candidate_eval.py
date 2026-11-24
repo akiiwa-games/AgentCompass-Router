@@ -135,6 +135,16 @@ def full_capacity_warning(account, model, shortfalls):
             'launched because the user named it')
 
 
+def fast_estimate_warning(account, model, price, shortfalls):
+    """The one warning a route the user named with --fast launches fast with when only the fast mode's consumption
+    estimate holds it (owner, 2026-11-24): each window's estimated fast use against what is left or its full capacity."""
+    parts = ', '.join(f"about {s['need']:.0f}% of {wid} against {s['against']} (with its {s['margin']:g}% margin)"
+                      for wid, s in shortfalls.items())
+    return (f"{account}/{model}: fast mode ({price:g}x burn) is estimated to use {parts}; this is the router's "
+            'estimate, so the run may stop at the limit before it finishes; launched fast because the user named it '
+            'with --fast')
+
+
 def local_estimate_warning(account, model, wid, remaining, need_pct, margin_pct):
     """The one warning a route the user named launches with on a free allowance that only the local spend estimate
     holds (`with_local_readings`): the estimate is not the vendor's reading, so it refuses nothing the user named; the
@@ -926,6 +936,10 @@ def evaluate_bundle(bundle, task, ctx):
             # No window to check (a metered account without a budget, an unlimited one): fast is offered only to a
             # route that names it, which is that route whatever prices it.
             fast_ok = bool(five_window_states) or bool(named and task.get('force_fast'))
+            # A route the user named with --fast is held only by facts (a window at its launch floor, an unpriced
+            # window); the fast burn estimate past what is left or past the full capacity launches it with a warning.
+            named_fast = override_named and bool(task.get('force_fast'))
+            fast_short = {}
             for wid, (wspec, st, cap_usd_w, unit) in five_window_states.items():
                 if pool and st.get('short'):
                     continue
@@ -945,28 +959,43 @@ def evaluate_bundle(bundle, task, ctx):
                     f_step = h_bef * f_unit
                     f_per = min(max(0.0, f_econ_h - h_bef), w_l) * f_unit
                     _, fl_pct, mg_pct = quota_pools.short_window_limits(spec, wid, policy, now)
-                    if st['remaining'] <= fl_pct or st['remaining'] - f_step < mg_pct or full - f_per < mg_pct:
+                    if st['remaining'] <= fl_pct:
                         fast_ok = False
                         break
+                    if st['remaining'] - f_step < mg_pct or full - f_per < mg_pct:
+                        if not named_fast:
+                            fast_ok = False
+                            break
+                        fast_short[wid] = ({'need': f_step, 'against': f"the {st['remaining']:.0f}% left", 'margin': mg_pct}
+                                           if st['remaining'] - f_step < mg_pct else
+                                           {'need': f_per, 'against': f'its full capacity ({full:.0f}%)', 'margin': mg_pct})
                 else:
                     req_h = f_chain_h if task['coupling'] == 'high' else f_econ_h
                     h_bef = quota_pools.hours_before(st, lambda s: req_h if (
                         (tau := s.get('reset_hours')) is None or tau == float('inf') or w_len is None)
                         else min(req_h, max(0.0, float(tau))), req_h * f_unit)
                     f_need = h_bef * f_unit
-                    if st['remaining'] - f_need < policy['safety_margin_pct']:
-                        fast_ok = False
-                        break
-                    if w_len is not None and req_h > h_bef:
-                        f_rem = min(req_h - h_bef, float(w_len)) * f_unit
-                        if full - f_rem < policy['safety_margin_pct']:
+                    margin = policy['safety_margin_pct']
+                    if st['remaining'] - f_need < margin:
+                        if not named_fast:
                             fast_ok = False
                             break
+                        fast_short[wid] = {'need': f_need, 'against': f"the {st['remaining']:.0f}% left", 'margin': margin}
+                    elif w_len is not None and req_h > h_bef:
+                        f_rem = min(req_h - h_bef, float(w_len)) * f_unit
+                        if full - f_rem < margin:
+                            if not named_fast:
+                                fast_ok = False
+                                break
+                            fast_short[wid] = {'need': f_rem, 'against': f'its full capacity ({full:.0f}%)', 'margin': margin}
             if task.get('force_fast') and not fast_ok:
                 exclude(f'fast mode ({f_price:g}x burn) exceeds remaining window safety margin')
             elif not fast_ok:
                 result['fast_not_offered'] = f'fast mode ({f_price:g}x burn) exceeds the remaining window safety margin'
             elif fast_ok:
+                if fast_short:
+                    result['fast_estimate_warning'] = fast_estimate_warning(bundle['account'], model, f_price, fast_short)
+                    result['notes'].append(result['fast_estimate_warning'])
                 result['_five_fast_candidate'] = {
                     'price_multiplier': f_price, 'speed_multiplier': f_speed,
                     'econ_hours': f_econ_h, 'chain_hours': f_chain_h, 'hours': f_hours,

@@ -5169,29 +5169,6 @@
     }
    }
   },
-  "vendor.fast_mode": {
-   "file": null,
-   "url": "https://code.claude.com/docs/en/fast-mode",
-   "fetched_at": null,
-   "sha256": null,
-   "as_of": "2026-11-10",
-   "as_of_kind": "data date",
-   "method": "Anthropic Claude Code fast-mode and API pricing documentation (read 2026-11-10)",
-   "models_listed": 2,
-   "kind": "vendor",
-   "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing"
-  },
-  "vendor.price": {
-   "file": null,
-   "url": "https://platform.claude.com/docs/en/about-claude/pricing",
-   "fetched_at": null,
-   "sha256": null,
-   "as_of": "2026-11-10",
-   "as_of_kind": "data date",
-   "method": "Anthropic API pricing documentation (read 2026-11-10): USD per million tokens",
-   "models_listed": 2,
-   "kind": "vendor"
-  },
   "community.wokey.claude": {
    "file": "community-wokey-claude.html",
    "url": "https://wokey.ai/claude-usage-limits",
@@ -7277,20 +7254,6 @@
      "url": "https://openrouter.ai/api/v1/models",
      "method": "USD per million tokens",
      "listed_as": "anthropic/claude-fable-5.2"
-    },
-    {
-     "source": "vendor.price",
-     "kind": "vendor",
-     "value": {
-      "input": 8.0,
-      "output": 40.0,
-      "cache_read": 0.2
-     },
-     "as_of": "2026-11-10",
-     "fetched_at": null,
-     "url": "https://platform.claude.com/docs/en/about-claude/pricing",
-     "method": "USD per million tokens (Anthropic API pricing documentation)",
-     "listed_as": "claude-fable-5-2"
     }
    ],
    "intelligence_index": [
@@ -7435,31 +7398,6 @@
      },
      "mix_source": "community.wokey.claude",
      "mix_as_of": "2026-11-16"
-    }
-   ],
-   "fast_mode": [
-    {
-     "source": "vendor.fast_mode",
-     "kind": "vendor",
-     "value": {
-      "price_multiplier": 2.0,
-      "speed_multiplier": 2.5
-     },
-     "as_of": "2026-11-10",
-     "fetched_at": null,
-     "url": "https://code.claude.com/docs/en/fast-mode",
-     "method": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Fable 5.2 fast mode is $16/$80 per MTok (2x standard $8/$40, cache read $0.20) with up to 2.5x output tokens per second.",
-     "fast_price": {
-      "input": 16.0,
-      "output": 80.0,
-      "cache_read": 0.4
-     },
-     "standard_price": {
-      "input": 8.0,
-      "output": 40.0,
-      "cache_read": 0.2
-     },
-     "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing"
     }
    ]
   },
@@ -7887,20 +7825,6 @@
      "url": "https://openrouter.ai/api/v1/models",
      "method": "USD per million tokens",
      "listed_as": "anthropic/claude-opus-5.5"
-    },
-    {
-     "source": "vendor.price",
-     "kind": "vendor",
-     "value": {
-      "input": 4.0,
-      "output": 20.0,
-      "cache_read": 0.2
-     },
-     "as_of": "2026-11-10",
-     "fetched_at": null,
-     "url": "https://platform.claude.com/docs/en/about-claude/pricing",
-     "method": "USD per million tokens (Anthropic API pricing documentation)",
-     "listed_as": "claude-opus-5-5"
     }
    ],
    "intelligence_index": [
@@ -8060,31 +7984,6 @@
      },
      "mix_source": "community.wokey.claude",
      "mix_as_of": "2026-11-16"
-    }
-   ],
-   "fast_mode": [
-    {
-     "source": "vendor.fast_mode",
-     "kind": "vendor",
-     "value": {
-      "price_multiplier": 2.0,
-      "speed_multiplier": 2.5
-     },
-     "as_of": "2026-11-10",
-     "fetched_at": null,
-     "url": "https://code.claude.com/docs/en/fast-mode",
-     "method": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Opus 5.5 fast mode is $8/$40 per MTok (2x standard $4/$20, cache read $0.20) with up to 2.5x output tokens per second.",
-     "fast_price": {
-      "input": 8.0,
-      "output": 40.0,
-      "cache_read": 0.4
-     },
-     "standard_price": {
-      "input": 4.0,
-      "output": 20.0,
-      "cache_read": 0.2
-     },
-     "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing"
     }
    ]
   },

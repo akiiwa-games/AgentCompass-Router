@@ -1,7 +1,7 @@
 {
  "schema": "agent-compass.five-axis-scores/12",
  "generated_at": "2026-11-19T00:35:51+00:00",
- "measurements_sha256": "6a75a64f5ff53513e3f16f08cdb63b5bbd55c190fa86bb301ed39bd5901339bd",
+ "measurements_sha256": "91016695d86afb74aa3a79ea30ec9571e6d80d51f11a9a8ba99f32ae44fa665f",
  "distrusted_sources": [],
  "method": "Category scores, usd_per_hour, duration and plan capacity from `references/public-measurements.json`.",
  "estimate_fits": {
@@ -1125,12 +1125,6 @@
    "as_of_kind": "fetch date (no data date found on the page)",
    "fetched_at": "2026-11-18T12:37:59+00:00"
   },
-  "vendor.fast_mode": {
-   "kind": "vendor",
-   "as_of": "2026-11-10",
-   "as_of_kind": "data date",
-   "fetched_at": null
-  },
   "vendor.google.ultra": {
    "kind": "vendor",
    "as_of": "2026-11-18",
@@ -1142,12 +1136,6 @@
    "as_of": "2026-11-18",
    "as_of_kind": "fetch date (no data date found on the page)",
    "fetched_at": "2026-11-18T12:38:00+00:00"
-  },
-  "vendor.price": {
-   "kind": "vendor",
-   "as_of": "2026-11-10",
-   "as_of_kind": "data date",
-   "fetched_at": null
   },
   "aa-release-glm-4-5.html": {
    "kind": null,
@@ -6095,25 +6083,10 @@
     ]
    },
    "fast_mode": {
-    "status": "ok",
-    "price_multiplier": 2.0,
-    "speed_multiplier": 2.5,
-    "source": "vendor.fast_mode",
-    "kind": "vendor",
-    "as_of": "2026-11-10",
-    "url": "https://code.claude.com/docs/en/fast-mode",
-    "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "fast_price": {
-     "input": 16.0,
-     "output": 80.0,
-     "cache_read": 0.4
-    },
-    "standard_price": {
-     "input": 8.0,
-     "output": 40.0,
-     "cache_read": 0.2
-    },
-    "method": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Fable 5.2 fast mode is $16/$80 per MTok (2x standard $8/$40, cache read $0.20) with up to 2.5x output tokens per second."
+    "status": "unsupported",
+    "price_multiplier": null,
+    "speed_multiplier": null,
+    "source": null
    },
    "price": {
     "value": {
@@ -6974,25 +6947,10 @@
     ]
    },
    "fast_mode": {
-    "status": "ok",
-    "price_multiplier": 2.0,
-    "speed_multiplier": 2.5,
-    "source": "vendor.fast_mode",
-    "kind": "vendor",
-    "as_of": "2026-11-10",
-    "url": "https://code.claude.com/docs/en/fast-mode",
-    "pricing_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "fast_price": {
-     "input": 8.0,
-     "output": 40.0,
-     "cache_read": 0.4
-    },
-    "standard_price": {
-     "input": 4.0,
-     "output": 20.0,
-     "cache_read": 0.2
-    },
-    "method": "Anthropic Claude Code fast mode & API pricing (read 2026-11-10): Claude Opus 5.5 fast mode is $8/$40 per MTok (2x standard $4/$20, cache read $0.20) with up to 2.5x output tokens per second."
+    "status": "unsupported",
+    "price_multiplier": null,
+    "speed_multiplier": null,
+    "source": null
    },
    "price": {
     "value": {
@@ -48453,11 +48411,10 @@
     ]
    },
    "fast_mode": {
-    "status": "missing",
+    "status": "unsupported",
     "price_multiplier": null,
     "speed_multiplier": null,
-    "source": null,
-    "reason": "provider does not publish a fast-mode burn or speed multiplier"
+    "source": null
    },
    "price": {
     "value": {
@@ -48505,15 +48462,7 @@
     },
     "aa_only": false
    },
-   "data_errors": [
-    {
-     "model": "claude-opus-4-8",
-     "field": "fast_mode",
-     "reason": "no_cited_source",
-     "level": "yellow",
-     "effect": "fast mode is not priced or enabled from a policy multiplier on the five-axis path"
-    }
-   ]
+   "data_errors": []
   },
   "grok-4.5": {
    "axes": {
@@ -131005,13 +130954,6 @@
    "reason": "aa_only",
    "level": "yellow",
    "effect": "every axis value comes from Artificial Analysis (the Intelligence Index and AA boards collinear with it): one source, not independent evidence"
-  },
-  {
-   "model": "claude-opus-4-8",
-   "field": "fast_mode",
-   "reason": "no_cited_source",
-   "level": "yellow",
-   "effect": "fast mode is not priced or enabled from a policy multiplier on the five-axis path"
   },
   {
    "model": "qwen3-flash-2025-07-28",
