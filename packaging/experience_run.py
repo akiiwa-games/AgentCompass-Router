@@ -676,6 +676,20 @@ def find_key(document, key):
     return None
 
 
+def compact_exclusions(ranking: list) -> list:
+    """The blocked candidates of a plan's recorded snapshot, in its order, with their reasons as recorded (ledger_snapshot
+    keeps the first reasons of at most SNAPSHOT_EXCLUDED of them and no component score, so a stronger or cheaper blocked
+    candidate is named by model and reason, never by fit or cost)."""
+    out = []
+    for candidate in ranking:
+        if not candidate.get("excluded") and candidate.get("score") is not None:
+            continue
+        bundle = candidate.get("bundle") or {}
+        out.append({"id": candidate.get("id"), "model": bundle.get("model"), "account": bundle.get("account"),
+                    "effort": bundle.get("effort"), "excluded": list(candidate.get("excluded") or [])})
+    return out
+
+
 def compact_ranking(ranking: list) -> list:
     """The eligible candidates of a plan's recorded snapshot (score not None), best first, with the router's own numbers
     copied as recorded: score N, fit, opportunity_cost (the quota cost N subtracts), quota_price, decided_by, the
@@ -902,6 +916,7 @@ class Play:
             "expected_hours": bundle.get("expected_hours"), "router_difficulty": (decision.get("task") or {}).get("difficulty"),
             "decision_reason": decision.get("reason"), "decision_action": decision.get("action"), "ledger_stage": row.get("stage"),
             "ledger_constraint": row.get("constraint"), "ranking": compact_ranking(snap.get("ranking") or []),
+            "excluded": compact_exclusions(snap.get("ranking") or []),
             # How many candidates the plan's ledger row kept, eligible and excluded: the row caps each (ledger_snapshot), so a
             # count at its cap may have cut the rest.
             "snapshot_rows": ({"eligible": sum(1 for c in snap["ranking"] if not c.get("excluded") and c.get("score") is not None),

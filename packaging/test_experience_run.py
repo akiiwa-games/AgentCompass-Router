@@ -129,3 +129,18 @@ def test_a_command_inside_its_limit_answers_as_before(tmp_path):
     done = xp.run_owned([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], cwd=tmp_path, env=dict(os.environ),
                         stdin="answer", timeout=60)
     assert (done.returncode, done.stdout.strip()) == (0, "ANSWER")
+
+
+def test_each_answer_keeps_the_blocked_candidates_of_its_plan_with_their_reasons():
+    """A plan's snapshot holds eligible rows (scored) and blocked rows (reasons, no components): the eligible go to
+    `ranking`, the blocked to `excluded` with model and reasons as recorded, so a reader can say why a stronger or cheaper
+    candidate did not take the work."""
+    snapshot = [
+        {"id": "a", "bundle": {"model": "m1", "account": "x", "effort": "high"}, "score": 0.5, "excluded": [],
+         "components": {"fit": 0.2, "opportunity_cost": 0.1}},
+        {"id": "b", "bundle": {"model": "m2", "account": "y", "effort": "max"}, "score": None,
+         "excluded": ["five_hour is empty for 3.0h", "weekly short"], "components": {}},
+    ]
+    assert [c["id"] for c in xp.compact_ranking(snapshot)] == ["a"]
+    assert xp.compact_exclusions(snapshot) == [
+        {"id": "b", "model": "m2", "account": "y", "effort": "max", "excluded": ["five_hour is empty for 3.0h", "weekly short"]}]
