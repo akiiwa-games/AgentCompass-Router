@@ -2657,3 +2657,128 @@ test('concurrent ensureNotification recovery waits for the winning watcher inste
     fs.rmSync(root, {recursive: true, force: true});
   }
 });
+test('stale .lock.recovery directory is reclaimed by one watcher while a fresh one is respected', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'router-stale-recovery-'));
+  const oldEnv = {ROUTER_STATE_DIR: process.env.ROUTER_STATE_DIR,
+    ROUTER_PASEO_SDK_ROOT: process.env.ROUTER_PASEO_SDK_ROOT, PASEO_HOME: process.env.PASEO_HOME};
+  const pids = new Set();
+  const running = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+  const until = async predicate => {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return;
+      await pause(50);
+    }
+    assert.fail('stale recovery test deadline exceeded');
+  };
+  try {
+    process.env.ROUTER_STATE_DIR = root;
+    const sdk = fakeNotifierSdk(root);
+    fs.writeFileSync(path.join(sdk, '@getpaseo/client/client.cjs'), `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const root = process.env.ROUTER_STATE_DIR;
+      exports.DaemonClient = class {
+        isConnected = false;
+        constructor() {
+          fs.appendFileSync(path.join(root, 'watchers.jsonl'),
+            JSON.stringify({pid: process.pid, argv: process.argv}) + '\\n');
+        }
+        async connect() { this.isConnected = true; }
+        async close() { this.isConnected = false; }
+        async fetchAgent(id) {
+          return {agent: id === 'parent' ? {status: 'running'} :
+            JSON.parse(fs.readFileSync(path.join(root, 'agent.json'), 'utf8'))};
+        }
+        async sendMessage(agent, text, options) {
+          fs.appendFileSync(path.join(root, 'messages.jsonl'), JSON.stringify({agent, text, options}) + '\\n');
+        }
+      };
+    `);
+    process.env.ROUTER_PASEO_SDK_ROOT = sdk;
+    process.env.PASEO_HOME = root;
+    fs.writeFileSync(path.join(root, 'agent.json'), JSON.stringify({status: 'running'}));
+    const dir = path.join(root, 'paseo-notifications');
+    fs.mkdirSync(dir, {recursive: true});
+    const deadPid = 99999991;
+    const seedDead = file => {
+      const id = path.basename(file, '.json');
+      fs.writeFileSync(file, JSON.stringify({dispatch_id: id, parent_id: 'parent', pid: deadPid,
+        status: 'watching', delivered: [], pending: null, created_at: Date.now(), deadline: Date.now() + 60_000,
+        creation_deadline: Date.now() + 60_000}));
+      fs.writeFileSync(`${file}.lock`, String(deadPid));
+      fs.mkdirSync(`${file}.lock.recovery`);
+    };
+
+    // 1. A fresh `.recovery` directory (< LOCK_STEP_LIMIT_MS) is respected: contender defers without removing it.
+    const {spawn: spawnNode} = await import('node:child_process');
+    const afterChildRan = () => new Promise(resolve =>
+      spawnNode(process.execPath, ['-e', 'setTimeout(() => {}, 50)'], {stdio: 'ignore'}).once('close', resolve));
+    const freshFile = path.join(dir, 'fresh-rec.json');
+    seedDead(freshFile);
+    const freshWaiter = ensureNotification({dispatch_id: 'fresh-rec', parent_id: 'parent'});
+    freshWaiter.catch(() => {});
+    await afterChildRan();
+    assert.equal(fs.existsSync(`${freshFile}.lock.recovery`), true);
+    assert.equal(fs.readFileSync(`${freshFile}.lock`, 'utf8').trim(), String(deadPid));
+    fs.writeFileSync(`${freshFile}.lock`, String(process.pid));
+    fs.writeFileSync(freshFile, JSON.stringify({dispatch_id: 'fresh-rec', parent_id: 'parent', pid: process.pid,
+      status: 'watching', delivered: [], pending: null, created_at: Date.now(), deadline: Date.now() + 60_000,
+      creation_deadline: Date.now() + 60_000}));
+    fs.rmdirSync(`${freshFile}.lock.recovery`);
+    const freshReceipt = await freshWaiter;
+    assert.equal(freshReceipt.status, 'watching');
+    assert.equal(freshReceipt.pid, process.pid);
+
+    // 2. A stale `.recovery` directory (>= LOCK_STEP_LIMIT_MS) beside a dead watcher's lock is reclaimed and removed.
+    const staleSec = (Date.now() - 3000) / 1000;
+    const staleFile = path.join(dir, 'stale-rec.json');
+    seedDead(staleFile);
+    fs.utimesSync(`${staleFile}.lock.recovery`, staleSec, staleSec);
+    const single = await ensureNotification({dispatch_id: 'stale-rec', parent_id: 'parent'});
+    pids.add(single.pid);
+    assert.equal(single.status, 'watching');
+    assert.notEqual(single.pid, deadPid);
+    assert.equal(running(single.pid), true);
+    assert.equal(fs.existsSync(`${staleFile}.lock.recovery`), false);
+    assert.equal(Number(fs.readFileSync(`${staleFile}.lock`, 'utf8').trim()), single.pid);
+
+    // 3. Two contenders seeing the same stale `.recovery` directory at once end with exactly one watcher.
+    const twoFile = path.join(dir, 'stale-two.json');
+    seedDead(twoFile);
+    fs.utimesSync(`${twoFile}.lock.recovery`, staleSec, staleSec);
+    const [twoA, twoB] = await Promise.all([
+      ensureNotification({dispatch_id: 'stale-two', parent_id: 'parent'}),
+      ensureNotification({dispatch_id: 'stale-two', parent_id: 'parent'}),
+    ]);
+    pids.add(twoA.pid);
+    pids.add(twoB.pid);
+    assert.equal(twoA.status, 'watching');
+    assert.equal(twoB.status, 'watching');
+    assert.equal(twoA.pid, twoB.pid);
+    assert.notEqual(twoA.pid, deadPid);
+    assert.equal(running(twoA.pid), true);
+    assert.equal(fs.existsSync(`${twoFile}.lock.recovery`), false);
+    const twoWatchers = fs.readFileSync(path.join(root, 'watchers.jsonl'), 'utf8').trim().split('\n')
+      .filter(Boolean).map(line => JSON.parse(line)).filter(e => e.argv.includes('stale-two'));
+    assert.deepEqual(twoWatchers.map(e => e.pid), [twoA.pid]);
+  } finally {
+    const watchersLog = path.join(root, 'watchers.jsonl');
+    if (fs.existsSync(watchersLog)) {
+      for (const line of fs.readFileSync(watchersLog, 'utf8').trim().split('\n').filter(Boolean)) {
+        try { pids.add(JSON.parse(line).pid); } catch {}
+      }
+    }
+    for (const name of ['stale-rec.json', 'stale-two.json']) {
+      const p = path.join(root, 'paseo-notifications', name);
+      if (fs.existsSync(p)) {
+        try { pids.add(JSON.parse(fs.readFileSync(p, 'utf8')).pid); } catch {}
+      }
+    }
+    for (const pid of pids) if (pid !== process.pid && running(pid)) process.kill(pid);
+    for (const name of ['ROUTER_STATE_DIR', 'ROUTER_PASEO_SDK_ROOT', 'PASEO_HOME']) {
+      if (oldEnv[name] === undefined) delete process.env[name]; else process.env[name] = oldEnv[name];
+    }
+    await until(() => [...pids].filter(pid => pid !== process.pid).every(pid => !running(pid)));
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});

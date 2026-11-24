@@ -37,6 +37,9 @@ const RUN_LEASE_MS = 10 * 60 * 1000;
 const WORKSPACE_LOOKUP_MS = 5000;
 // A stopped watcher notices its marker within one poll.
 const WATCHER_STOP_MS = 2 * POLL_MS;
+// Bounds the synchronous step between a contender creating `.lock` or `.lock.recovery` and finishing that step
+// (writing its PID or completing stale-lock reclamation); older leftovers are treated as abandoned.
+const LOCK_STEP_LIMIT_MS = 2000;
 // A provider that keeps retrying one request is stuck only once nothing but its retry notices has happened in the turn
 // for the whole RETRY_STUCK_MS window (and it retried at least RETRY_STUCK_ATTEMPTS times). Fast retries do not shorten
 // the window, and one long retry-after cannot end it early: a minute of provider overload must not stop a working
@@ -1017,19 +1020,80 @@ async function catchUpReason(client, record, input) {
   return recordedEnd(input.ended_as);
 }
 
+function fileAgeMs(target) {
+  try { return Date.now() - fs.statSync(target).mtimeMs; }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function enterRecovery(recovery) {
+  try { fs.mkdirSync(recovery); return true; }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const recoveryAge = fileAgeMs(recovery);
+  if (recoveryAge === null) {
+    try { fs.mkdirSync(recovery); return true; }
+    catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  }
+  if (recoveryAge < LOCK_STEP_LIMIT_MS) return false;
+  // Take over an abandoned `.recovery` directory atomically: contenders seeing the same stale directory race on
+  // `claim-1` (`wx`), so at most one enters lock reclamation while `recovery` stays in place blocking newcomers.
+  for (let slot = 1; ; slot++) {
+    const claim = path.join(recovery, `claim-${slot}`);
+    try {
+      const fd = fs.openSync(claim, 'wx');
+      try { fs.writeFileSync(fd, String(process.pid)); }
+      finally { fs.closeSync(fd); }
+      try {
+        const now = new Date();
+        fs.utimesSync(recovery, now, now);
+      } catch {}
+      return true;
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      if (error.code !== 'EEXIST') throw error;
+      let raw = '';
+      try { raw = retryBusySync(() => fs.readFileSync(claim, 'utf8')).trim(); }
+      catch (readErr) {
+        if (readErr.code === 'ENOENT') return false;
+        throw readErr;
+      }
+      const holder = raw ? Number(raw) : 0;
+      if (alive(holder)) return false;
+      if (!raw) {
+        const claimAge = fileAgeMs(claim);
+        if (claimAge === null || claimAge < LOCK_STEP_LIMIT_MS) return false;
+      }
+    }
+  }
+}
+
+function leaveRecovery(recovery) {
+  let names;
+  try { names = retryBusySync(() => fs.readdirSync(recovery)); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  for (const name of names) {
+    try { retryBusySync(() => fs.unlinkSync(path.join(recovery, name))); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  try { retryBusySync(() => fs.rmdirSync(recovery)); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
 async function watch(dispatchId, parentId, agentId, createDeadline) {
   const file = notificationFile(dispatchId), lock = `${file}.lock`;
   fs.mkdirSync(path.dirname(file), {recursive: true});
   let lockFd;
-  try { lockFd = fs.openSync(lock, 'wx'); }
-  catch (error) {
+  try {
+    lockFd = fs.openSync(lock, 'wx');
+    fs.writeFileSync(lockFd, String(process.pid));
+  } catch (error) {
     if (error.code !== 'EEXIST') throw error;
     // Serialize stale-lock reclamation too: two concurrent observers must not
     // unlink a new watcher's lock after both saw the same dead predecessor.
     const recovery = `${lock}.recovery`;
-    try { fs.mkdirSync(recovery); }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+    if (!enterRecovery(recovery)) {
       // Another starter is reclaiming `lock` right now; `ensureNotification` waits for the published ready receipt.
       process.send?.({ready: true}); return;
     }
@@ -1038,9 +1102,8 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
       const owner = raw ? Number(raw) : 0;
       if (alive(owner)) {process.send?.({ready: true}); return;}
       if (!raw && fs.existsSync(lock)) {
-        let ageMs = Infinity;
-        try { ageMs = Date.now() - fs.statSync(lock).mtimeMs; } catch {}
-        if (ageMs < 2000) {process.send?.({ready: true}); return;}
+        const lockAge = fileAgeMs(lock);
+        if (lockAge !== null && lockAge < LOCK_STEP_LIMIT_MS) {process.send?.({ready: true}); return;}
       }
       if (fs.existsSync(lock)) retryBusySync(() => fs.unlinkSync(lock));
       try { lockFd = fs.openSync(lock, 'wx'); }
@@ -1048,9 +1111,9 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
         if (inner.code !== 'EEXIST') throw inner;
         process.send?.({ready: true}); return;
       }
-    } finally { fs.rmdirSync(recovery); }
+      fs.writeFileSync(lockFd, String(process.pid));
+    } finally { leaveRecovery(recovery); }
   }
-  fs.writeFileSync(lockFd, String(process.pid));
   let client;
   let record;
   try {
