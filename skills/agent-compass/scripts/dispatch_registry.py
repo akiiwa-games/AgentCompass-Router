@@ -140,10 +140,13 @@ class RouteFactRefused(Refused):
     protection, cooldown, latch, missing credentials / sign-in, `cwd_regex`, or unreadable live model list), rather than
     an invalid flag or input. Carries `start_after_hours`, `retry_at` and `waiting_on` when every refusing quota window
     has an observed reset or, latched, a known end (`allocator.refusal_schedule`); `waiting_end` names a latch's end
-    (`quota_pools.latched_end_kind`), which a re-probe time never calls a reset."""
+    (`quota_pools.latched_end_kind`), which a re-probe time never calls a reset. `recorded`: refused at the re-check
+    before launch (`prepare`), after the route's record was written."""
 
-    def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None, waiting_end=None):
+    def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None, waiting_end=None,
+                 recorded=False):
         super().__init__(cause)
+        self.recorded = bool(recorded)
         self.cause = str(cause)
         self.user_named = bool(user_named)
         self.start_after_hours = start_after_hours
@@ -156,13 +159,16 @@ class RouteFactRefused(Refused):
         if self.start_after_hours is not None and self.retry_at:
             when_reset = (f', {self.waiting_on}: {self.waiting_end}' if self.waiting_on and self.waiting_end else
                           f', when {self.waiting_on} resets' if self.waiting_on else '')
-            return (f'Nothing was recorded or launched: {who} cannot start ({self.cause}); it can start in '
+            return (f'{self.nothing()}: {who} cannot start ({self.cause}); it can start in '
                     f'{self.start_after_hours}h (at {self.retry_at}{when_reset}). Tell the user why and when it can '
                     'start; the user may wait until then, name another route, or let the router choose (roll without '
                     '--provider, --account, --model, --effort, or --basis).')
-        return (f'Nothing was recorded or launched: {who} cannot start ({self.cause}). Tell the user why; the user '
+        return (f'{self.nothing()}: {who} cannot start ({self.cause}). Tell the user why; the user '
                 'may name another route, or let the router choose (roll without --provider, --account, --model, '
                 '--effort, or --basis).')
+
+    def nothing(self):
+        return 'Nothing was launched' if self.recorded else 'Nothing was recorded or launched'
 
     def answer(self, base=None, *, for_roll=False):
         out = dict(base or {}, status='blocked', caller_action='tell_user', cause=self.cause,
@@ -176,7 +182,7 @@ class RouteFactRefused(Refused):
         return out
 
 
-def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records):
+def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records, recorded=False):
     """The fact refusal of a recorded route that a window it draws stops whatever the task's size (an account
     protection of `check_launch_quota`: its launch floors, an unavailable account; `quota_pools.launch_blockers`: a
     latch, a window used up in this cycle), with `allocator.refusal_schedule`'s time when every such window has an
@@ -192,7 +198,7 @@ def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records):
     except LaunchFloorRefused as exc:
         floors = list(exc.floors)
     except Refused as exc:
-        return RouteFactRefused(str(exc), user_named=user_named)
+        return RouteFactRefused(str(exc), user_named=user_named, recorded=recorded)
     acc_usage = (usage.get('accounts') or {}).get(account) or {}
     blockers = []
     read = None
@@ -222,7 +228,8 @@ def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records):
     latched = waiting_on is not None and waiting_on in quota_pools.latched_windows(accounts, account)
     return RouteFactRefused('; '.join(reasons[wid] for wid in ordered_wids), user_named=user_named,
                             start_after_hours=start_after_hours, retry_at=retry_at, waiting_on=waiting_on,
-                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None)
+                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None,
+                            recorded=recorded)
 
 
 def plan_row_holds(candidate, named):
@@ -251,7 +258,7 @@ def hold_cause(candidate, exclusions, waits):
     return '; '.join([*exclusions, *(reasons[w] for w in sorted(waits, key=lambda w: -hours[w]))])
 
 
-def named_route_refusal(candidate, exclusions, waits, accounts, now, *, user_named):
+def named_route_refusal(candidate, exclusions, waits, accounts, now, *, user_named, recorded=False):
     """The fact refusal of a route the user named whose own plan row cannot start now (`plan_row_holds`): the row's
     words for each window and its state and, when only waits hold it, the row's own time (its binding wait, the time an
     automatic plan of the same reading defers to). An exclusion has no time, so a refusal with one carries none. One
@@ -260,14 +267,15 @@ def named_route_refusal(candidate, exclusions, waits, accounts, now, *, user_nam
     import quota_pools
     cause = hold_cause(candidate, exclusions, waits)
     if exclusions:
-        return RouteFactRefused(cause, user_named=user_named)
+        return RouteFactRefused(cause, user_named=user_named, recorded=recorded)
     waiting_on = max(waits, key=lambda w: candidate['waits'][w])
     hours = candidate['waits'][waiting_on]
     account = candidate['bundle']['account']
     latched = waiting_on in quota_pools.latched_windows(accounts, account)
     return RouteFactRefused(cause, user_named=user_named, start_after_hours=allocator.advised_hours(hours),
                             retry_at=(now + timedelta(hours=hours)).isoformat(), waiting_on=waiting_on,
-                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None)
+                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None,
+                            recorded=recorded)
 
 
 def plan_row(alloc_task, bundle, usage, now, accounts, records, route, named):
@@ -1977,7 +1985,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
         if user_named:
             # A route the user named is held by the facts its record checked, with the same words and time.
             refused = launch_fact_refusal(bundle, accounts, usage, now, user_named=True,
-                                          records=lambda: active_records(connection, now))
+                                          records=lambda: active_records(connection, now), recorded=True)
             if refused:
                 raise refused
         else:
@@ -2043,7 +2051,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                                       {wid: s for wid, s in short.items() if s.get('text') in exclusions})
         if user_named and (exclusions or waits):
             # A route the user named held by a fact: the refusal its record gives for the same reading.
-            raise named_route_refusal(candidate, exclusions, waits, accounts, now, user_named=True)
+            raise named_route_refusal(candidate, exclusions, waits, accounts, now, user_named=True, recorded=True)
         if exclusions or (resume_bundle is None and waits):
             raise CapacityChanged('Capacity/availability changed: '
                                   + hold_cause(candidate, exclusions, waits if resume_bundle is None else []))

@@ -273,7 +273,9 @@ def record_constraint(args, task=None, classified=None):
         quota_bundle['id'] = chosen
         quota_bundle.setdefault('bundle_id', chosen)
     _check_record_launch(args, pin, quota_bundle, accounts, usage, now)
-    if user_named and classified and chosen:
+    if user_named and classified and chosen and (isinstance(classified['task'].get('profile'), dict)
+                                                 or classified.get('unclassified')):
+        # A preview (`--dry-run`) classifies nothing: with no profile and no --hours there is no plan to read.
         _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, bool(getattr(args, 'fast', False)))
     unobserved = quota_unobserved(accounts, usage, quota_bundle)
     # A model the user names on a held account or model is the probe that can lift the hold: it goes, with a warning.
@@ -546,9 +548,9 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
 
 
 def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast):
-    """Refuse a route the user named that its own plan row holds (dispatch_registry.named_route_refusal): the task
-    planned as `prepare` plans it before launch (pinned, past what only automatic routing is held to and past the
-    full-capacity rule), so the record and the re-check before launch give one refusal for one reading."""
+    """Refuse a route the user named that a quota wait of its own plan row holds (dispatch_registry.named_route_refusal):
+    the task planned as `prepare` plans it before launch (pinned, past what only automatic routing is held to and past
+    the full-capacity rule), so the record and the re-check before launch give one refusal for one reading."""
     plan_task = {**classified['task'], **({'parent_agent_id': task['parent_agent_id']} if task.get('parent_agent_id') else {})}
     route = {**({'unclassified': classified['unclassified']} if classified.get('unclassified') else {}),
              'user_named_bundle': quota_bundle['bundle_id'], 'pinned_bundle': quota_bundle['bundle_id']}
@@ -564,7 +566,9 @@ def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, 
     if row is None:
         return      # nothing of it ranked: the re-check before launch answers it (no longer matches)
     exclusions, waits = dispatch_registry.plan_row_holds(row, True)
-    if exclusions or waits:
+    if waits and not exclusions:
+        # A quota wait of this work: the refusal with the row's time. The row's exclusions are what the launch facts
+        # above do not count (a stale reading among them); a launch through `prepare` is refused on them there.
         raise dispatch_registry.named_route_refusal(row, exclusions, waits, accounts, now, user_named=True)
 
 

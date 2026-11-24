@@ -679,8 +679,8 @@ def evaluate_bundle(bundle, task, ctx):
                         # A pool's wait is its next partial refill that holds the work (quota_pools.after_reset).
                         wait = renewed['deferred_hours']
                         available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
-                        wait_reasons[wid] = f'{wid} {what} for {wait:.1f}h; start after its reset' + refill_note(renewed)
-                        result['notes'].append(wait_reasons[wid])
+                        result['notes'].append(f'{wid} {what} for {wait:.1f}h; start after its reset' + refill_note(renewed))
+                        wait_reasons[wid] = result['notes'][-1]
                         renewed['unstarted'] = True
                         five_window_states[wid] = (wspec, renewed, cap_usd_w, unit)
                     elif not pool:
@@ -808,9 +808,11 @@ def evaluate_bundle(bundle, task, ctx):
                     available_at, waiting_on = binding_wait(available_at, waiting_on, renewed['deferred_hours'], CADENCE,
                                                            waits)
                     result['_five_long_wait'] = True
-                    wait_reasons[CADENCE] = (f'cadence frees {renewed["remaining"] * cap_count / 100.0:g} of {cap_count:g} '
-                                             f'dispatches in {renewed["deferred_hours"]:.1f}h; start then')
-                    result['notes'].append(wait_reasons[CADENCE])
+                    result['notes'].append(
+                        f'cadence frees {renewed["remaining"] * cap_count / 100.0:g} of {cap_count:g} dispatches in '
+                        f'{renewed["deferred_hours"]:.1f}h; start then'
+                    )
+                    wait_reasons[CADENCE] = result['notes'][-1]
         if spec.get('unmetered') and not spec.get('unlimited'):
             result.setdefault('_five_axis_windows', []).append('cadence')
             five_window_states['cadence'] = (wspec, state, cap_count, None)

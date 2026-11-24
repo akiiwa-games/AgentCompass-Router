@@ -1024,6 +1024,8 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
                     self.assertEqual((code_p, ans_p['status'], ans_p.get('caller_action')), (2, 'blocked', 'tell_user'),
                                      ans_p)
                     self.assertEqual((ans_p['cause'], ans_p['start_after_hours']), (ans['cause'], ans['start_after_hours']))
+                    self.assertTrue(ans_p['next_action'].startswith('Nothing was launched:'), ans_p['next_action'])
+                    self.assertTrue(ans['next_action'].startswith('Nothing was recorded or launched:'), ans['next_action'])
                 at_record, at_prepare = self.named_refusal_at_record_and_prepare(decision, task, args)
                 self.assertEqual(at_record.cause, at_prepare.cause)
                 self.assertEqual((at_record.start_after_hours, at_record.waiting_on),
