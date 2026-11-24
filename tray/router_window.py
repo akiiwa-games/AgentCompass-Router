@@ -647,8 +647,16 @@ class Panel(ScoringPage, QuotaPage, PolicyPage, ModelsTab, StrategyTab, SystemTa
     def attach_tooltip(self, widget, bind=True):
         def hide(_event=None):
             tip = getattr(widget, "_tooltip_window", None)
-            if tip is not None and tip.winfo_exists():
+            widget._tooltip_window = None
+            if tip is None:
+                return
+            try:
                 tip.destroy()
+            except self.tk.TclError:
+                pass  # the application is closing and took the window with it
+        # A hover text lives no longer than its widget. A list rebuilt or a menu closed under the pointer destroys
+        # the widget without a <Leave>, and the text (a topmost window of the root) would stay on screen for good.
+        widget.bind("<Destroy>", hide, add="+")
         def show(event):
             hide()
             if not getattr(widget, "_tooltip_text", ""):

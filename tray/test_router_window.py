@@ -1794,5 +1794,51 @@ class RotationThresholdEndToEndTests(unittest.TestCase):
                     self.assertEqual(panel.worker_table.heading("bar", "text"), "% of 1.5M cap")
 
 
+class TooltipLifetimeTests(unittest.TestCase):
+    """A hover text lives no longer than its widget (router_window.Panel.attach_tooltip)."""
+
+    def setUp(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import router_window
+        import tk_test_support
+        self.tk = tk
+        self.root = tk_test_support.shared_tk_root(self)
+        self.root.withdraw()
+        owner = SimpleNamespace(tk=tk, ttk=ttk, root=self.root)
+        self.attach = lambda widget, **kw: router_window.Panel.attach_tooltip(owner, widget, **kw)
+        self.holder = tk.Frame(self.root)
+        self.addCleanup(self.holder.destroy)
+        self.pointer = SimpleNamespace(x_root=10, y_root=10)
+
+    def hovered(self, parent):
+        label = self.tk.Label(parent, text="model")
+        label._tooltip_text = "hover"
+        show, hide = self.attach(label, bind=False)
+        show(self.pointer)
+        tip = label._tooltip_window
+        self.assertTrue(tip.winfo_exists())
+        return label, tip, hide
+
+    def test_a_widget_destroyed_under_the_pointer_takes_its_hover_text_with_it(self):
+        # A rebuilt list destroys the row without a <Leave>; the text is a topmost window of the root, not of the row.
+        label, tip, _ = self.hovered(self.holder)
+        label.destroy()
+        self.assertFalse(tip.winfo_exists())
+
+    def test_a_closed_container_takes_the_hover_texts_of_its_rows_with_it(self):
+        menu = self.tk.Frame(self.holder)
+        _, tip, _ = self.hovered(menu)
+        menu.destroy()
+        self.assertFalse(tip.winfo_exists())
+
+    def test_leaving_hides_the_text_and_a_second_show_leaves_one_window(self):
+        label, first, hide = self.hovered(self.holder)
+        hide()
+        self.assertFalse(first.winfo_exists())
+        self.assertIsNone(label._tooltip_window)
+        hide()   # nothing shown: nothing to do
+
+
 if __name__ == "__main__":
     unittest.main()
