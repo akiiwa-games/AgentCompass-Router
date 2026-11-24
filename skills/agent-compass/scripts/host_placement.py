@@ -93,8 +93,8 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
             '(no unique session marker among CLAUDE_CODE_SESSION_ID/CLAUDECODE, CODEX_THREAD_ID/CODEX_SESSION_ID, '
             'ANTIGRAVITY_CONVERSATION_ID, ORCA_AGENT_SESSION_ID, T3_MCP_URL+T3_MCP_BEARER_TOKEN)'
         )
-    decl = account_fleet.NATIVE_HOST_TOOLS.get(caller_host) or {}
-    tool = decl.get('tool')
+    decl = account_fleet.NATIVE_HOST_TOOLS[caller_host]
+    tool = decl['tool']
     if not tool:
         return None, f'caller host {caller_host!r} has no native sub-agent tool'
     if not isinstance(bundle, dict) or not (bundle.get('model') or bundle.get('launch_model')):
@@ -110,16 +110,16 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
     if effort and harness in account_fleet.EFFORT_IN_MODEL:
         effort = None
 
-    if decl.get('account_scope') == 'own_session':
-        if harness != decl.get('harness'):
-            return None, f"{tool} runs only on harness {decl.get('harness')!r}, not {harness!r} ({bundle.get('provider')!r})"
+    if decl['account_scope'] == 'own_session':
+        if harness != decl['harness']:
+            return None, f"{tool} runs only on harness {decl['harness']!r}, not {harness!r} ({bundle.get('provider')!r})"
         inventory = (accounts or {}).get('_discovery') or {}
         own_account = provider_inventory.session_account(decl['session_family'], inventory, environ=env)
         if not own_account:
             return None, f"{tool} requires the calling session's {decl['session_family']!r} account to be uniquely discovered"
         if account != own_account:
             return None, f"{tool} runs only on the caller's own account {own_account!r}, not {account!r}"
-        mode = decl.get('model_mode')
+        mode = decl['model_mode']
         if mode == 'caller_own_line':
             if env_override := _claude_alias_env_override(env, effort):
                 return None, f'{tool} alias cannot guarantee routed {wire_model!r}: {env_override}'
@@ -131,7 +131,7 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
                 )
             families = model_resolution.family_patterns(accounts)
             hit = model_resolution.family_row(wire_model, families)
-            known_lines = decl.get('known_lines') or ()
+            known_lines = decl['known_lines']
             line = hit.get('line') if isinstance(hit, dict) else None
             if line not in known_lines:
                 return None, f'{tool} has no model line alias for {wire_model!r}'
@@ -143,7 +143,7 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
                     f'login kinds only when the caller already runs that row, not {given!r} ({parent_rk})'
                 )
             fields = {decl['model_field']: line}
-            if decl.get('effort_field') and effort:
+            if decl['effort_field'] and effort:
                 fields[decl['effort_field']] = effort
             return {'host': caller_host, 'tool': tool, 'launch_fields': fields}, ''
         if mode == 'caller_own_model':
@@ -156,7 +156,9 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
             if given != wire_model and account_fleet.row_key(given, accounts) != account_fleet.row_key(wire_model, accounts):
                 return None, f"{tool} Model='inherit' runs caller model {given!r}, not routed {wire_model!r}"
             return {'host': caller_host, 'tool': tool, 'launch_fields': {decl['model_field']: 'inherit'}, 'hook_model': wire_model}, ''
-        if decl.get('effort_field') and not effort:
+        if mode != 'wire_id':
+            raise ValueError(f'unknown model_mode {mode!r} for {caller_host!r}')
+        if decl['effort_field'] and not effort:
             return None, f"{tool} requires an explicit {decl['effort_field']} so caller config cannot override it"
         acct_row = ((inventory.get('accounts') or {}).get(own_account)) or {}
         if isinstance(acct_row, dict) and acct_row.get('home'):
@@ -172,29 +174,29 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
                     if isinstance(default_role, dict) and default_role.get('config_file'):
                         return None, f'{tool} default role in {cfg_path} sets config_file and can override requested model/effort'
         fields = {decl['model_field']: _codex_wire_model(bundle)}
-        if decl.get('effort_field') and effort:
+        if decl['effort_field'] and effort:
             fields[decl['effort_field']] = effort
         return {'host': caller_host, 'tool': tool, 'launch_fields': fields}, ''
 
     if caller_host == 'orca':
         if harness not in decl['harnesses']:
             return None, f"Orca worker-start supports harnesses {decl['harnesses']}, not {harness!r}"
-        if effort and harness in (decl.get('effort_unsupported_harnesses') or ()):
+        if effort and harness in decl['effort_unsupported_harnesses']:
             return None, f'Orca worker-start does not support --effort for harness {harness!r}'
         fam = account_fleet.harness_family(harness)
         if acct_refusal := _orchestrator_account_refusal('Orca worker-start', fam, account, accounts, env):
             return None, acct_refusal
-        agent_name = decl['agent_names'].get(harness, harness)
+        agent_name = decl['agent_names'][harness]
         fields = {decl['agent_field']: agent_name, decl['model_field']: wire_model}
         if effort:
             fields[decl['effort_field']] = effort
         return {'host': 'orca', 'tool': tool, 'launch_fields': fields}, ''
 
     if caller_host == 't3':
-        driver = (decl.get('drivers') or {}).get(harness)
+        driver = decl['drivers'].get(harness)
         if not driver:
             return None, f"T3 delegate_task has no built-in driverKind for harness {harness!r}"
-        opt_id = (decl.get('option_effort_ids') or {}).get(harness)
+        opt_id = decl['option_effort_ids'].get(harness)
         if effort and not opt_id:
             return None, f'T3 delegate_task has no verified effort option for harness {harness!r}'
         fam = account_fleet.harness_family(harness)
@@ -281,7 +283,7 @@ def validate_workspace(raw_dir):
 def claude_agent_effort_note():
     """Single owner for the Claude Code `Agent` per-invocation `effort` version requirement and loop-free exit."""
     import account_fleet
-    min_ver = (account_fleet.NATIVE_HOST_TOOLS.get('claude') or {}).get('effort_min_version', 'v2.1.292')
+    min_ver = account_fleet.NATIVE_HOST_TOOLS['claude']['effort_min_version']
     return (
         f'Per-invocation `effort` on `Agent` requires Claude Code {min_ver}+; on an older version whose `Agent` '
         'schema lacks `effort`, do not omit `effort`—re-run `roll` without `--parent-host native` and without '

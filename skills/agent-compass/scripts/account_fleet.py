@@ -710,7 +710,14 @@ NATIVE_HOST_TOOLS = {
         'tool': 'shell:orca worker launch',
         'account_scope': 'single_default_account',
         'harnesses': ('claude', 'codex', 'antigravity-resilient', 'pi', 'opencode', 'grok'),
-        'agent_names': {'antigravity-resilient': 'antigravity'},
+        'agent_names': {
+            'claude': 'claude',
+            'codex': 'codex',
+            'antigravity-resilient': 'antigravity',
+            'pi': 'pi',
+            'opencode': 'opencode',
+            'grok': 'grok',
+        },
         'effort_unsupported_harnesses': ('opencode',),
         'model_mode': 'wire_id',
         'agent_field': '--agent',
@@ -792,7 +799,7 @@ def harness_family(harness):
 
 def t3_driver_family(driver_kind):
     """Map a T3 `target.driverKind` (`claudeAgent`, `antigravity`, ...) back to its provider family via `NATIVE_HOST_TOOLS`."""
-    drivers = (NATIVE_HOST_TOOLS.get('t3') or {}).get('drivers') or {}
+    drivers = NATIVE_HOST_TOOLS['t3']['drivers']
     reverse = {v: harness_family(k) for k, v in drivers.items()}
     return reverse.get(driver_kind, driver_kind)
 

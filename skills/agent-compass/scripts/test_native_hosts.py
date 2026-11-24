@@ -318,15 +318,32 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         self.assertIsNone(wc.caller_native_host('native', {'CLAUDE_CODE_SESSION_ID': 'c1', 'CODEX_THREAD_ID': 'x1'}))
 
     def test_declared_native_tools_cite_vendor_sources_and_link_to_harness_capabilities(self):
+        import host_placement
         tools = self.account_fleet.NATIVE_HOST_TOOLS
         self.assertEqual(set(tools), {'claude', 'codex', 'antigravity-resilient', 'orca', 't3', 'pi', 'opencode', 'herdr'})
         for host, decl in tools.items():
-            self.assertTrue(decl.get('as_of'), host)
-            self.assertTrue(decl.get('sources') and all(s.startswith('https://') for s in decl['sources']), host)
+            self.assertTrue(decl['as_of'], host)
+            self.assertTrue(decl['sources'] and all(s.startswith('https://') for s in decl['sources']), host)
         for harness in ('claude', 'codex', 'antigravity-resilient', 'pi', 'opencode'):
             self.assertIs(self.account_fleet.HARNESS_CAPABILITIES[harness]['native_tool'], tools[harness])
         for no_subagent in ('pi', 'opencode', 'herdr'):
             self.assertIsNone(tools[no_subagent]['tool'])
+        self.assertEqual(set(tools['orca']['agent_names']), set(tools['orca']['harnesses']))
+        # Readers index declared keys directly without silent literal fallbacks (N2):
+        with patch.dict(tools['claude'], {'effort_min_version': 'v9.9.9'}):
+            self.assertIn('v9.9.9+', host_placement.claude_agent_effort_note())
+        saved_ver = tools['claude'].pop('effort_min_version')
+        try:
+            with self.assertRaises(KeyError):
+                host_placement.claude_agent_effort_note()
+        finally:
+            tools['claude']['effort_min_version'] = saved_ver
+        saved_drivers = tools['t3'].pop('drivers')
+        try:
+            with self.assertRaises(KeyError):
+                self.account_fleet.t3_driver_family('claudeAgent')
+        finally:
+            tools['t3']['drivers'] = saved_drivers
 
     def test_native_answer_carries_declared_launch_fields_and_passes_gate_follow_through(self):
         from pathlib import Path
