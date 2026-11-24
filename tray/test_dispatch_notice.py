@@ -31,6 +31,7 @@ import account_fleet
 import dispatch_fallback
 import dispatch_flow
 import dispatch_registry as registry
+import override_store
 import provider_inventory
 import provider_retry
 import usage_reading
@@ -80,34 +81,64 @@ FAKE_SDK_CLIENT = r"""
 const fs = require('node:fs');
 const path = require('node:path');
 
+const BUSY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+const realDateNow = Date.now.bind(Date);
+
+function retryBusy(fn, attempts = 5, pauseMs = 20) {
+  for (let attempt = 0; attempt < attempts - 1; attempt++) {
+    try { return fn(); }
+    catch (error) {
+      if (!BUSY_CODES.has(error?.code)) throw error;
+      Atomics.wait(SLEEP_CELL, 0, 0, pauseMs);
+    }
+  }
+  return fn();
+}
+
 function statePath() {
   return path.join(process.env.ROUTER_STATE_DIR, 'fake-paseo-host.json');
 }
 
 function readState() {
   try {
-    return JSON.parse(fs.readFileSync(statePath(), 'utf8'));
-  } catch {
-    return {};
+    return JSON.parse(retryBusy(() => fs.readFileSync(statePath(), 'utf8')));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return {};
+    throw error;
   }
 }
+
+Date.now = () => {
+  try {
+    const clockMs = readState().clock_ms;
+    if (typeof clockMs === 'number' && Number.isFinite(clockMs)) return clockMs;
+  } catch {}
+  return realDateNow();
+};
 
 function writeState(state) {
   const target = statePath();
   const tmp = `${target}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state));
-  fs.renameSync(tmp, target);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    retryBusy(() => fs.renameSync(tmp, target));
+  } finally {
+    if (fs.existsSync(tmp)) {
+      try { fs.rmSync(tmp, {force: true}); } catch {}
+    }
+  }
 }
 
 function appendJsonl(name, entry) {
   const target = path.join(process.env.ROUTER_STATE_DIR, name);
-  fs.appendFileSync(target, JSON.stringify(entry) + '\n');
+  retryBusy(() => fs.appendFileSync(target, JSON.stringify(entry) + '\n'));
 }
 
 function deliveredIds() {
   const target = path.join(process.env.ROUTER_STATE_DIR, 'messages.jsonl');
   if (!fs.existsSync(target)) return new Set();
-  const lines = fs.readFileSync(target, 'utf8').trim().split('\n').filter(Boolean);
+  const lines = retryBusy(() => fs.readFileSync(target, 'utf8')).trim().split('\n').filter(Boolean);
   const ids = new Set();
   for (const line of lines) {
     try {
@@ -129,6 +160,9 @@ exports.DaemonClient = class {
   }
   async fetchAgent(id) {
     const state = readState();
+    if (process.argv.includes('--watch')) {
+      appendJsonl('watch_polls.jsonl', {pid: process.pid, id, at: Date.now()});
+    }
     if (Array.isArray(state.delay_fetch_ids) && state.delay_fetch_ids.includes(id) && !process.argv.includes('--watch')) {
       appendJsonl('slow_bridge.jsonl', {pid: process.pid, id, at: Date.now()});
       await new Promise(resolve => setTimeout(resolve, state.delay_fetch_ms || 6000));
@@ -1520,7 +1554,7 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
         target = self.state_dir / "fake-paseo-host.json"
         tmp = target.with_suffix(".tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(target)
+        override_store.retry_denied(lambda: tmp.replace(target))
 
     def write_dead_watcher_receipt(
         self,
@@ -1893,10 +1927,12 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
         self.assertTrue(dispatch_fallback.enabled())
         retry_store = self.state_dir / provider_retry.FILE
         with mock.patch.dict(os.environ, {"ROUTER_PROVIDER_RETRY": str(retry_store)}):
-            now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+            retry_due_dt = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=1)
             backoff_s = int(provider_retry.retry_seconds(1))
-            launched_dt = now_utc - timedelta(seconds=backoff_s + 15)
-            failed_dt = now_utc - timedelta(seconds=backoff_s - 4)  # retry_at ~4 s in the future
+            failed_dt = retry_due_dt - timedelta(seconds=backoff_s)
+            launched_dt = failed_dt - timedelta(seconds=15)
+            before_retry_dt = retry_due_dt - timedelta(seconds=60)
+            before_retry_ms = int(before_retry_dt.timestamp() * 1000)
             first_row = self.seed_routed_started_dispatch(
                 "t-sched-retry",
                 "w-sched-1",
@@ -1930,21 +1966,39 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
                 "labels": first_row["request"]["labels"],
                 "updatedAt": failed_dt.isoformat(),
             }
-            self.write_host_state({"parent_id": "parent-1", "agents": {"w-sched-1": failed_agent}, "timelines": {}})
-            # Settle attempt 1 (`provider_turn_failed`) and schedule its transient retry; `handle` starts `--watch`,
-            # which we then terminate mid-wait to simulate a tray restart killing the watcher during backoff.
+            self.write_host_state(
+                {
+                    "parent_id": "parent-1",
+                    "clock_ms": before_retry_ms,
+                    "agents": {"w-sched-1": failed_agent},
+                    "timelines": {},
+                }
+            )
+            # Settle attempt 1 (`provider_turn_failed`) and schedule its transient retry at `retry_due_dt` while the
+            # clock is set to `before_retry_dt`; terminate `--watch` (and any child step it started) to simulate a tray
+            # restart killing the watcher mid-backoff.
             receipt_path = self.write_dead_watcher_receipt(first_id, agent_id="w-sched-1")
             registry.observe(first_id, failed_agent, now=failed_dt, path=self.db_path, terminal=terminal)
-            scheduled = dispatch_fallback.handle(first_id)
+            with mock.patch.object(registry, "utcnow", return_value=before_retry_dt):
+                scheduled = dispatch_fallback.handle(first_id)
             self.assertEqual(scheduled["action"], "scheduled")
             retry_at_iso = scheduled["retry_at"]
+            self.assertEqual(registry.parse(retry_at_iso), retry_due_dt)
             saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             initial_watcher_pid = saved_receipt["pid"]
             hermetic_run._started.add(initial_watcher_pid)
             try:
                 proc_obj = psutil.Process(initial_watcher_pid)
+                children = proc_obj.children(recursive=True)
+                for child in children:
+                    hermetic_run._started.add(child.pid)
                 proc_obj.terminate()
-                proc_obj.wait(timeout=5)
+                for child in children:
+                    try:
+                        child.terminate()
+                    except psutil.Error:
+                        pass
+                psutil.wait_procs([proc_obj, *children], timeout=5)
             except psutil.Error:
                 pass
             self.assertFalse(psutil.pid_exists(initial_watcher_pid))
@@ -1953,19 +2007,22 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
                 started=True,
                 status="watching",
                 terminal=terminal,
-                fallback={"status": "scheduled", "at": datetime.now(timezone.utc).isoformat(), "retry_at": retry_at_iso},
+                fallback={"status": "scheduled", "at": before_retry_dt.isoformat(), "retry_at": retry_at_iso},
             )
             receipt_path.write_text(json.dumps(saved_receipt), encoding="utf-8")
+            (receipt_path.parent / f"{first_id}.json.lock").write_text(str(initial_watcher_pid), encoding="utf-8")
 
             # `needs_reader` holds the notice side (`needed: False`), while the tray gate catches the dead watcher on the
             # guard-active chain (`registry.fallback_guard` + `registry.current_attempt`).
-            needs = registry.needs_reader(path=self.db_path)
+            needs = registry.needs_reader(path=self.db_path, now=before_retry_dt)
             self.assertFalse(needs["needed"], needs)
             self.assertEqual((needs["due"], needs["observe"]), ([], []))
-            self.assertTrue(registry.fallback_guard(registry.inspect(first_id, self.db_path), registry.utcnow()))
-            self.assertTrue(services.dispatch_notice_needed())
+            self.assertTrue(registry.fallback_guard(registry.inspect(first_id, self.db_path), before_retry_dt))
+            self.assertTrue(services.dispatch_notice_needed(now=before_retry_dt))
 
             # 1. Pass runs `reconcile`, observes `first_id` via `failed_attempts`, and restarts `--watch <first_id>`.
+            #    With the clock held at `before_retry_dt` (< `retry_at`), the restarted watcher polls `w-sched-1`, keeps
+            #    `scheduled`, launches no retry worker, and sends no notice.
             self.run_pass_and_wait(force=True)
             log_text = (self.state_dir / "dispatch-notice.log").read_text(encoding="utf-8")
             reconcile_out = json.loads(log_text)
@@ -1973,16 +2030,27 @@ class DispatchNoticeIntegrationTests(unittest.TestCase):
             restarted_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             restarted_pid = restarted_receipt["pid"]
             hermetic_run._started.add(restarted_pid)
+            self.wait_until(
+                lambda: any(
+                    p.get("pid") == restarted_pid and p.get("id") == "w-sched-1"
+                    for p in self.read_jsonl("watch_polls.jsonl")
+                )
+            )
+            restarted_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertNotEqual(restarted_pid, initial_watcher_pid)
             self.assertEqual(restarted_receipt["status"], "watching")
             self.assertEqual((restarted_receipt.get("fallback") or {}).get("status"), "scheduled")
             self.assertTrue(psutil.pid_exists(restarted_pid))
             self.assertEqual(self.read_jsonl("messages.jsonl"), [])
-            if datetime.now(timezone.utc) < registry.parse(retry_at_iso) - timedelta(seconds=1):
-                self.assertEqual(self.read_jsonl("created_agents.jsonl"), [])
-                self.assertFalse(services.dispatch_notice_needed())
+            self.assertEqual(self.read_jsonl("created_agents.jsonl"), [])
+            self.assertFalse(services.dispatch_notice_needed(now=before_retry_dt))
 
-            # 2. At `retry_at`, the restarted watcher runs `fallback`, launches the same-bundle retry, and exits quietly.
+            # 2. Advance the clock past `retry_at`: the restarted watcher runs `fallback`, launches the same-bundle retry,
+            #    and exits quietly.
+            due_host_state = json.loads((self.state_dir / "fake-paseo-host.json").read_text(encoding="utf-8"))
+            due_host_state.pop("clock_ms", None)
+            self.write_host_state(due_host_state)
+
             def created_without_early_error():
                 early = self.read_jsonl("messages.jsonl")
                 if early:

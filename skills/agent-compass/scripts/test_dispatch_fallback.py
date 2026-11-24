@@ -1125,6 +1125,31 @@ class FallbackTests(unittest.TestCase):
         self.host.end(root['dispatch_id'], 'error', terminal={'reason': 'error'})
         self.assertEqual(self.handle(root['dispatch_id'])['action'], 'relaunched')
 
+    def test_backoff_and_hold_key_read_the_registry_clock(self):
+        """`Chain.backoff` and `hold_key` pass `now=registry.utcnow()` to `provider_retry.active`, so a caller driving
+        `registry.utcnow` sees the same hold state even when wall-clock `datetime.now` has already passed `retry_at`."""
+        import provider_retry
+        retry_store = self.root / provider_retry.FILE
+        real_now = registry.utcnow().replace(microsecond=0)
+        backoff_s = int(provider_retry.retry_seconds(1))
+        failed_at = real_now - timedelta(seconds=backoff_s + 5)   # retry_at is 5 s in the past of wall-clock now
+        launch_at = failed_at - timedelta(seconds=15)
+        clock_before = failed_at + timedelta(seconds=30)          # 90 s before retry_at on the registry clock
+        with patch.dict(os.environ, {'ROUTER_PROVIDER_RETRY': str(retry_store)}):
+            with patch.object(registry, 'utcnow', return_value=launch_at):
+                root = self.first(task=dict(self.task, can_wait_hours=1))
+            with patch.object(registry, 'utcnow', return_value=clock_before):
+                terminal = {'reason': 'error', 'at': failed_at.isoformat(),
+                            'failure_code': 'provider_turn_failed', 'provider_message': '503 upstream timeout'}
+                entry = provider_retry.record(root['bundle'], terminal, dispatch_id=root['dispatch_id'],
+                                              at=failed_at.isoformat(),
+                                              classify=lambda *_: ('transient', {'source': 'system_one', 'scorer_type': 'fixture'}))
+                self.host.end(root['dispatch_id'], 'error', terminal=terminal)
+                out = self.handle(root['dispatch_id'])
+                self.assertEqual(out['action'], 'scheduled')
+                self.assertEqual(registry.parse(out['retry_at']), registry.parse(entry['retry_at']))
+                self.assertEqual(out['attempts'][0].get('hold'), provider_retry.entry_key(entry))
+
     def test_a_live_step_holds_its_claim_past_its_lease(self):
         """Round 2 review E: a claim naming a live holder (pid and start time match) is held however long its step runs;
         no observer takes it over when RUN_LEASE passes. Only a claim naming no holder (older code) ends by time."""
