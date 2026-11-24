@@ -743,6 +743,47 @@ def render_scenario(scenario: dict, s: dict, run: dict) -> list[str]:
         out.append(f"Short results over {limit('long_answer_chars')} characters: " + ", ".join(f"chain {r['chain']} ({r['chars']})" for r in s["long_answers"][:12]))
     if s["no_way_out"]:
         out.append("Answers that did not launch and give no next_action: " + ", ".join(f"chain {r['chain']} step {r['step']} ({r['status']})" for r in s["no_way_out"]))
+    out += hold_lines(scenario)
+    return out
+
+
+def hold_entries(scenario: dict) -> list[dict]:
+    """Every entry of the router's hold stores as the run read them after each act (rows.json `holds`): the store, its key,
+    the simulated hour it was first and last seen and the entry as written, in the order they appeared."""
+    seen: dict[tuple, dict] = {}
+    for snap in scenario.get("holds") or []:
+        for store, document in (snap.get("stores") or {}).items():
+            items = document.items() if isinstance(document, dict) else []
+            for key, value in items:
+                if key in ("schema", "version"):
+                    continue
+                entries = value.items() if isinstance(value, dict) and all(isinstance(v, dict) for v in value.values()) and value else [("", value)]
+                for sub, entry in entries:
+                    ident = (store, key, sub, json.dumps(entry, sort_keys=True, default=str))
+                    row = seen.setdefault(ident, {"store": store, "key": f"{key}/{sub}" if sub else key, "first_at": snap["at"],
+                                                  "first_event": snap["event"], "entry": entry})
+                    row["last_at"], row["last_event"] = snap["at"], snap["event"]
+    return list(seen.values())
+
+
+def hold_lines(scenario: dict) -> list[str]:
+    out = []
+    entries = hold_entries(scenario)
+    if entries:
+        out += ["", "### Holds, cooldowns and latches", "",
+                "The router's stores after each act (first and last act that saw an entry as written; simulated hours):", ""]
+        out += md_table(["store", "key", "first seen", "last seen", "entry"],
+                        [[e["store"], e["key"], f"{e['first_at']} ({e['first_event']})", f"{e['last_at']} ({e['last_event']})",
+                          clip(json.dumps(e["entry"], ensure_ascii=False, default=str), 260)] for e in entries])
+    errors = scenario.get("vendor_errors") or []
+    if errors:
+        out += ["", "Free-limit errors the vendor answered (the fixture's rows in opencode.db; simulated hours):", ""]
+        out += md_table(["hour", "error", "stated wait (h)"], [[e["at"], e["type"], e["retry_after_hours"]] for e in errors])
+    free = scenario.get("free_limit_answers") or []
+    if free:
+        out += ["", "Free-model launches the vendor answered with its free-limit error (the fixture's vendor side):", ""]
+        out += md_table(["hour", "chain", "brief", "account", "model", "stated wait (h)"],
+                        [[f["at"], f["chain"], f["brief"], f["account"], f["model"], round(f["retryAfterMs"] / 3.6e6, 2)] for f in free])
     return out
 
 

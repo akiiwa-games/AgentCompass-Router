@@ -3,6 +3,7 @@
   "error_scopes": {
     "fixture worker failure": {"scope": "none", "why": "the worker says its task could not be completed: its own work failed, not the provider"},
     "You've hit your usage limit. Try again later.": {"scope": "account", "why": "the provider's usage-limit refusal of the signed-in account"},
+    "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.": {"scope": "account", "why": "OpenCode's free-limit refusal (provider.free-limit, 429) of the signed-in account's free allowance"},
     "worker process vanished": {"scope": "unknown", "why": "the host saw the worker's process end without a word: nothing in the text says whose doing it was"}
   },
   "briefs": {
@@ -59,6 +60,8 @@
       "profile": {"work_kind": "code_implementation", "primary_level": 1, "secondary_kind": "none", "secondary_level": 0, "access": "read-only", "local_only": false, "needs_visual": false, "wants_fast": false, "expected_hours": 0.2, "task_count": "1"}},
     "named_review": {"text": "Review the retry and backoff design written up inline below for failure modes under clock skew and partial network partitions; answer with the three most serious problems. (Design: each client retries with jittered exponential backoff capped at 30 s and a server-side token bucket per tenant.)",
       "profile": {"work_kind": "architecture_reasoning", "primary_level": 2, "secondary_kind": "none", "secondary_level": 0, "access": "read-only", "local_only": false, "needs_visual": false, "wants_fast": false, "expected_hours": 0.4, "task_count": "1"}},
+    "named_free_todo": {"text": "List every TODO comment under src/ of this checkout with its file, line and a one-line gist; change nothing.",
+      "profile": {"work_kind": "code_implementation", "primary_level": 1, "secondary_kind": "none", "secondary_level": 0, "access": "read-only", "local_only": false, "needs_visual": false, "wants_fast": false, "expected_hours": 0.3, "task_count": "1"}},
     "trivial_typo": {"text": "Fix the typo 'recieve' to 'receive' in README.md of this checkout; touch nothing else.",
       "profile": {"work_kind": "code_implementation", "primary_level": 1, "secondary_kind": "none", "secondary_level": 0, "access": "write", "local_only": true, "needs_visual": false, "wants_fast": false, "expected_hours": 0.05, "task_count": "1"}},
     "trivial_rename": {"text": "Rename the local variable tmp to buffer in src/io/reader.py function read_block; run nothing else.",
@@ -83,7 +86,9 @@
     {"at": 2.0, "brief": "multi_two"},
     {"at": 2.4, "brief": "forensics_race_l3", "can_wait_hours": 6},
     {"at": 2.8, "brief": "named_review", "named": {"family": "claude", "model": "claude-opus-5-5", "effort": "high", "basis": "the user said: have Opus look at this one"}},
+    {"at": 3.0, "brief": "named_free_todo", "named": {"family": "opencode", "model": "deepseek-v4.1-flash-free", "effort": "high", "basis": "the user said: use the free DeepSeek for this"}},
     {"at": 3.2, "brief": "visual_ocr_l1"},
+    {"at": 3.4, "brief": "named_free_todo", "named": {"family": "opencode", "model": "deepseek-v4.1-flash-free", "effort": "high", "basis": "the user said: use the free DeepSeek for this"}},
     {"at": 3.5, "brief": "impl_lock_refactor_l3", "fault": "reject"},
     {"at": 3.8, "brief": "trivial_typo", "worker": "error"},
     {"at": 4.0, "brief": "workspace_writer_a", "workspace": "repo-a", "worker": "slow"},

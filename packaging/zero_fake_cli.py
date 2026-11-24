@@ -12,11 +12,21 @@ Started by the Herdr adapter (the last argument tells it to read an assignment f
 the parent with the real ``hc send``.
 
 Scenarios: ok (default) | error | quota | hang | crash | slow | blocked (Herdr: announces "needs input" and waits)
+
+OpenCode's free limit (packaging/experience_run.py): when ``state/free-limit.json`` marks an account limited and this worker
+runs one of that account's free models (``-m``), it answers as OpenCode 2.2.6 does at the limit, whatever the scenario line
+says: the vendor's error object as the turn's error, the same object as an error row in the account's ``opencode.db``
+(``OPENCODE_DB_PATH``, else ``~/.local/share/opencode/opencode.db``), stamped on the run's simulated clock.
 """
+try:                                    # the experience run's simulated clock (does nothing without XP_CLOCK_FILE); first, so
+    import experience_sim_time  # noqa: F401   the names imported below are the simulated ones
+except ImportError:
+    pass
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,6 +36,7 @@ from pathlib import Path
 EXE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
 STATE = EXE.parent.parent / "state"
 ROUTER_VARS = ("AGENTCOMPASS_WORKER", "ROUTER_PARENT_AGENT_ID", "ROUTER_PARENT_HOST", "ROUTER_PARENT_ADDRESS")
+FREE_LIMIT_MESSAGE = "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models."
 
 
 def write(path: Path, document: dict) -> None:
@@ -33,6 +44,33 @@ def write(path: Path, document: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def free_limit(model: str | None) -> dict | None:
+    """The vendor's free-limit error object when free-limit.json says this model's account is at its limit, else None."""
+    try:
+        accounts = json.loads((STATE / "free-limit.json").read_text(encoding="utf-8")).get("accounts") or {}
+    except (OSError, ValueError):
+        return None
+    bare = str(model or "").split("/")[-1]
+    for account in accounts.values():
+        if account.get("limited") and bare and bare in account.get("models", []):
+            return {"type": "provider.free-limit", "message": FREE_LIMIT_MESSAGE, "status": 429, "retryAfterMs": int(account["retryAfterMs"])}
+    return None
+
+
+def store_error(error: dict) -> None:
+    """The error as OpenCode keeps it: a session_message row whose data carries the error object."""
+    path = Path(os.environ.get("OPENCODE_DB_PATH") or Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS session_message (id INTEGER PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+            conn.execute("INSERT INTO session_message (session_id, time_created, data) VALUES (?, ?, ?)",
+                         ("fixture", int(time.time() * 1000), json.dumps({"role": "assistant", "error": error})))
+    finally:
+        conn.close()
 
 
 def main() -> int:
@@ -91,6 +129,13 @@ def main() -> int:
             sent = subprocess.run(["hc", "send", parent, text], capture_output=True, text=True, timeout=60)
             write(STATE / "hc-send" / f"{os.getpid()}.json", {"exit": sent.returncode, "stdout": sent.stdout[-400:], "stderr": sent.stderr[-400:]})
 
+    model = sys.argv[sys.argv.index("-m") + 1] if "-m" in sys.argv[:-1] else None
+    limited = free_limit(model)
+    if limited:
+        store_error(limited)
+        sys.stderr.write(json.dumps(limited) + chr(10))
+        agent("error", lastError=limited["message"])
+        return 1
     if scenario == "crash":
         os._exit(0xC0000005 if os.name == "nt" else 139)
     if scenario == "blocked":

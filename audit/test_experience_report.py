@@ -188,3 +188,16 @@ def test_a_ranked_candidates_wait_is_shown_with_the_routers_sentence_or_not_reco
     assert report.waiting({"detail": True, "available_in_hours": 2.6, "wait_reason": []}) == "waits 2.6 h: why: not recorded"
     assert report.waiting({"detail": True, "available_in_hours": None, "wait_reason": None}) == "can start now"
     assert report.waiting({"detail": False, "available_in_hours": None}) == "wait not recorded"
+
+
+def test_hold_entries_list_each_entry_once_with_the_first_and_last_act_that_saw_it():
+    entry = {"reason": "quota", "until": "2026-11-24T07:00:00+00:00"}
+    scenario = {"holds": [
+        {"at": 0.0, "event": "setup", "stores": {"quota-exhaustion.json": None}},
+        {"at": 5.5, "event": "d1#20", "stores": {"quota-exhaustion.json": {"opencode": {"allowance": entry}}}},
+        {"at": 6.2, "event": "d1#24", "stores": {"quota-exhaustion.json": {"opencode": {"allowance": entry}}}},
+        {"at": 7.0, "event": "d1#27", "stores": {"quota-exhaustion.json": {}}}]}
+    rows = report.hold_entries(scenario)
+    assert len(rows) == 1
+    assert rows[0]["key"] == "opencode/allowance" and rows[0]["first_at"] == 5.5 and rows[0]["last_at"] == 6.2
+    assert any("Holds, cooldowns and latches" in line for line in report.hold_lines(scenario))

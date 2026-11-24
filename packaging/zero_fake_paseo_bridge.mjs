@@ -17,6 +17,9 @@ if (!STATE || !BIN) { console.log(JSON.stringify({ ok: false, sent: false, error
 const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
 const writeJson = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(value, null, 1)); };
 const agentFile = id => path.join(STATE, 'agents', `${id.replace(/[^\w.-]/g, '_')}.json`);
+// The experience run's simulated clock (packaging/experience_sim_time.py): the real time plus the offset in $XP_CLOCK_FILE.
+const simOffsetMs = () => { try { return 1000 * (Number(fs.readFileSync(process.env.XP_CLOCK_FILE, 'utf8').trim()) || 0); } catch { return 0; } };
+const nowIso = () => new Date(Date.now() + simOffsetMs()).toISOString();
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const canonicalPath = p => {
   if (typeof p !== 'string' || !p.trim()) return null;
@@ -55,7 +58,7 @@ function observeAgent(id) {
   if ((agent.status === 'running' || agent.status === 'initializing') && agent.pid && !alive(agent.pid)) {
     // the process is gone without having said how it ended: that is a crash
     agent.status = 'error'; agent.attentionReason = 'error'; agent.lastError = 'worker process vanished';
-    agent.updatedAt = new Date().toISOString();
+    agent.updatedAt = nowIso();
     writeJson(file, agent);
   }
   return agent;
@@ -78,7 +81,7 @@ function create(input) {
   const request = input.request;
   const slash = request.provider.indexOf('/');
   const provider = request.provider.slice(0, slash), model = request.provider.slice(slash + 1);
-  const now = new Date().toISOString();
+  const now = nowIso();
   const agent = {
     id: input.dispatch_id, provider, model, title: request.title, status: 'running', createdAt: now, updatedAt: now,
     cwd: request.cwd || process.cwd(),
@@ -121,7 +124,7 @@ function resume(input) {
   const request = input.request;
   const slash = request.provider.indexOf('/');
   const provider = request.provider.slice(0, slash), model = request.provider.slice(slash + 1);
-  const now = new Date().toISOString();
+  const now = nowIso();
   existing.status = 'running';
   existing.updatedAt = now;
   delete existing.attentionReason;
@@ -203,7 +206,7 @@ process.stdin.on('end', () => {
   try { input = JSON.parse(raw); } catch { console.log(JSON.stringify({ ok: false, error: 'invalid_request' })); return; }
   const log = path.join(STATE, 'bridge-calls.jsonl');
   fs.mkdirSync(STATE, { recursive: true });
-  fs.appendFileSync(log, JSON.stringify({ at: new Date().toISOString(), operation: input.operation, dispatch_id: input.dispatch_id, parent_id: input.parent_id }) + '\n');
+  fs.appendFileSync(log, JSON.stringify({ at: nowIso(), operation: input.operation, dispatch_id: input.dispatch_id, parent_id: input.parent_id }) + '\n');
   let result;
   try {
     result = input.operation === 'create' ? create(input)
@@ -214,7 +217,7 @@ process.stdin.on('end', () => {
   } catch (error) {
     result = { ok: false, sent: input.operation === 'create' || input.operation === 'resume', error: String(error.message || error) };
   }
-  fs.appendFileSync(path.join(STATE, 'bridge-responses.jsonl'), JSON.stringify({ at: new Date().toISOString(), operation: input.operation, dispatch_id: input.dispatch_id,
+  fs.appendFileSync(path.join(STATE, 'bridge-responses.jsonl'), JSON.stringify({ at: nowIso(), operation: input.operation, dispatch_id: input.dispatch_id,
     answer: { ok: result.ok, sent: result.sent, error: result.error, missing: result.missing, agent: result.agent ? { id: result.agent.id, status: result.agent.status, attentionReason: result.agent.attentionReason } : null } }) + String.fromCharCode(10));
   console.log(JSON.stringify(result));
 });

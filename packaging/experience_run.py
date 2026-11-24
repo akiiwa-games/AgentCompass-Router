@@ -29,12 +29,23 @@ the hours are the brief's declared expected hours). The router sees the clock on
 each roll the run collects usage (`agentcompass usage --force`, what the tray's collector does every five minutes) and the
 fixture answers each window's used share and its reset time as `now + (reset hour - clock)`.
 
-What the simulated clock does not cover: everything the router keeps on real time. Ledger timestamps, reservations and
-leases, launch-failure cooldowns, durable quota-exhaustion latches, an override's expiry, the dispatch cadence and the
-classification cache all run on the wall clock, which moves a few minutes per simulated day. So a cooldown after a failed
-launch still holds after the clock skipped a night, and a lease ends when its fixture worker ends (seconds), not after the
-worker's simulated hours (the launch charge stands in for it). Fixture workers do no work: they finish, fail, crash or run
-slowly as the stream declares.
+The simulated clock is also the time the product reads (packaging/experience_sim_time.py, installed into the sandbox
+virtualenv with a start-up `.pth` line): every interpreter of the installed product, the fake Paseo host and the fixture CLI
+read the real time plus the scenario's offset, which the run sets when its clock moves (to the scenario's start plus the
+simulated hours, never backwards). So launch-failure cooldowns, provider holds, quota latches, leases, the ledger's stamps
+and an override's expiry all run on the simulated clock and end inside a run as they do in life. Before the clock moves
+the run waits for the fixture workers still running to end (a worker's simulated hours are its launch charge; its process
+lives seconds), so a clock step never expires the lease of a worker that is still at work. Fixture workers do no work:
+they finish, fail, crash or run slowly as the stream declares.
+
+OpenCode's free allowance (an `opencode` account): the vendor's side is simulated too. The account has one allowance
+window of 24 h whose size is the scenario's `free_limit.after_usd` (default: the shipped measurement, plan-templates
+`opencode.free.capacity_measured`), with its first reset at `free_limit.first_reset_hour` (default: the usage state's).
+A launch on a free model writes its spend (expected_usd at the model's list price, as output tokens) into the account's
+`opencode.db` under the sandbox home, stamped on the simulated clock, which is where the router reads a free pool's use.
+Once the period's spend reaches the size, the next free-model worker answers as OpenCode 2.2.6 does at its limit: the
+error object {type provider.free-limit, message, status 429, retryAfterMs = time to the window's reset} as its turn error
+and in `opencode.db` (zero_fake_cli.py reads `free-limit.json`, which the run writes before every roll).
 
 Classifier. The default run spends no model tokens. `classify` asks the real configured classifier once per brief of the
 corpus (`agentcompass score --input` of the installed product, on this machine's real home) and writes each answer whole
@@ -53,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import copy
 import datetime as dt
 import hashlib
@@ -61,6 +73,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -72,6 +85,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import experience_clock as clock  # noqa: E402
+import experience_sim_time as simtime  # noqa: E402
 import sandbox_check as sc  # noqa: E402
 
 ROOT = sc.ROOT
@@ -91,6 +105,10 @@ COMMAND_TIMEOUT_SECONDS = 3600
 # The provider CLIs the fixture installs (each a copy of fake-cli.exe). A harness whose executable is not among them is
 # reported by discovery as missing_client: that is the fixture's gap, and the report says so where it shows it.
 FIXTURE_CLIS = ("codex", "claude", "opencode")
+FREE_WINDOW = "allowance"            # the one window of a free pool, as the router names it (axis_scores.FREE_WINDOW)
+# The router's stores of holds, cooldowns and latches (launch_failures, provider_retry, quota_exhaustion, model_latch,
+# account_state), read after every act for the report; the run never writes them.
+HOLD_FILES = ("launch-failures.json", "provider-retry.json", "quota-exhaustion.json", "model-unavailable.json", "plan-inactive.json")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -134,9 +152,25 @@ def brief_corpus(briefs_doc: dict) -> dict:
 class ScenarioClock:
     """One scenario's simulated hour; read by the usage fixture to turn simulated reset hours into real timestamps."""
 
-    def __init__(self):
+    def __init__(self, file: Path | None = None):
         self.now = 0.0
         self.lock = threading.Lock()
+        self.t0 = time.time()               # the scenario's start: simulated hour 0 is this real moment
+        self.offset = 0.0                   # seconds the product's clock is ahead of the real one (experience_sim_time)
+        self.file = file
+        if file is not None:
+            simtime.write(file, 0.0)
+
+    def set_hour(self, hour: float) -> None:
+        """Move the time the product reads to the scenario's start plus `hour` simulated hours; never backwards (real time
+        that passed while the run worked stays passed)."""
+        self.offset = max(self.offset, self.t0 + hour * 3600.0 - time.time())
+        if self.file is not None:
+            simtime.write(self.file, self.offset)
+
+    def sim_now(self) -> dt.datetime:
+        """The time the product reads now."""
+        return dt.datetime.fromtimestamp(time.time() + self.offset, dt.timezone.utc)
 
 
 class UsageServer:
@@ -192,11 +226,11 @@ class UsageServer:
 
     @staticmethod
     def answer(entry, host, path):
-        real = dt.datetime.now(dt.timezone.utc)
         sim = entry["clock"]
         with sim.lock:
             windows = [copy.copy(w) for w in entry["usage"].windows]
             now = sim.now
+            real = sim.sim_now()
 
         def at(window):
             return real + dt.timedelta(hours=window.remaining_hours(now))
@@ -308,7 +342,7 @@ class ReplayScorer:
 def fake_cli_build(cache: Path) -> Path:
     """The fixture CLI (packaging/zero_fake_cli.py) as a one-folder PyInstaller build, cached by the script's hash."""
     source = HERE / "zero_fake_cli.py"
-    key = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+    key = hashlib.sha256(source.read_bytes() + (HERE / "experience_sim_time.py").read_bytes()).hexdigest()[:12]
     built = cache / f"fakecli-{key}" / "dist" / "fake-cli"
     if (built / "fake-cli.exe").is_file():
         return built
@@ -331,7 +365,23 @@ def install_world(base: Path, wheel: Path | None) -> tuple[Path, Path]:
     subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, capture_output=True)
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     subprocess.run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", "--quiet", str(wheel)], check=True, capture_output=True)
+    install_sim_time(venv)
     return venv, wheel
+
+
+def install_sim_time(venv: Path) -> Path:
+    """experience_sim_time as `xp_sim_time` in the venv's site-packages, imported at every interpreter's start by a `.pth`
+    line (it does nothing without XP_CLOCK_FILE). Returns the site-packages directory."""
+    sites = venv / "Lib" / "site-packages" if os.name == "nt" else next((venv / "lib").glob("python*/site-packages"))
+    shutil.copyfile(HERE / "experience_sim_time.py", sites / "xp_sim_time.py")
+    (sites / "xp_sim_time.pth").write_text("import xp_sim_time\n", encoding="utf-8", newline="\n")
+    return sites
+
+
+def free_measurement() -> dict:
+    """The shipped measurement of OpenCode's free allowance (plan-templates opencode.free.capacity_measured)."""
+    templates = load_json(ROOT / "skills" / "agent-compass" / "references" / "plan-templates.json")
+    return templates["opencode"]["free"]["capacity_measured"]
 
 
 def parse(text: str):
@@ -366,7 +416,6 @@ class Scenario:
         self.run = sc.Run(self.report)
         self.box = sc.Sandbox(world.base, f"s{index:02d} {self.name}", world.venv, world.usage, self.run)
         self.box.ports.add(world.scorer.port)
-        self.clock = ScenarioClock()
         self.bin = self.box.root / "fixture" / "bin"
         self.state = self.box.root / "fixture" / "state"
         self.work = self.box.root / "work dir"
@@ -375,6 +424,10 @@ class Scenario:
             shutil.copy2(self.bin / "fake-cli.exe", self.bin / f"{name}.exe")
         (self.bin / "fake-cli.exe").unlink()
         self.state.mkdir(parents=True)
+        self.clock = ScenarioClock(self.state / "sim-clock.txt")
+        self.vendor: dict[str, dict] = {}       # opencode account -> {"size_usd", "spent": [(sim hour, usd)], "models"}
+        self.vendor_limited_at_roll: dict[str, int] = {}     # account -> retryAfterMs the fixture CLI answers, as last written
+        self.ended_workers: set[str] = set()
         (self.state / "parents.json").write_text(json.dumps([PARENT]), encoding="utf-8")
         self.work.mkdir()
         self.accounts: list[clock.AccountUsage] = []
@@ -390,7 +443,7 @@ class Scenario:
 
     def env(self, **extra) -> dict:
         return {"PATH": self.path(), "FIXTURE_STATE": str(self.state), "FIXTURE_BIN": str(self.bin), "ROUTER_SCORE_CACHE": "off",
-                "PASEO_AGENT_ID": PARENT, "ROUTER_PASEO_BRIDGE": str(BRIDGE), **extra}
+                "PASEO_AGENT_ID": PARENT, "ROUTER_PASEO_BRIDGE": str(BRIDGE), simtime.FILE_ENV: str(self.clock.file), **extra}
 
     def call(self, op, *args, stdin=None, timeout=COMMAND_TIMEOUT_SECONDS, **env):
         argv = [self.box.agentcompass, *map(str, args)]
@@ -439,6 +492,8 @@ class Scenario:
                 window = clock.start_window(wid, hours, used, elapsed)
                 window.models, window.models_except = wspec.get("models"), wspec.get("models_except")
                 windows.append(window)
+            if family == "opencode":
+                windows.append(self.free_allowance(name, state))
             usage = clock.AccountUsage(name, windows)
             self.accounts.append(usage)
             if family in ("claude", "codex"):
@@ -462,11 +517,12 @@ class Scenario:
         "                           'tier': (info.get('five_axis') or {}).get('tier'), 'usd_per_hour': info.get('usd_per_hour')}\n"
         "for name, spec in (acc.get('accounts') or {}).items():\n"
         "    out['capacity'][name] = dict(spec.get('capacity_usd') or {})\n"
+        "out['prices'] = {k: v[1]['value'] for k, v in axis_scores.opencode_list_prices(acc.get('models')).items()}\n"
         "print(json.dumps(out))\n")
 
     def read_sheet(self, op) -> dict:
         result = self.box.run_command(op, [self.box.python, "-X", "utf8", "-c", self.SHEET, self.box.scripts], cwd=self.work, **self.env())
-        sheet = parse(result.stdout) or {"bundles": {}, "capacity": {}}
+        sheet = parse(result.stdout) or {"bundles": {}, "capacity": {}, "prices": {}}
         names = set(self.account_specs)
         sheet["bundles"] = {bid: b for bid, b in sheet["bundles"].items() if b["account"] in names}
         sheet["capacity"] = {name: caps for name, caps in sheet["capacity"].items() if name in names}
@@ -507,12 +563,137 @@ class Scenario:
 
     # ---- clock
     def advance_to(self, hour: float) -> list[clock.ResetEvent]:
+        if hour <= self.clock.now:
+            return []
+        self.settle_workers()
         with self.clock.lock:
-            if hour <= self.clock.now:
-                return []
             events = clock.advance(self.accounts, self.clock.now, hour)
             self.clock.now = hour
+            self.clock.set_hour(hour)
+        for event in events:
+            if event.account in self.vendor and event.window == FREE_WINDOW:
+                self.vendor[event.account]["spent"] = []
         return events
+
+    def settle_workers(self, limit: float = 60.0) -> None:
+        """Wait (at most `limit` real seconds) for the fixture workers still running to end before the clock moves: a
+        worker's simulated hours are its launch charge, so by the next simulated moment it has ended, as in life."""
+        deadline = time.time() + limit
+        while time.time() < deadline:
+            if not [r for r in self.workers() if r.get("scenario") not in ("hang", "blocked") and self.running(r)]:
+                return
+            time.sleep(0.3)
+
+    def running(self, record: dict) -> bool:
+        key = f"{record.get('pid')}-{record.get('started')}"
+        if key in self.ended_workers:
+            return False
+        try:
+            import psutil
+            process = psutil.Process(int(record["pid"]))
+            alive = process.is_running() and Path(process.exe()).resolve().parent == self.bin.resolve()
+        except Exception:
+            alive = False
+        if not alive:
+            self.ended_workers.add(key)
+        return alive
+
+    # ---- OpenCode's free allowance, the vendor's side (see the module docstring)
+    def free_allowance(self, name: str, state: dict) -> clock.Window:
+        limit = self.spec.get("free_limit") or {}
+        measured = free_measurement()
+        size = float(limit.get("after_usd") or measured["capacity_usd"])
+        period = float(measured["period_hours"])
+        used, elapsed = state["short" if period < 24 else "long"]
+        window = clock.start_window(FREE_WINDOW, period, used, elapsed)
+        if limit.get("first_reset_hour") is not None:
+            window.reset_at = float(limit["first_reset_hour"])
+        self.vendor[name] = {"size_usd": size, "spent": [], "models": []}
+        db = self.opencode_db()
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS message (id INTEGER PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS session_message (id INTEGER PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)")
+        if window.used:
+            # the usage state's share, spent before the day began (the free models' list price comes with the sheet)
+            self.vendor[name]["opening_usd"] = round(size * window.used / 100.0, 6)
+        return window
+
+    def open_vendor(self, sheet: dict) -> None:
+        """Once the router's sheet is read: the free models of each opencode account (the bundles drawing its allowance) and
+        the usage state's opening share written as spend the day before (OpenCode keeps the spend; the router reads it)."""
+        for name, vendor in self.vendor.items():
+            vendor["models"] = sorted({b["model"] for b in sheet["bundles"].values() if b["account"] == name and FREE_WINDOW in (b.get("draws") or [])})
+            opening = vendor.pop("opening_usd", 0.0)
+            vendor["opening_usd"] = opening
+            if opening and vendor["models"]:
+                model = vendor["models"][0]
+                self.spend_free(name, model, opening, (sheet.get("prices") or {}).get(model))
+
+    def opencode_db(self) -> Path:
+        return self.box.home / ".local" / "share" / "opencode" / "opencode.db"
+
+    def free_spent(self, account: str) -> float:
+        vendor = self.vendor.get(account) or {}
+        return sum(usd for _, usd in vendor.get("spent") or [])
+
+    def free_limited(self, account: str) -> bool:
+        vendor = self.vendor.get(account)
+        return bool(vendor) and self.free_spent(account) >= vendor["size_usd"] - 1e-9
+
+    def write_vendor_state(self) -> None:
+        """free-limit.json for the fixture CLI: which free models answer the limit error now, and the reset it states."""
+        accounts = {}
+        for name, vendor in self.vendor.items():
+            window = self.usage_of(name).window(FREE_WINDOW)
+            with self.clock.lock:
+                left = window.remaining_hours(self.clock.now)
+            accounts[name] = {"limited": self.free_limited(name), "models": vendor["models"], "retryAfterMs": int(left * 3600 * 1000),
+                              "size_usd": vendor["size_usd"], "spent_usd": round(self.free_spent(name), 6)}
+            if accounts[name]["limited"]:
+                self.vendor_limited_at_roll[name] = accounts[name]["retryAfterMs"]
+            else:
+                self.vendor_limited_at_roll.pop(name, None)
+        (self.state / "free-limit.json").write_text(json.dumps({"accounts": accounts}), encoding="utf-8")
+
+    def spend_free(self, account: str, model: str, usd: float, price: dict | None) -> dict:
+        """One free-model spend as OpenCode stores it: an assistant message whose output tokens cost `usd` at the model's
+        list price, stamped on the product's clock."""
+        tokens = int(round(usd / float(price["output"]) * 1e6)) if price and price.get("output") else 0
+        stamp = int(self.clock.sim_now().timestamp() * 1000)
+        data = {"role": "assistant", "modelID": model, "providerID": "opencode",
+                "tokens": {"input": 0, "output": tokens, "reasoning": 0, "cache": {"read": 0, "write": 0}}}
+        with contextlib.closing(sqlite3.connect(self.opencode_db())) as conn, conn:
+            conn.execute("INSERT INTO message (session_id, time_created, data) VALUES (?, ?, ?)", ("xp", stamp, json.dumps(data)))
+        with self.clock.lock:
+            self.vendor[account]["spent"].append((self.clock.now, usd))
+            self.vendor[account].setdefault("log", []).append((round(self.clock.now, 3), usd))
+        return {"tokens_output": tokens, "time_created": stamp}
+
+    def vendor_errors(self) -> list[dict]:
+        """The free-limit errors the vendor answered (the fixture CLI's rows in opencode.db), on the simulated clock."""
+        db = self.opencode_db()
+        if not self.vendor or not db.is_file():
+            return []
+        with contextlib.closing(sqlite3.connect(db)) as conn:
+            rows = conn.execute("SELECT time_created, data FROM session_message ORDER BY time_created").fetchall()
+        out = []
+        for stamp, raw in rows:
+            error = (json.loads(raw).get("error") or {}) if raw else {}
+            out.append({"at": round((stamp / 1000.0 - self.clock.t0) / 3600.0, 3), "type": error.get("type"),
+                        "retry_after_hours": round(error.get("retryAfterMs", 0) / 3.6e6, 3)})
+        return out
+
+    def holds(self) -> dict:
+        """The router's hold, cooldown and latch stores of this home, as written (for the report's holds section)."""
+        out = {}
+        for name in HOLD_FILES:
+            path = self.box.state / name
+            try:
+                out[name] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+            except (OSError, ValueError):
+                out[name] = "unreadable"
+        return out
 
     def windows_now(self) -> dict:
         with self.clock.lock:
@@ -747,6 +928,8 @@ class Play:
         self.sheet: dict = {}
         self.setup: list[dict] = []
         self.exclusions: dict[str, dict] = {}     # bundle id -> {"plans", "eligible", "won", "gaps", "excluded": {reason: n}}
+        self.holds: list[dict] = []               # the hold stores after each act, when they changed
+        self.free_limit_answers: list[dict] = []  # free-model launches the vendor answered with its limit error
         self.counter = 0
 
     # ---- preparing the home as a user does
@@ -778,8 +961,10 @@ class Play:
         for entry in switches.get("plan_ends") or []:
             result = s.call(op, "override", "--account", entry["account"], "--basis", entry["basis"], "--expires-in", entry["in_hours"])
             self.setup.append({"argv": ["override", "--expires-in"], "exit": result.returncode, "tail": (result.stdout + result.stderr)[-600:]})
+        s.open_vendor(self.sheet)
         self.collect(op)
         self.timeline.append({"at": 0.0, "event": "start", "windows": s.windows_now()})
+        self.note_holds("setup")
 
     def collect(self, op):
         """What the tray's collector does every five minutes: one usage reading of every account."""
@@ -810,8 +995,17 @@ class Play:
                 self.note_resets(self.s.advance_to(start + float(act["at"])))
                 self.act(act, day, index)
                 self.timeline.append({"at": round(self.s.clock.now, 3), "event": f"d{day + 1}#{index}", "windows": self.s.windows_now()})
+                self.note_holds(f"d{day + 1}#{index}")
             if day + 1 < self.days:
                 self.note_resets(self.s.advance_to((day + 1) * 24.0))
+
+    def note_holds(self, event: str):
+        """The router's hold stores as they stand after an act, kept when they changed (the report's holds section)."""
+        stores = self.s.holds()
+        if self.holds and self.holds[-1]["stores"] == stores:
+            return
+        self.holds.append({"at": round(self.s.clock.now, 3), "sim_time": self.s.clock.sim_now().isoformat(timespec="seconds"), "event": event,
+                           "stores": stores})
 
     def note_resets(self, events):
         for event in events:
@@ -834,6 +1028,8 @@ class Play:
             chain["note"] = f"no worker was launched for label {act['resume']}, so there was nothing to resume"
             return
         self.roll(op, chain, self.argv(act, keys, day, index), act, keys)
+        if act.get("fault"):
+            s.set_fault()       # an act's fault is for its own create: one no create consumed does not reach a later act
 
     def argv(self, act, keys, day, index) -> list:
         s = self.s
@@ -863,6 +1059,7 @@ class Play:
         s = self.s
         if act.get("fault") and depth == 0:
             s.set_fault(create=act["fault"])
+        s.write_vendor_state()
         self.collect(op)
         before = len(s.ledger())
         started = time.time()
@@ -1090,9 +1287,28 @@ class Play:
         record["carried_launch"] = True        # the answer that carried this worker (the report's launch tables read it)
         if act.get("label") and record.get("agent_id") and not chain.get("batch_of"):
             self.labels[act["label"]] = record["agent_id"]
+        bundle = self.bundle_of(record)
+        account = record.get("account")
+        if FREE_WINDOW in (bundle.get("draws") or []) and self.s.vendor_limited_at_roll.get(account):
+            # the vendor answers this worker with its free-limit error (zero_fake_cli): nothing is spent
+            self.free_limit_answers.append({"chain": chain["id"], "brief": record["brief"], "account": account, "model": record.get("model"),
+                                            "at": round(self.s.clock.now, 3), "retryAfterMs": self.s.vendor_limited_at_roll[account]})
+            record["vendor_free_limit"] = True
+            if record.get("dispatch_id"):
+                self.observe_failure(op, chain, record)
+            return
         self.charge(chain, record)
         if act.get("worker") in ("error", "crash", "quota") and record.get("dispatch_id"):
             self.observe_failure(op, chain, record)
+
+    def bundle_of(self, record) -> dict:
+        """The sheet's bundle a launch ran on: by its id, else (a named route's ledger row says `constraint`) by account,
+        model and effort."""
+        bundle = self.sheet["bundles"].get(record.get("bundle_id") or "")
+        if bundle:
+            return bundle
+        same = [b for b in self.sheet["bundles"].values() if b["account"] == record.get("account") and b["model"] == record.get("model")]
+        return next((b for b in same if b.get("effort") == record.get("effort")), same[0] if same else {})
 
     def charge(self, chain, record):
         account, usd = record.get("account"), record.get("expected_usd")
@@ -1101,10 +1317,13 @@ class Play:
             self.charges.append({"chain": chain["id"], "brief": record["brief"], "account": account, "model": record.get("model"), "at": self.s.clock.now,
                                  "window": None, "pct": None, "note": "not charged: no windows or no expected_usd"})
             return
-        bundle = self.sheet["bundles"].get(record.get("bundle_id") or "") or {}
-        draws = bundle.get("draws") or [w.id for w in usage.windows]
+        draws = self.bundle_of(record).get("draws") or [w.id for w in usage.windows]
         for wid in draws:
             capacity = (self.sheet["capacity"].get(account) or {}).get(wid)
+            spend = None
+            if wid == FREE_WINDOW and account in self.s.vendor:
+                capacity = self.s.vendor[account]["size_usd"]          # the vendor's allowance, not the router's estimate
+                spend = self.s.spend_free(account, record.get("model"), float(usd), self.sheet.get("prices", {}).get(record.get("model") or ""))
             pct = clock.cost_pct(1.0, usd, capacity)
             with self.s.clock.lock:
                 done = clock.charge(usage, wid, pct, self.s.clock.now) if pct is not None else None
@@ -1112,7 +1331,7 @@ class Play:
                                  "model": record.get("model"), "effort": record.get("effort"), "at": round(self.s.clock.now, 3), "window": wid,
                                  "usd": usd, "capacity_usd": capacity, "pct": None if pct is None else round(pct, 4),
                                  "applied": None if done is None else round(done.applied, 4), "used_after": None if done is None else round(done.used_after, 3),
-                                 "note": None if pct is not None else "window has no capacity_usd"})
+                                 "note": None if pct is not None else "window has no capacity_usd", **({"opencode_db": spend} if spend else {})})
 
     def observe_failure(self, op, chain, record):
         """A worker that fails after launch: wait for the fixture worker to end, let the router observe it, keep what it says."""
@@ -1169,7 +1388,10 @@ def run_scenario(world: World, spec: dict, index: int, states: dict, corpus: dic
         result.update({"setup": play.setup, "answers": play.answers, "chains": play.chains, "charges": play.charges, "resets": play.resets,
                        "timeline": play.timeline, "exclusions": play.exclusions, "labels": play.labels,
                        "bundles": play.sheet.get("bundles"), "capacity": play.sheet.get("capacity"),
-                       "end_hour": scenario.clock.now})
+                       "end_hour": scenario.clock.now, "holds": play.holds, "vendor_errors": scenario.vendor_errors(), "free_limit_answers": play.free_limit_answers,
+                       "vendor": {name: {"size_usd": v["size_usd"], "models": v["models"], "spent": v["spent"], "log": v.get("log", []), "opening_usd": v.get("opening_usd")}
+                                  for name, v in scenario.vendor.items()},
+                       "sim_clock": {"t0": scenario.clock.t0, "offset_s": round(scenario.clock.offset, 1)}})
     result["seconds"] = round(time.time() - started, 1)
     print(f"  {spec['name']}: {len(result.get('answers') or [])} answers, {result['seconds']} s" + (" (error)" if result["error"] else ""), flush=True)
     return result
