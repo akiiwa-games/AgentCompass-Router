@@ -22,7 +22,7 @@ import reference_provenance
 import roll
 import route_judge
 import user_scores
-from router_test_support import isolated_router_state, usage_windows
+from router_test_support import cited_fast, isolated_router_state, usage_windows
 
 NO_DECLARATIONS = {'statement': 'none', 'defaults': {}, 'rows': {}}
 
@@ -402,7 +402,7 @@ class FixRoundRegressionTests(unittest.TestCase):
         usage = usage_windows(now, {
             'claude': [('five_hour', 90.0, 4.0), ('seven_day', 75.0, 84.0)],
             'claude-2': [('five_hour', 90.0, 4.0), ('seven_day', 30.0, 83.0)],
-            'codex': [('usage', 75.0, 84.0)],
+            'codex': [('usage', 50.0, 84.0)],      # on its line at mid-week: the fast twin's 2x burn costs more
         })
         task = {
             'objective': 'Small coding fix',
@@ -415,18 +415,22 @@ class FixRoundRegressionTests(unittest.TestCase):
                 'axis_demand': {'creativity': 0, 'coding': 3, 'aesthetics': 0, 'tool_operation': 1},
             },
         }
-        plan = allocator.plan(task, usage, now, accounts=copy.deepcopy(accounts),
-                              host_policy_config={'allowed_accounts': ['claude', 'claude-2', 'codex']}, read_local_state=False)
+        # The fast twin is Codex Sol's: Claude has no fast contract, and no shipped row cites its fast multipliers, so a
+        # synthetic cited row stands in (cited_fast).
+        with cited_fast():
+            plan = allocator.plan(task, usage, now, accounts=copy.deepcopy(accounts),
+                                  host_policy_config={'allowed_accounts': ['claude', 'claude-2', 'codex']}, read_local_state=False)
         c1 = next(c for c in plan['ranking'] if c['id'] == 'opus55_high')
         c2 = next(c for c in plan['ranking'] if c['id'] == 'claude2_opus55_high')
-        c1_fast = next(c for c in plan['ranking'] if c['id'] == 'opus55_high+fast')
+        x1 = next(c for c in plan['ranking'] if c['id'] == 'sol_high')
+        x1_fast = next(c for c in plan['ranking'] if c['id'] == 'sol_high+fast')
         self.assertLess(c1['components']['opportunity_cost'], c2['components']['opportunity_cost'])
         self.assertGreater(c1['score'], c2['score'])
         self.assertEqual(candidate_ranking.five_axis_deciding_key(c1, c2), 'net_score')
         # 2x burn of +fast has higher C and lower N than plain when wants_fast=False at mid-week ample (Pro and Max20 alike):
-        self.assertLess(c1['components']['opportunity_cost'], c1_fast['components']['opportunity_cost'])
-        self.assertGreater(c1['score'], c1_fast['score'])
-        self.assertEqual(candidate_ranking.five_axis_deciding_key(c1, c1_fast), 'net_score')
+        self.assertLess(x1['components']['opportunity_cost'], x1_fast['components']['opportunity_cost'])
+        self.assertGreater(x1['score'], x1_fast['score'])
+        self.assertEqual(candidate_ranking.five_axis_deciding_key(x1, x1_fast), 'net_score')
 
         acc_max20 = copy.deepcopy(accounts)
         acc_max20['accounts']['claude']['plan'] = 'max20'
@@ -436,10 +440,11 @@ class FixRoundRegressionTests(unittest.TestCase):
             'claude': [('five_hour', 90.0, 4.0), ('seven_day', 50.0, 84.0), ('weekly_fable', 50.0, 84.0)],
             'codex': [('usage', 50.0, 84.0)],
         })
-        plan_max20 = allocator.plan(task, usage_max20, now, accounts=acc_max20,
-                                    host_policy_config={'allowed_accounts': ['claude', 'codex']}, read_local_state=False)
-        m1 = next(c for c in plan_max20['ranking'] if c['id'] == 'opus55_high')
-        m1_fast = next(c for c in plan_max20['ranking'] if c['id'] == 'opus55_high+fast')
+        with cited_fast():
+            plan_max20 = allocator.plan(task, usage_max20, now, accounts=acc_max20,
+                                        host_policy_config={'allowed_accounts': ['claude', 'codex']}, read_local_state=False)
+        m1 = next(c for c in plan_max20['ranking'] if c['id'] == 'sol_high')
+        m1_fast = next(c for c in plan_max20['ranking'] if c['id'] == 'sol_high+fast')
         self.assertGreater(m1['score'], m1_fast['score'])
         self.assertEqual(candidate_ranking.five_axis_deciding_key(m1, m1_fast), 'net_score')
         self.assertFalse(plan_max20['selected_bundle'].get('fast'))
