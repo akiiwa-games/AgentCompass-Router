@@ -34,7 +34,10 @@ dispatch once in <state dir>/provider-retry.json:
     pool hold the classifier itself scoped `account` is about a subscription, a balance or credentials, which do not
     change in minutes: it lasts the re-probe period the latches share (account_state.LATCH_RETRY_HOURS) from its
     observation, from the first hold on, since each re-probe costs the caller a failed launch. A later `next` from the
-    provider wins. No hold waits for a person (owner,
+    provider wins. The trade, kept on purpose (review round 2 N3): a transient error the classifier mis-scopes as
+    `account` now holds for that period instead of 2 minutes, while a quota message no longer reaches this hold at all
+    (it is a latch with its own time, below), so an `account` hold is about a subscription, a balance or credentials,
+    and a good usage reading, a re-login or a named route lifts it earlier (Lifting early). No hold waits for a person (owner,
     2026-11-24): a hold written without a retry time (by v0.7.x, which held a classifier `account` answer until
     cleared) is due by the same rule, counted from its `observed_at` (`due_at`).
   - A failed turn the classifier answered `account` or not at all whose message is a confirmed quota failure is not a
