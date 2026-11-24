@@ -174,7 +174,7 @@ def bundle_view(bundle):
 def hold_key(bundle):
     import provider_retry
     try:
-        entry = provider_retry.entry_for(bundle, provider_retry.active())
+        entry = provider_retry.entry_for(bundle, provider_retry.active(now=registry.utcnow()))
     except OSError:
         return None
     return provider_retry.entry_key(entry) if entry else None
@@ -317,7 +317,7 @@ class Chain:
         import provider_retry
         try:
             entry = provider_retry.entry_for({k: attempt.get(k) for k in ('account', 'provider', 'model')},
-                                             provider_retry.active())
+                                             provider_retry.active(now=registry.utcnow()))
         except OSError:
             entry = None
         if entry and isinstance(entry.get('retry_at'), str):

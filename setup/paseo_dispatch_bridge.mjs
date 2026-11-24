@@ -158,8 +158,23 @@ export function notificationFile(dispatchId) {
     'paseo-notifications', `${dispatchId}.json`);
 }
 
+const RETRYABLE_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
+// Windows denies `rename` while a reader holds the file open without FILE_SHARE_DELETE, and `readFile` during a replace.
+function retryBusySync(fn, attempts = 5, pauseMs = 20) {
+  for (let attempt = 0; attempt < attempts - 1; attempt++) {
+    try { return fn(); }
+    catch (error) {
+      if (!RETRYABLE_FS_CODES.has(error?.code)) throw error;
+      Atomics.wait(SLEEP_CELL, 0, 0, pauseMs);
+    }
+  }
+  return fn();
+}
+
 function readRecord(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  try { return JSON.parse(retryBusySync(() => fs.readFileSync(file, 'utf8'))); }
   catch (error) {
     if (error.code === 'ENOENT') return null;
     throw new BridgeError('record_unreadable', {cause: error});
@@ -170,8 +185,14 @@ function saveRecord(file, record) {
   const temp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(temp, JSON.stringify(record), {mode: 0o600});
-    fs.renameSync(temp, file);
-  } catch (error) { throw new BridgeError('record_unwritable', {cause: error}); }
+    retryBusySync(() => fs.renameSync(temp, file));
+  } catch (error) {
+    throw new BridgeError('record_unwritable', {cause: error});
+  } finally {
+    if (fs.existsSync(temp)) {
+      try { fs.rmSync(temp, {force: true}); } catch {}
+    }
+  }
 }
 
 function alive(pid) {
@@ -759,11 +780,27 @@ export function agentResumed(agent, record) {
     && typeof agent.lastUserMessageAt === 'string' && Date.parse(agent.lastUserMessageAt) > failedAt;
 }
 
+// Records whose in-memory status moved to DONE before `persist()` succeeded: a retry poll must still persist before exiting.
+const unpersistedDone = new WeakSet();
+
 // This small step is also used by tests with an SDK fake. Persist the pending
 // message before sending: a lost acknowledgment retries the same messageId.
 export async function notificationStep(client, record, persist, now = Date.now(),
   fallback = fallbackArgv() ? defaultFallback : null) {
-  if (DONE.has(record.status)) return true;
+  const finish = update => {
+    update();
+    unpersistedDone.add(record);
+    persist();
+    unpersistedDone.delete(record);
+    return true;
+  };
+  if (DONE.has(record.status)) {
+    if (unpersistedDone.has(record)) {
+      persist();
+      unpersistedDone.delete(record);
+    }
+    return true;
+  }
   const targetId = record.agent_id ?? record.dispatch_id;
   // A transient failure's same-model retry is scheduled (dispatch_fallback.Chain.schedule): wait until it is due,
   // unless the parent resumed this worker in the meantime, which retires the retry at once.
@@ -840,9 +877,9 @@ export async function notificationStep(client, record, persist, now = Date.now()
         return false;
       }
       record.fallback = {status: 'done', ...fallbackRecord(outcome)};
-      if (outcome?.action === 'relaunched') {record.status = 'relaunched'; persist(); return true;}
+      if (outcome?.action === 'relaunched') return finish(() => { record.status = 'relaunched'; });
       if (outcome?.action === 'final' && (outcome.result === 'canceled' || outcome.result === 'resumed')) {
-        record.status = outcome.result; persist(); return true;
+        return finish(() => { record.status = outcome.result; });
       }
       if (!event && record.terminal?.reason) event = {key: 'terminal', reason: record.terminal.reason};
       persist();
@@ -852,23 +889,21 @@ export async function notificationStep(client, record, persist, now = Date.now()
   // are not that end. A terminal notice already composed is dropped at the send point once the continuation is known.
   if (!record.pending && event?.key === 'terminal') await noteContinuation(client, record);
   if (!record.pending && event?.key === 'terminal' && record.continued) {
-    record.status = 'continued';
-    persist();
-    return true;
+    return finish(() => { record.status = 'continued'; });
   }
   // A later dispatch on the worker: stop here and leave the notice to the registry's decision (continuedClaim).
   if (event?.key === 'terminal' || record.pending?.key === 'terminal') {
     const later = await continuedClaim(client, record);
     if (later) {
-      record.status = 'continued';
-      record.continued_by = later;
-      persist();
-      return true;
+      return finish(() => {
+        record.status = 'continued';
+        record.continued_by = later;
+      });
     }
   }
   const parent = (await client.fetchAgent(record.parent_id))?.agent;
   if (!parent || parent.archivedAt || parent.status === 'closed') {
-    record.status = 'parent_unavailable'; persist(); return true;
+    return finish(() => { record.status = 'parent_unavailable'; });
   }
   if (!record.pending) {
     if (event) {
@@ -883,10 +918,10 @@ export async function notificationStep(client, record, persist, now = Date.now()
   if (record.pending?.key === 'terminal') {
     await noteContinuation(client, record);
     if (record.continued) {
-      record.pending = null;
-      record.status = 'continued';
-      persist();
-      return true;
+      return finish(() => {
+        record.pending = null;
+        record.status = 'continued';
+      });
     }
   }
   if (!record.pending) return false;
@@ -898,9 +933,7 @@ export async function notificationStep(client, record, persist, now = Date.now()
     persist();
     return false;
   }
-  settleTerminal(record, result);
-  persist();
-  return true;
+  return finish(() => settleTerminal(record, result));
 }
 
 // The one catch-up send. The message id is derived here (noticeMessageId), never taken from the caller, and matches the
@@ -997,13 +1030,24 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
     try { fs.mkdirSync(recovery); }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      process.send?.({ready: false}); return;
+      // Another starter is reclaiming `lock` right now; `ensureNotification` waits for the published ready receipt.
+      process.send?.({ready: true}); return;
     }
     try {
-      const owner = fs.existsSync(lock) ? Number(fs.readFileSync(lock, 'utf8')) : null;
-      if (owner === 0 || alive(owner)) {process.send?.({ready: Boolean(owner)}); return;}
-      if (fs.existsSync(lock)) fs.unlinkSync(lock);
-      lockFd = fs.openSync(lock, 'wx');
+      const raw = fs.existsSync(lock) ? retryBusySync(() => fs.readFileSync(lock, 'utf8')).trim() : '';
+      const owner = raw ? Number(raw) : 0;
+      if (alive(owner)) {process.send?.({ready: true}); return;}
+      if (!raw && fs.existsSync(lock)) {
+        let ageMs = Infinity;
+        try { ageMs = Date.now() - fs.statSync(lock).mtimeMs; } catch {}
+        if (ageMs < 2000) {process.send?.({ready: true}); return;}
+      }
+      if (fs.existsSync(lock)) retryBusySync(() => fs.unlinkSync(lock));
+      try { lockFd = fs.openSync(lock, 'wx'); }
+      catch (inner) {
+        if (inner.code !== 'EEXIST') throw inner;
+        process.send?.({ready: true}); return;
+      }
     } finally { fs.rmdirSync(recovery); }
   }
   fs.writeFileSync(lockFd, String(process.pid));
@@ -1032,21 +1076,21 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
     process.send?.({ready: true});
     if (process.connected) process.disconnect();
     while (Date.now() < record.deadline + CREATE_LIMIT_MS) {
-      // The creator can receive an authoritative failure while we are polling.
-      // Stop only this dispatch's watcher, without replacing its receipt.
-      if (fs.existsSync(`${file}.creation-failed`)) {
-        record.status = 'creation_failed'; persist(); return;
-      }
       try {
+        // The creator can receive an authoritative failure while we are polling.
+        // Stop only this dispatch's watcher, without replacing its receipt.
+        if (fs.existsSync(`${file}.creation-failed`)) {
+          record.status = 'creation_failed'; persist(); return;
+        }
         if (!client.isConnected) await client.connect();
         if (await notificationStep(client, record, persist)) return;
+        if (fs.existsSync(`${file}.creation-failed`)) {
+          record.status = 'creation_failed'; persist(); return;
+        }
       } catch {
         // Do not persist SDK errors: they may contain prompts or credentials.
         await client.close().catch(() => {});
         client = await createClient();
-      }
-      if (fs.existsSync(`${file}.creation-failed`)) {
-        record.status = 'creation_failed'; persist(); return;
       }
       await pause(POLL_MS);
     }
@@ -1056,7 +1100,7 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
     try { await settleBeforeExit(record); } catch { /* a failed settle must not keep the lock */ }
     if (client) await client.close().catch(() => {});
     fs.closeSync(lockFd);
-    fs.unlinkSync(lock);
+    if (fs.existsSync(lock)) retryBusySync(() => fs.unlinkSync(lock));
   }
 }
 
