@@ -1036,13 +1036,15 @@ team_reason = gate.check_account_quota_exhausted(
     "team-anthropic", usage_cache_path=cache_path, now=now, accounts=accounts_team, model="claude-sonnet-5-5"
 )
 
-# --- Check C: Magpie pool with accounts: 2 is judged on N × (100 - mean) ---
+# --- Check C: a Magpie pool of 2 is judged on its members' windows (the sum of what each has left) ---
 write_cache({{
     "claude": {{
         "provider_id": "claude", "plan_label": "pro", "available": True, "stale": False, "fetched_at": now.isoformat(),
         "windows": [
-            {{"id": "five_hour", "used_pct": 80.0, "accounts": 2, "resets_at": reset_5h}},
-            {{"id": "seven_day", "used_pct": 30.0, "accounts": 2, "resets_at": reset_7d}},
+            {{"id": "five_hour", "used_pct": 80.0, "accounts": 2, "resets_at": reset_5h,
+              "members": [{{"used_pct": 80.0, "resets_at": reset_5h}}, {{"used_pct": 80.0, "resets_at": reset_5h}}]}},
+            {{"id": "seven_day", "used_pct": 30.0, "accounts": 2, "resets_at": reset_7d,
+              "members": [{{"used_pct": 30.0, "resets_at": reset_7d}}, {{"used_pct": 30.0, "resets_at": reset_7d}}]}},
         ],
     }},
     "claude-2": {{

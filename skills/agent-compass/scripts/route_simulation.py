@@ -172,7 +172,8 @@ def metered_accounts(accounts):
 
 def synthetic_document(accounts, now, scenario, pools=None):
     """Collector cache rows for every windowed account: ample everywhere except the scenario's scarce windows.
-    `pools` gives a Magpie pool's login count; the collector reports it per window as `accounts`."""
+    `pools` gives a Magpie pool's login count; the collector reports each pooled window as `accounts` and one member
+    window per login (`members`), here all in step with the scenario's reading."""
     providers = {}
     stale = scenario == 'stale'
     for name, spec in metered_accounts(accounts).items():
@@ -194,6 +195,8 @@ def synthetic_document(accounts, now, scenario, pools=None):
             row = {'id': wid, 'used_pct': used, 'resets_at': (now + timedelta(hours=reset)).isoformat()}
             if (pools or {}).get(name, 1) > 1:
                 row['accounts'] = pools[name]
+                row['members'] = [{'label': f'member-{n}', 'used_pct': used, 'resets_at': row['resets_at']}
+                                  for n in range(1, pools[name] + 1)]
             windows.append(row)
         fetched = now - STALE_AGE if stale else now
         providers[name] = {'fetched_at': fetched.isoformat(), 'stale': stale, 'available': True, 'windows': windows}

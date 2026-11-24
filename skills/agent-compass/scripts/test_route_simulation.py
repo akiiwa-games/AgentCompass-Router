@@ -100,6 +100,20 @@ class UsageAwareSimulationTests(unittest.TestCase):
                         'claude', 'seven_day')
         self.assertIsNone(weekly['remaining_pct_before_reset'])
 
+    def test_the_pool_account_set_reads_its_members_as_the_collector_writes_them(self):
+        # Review F2: the simulated pool is written in the collector's shape (one member window per login), so each of
+        # its windows reads the members' sum, `pools` times what the same account alone reads, in every state.
+        pooled, pools = sim.accounts_for('fresh', 'magpie pool (3x claude pro)')
+        alone, _ = sim.accounts_for('fresh', 'claude pro')
+        for state in ('ample', 'claude scarce', '5h-only scarce', 'claude tight'):
+            many, one = sim.usage_for(state, pooled, NOW, pools), sim.usage_for(state, alone, NOW)
+            for wid in ('five_hour', 'seven_day'):
+                with self.subTest(state=state, wid=wid):
+                    w1 = window(one, 'claude', wid)
+                    self.assertIsNotNone(w1['remaining_pct_before_reset'])
+                    self.assertAlmostEqual(window(many, 'claude', wid)['remaining_pct_before_reset'],
+                                           pools['claude'] * w1['remaining_pct_before_reset'])
+
     def test_old_shape_ledger_rows_are_skipped_with_a_warning_count(self):
         import json
         from pathlib import Path
