@@ -23,6 +23,18 @@ CI (`.github/workflows/ci.yml`, push to `main` and pull requests) runs the fast 
 
 Install test dependencies with `pip install -e ".[dev]"` (`pytest`, `pytest-xdist`, `psutil`); the tray tests also need the `tray` extra and the calibration tests the `calibration` extra (`numpy`, `pandas`, `pyarrow`), so CI and `packaging/verify_release.py` use `pip install -e ".[dev,tray,calibration]"`.
 
+## A Change Within a Version Is Light; the Full Process Runs at the Release
+
+Owner rule, 2026-11-24. A change within a version (a fix, a feature, a merge) carries only what is about that change:
+
+- **Review**: one round, of the change and of the code that reads it. One question: does the change do what it says without breaking its readers. A defect outside the change is listed in one line for the release review and not fixed here, unless it stops the user's work now. A fix of a finding is checked by reading it, not by another round.
+- **Tests**: one test for each rule the change adds or corrects, none for behaviour it leaves alone. No sweep over fixture combinations; a sweep belongs to a declared formula and is marked `slow`. A test diff larger than the code diff needs a reason.
+- **Able to fail**: needed only for a test of a gate, or of a rule that refuses, excludes or prices a route. Once per rule, not per test. For a fix: run the new test on the code before the fix and see it fail. For a new rule: undo the one line that states it, see the test fail, put it back. Record it as one line of the commit message (`able to fail: <test> is red without <what>`). No tables, and a reviewer does not repeat it.
+- **Documents**: change the sentence the change made false and add what a user can now see (a command, an option, a status), in the one place that owns it. No history and no walkthrough.
+- **Report**: the author's final reply. No report file.
+
+The release, once per version, over `<last tag>..main`: the open-ended review (any defect, each proven by a run, with the listed ones; fixed or deliberately left), the regression above, able-to-fail sampled over the version's new gate and rule tests, the documents against the code, `packaging/verify_release.py` and the sandbox check.
+
 ## Routing Tests Assert Rules, Never Outcomes
 
 - Never assert a routing outcome: which model or bundle wins (`choice == ...`), a model's share across scenarios, a ranking order, or an exact score, price or cost copied from current output. Nobody has validated those results as correct, so such an assertion only freezes whatever the router produced that day.
