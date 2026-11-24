@@ -571,6 +571,28 @@ class StatedResetParseTests(unittest.TestCase):
         with self.subTest('a zone name no zone database knows is unreadable'):
             self.assertIsNone(quota_exhaustion.stated_reset('It resets at 3:00 PM (Nowhere/Atlantis)', self.AT))
 
+    def test_a_zone_token_is_read_only_when_it_names_one_offset_and_the_machine_zone_only_when_there_is_none(self):
+        """Rule (quota_exhaustion._stated_zone, review round 2 N1): `Z` and a numeric offset (`+05:00`, `-0800`) name one
+        offset and are read; an abbreviation (PST, EST, JST) or any other zone-shaped token names no single offset, so the
+        sentence is unreadable (no reset: the re-probe period applies). The machine's zone applies only when the time
+        is followed by no zone token at all."""
+        plus5 = timezone(timedelta(hours=5))
+        read = {'It resets at 15:00Z': datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc),
+                'It resets at 15:00 Z': datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc),
+                'It resets at 20:00 +05:00': datetime(2026, 11, 24, 20, 0, tzinfo=plus5),
+                'It resets at 20:00+0500': datetime(2026, 11, 24, 20, 0, tzinfo=plus5),
+                'It resets at 7:00 AM -08:00': datetime(2026, 11, 24, 7, 0, tzinfo=timezone(timedelta(hours=-8))),
+                'They reset at Nov 26, 2026, 12:59AM +05:00': datetime(2026, 11, 26, 0, 59, tzinfo=plus5)}
+        for text, expected in read.items():
+            with self.subTest(text=text):
+                self.assertEqual(quota_exhaustion.stated_reset(text, self.AT), expected)
+        for text in ('It resets at 3:00 PM PST', 'It resets at 15:00 EST.', 'It resets at 23:00 JST',
+                     'They reset at Nov 26, 2026, 12:59AM CET', 'It resets at 15:00 (PDT)', 'It resets at 15:00 +25:00'):
+            with self.subTest(text=text):
+                self.assertIsNone(quota_exhaustion.stated_reset(text, self.AT))
+        local = quota_exhaustion.stated_reset('It resets at 21:00, try again later', self.AT)
+        self.assertEqual(local.utcoffset(), self.AT.astimezone().utcoffset())
+
     def test_a_reset_not_in_the_future_or_beyond_every_quota_period_is_unreadable(self):
         """A stated reset must lie after the observation and no further than the longest reset period any window of
         the shipped plan templates has (declared data); otherwise the latch's re-probe period applies."""

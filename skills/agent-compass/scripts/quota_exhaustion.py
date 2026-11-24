@@ -68,15 +68,21 @@ def confirmed(error):
 _RESET_DATE = re.compile(r'resets? at\s+([A-Za-z]{3,9}\.? \d{1,2},? \d{4},? \d{1,2}:\d{2}\s?[AaPp][Mm])')
 _RESET_CLOCK = re.compile(r'resets? at\s+(\d{1,2}):(\d{2})(?:\s?([AaPp][Mm]))?(?![\d:])')
 _RESET_COUNTDOWN = re.compile(r'(?:retrying in|reintentando en)\s+(\d+)\s*s\b', re.I)
-# A zone written right after the time: an IANA name ("(America/New_York)") or UTC/GMT with an optional offset.
+# A zone token written right after the time: an IANA name ("(America/New_York)"), UTC/GMT with an optional offset,
+# `Z`, a bare numeric offset ("+05:00", "-0800"), or an abbreviation ("PST", "JST"), which names no single offset.
 _ZONE = re.compile(r'\s*\(?\s*(?:(?P<iana>[A-Za-z]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)|'
-                   r'(?P<utc>UTC|GMT)(?![A-Za-z])\s*(?P<off>[+-]\d{1,2}(?::?\d{2})?)?)')
+                   r'(?P<utc>UTC|GMT)(?![A-Za-z])\s*(?P<off>[+-]\d{1,2}(?::?\d{2})?)?|'
+                   r'(?P<z>Z)(?![A-Za-z])|'
+                   r'(?P<bare>[+-]\d{2}(?::?\d{2})?)(?![\d:])|'
+                   r'(?P<abbr>[A-Z]{2,5})(?![A-Za-z]))')
 _UNKNOWN_ZONE = object()
 
 
 def _stated_zone(error, end):
-    """The zone the sentence states right after a time ending at `end`: a tzinfo, None when it states none, or
-    _UNKNOWN_ZONE for a zone name no zone database knows (the sentence is then unreadable)."""
+    """The zone the sentence states right after a time ending at `end`: a tzinfo, None when no zone token follows the
+    time, or _UNKNOWN_ZONE for a token that names no single offset (an abbreviation such as PST or JST, which several
+    zones share and which says nothing of daylight time; a zone name no zone database knows; an offset out of range):
+    the sentence is then unreadable, so the re-probe period applies, never the machine's zone."""
     m = _ZONE.match(error, end)
     if not m:
         return None
@@ -86,7 +92,9 @@ def _stated_zone(error, end):
             return ZoneInfo(m.group('iana'))
         except (ZoneInfoNotFoundError, ValueError):
             return _UNKNOWN_ZONE
-    offset = m.group('off')
+    if m.group('abbr'):
+        return _UNKNOWN_ZONE
+    offset = m.group('off') or m.group('bare')
     if not offset:
         return timezone.utc
     sign = -1 if offset[0] == '-' else 1
@@ -173,8 +181,9 @@ def stated_reset(error, at):
     """The reset time a limit error states, as an aware datetime, else None. The boundary parse of the vendor's sentence,
     in one place: a sentence in none of the forms above gives None (the latch's re-probe period applies), never a guess.
     `at` is when the error was observed: a countdown counts from it, and a bare clock time is its next occurrence. A
-    zone the sentence states is used; a time with none is the machine's local time (the vendor's client prints wall
-    time for its user). A reset not after `at`, or further from it than the longest reset period any shipped plan
+    zone the sentence states is used (`_stated_zone`: `Z`, a numeric offset, UTC/GMT, an IANA name); a token that names no
+    single offset makes the sentence unreadable; only a time followed by no zone token is the machine's local time (the
+    vendor's client prints wall time for its user). A reset not after `at`, or further from it than the longest reset period any shipped plan
     window has (`longest_reset_hours`), is unreadable too."""
     if not isinstance(error, str):
         return None
