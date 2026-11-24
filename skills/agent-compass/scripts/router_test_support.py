@@ -1,5 +1,5 @@
 """Hermetic router fixtures shared by contract tests and their subprocesses."""
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import copy
 from datetime import timedelta
 import os
@@ -50,6 +50,29 @@ def isolated_router_state(add_cleanup, *, discovery=True, policy=True):
     if policy:
         stack.enter_context(patch.object(host_policy, 'load_policy', return_value=None))
     return root
+
+
+CITED_FAST = {'status': 'ok', 'price_multiplier': 2.0, 'speed_multiplier': 1.5, 'source': 'vendor.fast_mode',
+              'reason': None}
+
+
+@contextmanager
+def cited_fast(*models, spec=CITED_FAST):
+    """The five-axis data with a synthetic cited fast-mode row on `models` (default: every model whose catalog row declares
+    a verified fast contract). No shipped row cites its fast multipliers, so the priced fast candidate is exercised on this
+    fixture, never on a guessed variant."""
+    import account_fleet
+    import axis_scores
+    import fast_modes
+    data = copy.deepcopy(axis_scores.load_five_axis())
+    if not models:
+        catalog = account_fleet.load_accounts(account_fleet.reference_fleet_path())['models']
+        models = [m for m, info in catalog.items() if isinstance(info, dict) and m in data['models']
+                  and any(fast_modes.supported(h, m, info) for h in fast_modes.HARNESSES)]
+    for model in models:
+        data['models'][model]['fast_mode'] = dict(spec)
+    with patch.object(axis_scores, 'load_five_axis', return_value=data):
+        yield data
 
 
 def usage_windows(now, accounts):

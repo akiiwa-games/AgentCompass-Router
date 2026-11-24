@@ -15,6 +15,7 @@ import allocator
 import axis_scores
 import provider_inventory
 import candidate_eval
+import fast_modes
 import task_intake
 import candidate_ranking
 import ledger_snapshot
@@ -23,7 +24,7 @@ import quota_pools
 import model_latch
 import provider_retry
 import route_simulation as sim
-from router_test_support import isolated_router_state
+from router_test_support import CITED_FAST, cited_fast, isolated_router_state
 from test_fleet_parity import shipped_template, snapshot
 
 
@@ -70,7 +71,9 @@ def ladder_for(spend_scale=1.0, with_outside=0.0):
 
 class Fleet:
     """Claude Max20 and Codex Pro on the shipped public data, each window on its own clock; the cheap Haiku and Luna lines
-    are added as bundles so the ladders have the same three rungs the advisor's probe had."""
+    are added as bundles so the ladders have the same three rungs the advisor's probe had. The Codex rows with a verified
+    fast contract carry a synthetic cited fast-mode row (`cited_fast`: no shipped row cites its multipliers), so the
+    fast variants are their own candidates."""
 
     def __init__(self):
         self.accounts = sim.fresh_accounts(shipped_template(), snapshot())
@@ -111,7 +114,7 @@ class Fleet:
             'level': 1.0, 'as_of': '2026-11-11', 'kind': 'maintainer',
         }
         route = {k: task.pop(k) for k in task_intake.ROUTE_FIELDS if k in task}   # route fields, never task fields
-        with patch.object(axis_scores.user_scores, 'load_public', return_value=pub):
+        with patch.object(axis_scores.user_scores, 'load_public', return_value=pub), cited_fast():
             return allocator.plan({'objective': 't', 'hours': hours, 'profile': profile, **task}, usage, NOW, accounts=acc,
                                   overrides=[], records=[], host_policy_config={'allowed_accounts': list(allowed)},
                                   route=route)
@@ -359,11 +362,11 @@ class FleetEconomyTests(unittest.TestCase):
         faster completion, then fewer USD (expiring quota is not a tie-break: it already lowers the quota cost). (1) A fast variant is its own candidate at its
         real spend; 2h before the weekly reset the cost of both is below N's resolution, so the fast one wins on time (round 15). (2) The under-line mid-week case keeps a plain variant on top instead of Opus+fast.
         (3) Where the quota costs nothing the fast variant and its base tie on N and the faster one wins by completion time."""
-        sprint = self.fleet.plan(0.6, 0.5, ec=1 - 2 / WEEK)
+        sprint = self.fleet.plan(0.5, 0.6, ex=1 - 2 / WEEK)
         for c in eligible(sprint):
             self.assertNotEqual(c['components'].get('decided_by'), 'speed')
-        opus = row(sprint, 'opus55_high')
-        fast = row(sprint, 'opus55_high', fast=True)
+        opus = row(sprint, 'sol_high')
+        fast = row(sprint, 'sol_high', fast=True)
         # (1) 2h to the weekly reset with 40% left: with the v3.1 burst size nothing of the week is likely to be needed,
         # so both variants cost less than the 4-place resolution of N, tie on N, and the fast one wins on completion time
         for c in (opus, fast):
@@ -388,16 +391,16 @@ class FleetEconomyTests(unittest.TestCase):
             self.assertLessEqual(cost_under[cid], cost_mid[cid] + 1e-12, cid)
         top = mid_week['ranking'][0]
         self.assertFalse(top['bundle'].get('fast'))
-        self.assertGreater(top['score'], row(mid_week, 'opus55_high', fast=True)['score'])
+        self.assertGreater(top['score'], row(mid_week, 'sol_high', fast=True)['score'])
         self.assertEqual([c['score'] for c in eligible(mid_week)], sorted((c['score'] for c in eligible(mid_week)), reverse=True))
         # (3) where the quota costs nothing (2h before the weekly reset, plenty left) the fast variant ties its base on N
         # and the faster one wins by completion time
-        free = self.fleet.plan(0.6, 0.5, allowed=('claude',), ec=1 - 2 / WEEK)
-        plain, quick = row(free, 'opus55_high'), row(free, 'opus55_high', fast=True)
+        free = self.fleet.plan(0.5, 0.6, allowed=('codex',), ex=1 - 2 / WEEK)
+        plain, quick = row(free, 'sol_high'), row(free, 'sol_high', fast=True)
         self.assertLess(plain['components']['opportunity_cost'], 5e-5)
         self.assertEqual(round(plain['score'], 4), round(quick['score'], 4))
         self.assertLess(quick['expected_hours'], plain['expected_hours'])
-        order = [c['bundle'].get('fast', False) for c in eligible(free) if (c.get('base_id') or c['id']) == 'opus55_high']
+        order = [c['bundle'].get('fast', False) for c in eligible(free) if (c.get('base_id') or c['id']) == 'sol_high']
         self.assertEqual(order, [True, False])
         self.assertEqual(quick['components']['decided_by'], 'completion_hours')
 
@@ -583,7 +586,7 @@ class FastVariantIdentityTests(unittest.TestCase):
 
     def plan(self, **task):
         # 2h before the weekly reset the quota costs nothing: the fast variant ties its base on N and wins on speed
-        return self.fleet.plan(0.6, 0.5, allowed=('claude',), ec=1 - 2 / WEEK, **task)
+        return self.fleet.plan(0.5, 0.3, allowed=('codex',), ex=1 - 2 / WEEK, **task)
 
     def assert_equal_n_fast_ranks_first(self, d):
         """User rule (2026-11-10): quota about to expire is optimised for speed. A fast variant that ties its base on N
@@ -609,31 +612,36 @@ class FastVariantIdentityTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         for f, b in tied:
             self.assertEqual(f['id'], b['id'] + '+fast')
-        fast = self.plan(pinned_bundle='opus55_high+fast')
-        self.assertEqual(fast['selected_bundle']['bundle_id'], 'opus55_high')
+        fast = self.plan(pinned_bundle='sol_high+fast')
+        self.assertEqual(fast['selected_bundle']['bundle_id'], 'sol_high')
         self.assertTrue(fast['selected_bundle']['fast'])
 
     def test_a_pinned_bundle_gets_exactly_that_variant(self):
-        base = self.plan(pinned_bundle='opus55_high')
-        self.assertEqual(base['choice'], 'opus55_high')
+        base = self.plan(pinned_bundle='sol_high')
+        self.assertEqual(base['choice'], 'sol_high')
         self.assertFalse(base['selected_bundle'].get('fast'))
-        base_row = next(c for c in base['ranking'] if c['id'] == 'opus55_high')
+        base_row = next(c for c in base['ranking'] if c['id'] == 'sol_high')
         usd_per_hour = base_row['five_axis_price']['usd_per_hour']
-        self.assertAlmostEqual(base['selected_bundle']['expected_usd'], 2.0 * usd_per_hour, places=1)   # hours x cited usd per hour
-        price_mult = axis_scores.load_five_axis()['models']['claude-opus-5-5']['fast_mode']['price_multiplier']
-        fast = self.plan(pinned_bundle='opus55_high+fast')
-        self.assertEqual(fast['choice'], 'opus55_high+fast')
+        self.assertAlmostEqual(base['selected_bundle']['expected_usd'], base_row['duration_hours'] * usd_per_hour, places=1)   # hours x cited usd per hour
+        price_mult = CITED_FAST['price_multiplier']
+        fast = self.plan(pinned_bundle='sol_high+fast')
+        self.assertEqual(fast['choice'], 'sol_high+fast')
         self.assertTrue(fast['selected_bundle']['fast'])
-        self.assertEqual(fast['selected_bundle']['bundle_id'], 'opus55_high')
-        self.assertAlmostEqual(fast['selected_bundle']['expected_usd'], 2.0 * usd_per_hour * price_mult, places=1)
-        forced = self.plan(pinned_bundle='opus55_high', force_fast=True)       # --fast on a named bundle: that bundle, fast
+        self.assertEqual(fast['selected_bundle']['bundle_id'], 'sol_high')
+        self.assertAlmostEqual(fast['selected_bundle']['expected_usd'], base['selected_bundle']['expected_usd'] * price_mult, places=1)
+        forced = self.plan(pinned_bundle='sol_high', force_fast=True)       # --fast on a named bundle: that bundle, fast
         self.assertTrue(forced['selected_bundle']['fast'])
-        self.assertEqual(forced['selected_bundle']['bundle_id'], 'opus55_high')
-        self.assertEqual(forced['choice'], 'opus55_high+fast')
+        self.assertEqual(forced['selected_bundle']['bundle_id'], 'sol_high')
+        self.assertEqual(forced['choice'], 'sol_high+fast')
 
     def test_alternatives_keep_the_base_variant_and_the_table_shows_which_row_is_fast(self):
         import demo_plan
-        d = self.plan()
+
+        def contracted_only(acc):       # every bundle can run fast, so the winner is a fast twin that ties its base
+            cx = acc['accounts']['codex']['bundles']
+            for key in [k for k, b in cx.items() if not fast_modes.supported('codex', b['model'], acc['models'].get(b['model']))]:
+                cx.pop(key)
+        d = self.plan(mutate=contracted_only)
         self.assert_equal_n_fast_ranks_first(d)
         winner = d['choice']
         self.assertTrue(d['selected_bundle'].get('fast'), 'a tied fast variant outranks its base, so the winner is fast')
@@ -854,8 +862,8 @@ class DurationKeyTests(unittest.TestCase):
         self.assertNotEqual(axis_scores.five_axis_values(state, 'default'), axis_scores.five_axis_values(state, 'low'))
 
     def test_a_fast_variant_shortens_the_candidates_hours_and_keeps_the_source(self):
-        d = self.fleet.plan(0.6, 0.5, ec=1 - 2 / WEEK)
-        base, fast = row(d, 'opus55_high'), row(d, 'opus55_high', fast=True)
+        d = self.fleet.plan(0.5, 0.6, ex=1 - 2 / WEEK)
+        base, fast = row(d, 'sol_high'), row(d, 'sol_high', fast=True)
         self.assertEqual(fast['components']['duration_source'], base['components']['duration_source'])
         self.assertLess(fast['duration_hours'], base['duration_hours'])
 

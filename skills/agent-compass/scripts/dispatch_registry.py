@@ -615,7 +615,7 @@ def launch_request(bundle, launch):
     if family == 'codex':
         settings['features'] = {'service_tier': 'priority' if bundle.get('fast') else 'default'}
     elif family == 'claude':
-        settings['features'] = {'fast_mode': bool(bundle.get('fast'))}
+        settings['features'] = {'fast_mode': False}     # no Claude fast contract (fast_modes.HARNESSES): always off
     return canonical_request(dict(launch, provider=provider + '/' + model, settings=settings))
 
 

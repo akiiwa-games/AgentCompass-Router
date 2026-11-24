@@ -315,8 +315,6 @@ def record_constraint(args, task=None, classified=None):
     bundle['harness'] = account_fleet.bundle_harness(bundle, args.account, chosen)
     if 'modeId' not in bundle and bundle['harness'] in auto_bundles.HARNESS_MODE:
         bundle['modeId'] = auto_bundles.HARNESS_MODE[bundle['harness']]
-    if fast_requested and bundle['harness'] == 'claude':
-        bundle['fast_billing'] = fast_modes.claude_billing(accounts['accounts'][args.account])
     result = {'stage': 'record', 'choice': 'constraint', 'source': 'constraint_record',
               'constraint': args.constraint, 'basis': basis, 'specialty': args.specialty,
               **({'_from_roll': True} if getattr(args, '_from_roll', False) else {}),

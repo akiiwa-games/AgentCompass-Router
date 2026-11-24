@@ -14,8 +14,10 @@ def variant_id(bundle_id):
     return f'{bundle_id}{ID_SUFFIX}'
 
 
-# Harnesses with an implemented fast launch setting (Codex service tier, Claude Code fastMode): a CLI protocol fact.
-HARNESSES = ('codex', 'claude')
+# Harnesses with an implemented fast launch setting (the Codex service tier): a CLI protocol fact. Claude Code's
+# fastMode spends paid usage credits outside the subscription, which the product does not use (owner, 2026-11-24): its
+# launches always pass it off.
+HARNESSES = ('codex',)
 
 
 def _row(model, model_info):
@@ -54,6 +56,3 @@ def validate(harness, model, model_info):
     if reason:
         raise ValueError(reason)
 
-
-def claude_billing(account):
-    return {'subscription': 'usage_credits', 'metered': 'api'}.get(account.get('billing'), 'unknown_paid')

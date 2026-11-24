@@ -47,9 +47,11 @@ WORKER_COMMUNICATION = SKILLS / 'agent-compass' / 'references' / 'worker-communi
 # executable and flags for (model, effort, cwd). agy takes its prompt only as the argument after --print; the
 # others read it from stdin; grok reads neither (headless ignores stdin) and takes --prompt-file.
 CLI_RUNS = {
+    # Claude has no fast contract (fast_modes.HARNESSES): fastMode is always passed off, so a saved preference never
+    # spends paid usage credits.
     'claude': ('claude', lambda model, effort, cwd, fast=False: ['-p', '--model', model, *(['--effort', effort] if effort else []),
                                                                  '--permission-mode', 'bypassPermissions',
-                                                                 '--settings', json.dumps({'fastMode': bool(fast)})]),
+                                                                 '--settings', json.dumps({'fastMode': False})]),
     'codex': ('codex', lambda model, effort, cwd, fast=False: ['exec', '-m', model,
                                                                *(['-c', 'model_reasoning_effort=' + launch_values.toml_string(effort)] if effort else []),
                                                                '-c', 'features.fast_mode=' + str(bool(fast)).lower(),
@@ -448,7 +450,7 @@ def model_comparison(fleet):
 def summary(decision):
     bundle = decision.get('selected_bundle') or {}
     out = {'choice': decision.get('choice'),
-           'bundle': {k: bundle[k] for k in ('provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast', 'fast_billing') if bundle.get(k)},
+           'bundle': {k: bundle[k] for k in ('provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast') if bundle.get(k)},
            'reason': ((decision.get('decision') or {}).get('reason') or '')[:300] or None,
            'alerts': [a['message'] for a in decision.get('alerts') or [] if a.get('severity') == 'warn'],
            **({'warnings': warnings} if (warnings := decision.get('warnings') or (decision.get('decision') or {}).get('warnings')) else {})}

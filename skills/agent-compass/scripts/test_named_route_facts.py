@@ -74,10 +74,10 @@ class FastModeFactTests(NamedRouteCase):
     def uncontracted(self):
         for bundle in account_fleet.bundles(self.accounts).values():
             harness = account_fleet.bundle_harness(bundle, bundle['account'])
-            if bundle.get('effort') and harness in fast_modes.HARNESSES and not fast_modes.supported(
+            if bundle.get('effort') and not fast_modes.supported(
                     harness, bundle['model'], account_fleet.model_spec(self.accounts, bundle['model'])):
                 return bundle, harness
-        self.skipTest('the reference fleet has no codex/claude row without a fast contract')
+        self.skipTest('the reference fleet has no row without a fast contract')
 
     def test_no_contract_is_refused_with_the_one_wording_at_record_and_at_launch(self):
         bundle, harness = self.uncontracted()

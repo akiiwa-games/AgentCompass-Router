@@ -126,7 +126,7 @@ def axes_of(scores, missing=()):
     return out
 
 
-def row(scores=0.8, usd=5.0, missing=(), image_input='yes', dur=1.0, fast=None, price=True):
+def row(scores=0.8, usd=5.0, missing=(), image_input='yes', dur=1.0, price=True):
     scores = scores if isinstance(scores, dict) else dict.fromkeys(axis_scores.FIVE_AXES, scores)
     img_val = True if image_input == 'yes' else False if image_input == 'no' else None
     axes = axes_of(scores, missing)
@@ -141,8 +141,6 @@ def row(scores=0.8, usd=5.0, missing=(), image_input='yes', dur=1.0, fast=None, 
     if price:       # the data's `price` row: public USD per million tokens with its source (aa.price, openrouter.price)
         out['price'] = {'value': {'input': 0.1, 'output': 0.4, 'cache_read': 0.01}, 'source': 'aa.price', 'kind': 'vendor',
                         'as_of': '2026-11-09', 'url': 'https://artificialanalysis.ai/leaderboards/models'}
-    if fast is not None:
-        out['fast_mode'] = fast
     return out
 
 
@@ -580,13 +578,12 @@ class FiveAxisTests(unittest.TestCase):
         acc['accounts']['claude-2']['bundles'] = {
             'claude-2__opus55_high': {'provider': 'claude', 'harness': 'claude', 'account': 'claude-2', 'model': 'claude-opus-5-5', 'effort': 'high'},
         }
-        fast_cfg = {'status': 'ok', 'price_multiplier': 2.0, 'speed_multiplier': 1.5, 'source': 'anthropic.fast_mode'}
         base_rows = {name: row(0.5, usd=5.0) for name, info in acc['models'].items() if isinstance(info, dict)}
         doc = document(
             acc['models'],
             **{
                 **base_rows,
-                'claude-opus-5-5': row(demand(0.7333, 0.8, 0.8, 0.8000), usd=22.86, dur=1.0, fast=fast_cfg),
+                'claude-opus-5-5': row(demand(0.7333, 0.8, 0.8, 0.8000), usd=22.86, dur=1.0),
                 'claude-sonnet-5-5': row(demand(0.6000, 0.6, 0.6, 0.7000), usd=12.83, dur=0.98),
                 'claude-haiku-5-5': row(demand(0.5000, 0.45, 0.45, 0.5000), usd=2.67, dur=0.11),
                 'glm-5.3-flash-free': row(demand(0.6820, 0.558, 0.558, 0.5000), usd=1.50, image_input='no'),
@@ -643,26 +640,12 @@ class FiveAxisTests(unittest.TestCase):
             self.assertAlmostEqual(w_a['elapsed_hours'], 166.0)
             self.assertEqual(w_a['spend_after_reset'], 0.0)
         # 2h before the reset with a 3h task: one hour of it falls into Pool A's next period, where its first dollar is needed
-        # again with the new period's own odds, so the plain Opus on Pool A pays for that hour and trails Pool B. Its fast
-        # variant finishes the 3h task in 2h, before the reset: nothing crosses and it is free again (fast mode is its own
-        # candidate at its real spend, so this is a result of the price and not a rule).
+        # again with the new period's own odds, so the plain Opus on Pool A pays for that hour and trails Pool B.
         d3 = run_case(3.0)
         a3, b3 = pools(d3)
         self.assertGreater(a3['economy']['windows'][0]['spend_after_reset'], 0.0)
         self.assertGreater(a3['components']['opportunity_cost'], b3['components']['opportunity_cost'])
         self.assertLess(a3['score'], b3['score'])
-        fast3 = next(c for c in d3['ranking'] if c['id'] == 'opus55_high+fast')
-        self.assertEqual(fast3['economy']['windows'][0]['spend_after_reset'], 0.0)
-        self.assertEqual(round(fast3['score'], 4), round(b3['score'], 4))
-        for sec_left in (7200, 600):    # near the reset both variants cost nothing: they tie on N and the faster one goes first
-            usage['accounts']['claude']['windows'][0]['seconds_until_reset'] = sec_left
-            near = run_case(0.1)
-            fast = next(c for c in near['ranking'] if c['id'] == 'opus55_high+fast')
-            plain = next(c for c in near['ranking'] if c['id'] == 'opus55_high' and not c['bundle'].get('fast'))
-            self.assertEqual(round(plain['score'], 4), round(fast['score'], 4))
-            self.assertLess(fast['expected_hours'], plain['expected_hours'])
-            self.assertTrue(near['selected_bundle'].get('fast'))
-        usage['accounts']['claude']['windows'][0]['seconds_until_reset'] = 2 * 3600
         # 6h: four of the six hours fall in the next period of Pool A, where the first dollar is again a coin flip. Each
         # pool is still priced on its own clock and Pool B (14% into its week, on its line) is the cheaper one for it.
         d6 = run_case(6.0)
@@ -797,8 +780,7 @@ class FiveAxisTests(unittest.TestCase):
         fallback"): every type score claude-fable-5-2 does not measure is claude-fable-5-1's (its same-series sibling) moved along
         the type score's fit on tier by the two tiers' difference. Its usd_per_hour is the figure of arena.ai's Agent sessions
         when that board lists it, else 5.1's times the declared API list price ratio over the community token mix. No
-        pessimistic 0, no option-B fallback. Fast-mode pricing ($16/$80 = 2x, 2.5x speed) and its maintainer image-input
-        declaration (2026-11-12) stay its own."""
+        pessimistic 0, no option-B fallback. Its maintainer image-input declaration (2026-11-12) stays its own."""
         shipped = axis_scores.load_five_axis()
         fable52, fable51 = shipped['models']['claude-fable-5-2'], shipped['models']['claude-fable-5-1']
         usd = fable52['usd_per_hour']
@@ -813,8 +795,6 @@ class FiveAxisTests(unittest.TestCase):
         else:
             self.assertEqual(usd['used'], ['arena.agent_sessions'])
             self.assertEqual(usd['value'], usd['sources']['arena.agent_sessions']['value'])      # the cited reading, nothing else
-        self.assertEqual(fable52['fast_mode']['status'], 'ok')
-        self.assertEqual((fable52['fast_mode']['price_multiplier'], fable52['fast_mode']['speed_multiplier']), (2.0, 2.5))
         self.assertEqual((fable52['image_input']['status'], fable52['image_input']['source']), ('yes', 'maintainer.image_input'))
         fits = shipped['estimate_fits']
         rejected = shipped['rejected_fits']

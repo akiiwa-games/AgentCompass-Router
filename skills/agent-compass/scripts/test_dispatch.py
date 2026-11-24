@@ -95,28 +95,25 @@ def test_host_bridge_does_not_open_a_console():
 
 class DispatchTests(unittest.TestCase):
     def test_fast_opt_out_after_record_is_rechecked_at_prepare(self):
-        # Claude fast mode has cited pricing and speed; the fixture's Opus bundle is switched on.
-        self.accounts['accounts']['claude-lab']['bundles']['lab_opus55_high']['disabled'] = False
-        self.bundle = dict(account_fleet.bundles(self.accounts)['lab_opus55_high'], bundle_id='lab_opus55_high', fast=True)
-        with patch.object(account_fleet, 'load_accounts', return_value=self.accounts):
-            decision = self.issue(stage='record', choice='constraint', constraint='user_override',
-                                  basis='Diagnostic fixture')
-        self.accounts['models']['claude-opus-5-5']['fast_capable'] = False
-        with self.assertRaisesRegex(ValueError, 'has no verified fast mode on claude; run it without --fast'):
+        # Rule (fast-modes.md): fast runs only on a verified contract (the Codex service tier here); a contract withdrawn
+        # after the record is refused at prepare and at the claim, never launched fast.
+        decision = self.override_decision(effort='high', selected_bundle={
+            'provider': 'codex', 'account': 'codex', 'model': 'gpt-6-astra', 'effort': 'high', 'fast': True})
+        self.accounts['models']['gpt-6-astra']['fast_capable'] = False
+        with self.assertRaisesRegex(ValueError, 'has no verified fast mode on codex'):
             self.prepare(decision)
-        self.accounts['models']['claude-opus-5-5']['fast_capable'] = True
+        self.accounts['models']['gpt-6-astra']['fast_capable'] = True
         row = self.prepare(decision)
         self.assertTrue(row['bundle']['fast'])
-        self.assertEqual(row['request']['settings']['features'], {'fast_mode': True})
-        self.accounts['models']['claude-opus-5-5']['fast_capable'] = False
-        import scorer_client
+        self.assertEqual(row['request']['settings']['features'], {'service_tier': 'priority'})
+        self.accounts['models']['gpt-6-astra']['fast_capable'] = False
         import usage_reading
         with patch.object(account_fleet, 'load_accounts', return_value=self.accounts), \
                 patch.object(usage_reading, 'usage_snapshot', return_value=self.usage):
-            with self.assertRaisesRegex(ValueError, 'has no verified fast mode on claude; run it without --fast'):
+            with self.assertRaisesRegex(ValueError, 'has no verified fast mode on codex'):
                 registry.claim(row['request'], parent_id='parent-a', call_id='fixture', now=self.now)
             self.assertEqual(registry.inspect(row['dispatch_id'])['state'], 'prepared')
-            self.accounts['models']['claude-opus-5-5']['fast_capable'] = True
+            self.accounts['models']['gpt-6-astra']['fast_capable'] = True
             self.assertEqual(registry.claim(row['request'], parent_id='parent-a',
                                            call_id='fixture', now=self.now)['state'], 'launching')
 
@@ -2660,28 +2657,35 @@ class RollTests(unittest.TestCase):
                 self.assertEqual(row['request']['settings'], {'modeId': 'build', 'thinkingOptionId': effort})
                 self.assertGreater(row['expected_usd'], 0.0)      # priced at the model's cited list price, not free
 
-    def test_fast_mode_bundle_emits_paseo_fast_feature_and_doubles_expected_usd(self):
-        # Claude fast mode is cited ($16/$80 against $8/$40, 2x): Opus 5.5 on a Max 20x plan, the fixture's bundle switched on.
-        self.accounts['accounts']['claude-lab']['bundles']['lab_opus55_high']['disabled'] = False
-        task = {**self.task, 'task_id': 'task-normal-1', 'work_kind': 'code_implementation'}
+    def test_fast_mode_bundle_emits_paseo_fast_feature_and_prices_expected_usd_at_the_cited_multiplier(self):
+        # Rule (fast-modes.md, router-internals.md): a fast candidate's spend is the plain spend times the cited price
+        # multiplier, and its launch asks Paseo for the fast feature. No shipped Codex row cites its multipliers, so a
+        # synthetic cited row stands in; the account is on a plan whose window capacity the shipped data cites.
+        from router_test_support import cited_fast
+        self.accounts['accounts']['codex']['plan'] = 'pro'
+        usage = copy.deepcopy(self.usage)
+        usage['accounts']['codex'] = {'status': 'fresh', 'fetched_at': self.now.isoformat(), 'windows': [
+            {'id': 'usage', 'used_pct': 10, 'remaining_pct_before_reset': 90,
+             'resets_at': (self.now + timedelta(hours=100)).isoformat(), 'seconds_until_reset': 100 * 3600}]}
+        task = {**self.task, 'task_id': 'task-normal-1', 'work_kind': 'code_implementation', 'expected_hours': 0.2}
         task['profile'] = profile_for(task)
-        normal_task = {**task, 'disable_fast': True}
-        normal_plan = allocator.plan(normal_task, self.usage, self.now, accounts=self.accounts,
-                                     route={'pinned_bundle': 'lab_opus55_high'})
-        self.assertEqual(normal_plan['choice'], 'lab_opus55_high')
-        normal_dec = registry.issue(dict(normal_plan, stage='plan'), task, self.now)
-        normal_row = registry.prepare(normal_dec['decision_id'], task, self.launch, self.usage, self.accounts, self.now)
-        self.assertEqual(normal_row['request']['settings']['features'], {'fast_mode': False})
+        with cited_fast('gpt-6.1-sol') as data:
+            cited = data['models']['gpt-6.1-sol']['fast_mode']['price_multiplier']
+            normal_plan = allocator.plan({**task, 'disable_fast': True}, usage, self.now, accounts=self.accounts,
+                                         route={'pinned_bundle': 'sol_high'})
+            self.assertEqual(normal_plan['choice'], 'sol_high')
+            normal_dec = registry.issue(dict(normal_plan, stage='plan'), task, self.now)
+            normal_row = registry.prepare(normal_dec['decision_id'], task, self.launch, usage, self.accounts, self.now)
+            self.assertEqual(normal_row['request']['settings']['features'], {'service_tier': 'default'})
 
-        fast_task = {**task, 'task_id': 'task-fast-1'}
-        fast_plan = allocator.plan(fast_task, self.usage, self.now, accounts=self.accounts,
-                                   route={'pinned_bundle': 'lab_opus55_high', 'force_fast': True})
-        self.assertTrue(fast_plan['selected_bundle'].get('fast'))
-        fast_dec = registry.issue(dict(fast_plan, stage='plan'), fast_task, self.now)
-        fast_row = registry.prepare(fast_dec['decision_id'], fast_task, self.launch, self.usage, self.accounts, self.now)
-        self.assertEqual(fast_row['request']['settings'],
-                         {'modeId': 'bypassPermissions', 'thinkingOptionId': 'high', 'features': {'fast_mode': True}})
-        self.assertAlmostEqual(fast_row['expected_usd'], normal_row['expected_usd'] * 2.0, delta=0.05)
+            fast_task = {**task, 'task_id': 'task-fast-1'}
+            fast_plan = allocator.plan(fast_task, usage, self.now, accounts=self.accounts,
+                                       route={'pinned_bundle': 'sol_high', 'force_fast': True})
+            self.assertTrue(fast_plan['selected_bundle'].get('fast'))
+            fast_dec = registry.issue(dict(fast_plan, stage='plan'), fast_task, self.now)
+            fast_row = registry.prepare(fast_dec['decision_id'], fast_task, self.launch, usage, self.accounts, self.now)
+        self.assertEqual(fast_row['request']['settings']['features'], {'service_tier': 'priority'})
+        self.assertAlmostEqual(fast_row['expected_usd'], normal_row['expected_usd'] * cited, delta=0.02)
 
     def test_followup_brief_resumes_completed_worker_and_new_worker_flag_forces_create(self):
         operations = []
