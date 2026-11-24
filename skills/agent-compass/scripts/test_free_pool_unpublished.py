@@ -35,6 +35,7 @@ import provider_retry
 import quota_exhaustion
 import route_simulation as sim
 import test_five_axis as tf
+from router_test_support import profile_for
 from test_fleet_parity import shipped_template, snapshot
 
 POOL = 'opencode'
@@ -529,6 +530,62 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertIn(quota_exhaustion.moment_text(reset), blockers[0][1])
         self.assertIn('the reset the provider stated', blockers[0][1])
         self.assertEqual(free, [])
+
+
+class PaidLatchReadingTests(unittest.TestCase):
+    """Review round 2 N2. Rule (quota_exhaustion.exhausted_windows, candidate_eval.evaluate_bundle): where the account has
+    a usage reader, the reading decides. A good reading newer than the latch releases it; the latch's end is a wait only
+    while no such reading exists; and a window that has a fresh reading is never "quota reading unavailable"."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp(prefix='paid-latch-'))
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        env = patch.dict(os.environ, {'ROUTER_STATE_DIR': str(self.state)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.base = sim.fresh_accounts(shipped_template(), snapshot())
+        self.windows = sorted(self.base['accounts']['claude']['windows'])
+        self.task = {'task_id': 'paid-latch', 'objective': 'fixture', 'work_kind': 'code_implementation',
+                     'difficulty': 'hard', 'expected_hours': 1.0, 'needs': {'local_only': True}}
+        self.task['profile'] = profile_for(self.task)
+
+    def plan_after(self, latch_at, fetched, used):
+        """A latch on claude's windows with no stated reset, published by discovery beside a reading `used`% used."""
+        store = self.state / 'quota-exhaustion.json'
+        store.unlink(missing_ok=True)
+        quota_exhaustion.record('claude', 'quota exceeded', windows=self.windows, at=latch_at.isoformat(), path=store)
+        doc = sim.synthetic_document(self.base, self.now, ())
+        doc['providers']['claude']['fetched_at'] = fetched.isoformat()
+        for window in doc['providers']['claude']['windows']:
+            window['used_pct'] = used
+        inventory = snapshot()
+        provider_inventory._latch_exhausted_quota(inventory['accounts'], self.state, doc['providers'])
+        accounts = sim.fresh_accounts(shipped_template(), inventory)
+        plan = allocator.plan(copy.deepcopy(self.task), sim.snapshot(doc, accounts, self.now), self.now,
+                              accounts=accounts, overrides=[], host_policy_config={'allowed_accounts': ['claude']},
+                              read_local_state=False)
+        return inventory['accounts']['claude'], [c for c in plan['ranking'] if c['bundle'].get('account') == 'claude']
+
+    def test_a_good_reading_newer_than_the_latch_releases_it_and_an_older_one_leaves_a_wait_not_an_unread_window(self):
+        import candidate_eval
+        for used in (10, 98):
+            with self.subTest(used=used, reading='newer'):
+                row, rows = self.plan_after(self.now - timedelta(minutes=10), self.now - timedelta(minutes=1), used)
+                self.assertNotIn('exhausted_windows', row)
+                if used == 10:      # ample: with the latch released nothing holds a claude bundle back
+                    for c in rows:
+                        self.assertFalse(c['excluded'] or c.get('available_in_hours'), (c['id'], c['excluded']))
+            with self.subTest(used=used, reading='older'):
+                latch_at = self.now - timedelta(minutes=1)
+                row, rows = self.plan_after(latch_at, self.now - timedelta(minutes=5), used)
+                self.assertEqual(row['exhausted_windows'], self.windows)
+                due = quota_exhaustion.due_at({'observed_at': latch_at.isoformat()})
+                for c in rows:
+                    self.assertFalse([e for e in c['excluded'] if candidate_eval.QUOTA_READING_UNAVAILABLE in e],
+                                     (c['id'], c['excluded']))
+                    self.assertIn(c.get('waiting_on'), self.windows, c['id'])
+                    self.assertAlmostEqual(c['available_in_hours'], (due - self.now).total_seconds() / 3600, places=3)
 
 
 class StatedResetParseTests(unittest.TestCase):
