@@ -11,7 +11,7 @@ import {setTimeout as pause} from 'node:timers/promises';
 import {execute, project, normalizeProviderModels, notificationStep, notificationEvents, ensureNotification, notificationReceipt,
   creationFailureClass, creationFailureCode, creationRecord, resolvePaseoPlacement, subscriptionLapsed, providerRetry, retryStreak, retryIsStuck,
   workedBeforeRetrying, endedOnReply, turnFailure, RETRY_STUCK_CODE, TURN_FAILED_CODE, fallbackArgv, abandonArgv, runFallback,
-  attemptsNote, notificationFile, agentResumed, settleArgv, settleBeforeExit,
+  attemptsNote, notificationFile, agentResumed, settleArgv, settleBeforeExit, enterRecovery, leaveRecovery,
   finalReplyText, reportSection, composeNotice, notifyEnd, hostFailure, hostFailureClass, CONDITIONS, RECORDED_ENDS,
   BridgeError, createClient, continuationVerdict, REPORT_INLINE_LIMIT, REPORT_SUMMARY_LIMIT} from './paseo_dispatch_bridge.mjs';
 
@@ -2773,6 +2773,136 @@ test('stale .lock.recovery directory is reclaimed by one watcher while a fresh o
       if (fs.existsSync(p)) {
         try { pids.add(JSON.parse(fs.readFileSync(p, 'utf8')).pid); } catch {}
       }
+    }
+    for (const pid of pids) if (pid !== process.pid && running(pid)) process.kill(pid);
+    for (const name of ['ROUTER_STATE_DIR', 'ROUTER_PASEO_SDK_ROOT', 'PASEO_HOME']) {
+      if (oldEnv[name] === undefined) delete process.env[name]; else process.env[name] = oldEnv[name];
+    }
+    await until(() => [...pids].filter(pid => pid !== process.pid).every(pid => !running(pid)));
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('leaveRecovery leaves a newly claimed .recovery directory to the late contender, which steps back and removes it', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'router-leave-recovery-'));
+  const oldEnv = {ROUTER_STATE_DIR: process.env.ROUTER_STATE_DIR,
+    ROUTER_PASEO_SDK_ROOT: process.env.ROUTER_PASEO_SDK_ROOT, PASEO_HOME: process.env.PASEO_HOME};
+  const pids = new Set();
+  const running = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+  const until = async predicate => {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return;
+      await pause(50);
+    }
+    assert.fail('leaveRecovery test deadline exceeded');
+  };
+  try {
+    process.env.ROUTER_STATE_DIR = root;
+    const sdk = fakeNotifierSdk(root);
+    fs.writeFileSync(path.join(sdk, '@getpaseo/client/client.cjs'), `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const root = process.env.ROUTER_STATE_DIR;
+      exports.DaemonClient = class {
+        isConnected = false;
+        constructor() {
+          fs.appendFileSync(path.join(root, 'watchers.jsonl'),
+            JSON.stringify({pid: process.pid, argv: process.argv}) + '\\n');
+        }
+        async connect() { this.isConnected = true; }
+        async close() { this.isConnected = false; }
+        async fetchAgent(id) {
+          return {agent: id === 'parent' ? {status: 'running'} :
+            JSON.parse(fs.readFileSync(path.join(root, 'agent.json'), 'utf8'))};
+        }
+        async sendMessage(agent, text, options) {
+          fs.appendFileSync(path.join(root, 'messages.jsonl'), JSON.stringify({agent, text, options}) + '\\n');
+        }
+      };
+    `);
+    process.env.ROUTER_PASEO_SDK_ROOT = sdk;
+    process.env.PASEO_HOME = root;
+    fs.writeFileSync(path.join(root, 'agent.json'), JSON.stringify({status: 'running'}));
+    const dir = path.join(root, 'paseo-notifications');
+    fs.mkdirSync(dir, {recursive: true});
+    const staleSec = (Date.now() - 3000) / 1000;
+
+    // 1. Winner A unlinks `claim-1` in `leaveRecovery`; contender B opens `claim-1` (`wx`) before A calls `rmdirSync`.
+    //    A ignores `ENOTEMPTY` and preserves B's live claim; B then leaves and removes `.recovery`.
+    const raceDir = path.join(dir, 'interleave.json.lock.recovery');
+    fs.mkdirSync(raceDir);
+    fs.utimesSync(raceDir, staleSec, staleSec);
+    const claimA = enterRecovery(raceDir);
+    assert.equal(claimA, path.join(raceDir, 'claim-1'));
+    const origUnlink = fs.unlinkSync;
+    let claimB = '';
+    fs.unlinkSync = target => {
+      const out = origUnlink(target);
+      if (target === claimA) {
+        fs.unlinkSync = origUnlink;
+        const fd = fs.openSync(claimA, 'wx');
+        try { fs.writeFileSync(fd, String(process.pid)); }
+        finally { fs.closeSync(fd); }
+        claimB = claimA;
+      }
+      return out;
+    };
+    try {
+      leaveRecovery(raceDir, claimA);
+    } finally {
+      fs.unlinkSync = origUnlink;
+    }
+    assert.equal(fs.existsSync(raceDir), true);
+    assert.equal(fs.existsSync(claimB), true);
+    leaveRecovery(raceDir, claimB);
+    assert.equal(fs.existsSync(raceDir), false);
+
+    // 2. If an earlier creator (`claim === ''`) leaves after a late contender wrote a live `claim-1`, the live claim
+    //    is not unlinked and `ENOTEMPTY` is ignored until that contender leaves.
+    const overlapDir = path.join(dir, 'overlap.json.lock.recovery');
+    const createdClaim = enterRecovery(overlapDir);
+    assert.equal(createdClaim, '');
+    fs.utimesSync(overlapDir, staleSec, staleSec);
+    const overlapB = enterRecovery(overlapDir);
+    assert.equal(overlapB, path.join(overlapDir, 'claim-1'));
+    leaveRecovery(overlapDir, createdClaim);
+    assert.equal(fs.existsSync(overlapB), true);
+    leaveRecovery(overlapDir, overlapB);
+    assert.equal(fs.existsSync(overlapDir), false);
+
+    // 3. Other direction with live watcher processes: watcher A holds `.lock` and stays alive while already-spawned
+    //    contender B claims a stale `.recovery` directory, reads A's live PID in `.lock`, steps back, and removes `.recovery`.
+    const {spawn: spawnNode} = await import('node:child_process');
+    const bridgeScript = fileURLToPath(new URL('./paseo_dispatch_bridge.mjs', import.meta.url));
+    const liveA = await ensureNotification({dispatch_id: 'late-contender', parent_id: 'parent'});
+    pids.add(liveA.pid);
+    const lateRecovery = path.join(dir, 'late-contender.json.lock.recovery');
+    fs.mkdirSync(lateRecovery);
+    fs.utimesSync(lateRecovery, staleSec, staleSec);
+    const contenderResult = await new Promise((resolve, reject) => {
+      const child = spawnNode(process.execPath, [bridgeScript, '--watch', 'late-contender', 'parent', '', ''],
+        {stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env: process.env});
+      let msg = null;
+      child.on('message', value => { msg = value; if (child.connected) child.disconnect(); });
+      child.once('error', reject);
+      child.once('exit', code => resolve({code, msg}));
+    });
+    assert.deepEqual(contenderResult, {code: 0, msg: {ready: true}});
+    assert.equal(running(liveA.pid), true);
+    assert.equal(fs.existsSync(lateRecovery), false);
+    const started = fs.readFileSync(path.join(root, 'watchers.jsonl'), 'utf8').trim().split('\n')
+      .filter(Boolean).map(line => JSON.parse(line)).filter(e => e.argv.includes('late-contender'));
+    assert.deepEqual(started.map(e => e.pid), [liveA.pid]);
+  } finally {
+    const watchersLog = path.join(root, 'watchers.jsonl');
+    if (fs.existsSync(watchersLog)) {
+      for (const line of fs.readFileSync(watchersLog, 'utf8').trim().split('\n').filter(Boolean)) {
+        try { pids.add(JSON.parse(line).pid); } catch {}
+      }
+    }
+    const p = path.join(root, 'paseo-notifications', 'late-contender.json');
+    if (fs.existsSync(p)) {
+      try { pids.add(JSON.parse(fs.readFileSync(p, 'utf8')).pid); } catch {}
     }
     for (const pid of pids) if (pid !== process.pid && running(pid)) process.kill(pid);
     for (const name of ['ROUTER_STATE_DIR', 'ROUTER_PASEO_SDK_ROOT', 'PASEO_HOME']) {

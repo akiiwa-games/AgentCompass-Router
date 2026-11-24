@@ -1028,15 +1028,17 @@ function fileAgeMs(target) {
   }
 }
 
-function enterRecovery(recovery) {
-  try { fs.mkdirSync(recovery); return true; }
+// Returns `''` when a fresh `.recovery` directory was created, the `claim-<slot>` path when an abandoned `.recovery`
+// directory was taken over, or `null` when another live contender owns recovery right now.
+export function enterRecovery(recovery) {
+  try { fs.mkdirSync(recovery); return ''; }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   const recoveryAge = fileAgeMs(recovery);
   if (recoveryAge === null) {
-    try { fs.mkdirSync(recovery); return true; }
-    catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+    try { fs.mkdirSync(recovery); return ''; }
+    catch (error) { if (error.code === 'EEXIST') return null; throw error; }
   }
-  if (recoveryAge < LOCK_STEP_LIMIT_MS) return false;
+  if (recoveryAge < LOCK_STEP_LIMIT_MS) return null;
   // Take over an abandoned `.recovery` directory atomically: contenders seeing the same stale directory race on
   // `claim-1` (`wx`), so at most one enters lock reclamation while `recovery` stays in place blocking newcomers.
   for (let slot = 1; ; slot++) {
@@ -1049,36 +1051,58 @@ function enterRecovery(recovery) {
         const now = new Date();
         fs.utimesSync(recovery, now, now);
       } catch {}
-      return true;
+      return claim;
     } catch (error) {
-      if (error.code === 'ENOENT') return false;
+      if (error.code === 'ENOENT') return null;
       if (error.code !== 'EEXIST') throw error;
       let raw = '';
       try { raw = retryBusySync(() => fs.readFileSync(claim, 'utf8')).trim(); }
       catch (readErr) {
-        if (readErr.code === 'ENOENT') return false;
+        if (readErr.code === 'ENOENT') return null;
         throw readErr;
       }
       const holder = raw ? Number(raw) : 0;
-      if (alive(holder)) return false;
+      if (alive(holder)) return null;
       if (!raw) {
         const claimAge = fileAgeMs(claim);
-        if (claimAge === null || claimAge < LOCK_STEP_LIMIT_MS) return false;
+        if (claimAge === null || claimAge < LOCK_STEP_LIMIT_MS) return null;
       }
     }
   }
 }
 
-function leaveRecovery(recovery) {
+export function leaveRecovery(recovery, claim = '') {
+  if (claim) {
+    try { retryBusySync(() => fs.unlinkSync(claim)); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
   let names;
   try { names = retryBusySync(() => fs.readdirSync(recovery)); }
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
   for (const name of names) {
-    try { retryBusySync(() => fs.unlinkSync(path.join(recovery, name))); }
+    const entry = path.join(recovery, name);
+    if (entry === claim) continue;
+    let raw = '';
+    try { raw = retryBusySync(() => fs.readFileSync(entry, 'utf8')).trim(); }
+    catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    const holder = raw ? Number(raw) : 0;
+    if (alive(holder)) continue;
+    if (!raw) {
+      const claimAge = fileAgeMs(entry);
+      if (claimAge === null || claimAge < LOCK_STEP_LIMIT_MS) continue;
+    }
+    try { retryBusySync(() => fs.unlinkSync(entry)); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   try { retryBusySync(() => fs.rmdirSync(recovery)); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  catch (error) {
+    // A contender that stated a stale `.recovery` before `utimesSync` may claim a slot right after `claim` is unlinked;
+    // it now owns `recovery`, reads the live PID in `.lock`, steps back, and removes `recovery` when it leaves.
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error;
+  }
 }
 
 async function watch(dispatchId, parentId, agentId, createDeadline) {
@@ -1093,7 +1117,8 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
     // Serialize stale-lock reclamation too: two concurrent observers must not
     // unlink a new watcher's lock after both saw the same dead predecessor.
     const recovery = `${lock}.recovery`;
-    if (!enterRecovery(recovery)) {
+    const claim = enterRecovery(recovery);
+    if (claim === null) {
       // Another starter is reclaiming `lock` right now; `ensureNotification` waits for the published ready receipt.
       process.send?.({ready: true}); return;
     }
@@ -1112,7 +1137,7 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
         process.send?.({ready: true}); return;
       }
       fs.writeFileSync(lockFd, String(process.pid));
-    } finally { leaveRecovery(recovery); }
+    } finally { leaveRecovery(recovery, claim); }
   }
   let client;
   let record;
