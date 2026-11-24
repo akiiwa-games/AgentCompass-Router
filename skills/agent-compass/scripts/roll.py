@@ -339,7 +339,7 @@ def _auto_resumable(worker, policy, usage_cache_path=None, accounts=None):
             return False
     rows = [r for r in account_fleet.bundle_rows(accounts, bundle.get('bundle_id') or bundle.get('id'))
             if r['account'] == bundle.get('account')]
-    if host_policy.disabled_cause(bundle['account'], rows, accounts):
+    if host_policy.unchecked_bundles(rows):
         return False
     return not _worker_gate_refusal(worker, usage_cache_path=usage_cache_path, accounts=accounts)
 
@@ -1409,6 +1409,81 @@ def launched_next(result, worker, argv):
     return result.get('next') or 'Worker launched; do not launch another.'
 
 
+CAUSE_LIMIT = 300
+
+
+def _raw_cause(result):
+    worker = result.get('worker') or {}
+    if result.get('error') == 'scorer_unavailable' or result.get('dispatch_mode') == 'scorer_unavailable':
+        return result.get('cause') or result.get('reason') or 'scorer_unavailable'
+    return result.get('error') or result.get('cause') or worker.get('cause') or worker.get('error') or worker.get('read_error')
+
+
+def _cause_sentence_ends(raw):
+    """End offsets of whole sentences/clauses in `raw` (`; ` or `. ` / `! ` / `? ` outside parentheses/brackets)."""
+    ends = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch in '([':
+            depth += 1
+        elif ch in ')]' and depth > 0:
+            depth -= 1
+        elif depth == 0 and i + 1 < n and raw[i + 1] == ' ':
+            if ch == ';' and raw[start:i].strip():
+                ends.append(i)
+                i += 2
+                while i < n and raw[i] == ' ':
+                    i += 1
+                start = i
+                continue
+            if (ch in '.!?'
+                    and raw[start:i + 1].strip()
+                    and not raw[:i + 1].lower().endswith(('e.g.', 'i.e.', 'vs.', 'etc.'))):
+                ends.append(i + 1)
+                i += 2
+                while i < n and raw[i] == ' ':
+                    i += 1
+                start = i
+                continue
+        i += 1
+    if raw[start:].strip():
+        ends.append(n)
+    return ends
+
+
+def _compact_cause(cause, next_action, detail_path):
+    """Short `cause` for `compact`: at most `CAUSE_LIMIT` including its note, never cut mid-word or mid-sentence when
+    a boundary exists, and naming where the rest is (`next_action` and/or `the details file`, without repeating `details`)."""
+    raw = str(cause)
+    if len(raw) <= CAUSE_LIMIT:
+        return raw
+    in_next = bool(next_action and raw in next_action)
+    if not in_next and detail_path is None:
+        return raw      # nothing else holds the rest, so nothing is cut (as for route.warnings)
+    where = ('next_action and the details file' if in_next and detail_path
+             else 'the details file' if detail_path else 'next_action')
+    ends = _cause_sentence_ends(raw)
+    for idx in range(len(ends) - 2, -1, -1):
+        kept = raw[:ends[idx]]
+        more = len(ends) - 1 - idx
+        note = (f'{kept} The rest ({more} more) is in {where}.'
+                if kept.endswith(('.', '!', '?'))
+                else f'{kept}; the rest ({more} more) is in {where}')
+        if len(note) <= CAUSE_LIMIT:
+            return note
+    tail = f'... (the rest is in {where})'
+    budget = CAUSE_LIMIT - len(tail)
+    cut = raw.rfind(' ', 0, budget + 1)
+    prefix = raw[:cut].rstrip(' ,;:') if cut > 0 else ''
+    if not prefix:
+        prefix = raw[:budget]
+    return f'{prefix}{tail}'
+
+
 def compact(result, status, detail_path):
     """The default --task answer: state, worker, reason and the single next action; everything else is on disk."""
     worker = result.get('worker') or {}
@@ -1436,11 +1511,9 @@ def compact(result, status, detail_path):
            'reason': reason_val, 'next_action': nxt}
     if is_scorer_unavail:
         out['error'] = 'scorer_unavailable'
-        cause = result.get('cause') or ((result.get('route') or {}).get('reason')) or result.get('reason') or 'scorer_unavailable'
-    else:
-        cause = result.get('error') or worker.get('cause') or worker.get('error') or worker.get('read_error')
+    cause = _raw_cause(result)
     if cause and status in ('error', 'blocked', 'pending'):
-        out['cause'] = str(cause)[:300]
+        out['cause'] = _compact_cause(cause, nxt, detail_path)
     route_warnings = (result.get('route') or {}).get('warnings') or []
     if route_warnings:
         # The first four, and how many more the details file holds: none is dropped without a word.
@@ -1459,10 +1532,10 @@ def compact(result, status, detail_path):
         out['native_tool'], out['launch_fields'] = result.get('native_tool'), result.get('launch_fields')
     if status == 'split':
         out['task_count'] = result.get('task_count')
+    if status == 'blocked' and result.get('caller_action') in ('wait_for_reset', 'tell_user'):
+        out['caller_action'] = result['caller_action']
     if result.get('start_after_hours') is not None:
         out['start_after_hours'] = result['start_after_hours']
-        if result.get('caller_action') == 'wait_for_reset':
-            out['caller_action'] = 'wait_for_reset'
     if result.get('retry_at'):
         out['retry_at'] = result['retry_at']
     if result.get('workspace'):
@@ -1554,7 +1627,9 @@ def run(args, judge):
     agent_id = (result.get('worker') or {}).get('agent_id')
     if agent_id:
         result['continuation'] = worker_sessions.continuation_verdict(agent_id)
-    # The file on disk and --verbose carry the same cause and next action as the compact answer.
+    # The file on disk and --verbose carry the full cause and the same next action as the compact answer.
+    if status in ('error', 'blocked', 'pending') and 'cause' not in result and (raw := _raw_cause(result)):
+        result['cause'] = str(raw)
     summary = compact(result, status, None)
     result.update({k: summary[k] for k in ('cause', 'next_action') if summary.get(k) and k not in result})
     if getattr(args, 'verbose', False):
@@ -1709,7 +1784,14 @@ def _run(args, judge):
             # Only the model is pinned: the task is classified exactly as an automatic roll's, and the pinned bundle
             # is priced and reserved from that profile.
             classified = judge.classify_pinned(task, args)
-            decision = classified['result'] if 'result' in classified else judge.record_constraint(args, task, classified)
+            try:
+                decision = classified['result'] if 'result' in classified else judge.record_constraint(args, task, classified)
+            except registry.RouteFactRefused as refused:
+                base = {'stage': 'roll', 'parent_id': parent, 'parent_host': parent_host,
+                        'parent_address': parent_address, **({'workspace': canonical_ws} if canonical_ws else {})}
+                if (notes := ignored_flag_notes(args, {}, explicit_id)):
+                    base['warnings'] = notes
+                return refused.answer(base, for_roll=True), 2
         else:
             args.stage = 'roll'
             decision, _ = judge.plan_stage({'task': task}, args)

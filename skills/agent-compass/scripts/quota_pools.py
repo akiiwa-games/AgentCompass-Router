@@ -240,9 +240,9 @@ def used_up_in_cycle(observed, now):
 def window_refusal(wid, window, observed, usage_row, now, latched=()):
     """Why a drawn window refuses any launch now, whatever the task's size; None when it does not."""
     if wid in latched:
-        return f'{wid}: quota confirmed exhausted; refresh quota or replan'
+        return f'{wid}: quota confirmed exhausted'
     if below_launch_floor(window, observed, usage_row, now):
-        return f'{wid}: confirmed exhausted or below launch floor; refresh quota or replan'
+        return f'{wid}: confirmed exhausted or below launch floor'
     return None
 
 
@@ -314,7 +314,7 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
             pass
         elif state['known'] and isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) and state['remaining'] <= float(wspec['launch_min_remaining_pct']):
             floor = float(wspec['launch_min_remaining_pct'])
-            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%); refresh quota or replan"
+            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%)"
         elif not state['short']:
             # Priced work needs remaining - need >= safety margin; no task size passes at or under the margin. A window
             # of unknown capacity cannot price the need at all, so it is held at the margin too (as candidate_eval does).

@@ -1881,7 +1881,9 @@ process.stdout.write(JSON.stringify(out));
     def test_preferences_refuse_launches_only_and_facts_refuse_own_turns_only(self):
         # Gate contract (parent-address-gate.md): an unchecked model refuses a launch, host policy refuses neither a launch
         # nor a turn, a turn to an agent the caller does not own is communication and is not checked, and the caller's own
-        # idle worker is refused only for facts (leftover meter fields here; quota and compaction in the tests below).
+        # idle worker is refused only for facts (confirmed quota exhaustion here; window readings and compaction elsewhere).
+        from contextlib import contextmanager, nullcontext
+
         names = ("own", "peer", "free")
         ids = {name: f"{i:08d}-0000-4000-8000-000000000000" for i, name in enumerate(names, 1)}
         directory = self.state / "agents" / "project"
@@ -1909,32 +1911,35 @@ process.stdout.write(JSON.stringify(out));
                 "labels": {"router.account": "claude-lab", "router.bundle_id": f"lab_{model}55_high",
                            "router.dispatch_id": f"d-{model}"}}}
 
+        @contextmanager
+        def latched_exhaustion():
+            exhaustion = gate.router_module("quota_exhaustion")
+            with mock.patch.dict(os.environ, {"ROUTER_STATE_DIR": str(self.state)}):
+                self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+                try:
+                    yield
+                finally:
+                    exhaustion.clear("claude-lab")
+
         communication = turns("peer", "actual-parent") + turns("free", "actual-parent") + turns("own", "another-parent") + turns("own", None)
         own_turns = turns("own", "actual-parent")
         everyone = ["claude", "codex", "antigravity", "dot"]
-        real_accounts = gate.load_dispatch_accounts
-
-        def with_legacy():
-            accounts = real_accounts()
-            accounts["accounts"]["claude-lab"]["legacy_meter"] = "old meter fields remain on claude-lab"
-            return accounts
-
-        no_legacy = mock.patch.object(gate, "load_dispatch_accounts", side_effect=real_accounts)
-        legacy = mock.patch.object(gate, "load_dispatch_accounts", side_effect=with_legacy)
         unchecked = {"claude-lab": {"bundles": {"lab_sonnet55_high": {"disabled": True},
                                                 "lab_sonnet55_medium": {"disabled": True},
                                                 "lab_opus55_high": {"disabled": False}}}}
         with mock.patch.object(gate.router_module("dispatch_registry"), "claim", return_value=None):
-            # (case, settings, accounts loader, cause in the block reason, blocked calls, passed calls)
-            for case, settings, loader, cause, blocked, passed in (
-                    ("out of automatic routing", {"allowed": everyone}, no_legacy, None, (),
+            # (case, settings, fact context, cause in the block reason, blocked calls, passed calls)
+            for case, settings, fact_ctx, cause, blocked, passed in (
+                    ("out of automatic routing", {"allowed": everyone}, nullcontext, None, (),
                      own_turns + communication + [launch("sonnet")]),
-                    ("unchecked model", {"accounts": unchecked}, no_legacy, "档位 lab_sonnet55_high",
+                    ("unchecked model", {"accounts": unchecked}, nullcontext, "档位 lab_sonnet55_high",
                      [launch("sonnet")], own_turns + communication + [launch("opus")]),
-                    ("leftover meter", {}, legacy, "old meter fields remain", own_turns + [launch("opus")], communication),
+                    ("confirmed quota exhaustion", {}, latched_exhaustion,
+                     "confirmed quota failure is recorded for every window of claude-lab",
+                     own_turns + [launch("opus")], communication),
             ):
                 self.write_settings(**settings)
-                with loader:
+                with fact_ctx():
                     for payload in blocked:
                         with self.subTest(case=case, blocked=payload):
                             result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0)
@@ -2119,12 +2124,7 @@ process.stdout.write(JSON.stringify(out));
         for agent_id, doc in records.items():
             (directory / (agent_id + ".json")).write_text(json.dumps(doc), encoding="utf-8")
         ledger = self.write_ledger(str(self.state), [self.route("claude-lab", "claude-sonnet-5-5", "high")])
-        real_accounts = gate.load_dispatch_accounts
-
-        def with_legacy():
-            accounts = real_accounts()
-            accounts["accounts"]["claude-lab"]["legacy_meter"] = "old meter fields remain on claude-lab"
-            return accounts
+        exhaustion = gate.router_module("quota_exhaustion")
 
         cases = (   # (target, hook session id, owned: the fact refuses the turn)
             ("worker-of-parent", "sess-parent", True),      # the parent's record runs the caller's session
@@ -2135,17 +2135,20 @@ process.stdout.write(JSON.stringify(out));
             ("worker-of-parent", "sess-worker", False),     # the worker messaging itself is not its own parent
             ("self-labelled", "sess-self", False),          # a record naming itself as parent: the caller is the target
         )
-        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": ""}), \
-                mock.patch.object(gate, "load_dispatch_accounts", side_effect=with_legacy):
-            for target, session, owned in cases:
-                payload = {"tool_name": "mcp__paseo__send_agent_prompt",
-                           "tool_input": {"agentId": target, "prompt": "continue"},
-                           **({"session_id": session} if session else {})}
-                with self.subTest(target=target, session=session):
-                    result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0)
-                    self.assertEqual("reason" in result, owned, result)
-                    if owned:
-                        self.assertIn("old meter fields remain", result["reason"])
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "", "ROUTER_STATE_DIR": str(self.state)}):
+            self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+            try:
+                for target, session, owned in cases:
+                    payload = {"tool_name": "mcp__paseo__send_agent_prompt",
+                               "tool_input": {"agentId": target, "prompt": "continue"},
+                               **({"session_id": session} if session else {})}
+                    with self.subTest(target=target, session=session):
+                        result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0)
+                        self.assertEqual("reason" in result, owned, result)
+                        if owned:
+                            self.assertIn("confirmed quota failure is recorded for every window of claude-lab", result["reason"])
+            finally:
+                exhaustion.clear("claude-lab")
 
     def test_a_native_launch_on_a_refused_record_is_blocked_and_a_named_one_passes(self):
         # Gate contract (parent-address-gate.md): `record` writes `host_policy_violation` only on constraints other
@@ -3667,18 +3670,45 @@ if __name__ == "__main__":
 
 
 def test_legacy_account_flag_does_not_break_rotation_check(tmp_path, monkeypatch):
-    import account_fleet
-    import host_policy
-    import worker_sessions
-    path = tmp_path / 'accounts-override.json'
-    path.write_text(json.dumps({'schema_version': 2, 'accounts': {'codex': {'verified': False}}}), encoding='utf-8')
-    monkeypatch.setattr(account_fleet, 'accounts_override_path', lambda: path)
-    monkeypatch.setattr(host_policy, 'sync_discovered', lambda accounts: {})
-    monkeypatch.setattr(gate, 'is_delegated_worker', lambda *args, **kwargs: True)
-    monkeypatch.setattr(gate, 'owns_running_worker', lambda *args: False)
-    monkeypatch.setattr(gate, 'load_paseo_agent', lambda *args: {})
-    monkeypatch.setattr(worker_sessions, 'session_state', lambda *args, **kwargs: {})
-    assert gate.check_worker_compaction_limit('worker', paseo_agents_dir=tmp_path / 'agents') is None
+    """Rule (AGENTS.md, what a released version wrote for the user is kept; parent-address-gate.md): an
+    `accounts-override.json` carrying `verified: false` (v0.1.0 to v0.5.0) is upgraded by `account_fleet.load_accounts`
+    without raising, so `check_worker_compaction_limit` still evaluates the configured rotation threshold on an owned
+    idle worker (allowing below threshold and blocking at threshold)."""
+    account_fleet = gate.router_module('account_fleet')
+    host_policy = gate.router_module('host_policy')
+    provider_inventory = gate.router_module('provider_inventory')
+    worker_sessions = gate.router_module('worker_sessions')
+    override = tmp_path / 'accounts-override.json'
+    policy = tmp_path / 'host-policy.json'
+    agents_dir = tmp_path / '.paseo' / 'agents'
+    (agents_dir / 'ws').mkdir(parents=True, exist_ok=True)
+    (agents_dir / 'ws' / 'worker.json').write_text(
+        json.dumps({'id': 'worker', 'provider': 'codex', 'lastStatus': 'idle',
+                    'labels': {'router.parent_id': 'parent-main'}}),
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('AGENTCOMPASS_ACCOUNTS_OVERRIDE', str(override))
+    monkeypatch.setenv('ROUTER_HOST_POLICY', str(policy))
+    monkeypatch.setattr(account_fleet, 'accounts_override_path', lambda: override)
+    monkeypatch.setattr(host_policy, 'policy_path', lambda: (policy, False))
+    monkeypatch.setattr(provider_inventory, 'current', lambda: {'accounts': {}})
+    threshold = worker_sessions.rotation_threshold(worker_sessions.shipped_scoring())
+
+    override.write_text(json.dumps({'schema_version': 2, 'accounts': {'codex': {'verified': False}}}), encoding='utf-8')
+    monkeypatch.setattr(worker_sessions, 'session_state',
+                        lambda *args, **kwargs: {'historical_context_tokens': threshold - 1})
+    assert gate.check_worker_compaction_limit(
+        'worker', paseo_agents_dir=agents_dir, home=tmp_path, identities={'parent-main'},
+    ) is None
+
+    override.write_text(json.dumps({'schema_version': 2, 'accounts': {'codex': {'verified': False}}}), encoding='utf-8')
+    policy.unlink(missing_ok=True)
+    monkeypatch.setattr(worker_sessions, 'session_state',
+                        lambda *args, **kwargs: {'historical_context_tokens': threshold})
+    reason = gate.check_worker_compaction_limit(
+        'worker', paseo_agents_dir=agents_dir, home=tmp_path, identities={'parent-main'},
+    )
+    assert reason is not None and f'rotate_after_carried_tokens={threshold:,}' in reason
 
 
 def hold_broken_fetched_set(monkeypatch):

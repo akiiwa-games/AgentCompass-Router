@@ -48,6 +48,65 @@ def advised_hours(hours):
     return round(advised, 1)
 
 
+def refusal_schedule(bundle, accounts, usage, now, *, blocked_wids=None, latched=None, records=None):
+    """`(start_after_hours, retry_at, waiting_on)` when every refusing quota window (`blocked_wids`, else
+    `quota_pools.launch_blockers`) has an observed reset (`quota_pools.after_reset`), computed by the same owners the
+    automatic deferral path uses (`quota_pools.window_state`, `quota_pools.after_reset`, `candidate_eval.binding_wait`,
+    `advised_hours`); `(None, None, None)` otherwise."""
+    accounts = accounts if isinstance(accounts, dict) else {}
+    if '_five_axis' not in accounts:
+        accounts = axis_scores.five_axis_overlay(accounts)
+    usage = provider_inventory.merge_usage(usage, accounts, now)
+    latched_set = quota_pools.latched_windows(accounts, bundle['account']) if latched is None else set(latched)
+    if blocked_wids is None:
+        blocked_wids = {
+            wid for wid, _ in quota_pools.launch_blockers(
+                bundle, accounts, usage, now, latched=latched_set, records=records,
+            )
+        }
+    else:
+        blocked_wids = set(blocked_wids)
+    if not blocked_wids:
+        return None, None, None
+    spec = (accounts.get('accounts') or {}).get(bundle.get('account')) or {}
+    policy = accounts.get('scoring') or {}
+    row = ((usage or {}).get('accounts') or {}).get(bundle['account']) or {}
+    stale = row.get('status') == 'stale' or row.get('stale') is True
+    model = account_fleet.canonical(bundle.get('model') or '', accounts)
+    available_at, waiting_on, waits, reset_times = None, None, {}, {}
+    seen = set()
+    for wid, wspec, observed in quota_pools.applicable_windows(spec, model, row, bundle, accounts):
+        if wid not in blocked_wids:
+            continue
+        seen.add(wid)
+        if wid in latched_set:
+            return None, None, None
+        observed = quota_pools.cycle_observation(wspec, observed, row, now)
+        state = quota_pools.window_state(
+            wid, wspec, observed, spec, now, policy.get('short_window_hours', 24), account_stale=stale,
+        )
+        if not state['known'] or wspec.get('hours') is None:
+            return None, None, None
+        state, _, _ = quota_pools.reserve_inflight(
+            bundle['account'], spec, wid, wspec, state, records, accounts, policy, now,
+        )
+        launch_floor = (float(wspec['launch_min_remaining_pct'])
+                        if isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) else None)
+        if launch_floor is not None and state.get('full', 100.0) <= launch_floor:
+            return None, None, None
+        renewed = quota_pools.after_reset(state, wspec['hours'])
+        if renewed is None:
+            return None, None, None
+        available_at, waiting_on = candidate_eval.binding_wait(
+            available_at, waiting_on, renewed['deferred_hours'], wid, waits,
+        )
+        reset_dt = quota_pools.parse_time(state.get('reset_at')) or (now + timedelta(hours=renewed['deferred_hours']))
+        reset_times[wid] = reset_dt.isoformat()
+    if seen != blocked_wids or not available_at or not waiting_on:
+        return None, None, None
+    return advised_hours(available_at), reset_times[waiting_on], waiting_on
+
+
 def named_pin_block(task, candidates):
     """Why what the user named cannot run, one line per row; [] when the task names nothing."""
     if not (task.get('constraint_model') or task.get('constraint_bundle') or task.get('constraint_effort') or task.get('pinned_bundle')):

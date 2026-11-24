@@ -90,7 +90,8 @@ def test_routing_excludes_only_bundles_drawing_a_latched_window():
     decision = allocator.plan({'objective': 'Reply with exactly OK', 'hours': 0.1}, {}, accounts=accounts,
                               overrides=[], host_policy_config=None)
     rows = {row['id']: row for row in decision['ranking']}
-    latched = '3p-weekly: quota confirmed exhausted; refresh quota or replan'
+    latched = '3p-weekly: quota confirmed exhausted'
     assert latched in rows['agy_opus55_high']['excluded']
+    assert not any('replan' in e for row in rows.values() for e in row['excluded'])
     assert latched not in rows['argon_high']['excluded']
     assert latched not in rows['flash_high']['excluded']
