@@ -1,5 +1,6 @@
 """The routing simulation feeds usage through the roll pipeline, so quota scarcity moves the distribution."""
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 
 import route_simulation as sim
@@ -77,21 +78,27 @@ class UsageAwareSimulationTests(unittest.TestCase):
         self.assertAlmostEqual(weekly['seconds_until_reset'], 3 * 86400, delta=1)
 
 
-    def test_a_pooled_window_keeps_its_account_count_through_the_ledger(self):
-        import quota_pools
+    def test_a_pooled_window_keeps_its_members_through_the_ledger_and_an_old_pooled_record_is_skipped(self):
+        # A replay reads a pool member by member as routing does (owner 2026-11-24); a record of a pooled window without
+        # its members (older ledgers, marked pooled from the live cache) is not read, never priced as one merged window.
         import decision_ledger
         at = NOW - timedelta(days=2)
-        reading = {'id': 'seven_day', 'used_pct': 40.0, 'resets_at': (at + timedelta(days=3)).isoformat(), 'accounts': 3}
+        members = [{'label': 'member-1', 'used_pct': 0.0, 'resets_at': (at + timedelta(days=5)).isoformat()},
+                   {'label': 'member-2', 'used_pct': 30.0, 'resets_at': (at + timedelta(days=3)).isoformat()}]
+        reading = {'id': 'seven_day', 'used_pct': 15.0, 'resets_at': members[0]['resets_at'], 'accounts': 2,
+                   'members': members}
         digest = decision_ledger.usage_digest({'accounts': {'claude': {'status': 'ok', 'fetched_at': at.isoformat(),
                                                                    'windows': [reading]}}})
-        self.assertEqual(digest['claude']['windows'][0]['accounts'], 3)
-        old = {'claude': {'status': 'ok', 'fetched_at': at.isoformat(), 'windows': [dict(reading, accounts=None)]}}
-        old['claude']['windows'][0].pop('accounts')
-        for compact, pools in ((digest, None), (old, {'claude': {'seven_day': 3}})):
-            usage = sim.snapshot(sim.ledger_document(compact, pools), self.accounts, at)
-            self.assertEqual(quota_pools.pool_size(window(usage, 'claude', 'seven_day')), 3)
-        usage = sim.snapshot(sim.ledger_document(old), self.accounts, at)    # old record, no live pool: one account
-        self.assertEqual(quota_pools.pool_size(window(usage, 'claude', 'seven_day')), 1)
+        kept = digest['claude']['windows'][0]
+        self.assertEqual((kept['accounts'], [m['used_pct'] for m in kept['members']]), (2, [0.0, 30.0]))
+        self.assertNotIn('label', json.dumps(kept))      # the ledger keeps positions, no label
+        weekly = window(sim.snapshot(sim.ledger_document(digest), self.accounts, at), 'claude', 'seven_day')
+        self.assertAlmostEqual(weekly['remaining_pct_before_reset'], 170.0)
+        old = {'claude': {'status': 'ok', 'fetched_at': at.isoformat(),
+                          'windows': [{k: reading[k] for k in ('id', 'used_pct', 'resets_at')}]}}
+        weekly = window(sim.snapshot(sim.ledger_document(old, {'claude': {'seven_day': 2}}), self.accounts, at),
+                        'claude', 'seven_day')
+        self.assertIsNone(weekly['remaining_pct_before_reset'])
 
     def test_old_shape_ledger_rows_are_skipped_with_a_warning_count(self):
         import json

@@ -5,6 +5,7 @@ import math
 
 import fast_modes
 import provider_inventory
+import quota_pools
 import axis_scores
 import worker_sessions
 
@@ -413,14 +414,31 @@ class FiveAxisEconomy:
 
     def rec(self, entry, wid):
         st, cap = entry['states'][wid]
-        return self.record((entry['qsrc'], wid), st, cap)
+        return self.member_records((entry['qsrc'], wid), st, cap)
 
-    def record(self, wkey, st, cap):
-        """The window's recovery record with its burst size `lump_usd` attached (None when the window is unreadable)."""
+    def record(self, wkey, st, cap, share=1.0):
+        """The window's recovery record with its burst size `lump_usd` attached (None when the window is unreadable). A
+        pool member taking the share `share` of the work sees that share of each burst."""
         rec = five_axis_window_recovery(st, cap)
         if rec is not None:
-            rec['lump_usd'] = self.lump(wkey, rec['reset_hours'])
+            rec['lump_usd'] = self.lump(wkey, rec['reset_hours']) * share
         return rec
+
+    def member_records(self, wkey, st, cap):
+        """[(state, record, share)] of the windows that serve window `wkey`'s work: the window itself (share 1), or for a
+        pool (`members`, quota_pools.pool_row) each counted member on its own window (owner 2026-11-24). The work is split
+        evenly over the serving members (quota_pools.serving_members: the balanced assumption). Each member's term is this module's own record on its C, U, e, reset and share, so members in step (same used
+        share, same reset) give the merged window's term: capacity, used and burst all scale by the share."""
+        if not st.get('members'):
+            rec = self.record(wkey, st, cap)
+            return [] if rec is None else [(st, rec, 1.0)]
+        serving = quota_pools.serving_members(st)
+        out = []
+        for m in serving:
+            rec = self.record(wkey, m, cap, 1.0 / len(serving))
+            if rec is not None:
+                out.append((m, rec, 1.0 / len(serving)))
+        return out
 
     def lump(self, wkey, reset_hours=None):
         """q_w, the window's burst size (advisor v3.1, option A, owner round 15): the average over the demand grid of what one
@@ -452,9 +470,10 @@ class FiveAxisEconomy:
             best = max(rows, key=lambda e: (round(e['fits'][gi], 9), -e['spend']))
             slack = 1.0
             for wid in best['states']:
-                rec = self.rec(best, wid)
-                if rec is not None:
-                    slack = min(slack, five_axis_substitute_slack(rec, best['spend']))
+                recs = self.rec(best, wid)
+                if recs:        # a pool: the mean of its serving members' slack, each at its share of the spend
+                    slack = min(slack, sum(five_axis_substitute_slack(rec, best['spend'] * share)
+                                           for _, rec, share in recs) / len(recs))
             got = self._alts[(unit, gi)] = (best['fits'][gi], slack)
         return got
 
@@ -486,11 +505,15 @@ class FiveAxisEconomy:
             none_open *= (1.0 - a)
         return five_axis_outside_value(alts, best), best, 1.0 - none_open
 
-    def window_cost(self, wkey, rec, spend, econ_hours, start_offset_hours=0.0):
+    def window_cost(self, wkey, rec, spend, econ_hours, start_offset_hours=0.0, share=1.0):
+        """The cost of `spend` on window record `rec`; a pool member (`share` < 1) prices its share of the work on its
+        own record, with the largest spend and the fresh period's burst at that share too."""
+        spend_max = self.spend_max.get(wkey, spend / share) * share
         tables = self._tables.setdefault((wkey, round(rec['used_usd'], 6), round(rec['elapsed_frac'], 9),
-                                          round(rec['capacity_usd'], 6), round(rec['lump_usd'], 6)), {})
-        return five_axis_spend_cost(rec, self.ladder(wkey), spend, econ_hours, self.spend_max.get(wkey, spend), tables,
-                                    fresh_lump=self.lump(wkey), start_offset_hours=start_offset_hours)
+                                          round(rec['capacity_usd'], 6), round(rec['lump_usd'], 6),
+                                          round(spend_max, 6)), {})
+        return five_axis_spend_cost(rec, self.ladder(wkey), spend, econ_hours, spend_max, tables,
+                                    fresh_lump=self.lump(wkey) * share, start_offset_hours=start_offset_hours)
 
     def report(self):
         """One block per priced window for the plan's `system.quota_windows` (and the README page): its state and its
@@ -498,26 +521,57 @@ class FiveAxisEconomy:
         out = []
         for wkey in sorted(self.points):
             e = self.points[wkey][0]
-            rec = self.rec(e, wkey[1])
-            if rec is None:
+            st, cap = e['states'][wkey[1]]
+            recs = self.rec(e, wkey[1])
+            if not recs:
                 continue
             ladder = self.ladder(wkey)
             outside, best, slack = self.outside_at_task(wkey)
-            period = rec['period_hours']
+            terms = [{'need_probability': five_axis_need_probability(rec, rec['used_usd']),
+                      'quota_price': five_axis_quota_price(rec, ladder, rec['used_usd']) if ladder['steps'] else 0.0}
+                     for _, rec, _ in recs]
+            agg = pool_record(st, cap, recs)
+            period = agg['period_hours']
             out.append({
                 'label': f'{wkey[0]}/{wkey[1]}', 'quota_source': wkey[0], 'window': wkey[1],
-                'capacity_usd': round(rec['capacity_usd'], 2), 'used_usd': round(rec['used_usd'], 2),
-                'recovery_line_usd': round(rec['line_now_usd'], 2),
+                'capacity_usd': round(agg['capacity_usd'], 2), 'used_usd': round(agg['used_usd'], 2),
+                'recovery_line_usd': round(agg['line_now_usd'], 2),
                 'period_hours': None if period is None else round(period, 2),
-                'elapsed_hours': None if period is None else round(period - rec['reset_hours'], 2),
-                'reset_in_hours': None if rec['reset_hours'] == float('inf') else round(rec['reset_hours'], 2),
-                'need_probability': round(five_axis_need_probability(rec, rec['used_usd']), 4),
-                'lump_usd': round(rec['lump_usd'], 2),
-                'quota_price': round(five_axis_quota_price(rec, ladder, rec['used_usd']), 6) if ladder['steps'] else 0.0,
+                'elapsed_hours': None if period is None else round(period - agg['reset_hours'], 2),
+                'reset_in_hours': None if agg['reset_hours'] == float('inf') else round(agg['reset_hours'], 2),
+                'need_probability': round(sum(t['need_probability'] for t in terms) / len(terms), 4),
+                'lump_usd': round(sum(rec['lump_usd'] for _, rec, _ in recs), 2),
+                'quota_price': round(sum(t['quota_price'] for t in terms) / len(terms), 6),
                 'ladder_steps': len(ladder['steps']), 'outside_fit': round(outside, 4), 'best_fit': round(best, 4),
                 'substitute_slack': round(slack, 4), 'candidates': len(self.points[wkey]),
+                **({'members': [member_view(m, rec, t) for (m, rec, _), t in zip(recs, terms)]}
+                   if st.get('members') else {}),
             })
         return out
+
+
+def pool_record(st, cap, recs):
+    """The window as one record for display: the record itself, or for a pool its members' summed capacity and use (every
+    known member, so a member at 0 still shows as spent), the pool's own reset (the next partial refill) and period."""
+    if not st.get('members'):
+        return recs[0][1]
+    known = [five_axis_window_recovery(m, cap) for m in st['members'] if m.get('known')]
+    known = [r for r in known if r is not None]
+    reset = st.get('reset_hours')
+    hours = st.get('hours')
+    period = None if hours is None or hours == float('inf') else float(hours)
+    tau = float('inf') if reset is None or reset == float('inf') or period is None else max(0.0, min(period, float(reset)))
+    return {'capacity_usd': sum(r['capacity_usd'] for r in known), 'used_usd': sum(r['used_usd'] for r in known),
+            'line_now_usd': sum(r['line_now_usd'] for r in known), 'period_hours': period, 'reset_hours': tau,
+            'unstarted': all(r['unstarted'] for r in known)}
+
+
+def member_view(m, rec, terms):
+    """One pool member's row in a capacity or report block, by position and masked label, never a full identity."""
+    return {'position': m.get('position'), 'label': m.get('label'), 'capacity_usd': round(rec['capacity_usd'], 2),
+            'used_usd': round(rec['used_usd'], 2),
+            'reset_in_hours': None if rec['reset_hours'] == float('inf') else round(rec['reset_hours'], 2),
+            **{k: round(v, 6 if k in ('quota_price', 'cost') else 4) for k, v in terms.items()}}
 
 
 def five_axis_make_fast(c, fast_cand, reason):
@@ -556,8 +610,12 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
     def eval_windows(c, w_states, own_qsrc, spend, chain_usd, econ_h):
         rows = []
         for wid, (wspec, st, cap_usd_w, _) in w_states.items():
-            rec = (five_axis_window_recovery(st, cap_usd_w) if st.get('short')
-                   else econ.record((own_qsrc, wid), st, cap_usd_w))
+            if st.get('short'):
+                rec = five_axis_window_recovery(st, cap_usd_w)
+                recs = []
+            else:
+                recs = econ.member_records((own_qsrc, wid), st, cap_usd_w)
+                rec = pool_record(st, cap_usd_w, recs) if recs else None
             if rec is None:
                 continue
             rem = st['remaining']
@@ -584,13 +642,24 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                 **({k: st[k] for k in ('natural_reset_hours', 'expected_reset_at') if k in st}),
             }
             if not row['short'] and spend > 0:
-                got = econ.window_cost((own_qsrc, wid), rec, spend, econ_h,
-                                       start_offset_hours=float(st.get('start_offset_hours') or 0.0))
-                unit_cost = float((1.0 + float(got['cost'])) - 1.0)
+                # Each serving window prices its share of the spend on its own record; the window's term is their sum
+                # and its price and need the members' mean (member_records; one window is the case of one member).
+                gots = [econ.window_cost((own_qsrc, wid), m_rec, spend * share, econ_h,
+                                         start_offset_hours=max(float(m.get('start_offset_hours') or 0.0),
+                                                                float(st.get('start_offset_hours') or 0.0)),
+                                         share=share)
+                        for m, m_rec, share in recs]
+                unit_cost = float((1.0 + sum(float(g['cost']) for g in gots)) - 1.0)
                 row.update(priced=True, cost=unit_cost, opportunity_cost=unit_cost,
-                           quota_price=round(got['lambda_start'], 6), need_start=round(got['need_start'], 4),
-                           need_end=round(got['need_end'], 4), spend_before_reset=round(got['spend_before'], 2),
-                           spend_after_reset=round(got['spend_after'], 2))
+                           quota_price=round(sum(g['lambda_start'] for g in gots) / len(gots), 6),
+                           need_start=round(sum(g['need_start'] for g in gots) / len(gots), 4),
+                           need_end=round(sum(g['need_end'] for g in gots) / len(gots), 4),
+                           spend_before_reset=round(sum(g['spend_before'] for g in gots), 2),
+                           spend_after_reset=round(sum(g['spend_after'] for g in gots), 2))
+                if st.get('members'):
+                    row['members'] = [member_view(m, m_rec, {'quota_price': g['lambda_start'], 'need_start': g['need_start'],
+                                                             'cost': g['cost'], 'spend_usd': spend * share})
+                                      for (m, m_rec, share), g in zip(recs, gots)]
             rows.append(row)
         if not rows:
             return None
@@ -602,6 +671,7 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                                            'need_end', 'spend_before_reset', 'spend_after_reset')}
                         | {'spend_usd': r['expected_usd'],
                            'reset_in_hours': None if r['reset_hours'] is None else round(r['reset_hours'], 2)}
+                        | ({'members': r['members']} if 'members' in r else {})
                         for r in priced],
             'cost': binding['cost'], 'need_end_max': max((r['need_end'] for r in priced), default=0.0),
             'binding_window': binding['window'] if binding['priced'] else None,

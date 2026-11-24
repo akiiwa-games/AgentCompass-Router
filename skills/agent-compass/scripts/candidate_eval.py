@@ -73,6 +73,22 @@ def local_settings(candidate):
     return kinds if kinds and len(kinds) == len(candidate.get('excluded') or ()) else None
 
 
+def renewed_horizon(renewed, req_hours):
+    """Hours of the work before the renewed window's next reset, counted from the renewal: the window's length for one
+    account; for a pool the mean over its serving members of each one's time to its own next reset
+    (quota_pools.hours_before; equal to the length when the members are in step)."""
+    at = float(renewed['deferred_hours'])
+    return quota_pools.hours_before(renewed, lambda s: min(float(req_hours), max(0.0, float(s['reset_hours']) - at)))
+
+
+def refill_note(renewed):
+    """For a pool, which members the wait renews (by position): its next partial refill; '' for one account."""
+    if not renewed.get('members'):
+        return ''
+    back = [str(m['position']) for m in renewed['members'] if m.get('deferred_hours') == renewed['deferred_hours']]
+    return f"; the pool's next partial refill (member {', '.join(back)} of {len(renewed['members'])} renews)"
+
+
 def binding_wait(available_at, waiting_on, hours, window, waits):
     """`(available_at, waiting_on)` once `window` also holds the candidate back for `hours`: a candidate held by several
     windows can start when the last of them returns, so the later reset sets the wait and its window is the one named.
@@ -620,8 +636,9 @@ def evaluate_bundle(bundle, task, ctx):
                             if isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) else None)
             if state['short']:
                 w_len = float(wspec.get('hours') or 0) or econ_hours
-                tau = state.get('reset_hours', w_len)
-                h_before = min(econ_hours, w_len) if (tau is None or tau == float('inf') or state.get('unstarted')) else min(econ_hours, max(0.0, float(tau)))
+                h_before = quota_pools.hours_before(state, lambda s: min(econ_hours, w_len) if (
+                    (tau := s.get('reset_hours', w_len)) is None or tau == float('inf') or s.get('unstarted'))
+                    else min(econ_hours, max(0.0, float(tau))))
                 step = None if unit is None else h_before * unit * context_burn
                 _, floor_pct, margin_pct = quota_pools.short_window_limits(spec, wid, policy, now)
                 eff_floor = max(floor_pct, launch_floor) if launch_floor is not None else floor_pct
@@ -639,9 +656,15 @@ def evaluate_bundle(bundle, task, ctx):
                           and wait >= state.get('natural_reset_hours', wait)
                           and expires is not None and (expires - now).total_seconds() < (wait + hours) * 3600):
                         task_exclude('subscription ends before the work would finish')
-                    elif not pool and (renewed := quota_pools.after_reset(state, w_len)) is not None:
+                    elif not pool and (renewed := quota_pools.after_reset(
+                            state, w_len, holds=lambda r: r['remaining'] > eff_floor and (
+                                step is None or r['remaining'] - min(econ_hours, w_len) * unit * context_burn >= margin_pct)
+                            )) is not None:
+                        # A pool's wait is its next partial refill that holds the work (quota_pools.after_reset).
+                        wait = renewed['deferred_hours']
                         available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
-                        result['notes'].append(f'{wid} {what} for {wait:.1f}h; start after its reset')
+                        result['notes'].append(f'{wid} {what} for {wait:.1f}h; start after its reset'
+                                               + refill_note(renewed))
                         renewed['unstarted'] = True
                         five_window_states[wid] = (wspec, renewed, cap_usd_w, unit)
                     elif not pool:
@@ -656,9 +679,10 @@ def evaluate_bundle(bundle, task, ctx):
                     exclude(floor_refusal)
                 continue
             w_len = wspec.get('hours')
-            tau = state.get('reset_hours')
             req_hours = econ_chain_hours if task['coupling'] == 'high' else econ_hours
-            h_before = req_hours if (tau is None or tau == float('inf') or w_len is None) else min(req_hours, max(0.0, float(tau)))
+            h_before = quota_pools.hours_before(state, lambda s: req_hours if (
+                (tau := s.get('reset_hours')) is None or tau == float('inf') or w_len is None)
+                else min(req_hours, max(0.0, float(tau))))
             need = h_before * unit * context_burn
             held_on_long = (below_floor
                             or (launch_floor is not None and state['remaining'] <= launch_floor)
@@ -683,14 +707,18 @@ def evaluate_bundle(bundle, task, ctx):
                       and wait >= state.get('natural_reset_hours', wait)
                       and expires is not None and (expires - now).total_seconds() < (wait + hours) * 3600):
                     task_exclude('subscription ends before the work would finish')
-                elif w_len is not None and (renewed := quota_pools.after_reset(state, w_len)) is not None:
+                elif w_len is not None and (renewed := quota_pools.after_reset(
+                        state, w_len, holds=lambda r: (r['remaining'] - renewed_horizon(r, req_hours) * unit * context_burn
+                                                       >= policy['safety_margin_pct']))) is not None:
                     state = renewed
                     available_at, waiting_on = binding_wait(available_at, waiting_on, renewed['deferred_hours'], wid,
                                                             waits)
                     result['_five_long_wait'] = True        # a long window must renew first: no absorber of other work now
-                    h_before = min(req_hours, float(w_len))
+                    h_before = renewed_horizon(renewed, req_hours)
                     need = h_before * unit * context_burn
-                    result['notes'].append(f'{wid} renews in {renewed["deferred_hours"]:.1f}h; start then (assumes a full renewal)')
+                    result['notes'].append(f'{wid} renews in {renewed["deferred_hours"]:.1f}h; start then '
+                                           + (refill_note(renewed).lstrip('; ') if renewed.get('members')
+                                              else '(assumes a full renewal)'))
                 else:
                     task_exclude(floor_refusal or (
                         f'{wid} has {state["remaining"]:.0f}% left; the work needs ~{need:.1f}% plus a {policy["safety_margin_pct"]}% margin '
@@ -816,14 +844,14 @@ def evaluate_bundle(bundle, task, ctx):
                                            f'(in {orig_reset:.1f}h; priced on a full renewal)')
                 five_window_states[wid] = (wspec, renewed_other, cap_usd_w, unit)
             else:
-                tau_start = orig_reset - available_at
                 if st.get('short'):
                     w_l = float(w_len or 0) or econ_hours
-                    h_bef = min(econ_hours, w_l) if st.get('unstarted') else min(econ_hours, tau_start)
+                    h_bef = quota_pools.hours_before(st, lambda s: min(econ_hours, w_l) if s.get('unstarted')
+                                                     else min(econ_hours, max(0.0, s['reset_hours'] - available_at)))
                     exclude_if_renewal_short(wid, wspec, st, unit, work_hours=econ_hours - h_bef)
                 elif unit is not None:
                     req_hours = econ_chain_hours if task['coupling'] == 'high' else econ_hours
-                    h_bef = min(req_hours, tau_start)
+                    h_bef = quota_pools.hours_before(st, lambda s: min(req_hours, max(0.0, s['reset_hours'] - available_at)))
                     if exclude_if_renewal_short(wid, wspec, st, unit, work_hours=req_hours - h_bef):
                         continue
                     five_window_states[wid] = (wspec, {**st, 'start_offset_hours': available_at}, cap_usd_w, unit)
@@ -855,26 +883,30 @@ def evaluate_bundle(bundle, task, ctx):
                     continue        # the pool asks what the account can run, not whether it fits the remaining capacity now
                 f_unit = unit * f_price * f_speed * context_burn     # per fast hour; x f_econ_h is price x the normal spend
                 w_len = wspec.get('hours')
-                tau = st.get('reset_hours')
+                full = st.get('full', 100.0)
                 if st['short']:
                     w_l = float(w_len or 0) or f_econ_h
-                    h_bef = min(f_econ_h, w_l) if (tau is None or tau == float('inf') or st.get('unstarted')) else min(f_econ_h, max(0.0, float(tau)))
+                    h_bef = quota_pools.hours_before(st, lambda s: min(f_econ_h, w_l) if (
+                        (tau := s.get('reset_hours')) is None or tau == float('inf') or s.get('unstarted'))
+                        else min(f_econ_h, max(0.0, float(tau))))
                     f_step = h_bef * f_unit
                     f_per = min(max(0.0, f_econ_h - h_bef), w_l) * f_unit
                     _, fl_pct, mg_pct = quota_pools.short_window_limits(spec, wid, policy, now)
-                    if st['remaining'] <= fl_pct or st['remaining'] - f_step < mg_pct or 100.0 - f_per < mg_pct:
+                    if st['remaining'] <= fl_pct or st['remaining'] - f_step < mg_pct or full - f_per < mg_pct:
                         fast_ok = False
                         break
                 else:
                     req_h = f_chain_h if task['coupling'] == 'high' else f_econ_h
-                    h_bef = req_h if (tau is None or tau == float('inf') or w_len is None) else min(req_h, max(0.0, float(tau)))
+                    h_bef = quota_pools.hours_before(st, lambda s: req_h if (
+                        (tau := s.get('reset_hours')) is None or tau == float('inf') or w_len is None)
+                        else min(req_h, max(0.0, float(tau))))
                     f_need = h_bef * f_unit
                     if st['remaining'] - f_need < policy['safety_margin_pct']:
                         fast_ok = False
                         break
                     if w_len is not None and req_h > h_bef:
                         f_rem = min(req_h - h_bef, float(w_len)) * f_unit
-                        if 100.0 - f_rem < policy['safety_margin_pct']:
+                        if full - f_rem < policy['safety_margin_pct']:
                             fast_ok = False
                             break
             if task.get('force_fast') and not fast_ok:

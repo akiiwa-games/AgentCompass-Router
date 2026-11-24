@@ -182,8 +182,14 @@ class RoutingTests(unittest.TestCase):
         # Window math
         w = usage_reading.window_state({'used_pct': 35, 'resets_at': '2026-10-04T11:00:00+08:00'}, self.now)
         self.assertEqual((w['seconds_until_reset'], w['remaining_pct_before_reset']), (7200, 65))
-        pool = usage_reading.window_state({'used_pct': 25, 'accounts': 2, 'resets_at': '2026-10-04T11:00:00+08:00'}, self.now)
+        # A pool is read member by member (owner 2026-11-24): what is left is the members' sum; a pooled window without
+        # its members (an earlier version's reading) is not read.
+        pool = usage_reading.window_state({'used_pct': 25, 'accounts': 2, 'members': [
+            {'used_pct': 0, 'resets_at': '2026-10-04T12:00:00+08:00'},
+            {'used_pct': 50, 'resets_at': '2026-10-04T11:00:00+08:00'}]}, self.now)
         self.assertEqual((pool['used_pct'], pool['remaining_pct_before_reset'], pool['accounts']), (25, 150, 2))
+        self.assertIsNone(usage_reading.window_state({'used_pct': 25, 'accounts': 2, 'resets_at': '2026-10-04T11:00:00+08:00'},
+                                                     self.now)['remaining_pct_before_reset'])
         for odd in (1, 0, True, '2'):
             self.assertEqual(usage_reading.window_state({'used_pct': 0, 'accounts': odd, 'resets_at': '2026-10-04T11:00:00+08:00'},
                                                  self.now)['remaining_pct_before_reset'], 100)

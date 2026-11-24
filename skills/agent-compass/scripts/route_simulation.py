@@ -223,8 +223,10 @@ def pool_counts(document):
 def ledger_document(compact, pools=None):
     """A ledger record's compact usage as the cache document it was read from (fetched_at, stale, windows).
 
-    Records since 2026-11-04 keep a pooled window's `accounts`. Older ones dropped it; for those `pools` (the live cache's
-    pool counts, `pool_counts(live_document())`) fills it in, on the assumption that a pool's size rarely changes."""
+    Records since 2026-11-24 keep a pooled window's members, which the replay reads as routing does. Older records kept
+    at most `accounts` (none before 2026-11-04; for those `pools`, the live cache's pool counts
+    `pool_counts(live_document())`, marks the window pooled): a pooled window without its members is not read
+    (usage_reading.window_state), so such a record is skipped for that window, never priced as one merged window."""
     providers = {}
     for name, row in (compact or {}).items():
         if isinstance(row, dict) and row.get('fetched_at'):
