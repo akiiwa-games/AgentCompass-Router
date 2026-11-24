@@ -17,6 +17,7 @@ from datetime import timedelta
 import itertools
 import json
 import unittest
+import unittest.mock
 
 import ledger_snapshot
 import quota_economy
@@ -164,6 +165,45 @@ class PoolOfOneTests(unittest.TestCase):
                 self.assertTrue(any(not r[1] for r in alone))      # the account is in routing: not a vacuous equality
                 self.assertEqual(one, alone)
 
+
+class SubstituteTests(unittest.TestCase):
+    def test_a_members_substitutes_are_the_other_members_slack_for_their_own_shares(self):
+        """Rule (router-internals.md, Account pools; quota_economy.FiveAxisEconomy.substitutes, ladder): through
+        allocator.plan, every time the real economy prices a pool, member i's substitutes are the k-1 other members,
+        each one's five_axis_substitute_slack for its own share of the spend, and the real ladder is built with exactly
+        those; a pool of one member has none."""
+        econ_cls = quota_economy.FiveAxisEconomy
+        real_substitutes, real_ladder = econ_cls.substitutes, econ_cls.ladder
+        calls, ladders = [], []
+
+        def spy_substitutes(recs, spend):
+            got = real_substitutes(recs, spend)
+            calls.append((list(recs), spend, got))
+            return got
+
+        def spy_ladder(self, wkey, substitutes=()):
+            ladders.append(tuple(sorted(substitutes)))
+            return real_ladder(self, wkey, substitutes)
+
+        for members in ([(0.0, 146.0), (31.0, 30.0)], [(10.0, 146.0), (40.0, 60.0), (97.0, 20.0)], [(31.0, 30.0)]):
+            with self.subTest(members=members):
+                calls.clear()
+                ladders.clear()
+                reading = raw_pool(members) if len(members) > 1 else dict(raw_pool(members), accounts=1)
+                with unittest.mock.patch.object(econ_cls, 'substitutes', staticmethod(spy_substitutes)),                         unittest.mock.patch.object(econ_cls, 'ladder', spy_ladder):
+                    plan_with(reading)
+                pooled = [c for c in calls if len(c[0]) == len(members)]
+                self.assertTrue(pooled, 'the pool was priced through FiveAxisEconomy.substitutes')
+                for recs, spend, got in pooled:
+                    self.assertEqual(len(got), len(recs))
+                    for i, subs in enumerate(got):
+                        expected = tuple(quota_economy.five_axis_substitute_slack(rec, spend * share)
+                                         for j, (_, rec, share) in enumerate(recs) if j != i)
+                        self.assertEqual(len(subs), len(recs) - 1)
+                        self.assertEqual(subs, expected)
+                        self.assertIn(tuple(sorted(subs)), ladders)     # the real ladder is built with them
+                if len(members) == 1:
+                    self.assertTrue(all(got == [()] for recs, _, got in calls if len(recs) == 1))
 
 def rows_of(decision, account):
     return [(c['id'], c.get('excluded'), c.get('available_in_hours'), c['components'].get('quota_price'),
