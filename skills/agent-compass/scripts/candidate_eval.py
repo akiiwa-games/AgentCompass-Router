@@ -577,6 +577,11 @@ def evaluate_bundle(bundle, task, ctx):
             is_short = quota_pools.window_is_short(wspec, policy)
             long_applicable = long_applicable or not is_short
             observed = quota_pools.cycle_observation(wspec, observed, acct_usage, now, read_failed_ok=True)
+            if observed and observed.get('passed_members'):
+                left_out = observed['passed_members']
+                result['notes'].append(
+                    f"{wid}: pool member {', '.join(map(str, left_out['positions']))} of {left_out['of']} is left out "
+                    'until it is read again (its reset has passed since the reading); the pool is priced on the others')
             if wid in latched and latched_reset is not None and latched_reset > now:
                 # 0 left until the latch ends by itself (the reset the provider's error stated, else its re-probe
                 # time): a quota wait like any window used up with a known reset (the merged quota-wait rule).

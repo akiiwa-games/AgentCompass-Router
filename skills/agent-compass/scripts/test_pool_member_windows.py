@@ -347,6 +347,24 @@ class OutOfStepTests(unittest.TestCase):
         self.assertAlmostEqual(quota_pools.hours_before(pool, horizon, 6.0), (5.0 + 3.0 + 1.0) / 3)
 
 
+class PassedMemberTests(unittest.TestCase):
+    def test_a_member_whose_reset_passed_since_the_reading_is_left_out_and_said(self):
+        # R5 and review N2: a member whose reset has passed since its reading is not read until it is read again (as
+        # one account's such window); the pool is the others, and the candidate's notes say which member waits.
+        raw = raw_pool([(0.0, 146.0), (31.0, -1.0)])
+        row = {'status': 'fresh', 'fetched_at': NOW.isoformat()}
+        observed = quota_pools.cycle_observation(SPEC, usage_reading.window_state(raw, NOW), row, NOW)
+        self.assertEqual(observed['passed_members'], {'positions': [2], 'of': 2})
+        alone = single_state(0.0, 146.0)
+        state = quota_pools.window_state('seven_day', SPEC, observed, {}, NOW, 24)
+        self.assertEqual({f: state[f] for f in GATE_FIELDS}, {f: alone[f] for f in GATE_FIELDS})
+        d = plan_with(raw)
+        notes = [n for c in d['ranking'] if c['bundle']['account'] == 'claude-2' for n in c.get('notes') or ()]
+        self.assertTrue(any('pool member 2 of 2 is left out' in n for n in notes))
+        self.assertFalse(any('left out' in n for c in plan_with(raw_pool([(0.0, 146.0), (31.0, 30.0)]))['ranking']
+                             if c['bundle']['account'] == 'claude-2' for n in c.get('notes') or ()))
+
+
 class WaitTests(unittest.TestCase):
     def test_the_wait_is_the_earliest_member_reset_that_restores_capacity_for_the_work(self):
         # R4: an exhausted pool renews member by member; its wait is the soonest reset that gives quota back, and with

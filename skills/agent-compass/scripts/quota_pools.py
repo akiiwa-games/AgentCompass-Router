@@ -239,7 +239,12 @@ def cycle_observation(window, observed, usage_row, now, read_failed_ok=False):
         # A pool: each member's reading is kept or dropped as one account's would be, and the pool is what is kept.
         kept = [m for m in (cycle_observation(window, member, usage_row, now, read_failed_ok)
                             for member in observed['members']) if m is not None]
-        return usage_reading.pooled_reading(observed.get('id'), kept, observed.get('models'))
+        pooled = usage_reading.pooled_reading(observed.get('id'), kept, observed.get('models'))
+        passed = [m.get('position') for m in observed['members'] if m.get('reset_time_passed') is True]
+        if pooled is not None and passed:
+            # Said where it is read (review N2): which members wait for a new reading, so the pool is the others.
+            pooled['passed_members'] = {'positions': passed, 'of': len(observed['members'])}
+        return pooled
     if observed.get('reset_time_passed') is True:
         return None
     if usage_row.get('status') in (None, 'fresh'):
