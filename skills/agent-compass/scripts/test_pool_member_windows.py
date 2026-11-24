@@ -15,8 +15,10 @@ ordered."""
 import copy
 from datetime import timedelta
 import itertools
+import json
 import unittest
 
+import ledger_snapshot
 import quota_economy
 import quota_pools
 import usage_reading
@@ -281,12 +283,14 @@ class WaitTests(unittest.TestCase):
 
 
 class ShownTests(unittest.TestCase):
-    def test_the_capacity_rows_name_the_member_windows_by_position_and_masked_label(self):
-        # Rule 6 (brief): the candidate's economy rows name the member windows, by position or masked label.
+    def test_the_capacity_rows_name_the_member_windows_by_position_and_carry_no_label(self):
+        # Rule 6 (brief): the candidate's economy rows name the member windows; owner 2026-11-24: by position only, so
+        # the decision snapshot written to the ledger carries no label (the usage reading keeps the masked label).
         d = plan_with(raw_pool([(0.0, 146.0), (31.0, 30.0)]))
         row = next(c for c in d['ranking'] if c['bundle']['account'] == 'claude-2' and not c.get('excluded'))
         members = row['economy']['windows'][0]['members']
-        self.assertEqual([(m['position'], m['label']) for m in members], [(1, 'member-1'), (2, 'member-2')])
+        self.assertEqual([m['position'] for m in members], [1, 2])
+        self.assertNotIn('member-', json.dumps(ledger_snapshot.decision_snapshot(d), default=str))
         self.assertAlmostEqual(sum(m['cost'] for m in members), row['economy']['windows'][0]['cost'], places=5)
 
 

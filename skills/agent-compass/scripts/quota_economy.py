@@ -567,8 +567,9 @@ def pool_record(st, cap, recs):
 
 
 def member_view(m, rec, terms):
-    """One pool member's row in a capacity or report block, by position and masked label, never a full identity."""
-    return {'position': m.get('position'), 'label': m.get('label'), 'capacity_usd': round(rec['capacity_usd'], 2),
+    """One pool member's row in a capacity or report block, by its position alone (owner 2026-11-24: the decision
+    snapshot written to the ledger keeps no label; the masked label stays on the usage reading the tray hover reads)."""
+    return {'position': m.get('position'), 'capacity_usd': round(rec['capacity_usd'], 2),
             'used_usd': round(rec['used_usd'], 2),
             'reset_in_hours': None if rec['reset_hours'] == float('inf') else round(rec['reset_hours'], 2),
             **{k: round(v, 6 if k in ('quota_price', 'cost') else 4) for k, v in terms.items()}}
