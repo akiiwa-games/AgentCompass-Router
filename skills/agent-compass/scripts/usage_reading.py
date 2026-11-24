@@ -153,18 +153,64 @@ def claude_session_limit(account, home_dir, now, inventory=None):
     return None
 
 
+def pooled_reading(window_id, members, models=None):
+    """One pooled window reading built from its members' own readings (each `window_state` of one account's window),
+    by these rules: what is left is the sum over the members whose share is read, in percent of one account (two fresh
+    accounts are 200%; a member with no reset yet adds what it shows left; a member not read, or whose reset has passed
+    since its reading, adds nothing; None when none is read); the used share shown is the mean of the
+    read ones; the reset is the next partial refill, the soonest reset still ahead of a member that has
+    spent some (else the soonest one ahead); the reset has passed only when every member's has. The members travel with it, so
+    routing prices and gates each on its own window (quota_pools.window_state). None for no member."""
+    if not members:
+        return None
+    left = [m['observed_remaining_pct'] for m in members if m['observed_remaining_pct'] is not None]
+    # A member whose window reports no reset yet (an idle account) counts with what it shows left, as one account's
+    # such window is read (quota_pools.window_state: no remaining-before-reset -> the observed remaining).
+    before = [b for m in members if (b := m['remaining_pct_before_reset'] if m['remaining_pct_before_reset'] is not None
+                                     else m['observed_remaining_pct'] if m['reset_time_passed'] is None else None)
+              is not None]
+    used = [m['used_pct'] for m in members if m['used_pct'] is not None]
+    active = [m for m in members if m['reset_time_passed'] is False]
+    spent = [m for m in active if (m['used_pct'] or 0) > 0]
+    soonest = min(spent or active, key=lambda m: timestamp(m['resets_at'])) if active else None
+    passed = [m['reset_time_passed'] for m in members]
+    return {
+        'id': window_id,
+        'used_pct': sum(used) / len(used) if used else None,
+        'resets_at': soonest['resets_at'] if soonest else None,
+        'seconds_until_reset': soonest['seconds_until_reset'] if soonest else None,
+        'reset_time_passed': True if all(p is True for p in passed) else (False if soonest else None),
+        'observed_remaining_pct': sum(left) if left else None,
+        'remaining_pct_before_reset': sum(before) if before else None,
+        'accounts': len(members),
+        'members': list(members),
+        **({'models': models} if models else {}),
+    }
+
+
 def window_state(window, now, observation_current=True):
+    if isinstance(window.get('members'), list):
+        # A pool: each counted account's own window is read as one account's, then pooled (pooled_reading).
+        members = [{**window_state({'id': window.get('id'), 'used_pct': m.get('used_pct'), 'resets_at': m.get('resets_at')},
+                                   now, observation_current),
+                    'label': m.get('label'), 'position': n}
+                   for n, m in enumerate(window['members'], 1) if isinstance(m, dict)]
+        models = window_state({'id': window.get('id'), 'models': window.get('models')}, now).get('models')
+        pooled = pooled_reading(window.get('id') if isinstance(window.get('id'), str) else None, members, models)
+        if pooled is not None:
+            return {**pooled, **({'rate_limited': True} if window.get('rate_limited') is True and pooled['reset_time_passed'] is False else {})}
     reset = timestamp(window.get('resets_at'))
     used = window.get('used_pct')
     # Providers (e.g. Magpie/Claude at 5h session limit) can report >100% utilization
     # (such as 101.0%); clamp finite values >100 to 100.0 instead of dropping to None.
     used = (100.0 if used > 100 else used) if finite_number(used, low=0, high=float('inf')) else None
     passed = reset <= now if reset else None
-    # A Magpie pool of N same-plan subscriptions reports their mean usage; what is left is N accounts' worth, in
-    # percent of one account (the unit of capacity_usd), so two fresh accounts are 200%.
+    # A pooled window without its members' own windows is a reading of an earlier version (the cache is derived state):
+    # it is not read (refetched by the collector), never priced as one merged window.
     count = window.get('accounts')
-    count = count if isinstance(count, int) and not isinstance(count, bool) and count > 1 else 1
-    left = count * (100 - used) if used is not None else None
+    if isinstance(count, int) and not isinstance(count, bool) and count > 1:
+        used = None
+    left = 100 - used if used is not None else None
     return {
         'id': window.get('id') if isinstance(window.get('id'), str) else None,
         'used_pct': used,
@@ -173,7 +219,6 @@ def window_state(window, now, observation_current=True):
         'reset_time_passed': passed,
         'observed_remaining_pct': left,
         'remaining_pct_before_reset': left if passed is False and observation_current else None,
-        **({'accounts': count} if count > 1 else {}),
         **({'rate_limited': True} if window.get('rate_limited') is True and passed is False else {}),
         **({'models': window['models']} if isinstance(window.get('models'), list) and window['models']
            and all(isinstance(model, str) and model for model in window['models']) else {}),

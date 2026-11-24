@@ -555,6 +555,8 @@ class UsageWindow:
     accounts: int = 1
     # Models this allowance is scoped to, as the provider names them; None binds every model (window_scope.py).
     models: list[str] | None = None
+    # A pool's counted accounts, each with its own window ({label, used_pct, resets_at}): routing reads these.
+    members: list[dict] | None = None
 
 
 @dataclass
@@ -652,6 +654,7 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
                 "resets_at": w.resets_at,
                 **({"accounts": w.accounts} if w.accounts > 1 else {}),
                 **({"models": list(w.models)} if w.models else {}),
+                **({"members": [dict(m) for m in w.members]} if w.members else {}),
             }
             for w in p.windows
         ],
@@ -700,6 +703,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
             resets_at=w.get("resets_at"),
             accounts=pool_accounts(w),
             models=window_models(w),
+            members=[dict(m) for m in w["members"] if isinstance(m, dict)] if isinstance(w.get("members"), list) else None,
         )
         for w in (d.get("windows") or [])
         if isinstance(w, dict)

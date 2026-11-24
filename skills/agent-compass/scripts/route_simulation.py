@@ -172,7 +172,8 @@ def metered_accounts(accounts):
 
 def synthetic_document(accounts, now, scenario, pools=None):
     """Collector cache rows for every windowed account: ample everywhere except the scenario's scarce windows.
-    `pools` gives a Magpie pool's login count; the collector reports it per window as `accounts`."""
+    `pools` gives a Magpie pool's login count; the collector reports each pooled window as `accounts` and one member
+    window per login (`members`), here all in step with the scenario's reading."""
     providers = {}
     stale = scenario == 'stale'
     for name, spec in metered_accounts(accounts).items():
@@ -194,6 +195,8 @@ def synthetic_document(accounts, now, scenario, pools=None):
             row = {'id': wid, 'used_pct': used, 'resets_at': (now + timedelta(hours=reset)).isoformat()}
             if (pools or {}).get(name, 1) > 1:
                 row['accounts'] = pools[name]
+                row['members'] = [{'label': f'member-{n}', 'used_pct': used, 'resets_at': row['resets_at']}
+                                  for n in range(1, pools[name] + 1)]
             windows.append(row)
         fetched = now - STALE_AGE if stale else now
         providers[name] = {'fetched_at': fetched.isoformat(), 'stale': stale, 'available': True, 'windows': windows}
@@ -223,8 +226,10 @@ def pool_counts(document):
 def ledger_document(compact, pools=None):
     """A ledger record's compact usage as the cache document it was read from (fetched_at, stale, windows).
 
-    Records since 2026-11-04 keep a pooled window's `accounts`. Older ones dropped it; for those `pools` (the live cache's
-    pool counts, `pool_counts(live_document())`) fills it in, on the assumption that a pool's size rarely changes."""
+    Records since 2026-11-24 keep a pooled window's members, which the replay reads as routing does. Older records kept
+    at most `accounts` (none before 2026-11-04; for those `pools`, the live cache's pool counts
+    `pool_counts(live_document())`, marks the window pooled): a pooled window without its members is not read
+    (usage_reading.window_state), so such a record is skipped for that window, never priced as one merged window."""
     providers = {}
     for name, row in (compact or {}).items():
         if isinstance(row, dict) and row.get('fetched_at'):

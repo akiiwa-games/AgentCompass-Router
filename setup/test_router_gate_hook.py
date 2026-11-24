@@ -2375,7 +2375,11 @@ process.stdout.write(JSON.stringify(out));
 
     @staticmethod
     def window(wid, used, hours=2.0, **extra):
-        return {"id": wid, "used_pct": used, "resets_at": (T0 + dt.timedelta(hours=hours)).isoformat(), **extra}
+        row = {"id": wid, "used_pct": used, "resets_at": (T0 + dt.timedelta(hours=hours)).isoformat(), **extra}
+        if (extra.get("accounts") or 1) > 1:     # a pool as the collector writes it: one member window per login
+            row["members"] = [{"label": f"member-{n}", "used_pct": used, "resets_at": row["resets_at"]}
+                              for n in range(1, extra["accounts"] + 1)]
+        return row
 
     def owned_worker(self, account, bundle_id, provider, status="running"):
         directory = self.state / "agents" / "project"

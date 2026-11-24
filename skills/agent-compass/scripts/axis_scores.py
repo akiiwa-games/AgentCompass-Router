@@ -508,8 +508,10 @@ def with_local_readings(usage, accounts, now):
         row = out['accounts'].get(name) or {}
         if not cap or any(isinstance(w, dict) and w.get('id') == FREE_WINDOW for w in row.get('windows') or ()):
             continue
-        window = usage_reading.window_state({'id': FREE_WINDOW, 'used_pct': 100.0 * period['used_usd'] / cap,
-                                             'resets_at': period['resets_at']}, now)
+        # `local_estimate`: the reading is this machine's spend at list price, not the vendor's (a route the user
+        # names launches past it with a warning, candidate_eval.local_estimate_warning).
+        window = {**usage_reading.window_state({'id': FREE_WINDOW, 'used_pct': 100.0 * period['used_usd'] / cap,
+                                                'resets_at': period['resets_at']}, now), 'local_estimate': True}
         out['accounts'][name] = {**row, 'status': 'fresh', 'available': True, 'fetched_at': now.isoformat(),
                                  'source': 'opencode.db spend at public list price (lower bound)',
                                  'windows': [*(row.get('windows') or ()), window]}

@@ -6,6 +6,7 @@ import re
 
 import window_scope
 import provider_inventory
+import usage_reading
 import account_fleet
 import axis_scores
 import quota_economy
@@ -170,13 +171,19 @@ def applicable_windows(account_spec, model, usage_row, bundle=None, accounts=Non
     return [(wid, windows[wid], observed.get(wid)) for wid in ids if wid in windows]
 
 
+def observed_reset(observed, now):
+    """Whether the reading shows a reset still ahead (a future `resets_at`, else a countdown whose reset has not passed)."""
+    reset = parse_time((observed or {}).get('resets_at'))
+    seconds = (observed or {}).get('seconds_until_reset')
+    return (reset is not None and reset > now) or (
+        reset is None and isinstance(seconds, (int, float)) and seconds > 0 and (observed or {}).get('reset_time_passed') is not True)
+
+
 def below_launch_floor(window, observed, usage_row, now):
     """Existing launch protection, shared by ranking and dispatch."""
     floor = window.get('launch_min_remaining_pct')
     reset = parse_time((observed or {}).get('resets_at'))
-    seconds = (observed or {}).get('seconds_until_reset')
-    active_reset = (reset is not None and reset > now) or (
-        reset is None and isinstance(seconds, (int, float)) and seconds > 0 and (observed or {}).get('reset_time_passed') is not True)
+    active_reset = observed_reset(observed, now)
     if floor is not None and (observed or {}).get('rate_limited') is True and active_reset:
         return True
     fetched = parse_time(usage_row.get('fetched_at'))
@@ -234,6 +241,16 @@ def cycle_observation(window, observed, usage_row, now, read_failed_ok=False):
     """
     if observed is None or observed.get('rate_limited') is True:
         return observed
+    if isinstance(observed.get('members'), list):
+        # A pool: each member's reading is kept or dropped as one account's would be, and the pool is what is kept.
+        kept = [m for m in (cycle_observation(window, member, usage_row, now, read_failed_ok)
+                            for member in observed['members']) if m is not None]
+        pooled = usage_reading.pooled_reading(observed.get('id'), kept, observed.get('models'))
+        passed = [m.get('position') for m in observed['members'] if m.get('reset_time_passed') is True]
+        if pooled is not None and passed:
+            # Said where it is read (review N2): which members wait for a new reading, so the pool is the others.
+            pooled['passed_members'] = {'positions': passed, 'of': len(observed['members'])}
+        return pooled
     if observed.get('reset_time_passed') is True:
         return None
     if usage_row.get('status') in (None, 'fresh'):
@@ -267,7 +284,9 @@ def window_refusal(wid, window, observed, usage_row, now, latched=()):
     if wid in latched:
         return f'{wid}: quota confirmed exhausted'
     if below_launch_floor(window, observed, usage_row, now):
-        return f'{wid}: confirmed exhausted or below launch floor'
+        # With no reset ahead in the reading there is no time to start at: the refusal says so.
+        return f'{wid}: confirmed exhausted or below launch floor' + (
+            '' if observed_reset(observed, now) else '; no reset of it is observed')
     return None
 
 
@@ -288,11 +307,27 @@ def reserve_inflight(account, spec, wid, wspec, state, records, accounts, policy
     reserved_usd = inflight_reserved_usd(account, spec, wid, wspec, state, win_cap_usd, records, accounts, policy, now)
     if reserved_usd > 0 and win_cap_usd:
         reserved_pct = min(state['remaining'], round(100.0 * reserved_usd / win_cap_usd, 2))
+        if state.get('members'):
+            # The in-flight work draws on the members by the one split (shares): never above a member's room.
+            members = _draw(state, reserved_pct, win_cap_usd)
+            state = {**pool_row({k: state[k] for k in ('id', 'hours', 'short', 'stale') if k in state}, members),
+                     **{k: state[k] for k in ('deferred_hours', 'start_offset_hours') if k in state}}
+            state.update(observed_remaining=state['remaining'] + reserved_pct, reserved_usd=round(reserved_usd, 2))
+            return state, reserved_usd, reserved_pct
         state = {**state, 'observed_remaining': state['remaining'],
                  'remaining': max(0.0, state['remaining'] - reserved_pct),
                  'reserved_usd': round(reserved_usd, 2)}
         return state, reserved_usd, reserved_pct
     return state, 0.0, 0.0
+
+
+def _draw(state, pct, cap_usd):
+    """The pool's members after `pct` (percent of one account, at most what the pool has left) is drawn by `shares`."""
+    taken = {m['position']: share * pct for m, share in shares(state, pct)}
+    members = state['members']
+    return [{**m, 'remaining': m['remaining'] - taken.get(m['position'], 0.0),
+             **({'observed_remaining': m['remaining'], 'reserved_usd': round(taken[m['position']] * cap_usd / 100.0, 2)}
+                if taken.get(m['position'], 0.0) > 0 else {})} for m in members]
 
 
 def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
@@ -376,12 +411,6 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
     return found
 
 
-def pool_size(observed):
-    """How many accounts a window reading pools (a Magpie pool reports `accounts: N`); 1 for a single account."""
-    count = (observed or {}).get('accounts')
-    return count if isinstance(count, int) and not isinstance(count, bool) and count > 1 else 1
-
-
 def metered_usd_uncapped(spec):
     """A dollar account with no budget has no window and is not excluded for exhaustion.
 
@@ -402,8 +431,85 @@ def window_is_short(wspec, policy):
     return hours is not None and hours != float('inf') and hours < policy['short_window_hours']
 
 
+def pool_row(base, members):
+    """A pool's window state from its members' own states (each `window_state` of one account's window; owner
+    2026-11-24: each member is priced and gated on its own window), by these rules: a member whose state is not known
+    is out (no capacity, no share), as one account's unknown window is; the pool's full capacity and what is left are
+    the known members' sums (in percent of one account); its reset is the next partial refill, the soonest reset of a
+    known member that has spent some (else the soonest); it is stale when a known member is, unstarted when every known
+    member is. Members in step give the merged window's figures."""
+    known = [m for m in members if m.get('known')]
+    row = {**base, 'members': members, 'known': bool(known)}
+    if not known:
+        return row
+    spent = [m for m in known if m['remaining'] < m.get('full', 100.0)]
+    first = min(spent or known, key=lambda m: m['reset_hours'])
+    expiry = first.get('expiry_hours')
+    row.update({'full': sum(m.get('full', 100.0) for m in known), 'remaining': sum(m['remaining'] for m in known),
+                'target_remaining': sum(m['target_remaining'] for m in known), 'reset_hours': first['reset_hours'],
+                'end_hours': first['reset_hours'] if expiry is None else min(first['reset_hours'], expiry),
+                'expiry_hours': expiry, 'reset_at': first.get('reset_at'),
+                'stale': bool(base.get('stale')) or any(m.get('stale') for m in known)})
+    row.pop('unstarted', None)
+    if all(m.get('unstarted') for m in known):
+        row['unstarted'] = True
+    for k in ('natural_reset_hours', 'expected_reset_at'):
+        row.pop(k, None)
+        if k in first:
+            row[k] = first[k]
+    return row
+
+
+def shares(state, amount=None):
+    """[(member, share of the work)]: the one split of a pool's work over its members, read by the price, the need, the
+    substitute slack, the gates and the in-flight reservations alike. The gateway's choice among members is taken as
+    balanced (owner 2026-11-24, an assumption and not a measurement), by room (review round 2): equal shares among the
+    known members, none given more than its room (what it has left, in percent of one account); what a member cannot
+    hold goes to the others in equal parts. Work beyond every member's room is split evenly over all known members, as
+    one window prices the work past its remaining. `amount` is the work in percent of one account; None (or 0) is the
+    limit of a small work: equal shares among the members with quota left, or among all known ones when none has. A
+    member whose state is not known takes no share. Members in step get equal shares."""
+    known = [m for m in state['members'] if m.get('known')]
+    if not known:
+        return []
+    if amount is None or amount <= 1e-12:
+        serving = [m for m in known if m['remaining'] > 1e-9] or known
+        return [(m, 1.0 / len(serving)) for m in serving]
+    taken = [0.0] * len(known)
+    left = float(amount)
+    while left > 1e-12:
+        open_ = [i for i, m in enumerate(known) if m['remaining'] - taken[i] > 1e-12]
+        if not open_:
+            break
+        part = left / len(open_)
+        for i in open_:
+            take = min(part, known[i]['remaining'] - taken[i])
+            taken[i] += take
+            left -= take
+    if left > 1e-12:
+        taken = [t + left / len(known) for t in taken]
+    return [(m, t / amount) for m, t in zip(known, taken) if t > 0]
+
+
+def hours_before(state, horizon, amount=None):
+    """Hours of the work that fall before a window's reset, `horizon(st)` for one account's window. For a pool each
+    member's share of the work (`shares`, of the work `amount`) runs to its own reset, so the pool's hours before reset
+    are the members' horizons weighted by their shares (the merged window's when the members are in step)."""
+    if not state.get('members'):
+        return horizon(state)
+    split = shares(state, amount)
+    return sum(share * horizon(m) for m, share in split) if split else horizon(state)
+
+
 def window_state(wid, spec, observed, account_spec, now, short_hours, account_stale=False, expected_reset_at=None):
     """Remaining capacity, time to the end of the allowance and how sure we are."""
+    if isinstance((observed or {}).get('members'), list):
+        # A pool: each member on its own window, then pooled (pool_row).
+        members = [{**window_state(wid, spec, m, account_spec, now, short_hours, account_stale, expected_reset_at),
+                    'label': m.get('label'), 'position': m.get('position')} for m in observed['members']]
+        hours = spec.get('hours')
+        return pool_row({'id': wid, 'hours': hours, 'stale': bool(account_stale),
+                         'short': hours is not None and hours != float('inf') and hours < short_hours}, members)
     hours = spec.get('hours')
     starter = hours is None or hours == float('inf')
     expires = parse_time(account_spec.get('expires_at'))
@@ -413,7 +519,7 @@ def window_state(wid, spec, observed, account_spec, now, short_hours, account_st
         cap = quota_economy.capacity_usd(account_spec, wid)
         if cap is None or cap <= 0:
             return row
-        full = 100.0 * pool_size(observed)
+        full = 100.0
         row['full'] = full
         remaining = (observed or {}).get('remaining_pct_before_reset')
         if remaining is None:
@@ -430,8 +536,8 @@ def window_state(wid, spec, observed, account_spec, now, short_hours, account_st
         return row
     if observed is None or hours is None:
         return row
-    # Percentages are of one account's allowance; a pool of N accounts holds N x 100 when full.
-    row['full'] = full = 100.0 * pool_size(observed)
+    # Percentages are of one account's allowance; a pool is its members' windows, each one account's (pool_row).
+    row['full'] = full = 100.0
     remaining = observed.get('remaining_pct_before_reset')
     if remaining is None:
         remaining = observed.get('observed_remaining_pct')
@@ -464,10 +570,17 @@ def window_state(wid, spec, observed, account_spec, now, short_hours, account_st
     return row
 
 
-def after_reset(state, hours, *, start_hours=None):
+def after_reset(state, hours, *, start_hours=None, holds=None):
     """The same allowance once it renews: in full, or what the state says comes back (`renews_to`). `start_hours`
     anchors the candidate's start when another window defers past this window's reset. None when no reset was observed,
-    the reading is stale or predicted, or the plan ends first."""
+    the reading is stale or predicted, or the plan ends first.
+
+    A pool renews member by member: at each member's own reset that member comes back as one account's window does and
+    the others stay as they are (their start deferred to then). The answer is the next partial refill that gives some
+    quota back and, with `holds` (the caller's test of a renewed state: does it hold the work), the first that holds it;
+    when none does, the last. Members in step renew together, as the merged window did."""
+    if state.get('members'):
+        return _pool_after_reset(state, hours, start_hours, holds)
     wait = state['reset_hours']
     if state.get('unstarted'):
         return None  # An unstarted rolling window has no observed reset timestamp.
@@ -486,6 +599,26 @@ def after_reset(state, hours, *, start_hours=None):
     return dict(state, remaining=state.get('renews_to', full), reset_hours=at + state['hours'], end_hours=end,
                 target_remaining=full * min(1.0, end / state['hours']), deferred_hours=at,
                 expiry_hours=left)
+
+
+def _pool_after_reset(state, hours, start_hours, holds):
+    renewals = {m['position']: after_reset(m, hours, start_hours=start_hours) for m in state['members'] if m.get('known')}
+    base = {k: state[k] for k in ('id', 'hours', 'short') if k in state}
+    last = None
+    for at in sorted({r['deferred_hours'] for r in renewals.values() if r is not None}):
+        members = []
+        for m in state['members']:
+            r = renewals.get(m['position']) if m.get('known') else None
+            if r is not None and r['deferred_hours'] <= at:
+                members.append({**r, 'label': m.get('label'), 'position': m['position']})
+            elif m.get('known'):
+                members.append({**m, 'start_offset_hours': at})
+            else:
+                members.append(m)
+        last = dict(pool_row({**base, 'stale': False}, members), deferred_hours=at)
+        if last['remaining'] > state['remaining'] + 1e-9 and (holds is None or holds(last)):
+            return last
+    return last
 
 
 def cadence_limits(spec):

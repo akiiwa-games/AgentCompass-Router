@@ -230,9 +230,15 @@ def _parse_pool(matches, source):
         values = [m["windows"][window_id] for m in largest]
         # The latest reset is when every account has refilled; an earlier one refills only part of the pool.
         resets = [w["resets_at"] for w in values if w["resets_at"]]
+        # Each counted account's own window travels with a pooled one (`members`, in the accounts' order, by masked
+        # label): routing prices and gates the pool member by member (usage_reading.pooled_reading); the pooled
+        # figures here are the display's.
         combined.append(dict(id=window_id, label=values[0]["label"] + suffix,
                              used_pct=sum(w["used_pct"] for w in values) / count,
                              resets_at=max(resets, key=_timestamp) if resets else None, accounts=count,
+                             **({"members": [{"label": m["label"], "used_pct": m["windows"][window_id]["used_pct"],
+                                              "resets_at": m["windows"][window_id]["resets_at"]} for m in largest]}
+                                if count > 1 else {}),
                              **({"models": values[0]["models"]} if values[0].get("models") else {})))
     fingerprint = hashlib.sha256("\0".join(sorted(seen)).encode()).hexdigest()
     plan = largest[0]["plan"] or "subscription"
