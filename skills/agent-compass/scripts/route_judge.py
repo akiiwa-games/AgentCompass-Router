@@ -159,25 +159,25 @@ def record_constraint(args, task=None, classified=None):
                          f'{WORKFLOW_CONSTRAINT} (the user asked for the Workflow in this request, in their words in '
                          f'--basis); a {args.constraint} record does not authorize it. Record it with --constraint '
                          f'{WORKFLOW_CONSTRAINT} when the user asked for the Workflow, or drop --trigger.')
-    import model_resolution
-    model_resolution.check_model_pin(args.model, '--model')
-    started = time.monotonic()
-    task = _record_task(args, task)
-    no_task = classified is None and not (set(task) - {'parent_agent_id'})
     import account_fleet
     import auto_bundles
     import axis_scores
     import model_resolution
     import provider_retry
+    model_resolution.check_model_pin(args.model, '--model')
+    started = time.monotonic()
+    task = _record_task(args, task)
+    no_task = classified is None and not (set(task) - {'parent_agent_id'})
     accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
     now = datetime.now(timezone.utc)
     usage = usage_reading.usage_snapshot(args.usage_cache, args.accounts, now)
     usage = provider_inventory.merge_usage(usage, accounts, now, args.accounts)
-    unavailable = provider_inventory.unavailable_reason(accounts.get('_discovery') or {}, args.account, args.provider)
-    if unavailable:
-        raise ValueError(unavailable)
+    user_named = args.constraint == 'user_override'
     if refusal := named_pair_refusal(accounts, args.account, args.provider):
         raise ValueError(refusal)
+    unavailable = provider_inventory.unavailable_reason(accounts.get('_discovery') or {}, args.account, args.provider)
+    if unavailable:
+        raise dispatch_registry.RouteFactRefused(unavailable, user_named=user_named)
     # `model:effort` and `model-effort` name an effort; --effort, when given too, wins.
     raw_spelled, raw_effort = model_resolution.split_model_effort(args.model)
     pin = copy.copy(args)
@@ -207,8 +207,17 @@ def record_constraint(args, task=None, classified=None):
             rows, why = provider_inventory.listed_rows(
                 accounts, args.account, args.provider, pin.model, pin.effort, live_doc)
         if rows is None:
-            raise ValueError(f"named_model_unavailable: {pin.model}{':' + pin.effort if pin.effort else ''} has no row on "
-                             f"{args.account}/{args.provider}, and {why}. Tell the user; do not substitute another model.")
+            prov_entry = ((live_doc or {}).get('providers') or {}).get(args.provider)
+            list_unreadable = (
+                isinstance(prov_entry, dict)
+                and prov_entry.get('ok') is not True
+                and not live_models.is_unknown_provider(prov_entry)
+            )
+            detail = (f"named_model_unavailable: {pin.model}{':' + pin.effort if pin.effort else ''} has no row on "
+                      f"{args.account}/{args.provider}, and {why}")
+            if list_unreadable:
+                raise dispatch_registry.RouteFactRefused(detail, user_named=user_named)
+            raise ValueError(f"{detail}. Tell the user; do not substitute another model.")
         listed = {'account': args.account, 'rows': rows}
         accounts = provider_inventory.with_listed_rows(accounts, listed)
         acct_pool, direct = _sync_pin_as_read(accounts)
@@ -241,7 +250,7 @@ def record_constraint(args, task=None, classified=None):
         raise ValueError(_cadence_refusal(args, cadence))
     discovered = account_fleet.bundles(accounts).get(chosen) or {}
     if discovered.get('discovery_unavailable'):
-        raise ValueError(discovered['discovery_unavailable'])
+        raise dispatch_registry.RouteFactRefused(discovered['discovery_unavailable'], user_named=user_named)
     # The account's other row of this model supplies the launch fields of an effort it has no row for.
     sibling_id = (chosen or match_bundle(accounts, _with_effort(pin, None))
                   or match_bundle(accounts, _with_effort(pin, None), include_disabled=True))
@@ -249,8 +258,11 @@ def record_constraint(args, task=None, classified=None):
     inherited = {k: sibling[k] for k in NAMED_ROW_FIELDS if k in sibling}
     acc_spec = (accounts.get('accounts') or {}).get(args.account) or {}
     if not account_fleet.account_cwd_allowed(acc_spec, (task or {}).get('cwd')):
-        raise ValueError(cwd_policy.refusal(args.account, acc_spec.get('cwd_regex'), (task or {}).get('cwd'))
-                         + '; a named route does not reach past it. Tell the user; do not substitute another account.')
+        raise dispatch_registry.RouteFactRefused(
+            cwd_policy.refusal(args.account, acc_spec.get('cwd_regex'), (task or {}).get('cwd'))
+            + '; a named route does not reach past it',
+            user_named=user_named,
+        )
     # External runners dispatch directly after record; apply the same registered
     # window protection used by prepared dispatches.
     base_b = account_fleet.bundles(accounts).get(chosen) or {}
@@ -374,7 +386,7 @@ def record_resume(args, task, classified, bundle, agent_id):
     """`roll --resume <agent_id>`: the caller named a worker, so the route is that worker's own bundle, whatever an
     automatic plan would choose for the task (an account out of automatic routing included). The task is classified
     like any roll (`classify_pinned`) so the turn is priced and reserved; the facts about the worker (busy, worn, a
-    refusing window, leftover meter fields, a model its account no longer offers) are decided where they live: roll's
+    refusing window, a model its account no longer offers) are decided where they live: roll's
     resume checks, the gate's turn check and `dispatch_registry.prepare`. Returns the finalized decision."""
     started = time.monotonic()
     import account_fleet
@@ -428,17 +440,24 @@ NO_TASK_COMPARED = ("No task was given (record reads one only from --input), so 
 
 def named_pair_refusal(accounts, account, provider):
     """Why `account` / `provider` names no route on this machine, before any model list is read; None when it does: an
-    account the fleet does not have, or a provider the account does not launch through (`auto_bundles.launch_providers`,
-    and the providers of its bundles)."""
+    account neither the fleet nor discovery knows, or a provider the account does not launch through
+    (`auto_bundles.launch_providers`, its discovered provider, and the providers of its bundles)."""
     import account_fleet
     import auto_bundles
     specs = accounts.get('accounts') or {}
+    disc_accounts = ((accounts.get('_discovery') or {}).get('accounts')) or {}
     spec = specs.get(account)
-    if not isinstance(spec, dict):
-        names = ', '.join(sorted(name for name, row in specs.items() if isinstance(row, dict)))
+    disc_row = disc_accounts.get(account)
+    if not isinstance(spec, dict) and not isinstance(disc_row, dict):
+        names = ', '.join(sorted({
+            *(name for name, row in specs.items() if isinstance(row, dict)),
+            *(name for name, row in disc_accounts.items() if isinstance(row, dict)),
+        }))
         return (f'account {account} is not configured on this machine (its accounts: {names}). Ask the user which one '
                 'they meant; do not substitute another account.')
-    served = auto_bundles.launch_providers(account, spec)
+    served = (auto_bundles.launch_providers(account, spec)
+              if isinstance(spec, dict)
+              else sorted({p for p in (disc_row.get('provider'), account) if isinstance(p, str) and p}))
     if provider in served or account_fleet.pin_pool(accounts, account=account, provider=provider):
         return None
     return (f"account {account} does not launch through provider {provider} (it launches through {', '.join(served)}). "
@@ -505,46 +524,76 @@ def _record_task(args, task):
 def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
     """Refuse a forced route that cannot launch now: no quota left in a window it draws, a launch cooling down, or a
     latched model. External runners dispatch directly after record, so this is the protection prepared dispatches get."""
-    import candidate_eval
     import launch_failures
     import model_latch
     import quota_pools
-    dispatch_registry.check_launch_quota(quota_bundle, accounts, usage, now)
+    user_named = getattr(args, 'constraint', None) == 'user_override'
+    floors = []
+    try:
+        dispatch_registry.check_launch_quota(quota_bundle, accounts, usage, now)
+    except dispatch_registry.LaunchFloorRefused as exc:
+        floors = list(exc.floors)
+    except dispatch_registry.Refused as exc:
+        raise dispatch_registry.RouteFactRefused(str(exc), user_named=user_named) from exc
     acc_usage = (usage.get('accounts') or {}).get(args.account) or {}
-    if acc_usage.get('status') == 'fresh' or acc_usage.get('rate_limited_until') or quota_pools.latched_windows(accounts, args.account):
-        blockers = quota_pools.launch_blockers(
-            quota_bundle, accounts, usage, now, records=dispatch_flow.reservation_records(read_only=True))
-        if blockers:
-            wid, reason = blockers[0]
-            reset = quota_pools.latched_reset(accounts, args.account) if wid in quota_pools.latched_windows(
-                accounts, args.account) else None
-            if reset is not None and reset > now:
-                # A latched window with a known end is a quota wait (wait_for_reset), named or not.
-                raise ValueError(f"Account {args.account!r} window {wid!r}: {reason} "
-                                 f"(wait_for_reset, start_after_hours={(reset - now).total_seconds() / 3600:.2f}).")
-            raise ValueError(
-                f"Account {args.account!r} window {wid!r} is exhausted or below safety floor ({reason}). "
-                f"Do not dispatch {args.account}; run `{router_command()} plan` to pick an account with remaining capacity."
-            )
-    cooling = (candidate_eval.cooling_reason(quota_bundle, launch_failures.active(), accounts)
-               if launch_failures.enabled() else None)
+    blockers = []
+    records = None
+    if (floors or acc_usage.get('status') == 'fresh' or acc_usage.get('rate_limited_until')
+            or quota_pools.latched_windows(accounts, args.account)):
+        records = dispatch_flow.reservation_records(read_only=True)
+        blockers = quota_pools.launch_blockers(quota_bundle, accounts, usage, now, records=records)
+    if floors or blockers:
+        import allocator
+        spec_windows = ((accounts.get('accounts') or {}).get(args.account) or {}).get('windows') or {}
+        floor_by_wid = dict(floors)
+        blocker_by_wid = {
+            wid: f"Account {args.account!r} window {wid!r} is exhausted or below safety floor ({reason})"
+            for wid, reason in blockers
+        }
+        ordered_wids = list(dict.fromkeys([*(wid for wid, _ in floors), *(wid for wid, _ in blockers)]))
+        reasons = {
+            wid: (floor_by_wid[wid]
+                  if wid in floor_by_wid and ((spec_windows.get(wid) or {}).get('launch_min_remaining_pct')
+                                              or wid not in blocker_by_wid)
+                  else blocker_by_wid[wid])
+            for wid in ordered_wids
+        }
+        start_after_hours, retry_at, waiting_on = allocator.refusal_schedule(
+            quota_bundle, accounts, usage, now, blocked_wids=ordered_wids, records=records,
+        )
+        if waiting_on in reasons:
+            ordered_wids = [waiting_on, *(wid for wid in ordered_wids if wid != waiting_on)]
+        latched = waiting_on is not None and waiting_on in quota_pools.latched_windows(accounts, args.account)
+        raise dispatch_registry.RouteFactRefused(
+            '; '.join(reasons[wid] for wid in ordered_wids),
+            user_named=user_named,
+            start_after_hours=start_after_hours,
+            retry_at=retry_at,
+            waiting_on=waiting_on,
+            waiting_end=quota_pools.latched_end_kind(accounts, args.account) if latched else None,
+        )
+    if launch_failures.enabled():
+        import candidate_eval
+        cooling = candidate_eval.cooling_reason(quota_bundle, launch_failures.active(), accounts)
+    else:
+        cooling = None
     if cooling:
-        raise ValueError(f"{args.account}/{pin.model} is cooling down ({cooling}). Tell the user; do not substitute another model.")
+        raise dispatch_registry.RouteFactRefused(f"{args.account}/{pin.model} is cooling down ({cooling})", user_named=user_named)
     latched_model = model_latch.reason(quota_bundle, model_latch.active(now=now))
     if latched_model:
-        raise ValueError(f"{args.account}/{pin.model}: {latched_model}. Tell the user; do not substitute another model.")
+        raise dispatch_registry.RouteFactRefused(f"{args.account}/{pin.model}: {latched_model}", user_named=user_named)
 
 
 def _compare_with_router(result, task, usage, now, chosen, fast_requested, classified):
     """Add to a record what the router would have chosen for the same task, and what the override cost."""
-    import account_fleet
-    import allocator
-    import candidate_ranking
     if task and not isinstance(task.get('profile'), dict):
         # record / roll --provider never calls the classifier, and the router plans only a classified task: with no
         # caller profile there is nothing to compare the user's choice with.
         result.update({'router_choice': None, 'agrees': None, 'classifier_skipped': True})
     elif task:
+        import account_fleet
+        import allocator
+        import candidate_ranking
         try:
             loaded_accounts = account_fleet.load_accounts() if decision_ledger.LEDGER_WRITES else account_fleet.load_accounts(read_only=True)
             has_cadence = any(
@@ -1320,9 +1369,12 @@ def _stage_result(args):
     elif args.stage == 'record':
         if args.constraint is None:
             raise ValueError('record requires --constraint.')
-        result = record_constraint(args)
-        # A record the host's switches do not let launch is still written (the spawn gate reads it and refuses the
-        # launch); its answer says so, and the exit is not success.
+        try:
+            result = record_constraint(args)
+        except dispatch_registry.RouteFactRefused as refused:
+            result = refused.answer({'stage': 'record', 'constraint': args.constraint})
+        # A record refused by an account/model/host fact (nothing written) or held back by host policy (written with
+        # host_policy_violation so the spawn gate refuses the launch) answers `status: blocked` and exits 2.
         code = 2 if result.get('status') == 'blocked' else 0
     else:   # plan: the last of stage_help.STAGES
         if args.input is None and args.demo:

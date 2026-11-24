@@ -3047,6 +3047,54 @@ class PinnedRollTests(unittest.TestCase):
         self.assertGreater(quota_pools.inflight_reserved_usd('claude-lab', spec, 'five_hour', spec['windows']['five_hour'],
                            {'remaining': 100}, 1000, held, self.accounts, self.accounts['scoring'], self.now), 0)
 
+    def test_the_full_capacity_rule_is_no_fact_of_the_named_route_path(self):
+        """Merged with the named-route refusals (addendum 3, points 1 and 3). The full-capacity rule
+        (candidate_eval.renewal_capacity_refusal) is an estimate, not a fact of the account: record's fact checks
+        (route_judge._check_record_launch, RouteFactRefused -> blocked / tell_user) never apply it. A route the user
+        named (user_override) is recorded and launches with its one warning; a project rule (hard_constraint) is recorded
+        and refused at prepare with CapacityChanged, a Refused that is no RouteFactRefused, so its answer is the request
+        refused as given (route_judge.failure_answer: status error), with no schedule since no renewal could hold it."""
+        import route_judge
+        judge, _ = self.judged((profile_for(self.task), {'source': 'system_one', 'model': 'fixture-scorer'}))
+        task = found = None
+        for hours in (1, 2, 4, 8, 16, 40, 120):     # the first length of work this window's full capacity cannot hold
+            task = dict(self.task, task_id=f'named-long-{hours}', expected_hours=hours)
+            task['profile'] = profile_for(task)
+            plan = allocator.plan(copy.deepcopy(task), self.usage, self.now, accounts=copy.deepcopy(self.accounts),
+                                  host_policy_config={'allowed_accounts': ['claude-lab']}, read_local_state=False)
+            found = next(c for c in plan['ranking'] if c['id'] == 'lab_sonnet55_high').get('full_capacity_short')
+            if found:
+                break
+        self.assertIsNotNone(found, 'no length of work reaches the full-capacity rule on this window')
+        import scorer_client
+        import usage_reading
+        answers = {}
+        # The project rule first: it reserves nothing, where the named launch's reservation would leave the windows
+        # below their floors for a record after it.
+        for constraint in ('hard_constraint', 'user_override'):
+            named = dict(task, task_id=f'named-{constraint}')
+            args = self.args(constraint=constraint, hours=named['expected_hours'])
+            with patch.object(account_fleet, 'load_accounts', return_value=self.accounts), \
+                    patch.object(usage_reading, 'usage_snapshot', return_value=copy.deepcopy(self.usage)), \
+                    patch.object(scorer_client, 'score_task',
+                                 return_value=(named['profile'], {'source': 'system_one', 'model': 'fixture-scorer'})):
+                decision = judge.record_constraint(args, named, judge.classify_pinned(named, args))
+            self.assertNotEqual(decision.get('status'), 'blocked', decision)
+            try:
+                answers[constraint] = registry.prepare(decision['decision_id'], named, self.launch, self.usage,
+                                                       accounts=self.accounts, now=self.now)
+            except registry.Refused as refused:
+                answers[constraint] = refused
+        launched = answers['user_override']
+        self.assertIsInstance(launched, dict)
+        self.assertEqual(len(launched['warnings']), 1, launched.get('warnings'))
+        refused = answers['hard_constraint']
+        self.assertIsInstance(refused, registry.CapacityChanged)
+        self.assertNotIsInstance(refused, registry.RouteFactRefused)
+        answer = route_judge.failure_answer(refused, 'dispatch')
+        self.assertEqual(answer['status'], 'error')
+        self.assertNotIn('start_after_hours', answer)
+
     def test_no_classifier_and_no_hours_says_so_and_never_prints_none(self):
         import roll
         judge, patches = self.judged((None, {'source': 'scorer_unavailable', 'fallback_reason': 'all_classifiers_failed'}))

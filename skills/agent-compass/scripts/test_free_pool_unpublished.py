@@ -499,6 +499,30 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         return [(CLOCK, clock), (DATE.format(date=date_text), dated.astimezone()),
                 (COUNTDOWN, self.now + timedelta(seconds=74000))]
 
+    def assert_named_refusal(self, held, bid, bundle, end, *, stated):
+        """Rule (route_judge._check_record_launch, allocator.refusal_schedule; addendum 3 point 2): a route the user
+        named on the allowance latched at 0 is a fact refusal, `blocked` / `tell_user`, and carries the latch's own end
+        as its schedule (`retry_at`, `start_after_hours`), named as that end is (quota_exhaustion.end_kind), never a reset
+        where it is a re-probe time."""
+        import dispatch_registry
+        import quota_pools
+        import route_judge
+        from types import SimpleNamespace
+        with tf._synthetic_doc_ctx(self.doc), self.assertRaises(dispatch_registry.RouteFactRefused) as refused:
+            route_judge._check_record_launch(SimpleNamespace(account=POOL, constraint='user_override'),
+                                             SimpleNamespace(model=bundle['model']),
+                                             {**bundle, 'id': bid, 'account': POOL}, held, {'accounts': {}}, self.now)
+        fact = refused.exception
+        answer = fact.answer({'stage': 'record'})
+        self.assertEqual((answer['status'], answer['caller_action']), ('blocked', 'tell_user'))
+        self.assertEqual(datetime.fromisoformat(answer['retry_at']), end)
+        self.assertGreaterEqual(answer['start_after_hours'], (end - self.now).total_seconds() / 3600 - 0.01)
+        self.assertEqual(fact.waiting_on, 'allowance')
+        self.assertIn(quota_pools.latched_wait_text(held, POOL, 'allowance'), fact.cause)
+        self.assertIn(quota_exhaustion.end_kind(stated), answer['next_action'])
+        if not stated:
+            self.assertNotIn('allowance resets', answer['next_action'])
+
     def test_each_documented_limit_sentence_holds_the_pool_until_its_stated_reset_then_frees_it(self):
         for n, (message, reset) in enumerate(self.expected_resets()):
             with self.subTest(message=message):
@@ -514,6 +538,8 @@ class UnpublishedFreePoolTests(unittest.TestCase):
                 decision = self.plan(held)
                 rows = self.rows(decision)
                 self.assertTrue(rows)
+                bid, bundle = next(iter(held['accounts'][POOL]['bundles'].items()))
+                self.assert_named_refusal(held, bid, bundle, reset, stated=True)
                 hours = (reset - self.now).total_seconds() / 3600
                 for c in rows:     # every bundle drawing the allowance: a quota wait to the stated reset
                     self.assertFalse(c['excluded'], c['excluded'])
@@ -570,20 +596,39 @@ class UnpublishedFreePoolTests(unittest.TestCase):
                 named = self.plan(held, constraint_bundle=bid)
                 self.assertEqual(named['decision']['action'], 'defer')
                 self.assertGreaterEqual(named['decision']['start_after_hours'], hours - 0.01)
-                # A forced route checked at record (route_judge._check_record_launch) says the same time.
-                import route_judge
-                from types import SimpleNamespace
-                with tf._synthetic_doc_ctx(self.doc), self.assertRaises(ValueError) as refused:
-                    route_judge._check_record_launch(SimpleNamespace(account=POOL), SimpleNamespace(model=bundle['model']),
-                                                     {**bundle, 'id': bid, 'account': POOL}, held, {'accounts': {}}, self.now)
-                said = str(refused.exception)
-                self.assertIn(quota_pools.latched_wait_text(held, POOL, 'allowance'), said)
-                self.assertIn(f'start_after_hours={(due - self.now).total_seconds() / 3600:.2f}', said)
+                # A named route checked at record says the same time (merged with main's named-route refusals).
+                self.assert_named_refusal(held, bid, bundle, due, stated=False)
                 for moment, latched in ((due - timedelta(minutes=1), True), (due + timedelta(minutes=1), False)):
                     with patch.object(quota_exhaustion, 'datetime', wraps=datetime) as clock:
                         clock.now.side_effect = lambda tz=None, m=moment: m
                         row = self.discovered(acc)['_discovery']['accounts'][POOL]
                     self.assertEqual('exhausted_windows' in row, latched, moment)
+
+    def test_the_free_pool_path_reads_no_registry_inside_prepare(self):
+        """Merged with main (addendum 3 point 4; the named-route branch's round-1 regression): what prepare and claim
+        evaluate for a free pool (the overlay's observation and spend read, the latch, the launch blockers, the refusal
+        schedule) reads its records from the caller and opens no registry connection of its own."""
+        import dispatch_flow
+        import dispatch_registry
+        import quota_pools
+        message, _ = self.expected_resets()[0]
+        acc = self.only(POOL)
+        self.fail_turn(acc, message, 'd-registry')
+        held = self.discovered(acc)
+        bid, bundle = next(iter(held['accounts'][POOL]['bundles'].items()))
+        quota_bundle = {**bundle, 'id': bid, 'account': POOL}
+
+        def opened(*args, **kwargs):
+            raise AssertionError('a registry read inside the free-pool path')
+        with patch.object(dispatch_registry, 'transaction', opened),                 patch.object(dispatch_registry, 'reservations', opened),                 patch.object(dispatch_registry, 'launch_records', opened),                 patch.object(dispatch_flow, 'reservation_records', opened),                 patch.object(axis_scores, 'opencode_local_spend', spend_of(0.05)):
+            decision = self.plan(held, constraint_bundle=bid)
+            with tf._synthetic_doc_ctx(self.doc):
+                blockers = quota_pools.launch_blockers(quota_bundle, held, {'accounts': {}}, self.now, records=[])
+                schedule = allocator.refusal_schedule(quota_bundle, held, {'accounts': {}}, self.now,
+                                                      blocked_wids=[w for w, _ in blockers], records=[])
+        self.assertTrue(self.rows(decision))
+        self.assertEqual([w for w, _ in blockers], ['allowance'])
+        self.assertEqual(schedule[2], 'allowance')
 
     def test_with_only_the_held_pool_signed_in_the_answer_is_the_quota_wait_to_the_reset(self):
         message, reset = self.expected_resets()[2]

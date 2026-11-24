@@ -571,9 +571,9 @@ def evaluate_bundle(bundle, task, ctx):
                     result['notes'].append(quota_pools.latched_wait_text(accounts, bundle['account'], wid))
                 continue
             if wid in latched:
-                (short_exclude if is_short else exclude)(f'{wid}: quota confirmed exhausted; refresh quota or replan')
-            below_floor = wid not in latched and quota_pools.below_launch_floor(wspec, observed, acct_usage, now)
-            floor_refusal = f'{wid}: confirmed exhausted or below launch floor; refresh quota or replan' if below_floor else None
+                (short_exclude if is_short else exclude)(quota_pools.window_refusal(wid, wspec, observed, acct_usage, now, latched))
+            floor_refusal = None if wid in latched else quota_pools.window_refusal(wid, wspec, observed, acct_usage, now)
+            below_floor = floor_refusal is not None
             expected = quota_overrides.window_reset_expectation(
                 ctx.get('overrides', ()), bundle['account'], model, wid, spec, accounts, now,
                 bundle=bundle, pool=acct_pool,

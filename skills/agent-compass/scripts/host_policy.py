@@ -281,31 +281,18 @@ def exclusion_texts(bundle, accounts, policy):
     return [texts[name]() for name in automatic_routing_exclusions(bundle, accounts, policy)]
 
 
-def legacy_cause(account, accounts):
-    """('legacy', text) when the account still carries leftover meter text, else None. A fact: it refuses a launch and
-    a parent's new turn to its own worker alike."""
-    legacy = ((accounts or {}).get('accounts') or {}).get(account, {}).get('legacy_meter')
-    return ('legacy', legacy) if isinstance(legacy, str) and legacy.strip() else None
-
-
-def disabled_cause(account, candidates, accounts):
-    """(kind, detail) when a launch of the target needs more than a routing decision, else None. Kinds: `legacy`
-    (`legacy_cause`, a fact: refused whatever the route), `bundles` (ids all unchecked in model management;
-    `candidates` are the account's matching bundle rows: out of automatic routing, so only a route the user named
-    launches it). A new turn to an existing worker reads only `legacy_cause`: continuing a worker is not choosing its
-    model. Host policy is not a cause: it governs automatic routing only (`account_allowed`)."""
-    found = legacy_cause(account, accounts)
-    if found:
-        return found
+def unchecked_bundles(candidates):
+    """Bundle ids when `candidates` is non-empty and every matching bundle row is unchecked in model management, else
+    `[]`. Out of automatic routing: only a route the user named (`user_override`) launches it, and continuing an
+    existing worker does not read it. Host policy governs automatic routing only (`account_allowed`)."""
     if candidates and all(c.get('disabled') for c in candidates):
-        return 'bundles', [c['bundle_id'] for c in candidates]
-    return None
+        return [c['bundle_id'] for c in candidates]
+    return []
 
 
-def disabled_text(cause):
-    """The spawn gate's wording of a `disabled_cause`: the leftover meter text itself, or the unchecked bundles."""
-    kind, detail = cause
-    return detail if kind == 'legacy' else "档位 " + ", ".join(detail) + " 在模型管理中未勾选（不参与自动派发）"
+def unchecked_bundles_text(bundle_ids):
+    """The spawn gate's wording for `unchecked_bundles`."""
+    return "档位 " + ", ".join(bundle_ids) + " 在模型管理中未勾选（不参与自动派发）"
 
 
 def usage_providers(policy, defaults):

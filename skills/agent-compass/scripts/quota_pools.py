@@ -202,16 +202,22 @@ def latched_reset(accounts, account):
     return parse_time(row.get('exhausted_resets_at'))
 
 
+def latched_end_kind(accounts, account):
+    """Which end this account's latch has (quota_exhaustion.end_kind: the reset the provider stated, else the time it
+    is re-probed)."""
+    import quota_exhaustion
+    return quota_exhaustion.end_kind((((accounts.get('_discovery') or {}).get('accounts') or {}).get(account) or {})
+                                     .get('exhausted_reset_stated'))
+
+
 def latched_wait_text(accounts, account, wid):
     """Why a latched window waits: 0 left until its end, and which end that is; None when it has no known end."""
     import quota_exhaustion
     reset = latched_reset(accounts, account)
     if reset is None:
         return None
-    stated = ((((accounts.get('_discovery') or {}).get('accounts') or {}).get(account) or {})
-              .get('exhausted_reset_stated'))
     return (f'{wid} has 0 left until {quota_exhaustion.moment_text(reset)} '
-            f'({quota_exhaustion.end_kind(stated)}); start after it')
+            f'({latched_end_kind(accounts, account)}); start after it')
 
 
 def cycle_observation(window, observed, usage_row, now, read_failed_ok=False):
@@ -259,9 +265,9 @@ def used_up_in_cycle(observed, now):
 def window_refusal(wid, window, observed, usage_row, now, latched=()):
     """Why a drawn window refuses any launch now, whatever the task's size; None when it does not."""
     if wid in latched:
-        return f'{wid}: quota confirmed exhausted; refresh quota or replan'
+        return f'{wid}: quota confirmed exhausted'
     if below_launch_floor(window, observed, usage_row, now):
-        return f'{wid}: confirmed exhausted or below launch floor; refresh quota or replan'
+        return f'{wid}: confirmed exhausted or below launch floor'
     return None
 
 
@@ -340,7 +346,7 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
             pass
         elif state['known'] and isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) and state['remaining'] <= float(wspec['launch_min_remaining_pct']):
             floor = float(wspec['launch_min_remaining_pct'])
-            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%); refresh quota or replan"
+            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%)"
         elif not state['short']:
             # Priced work needs remaining - need >= safety margin; no task size passes at or under the margin. A window
             # of unknown capacity cannot price the need at all, so it is held at the margin too (as candidate_eval does).

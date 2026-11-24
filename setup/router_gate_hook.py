@@ -1305,28 +1305,22 @@ def native_unchecked_text(account: str, model: str, row: dict) -> str:
 
 DISABLED_RECOVERY = (
     f"请把任务写进 <task.md>，运行 {ROUTER_CMD} roll --brief <task.md> 由路由在参与自动派发的模型中选择；"
-    "用户在本次请求中点名了该模型时，用 --provider/--account/--model --basis \"<用户原话>\" 记录后启动"
-    f"（账号残留旧计量字段时运行 {ROUTER_CMD} setup 清除）。"
+    "用户在本次请求中点名了该模型时，用 --provider/--account/--model --basis \"<用户原话>\" 记录后启动。"
 )
 
 
-def check_target_disabled(
-    target: dict, account: str | None, candidates: list[dict], accounts: dict | None,
-) -> tuple[str, str] | None:
-    """(kind, refusal) for a launch on an account with leftover meter fields (`legacy`, a fact: refused whatever the
-    route) or with every matching bundle unchecked in model management (`bundles`: out of automatic routing, so the
-    launch passes only on a route the user named, which the caller decides from the launch's authority). Host policy
-    is not read here: it governs automatic routing, and a launch carries the authority of the route it matches."""
+def check_target_disabled(account: str | None, candidates: list[dict]) -> str | None:
+    """Refusal when every matching bundle on `account` is unchecked in model management (out of automatic routing, so
+    the launch passes only on a route the user named, which the caller decides from the launch's authority), else None.
+    Host policy is not read here: it governs automatic routing, and a launch carries the authority of the route it matches."""
     if not account:
         return None
-    disabled_cause, disabled_text = router_owner("host_policy", "disabled_cause", "disabled_text")
-    found = disabled_cause(account, candidates, accounts)
+    unchecked_bundles, unchecked_bundles_text = router_owner("host_policy", "unchecked_bundles", "unchecked_bundles_text")
+    found = unchecked_bundles(candidates)
     if not found:
         return None
-    if found[0] == "legacy":
-        return "legacy", f"[Router Gate] 拦截启动残留旧计量字段的账号：{disabled_text(found)}。" + DISABLED_RECOVERY
-    return "bundles", (f"[Router Gate] 拦截：{disabled_text(found)}，只有用户在本次请求中点名的路由"
-                       "（user_override 记录）可以启动它。" + DISABLED_RECOVERY)
+    return (f"[Router Gate] 拦截：{unchecked_bundles_text(found)}，只有用户在本次请求中点名的路由"
+            "（user_override 记录）可以启动它。" + DISABLED_RECOVERY)
 
 
 def read_reference(read):
@@ -1338,17 +1332,6 @@ def read_reference(read):
     except ImportError:
         return read()
     return public_data.with_fallback(read)
-
-
-def check_own_worker_legacy(target: dict, account: str | None, accounts: dict | None) -> str | None:
-    """Block a parent's new turn to its own idle worker on an account with leftover meter fields: a fact, like an
-    exhausted window. The preference switches (host policy, an unchecked model) do not refuse continuing a worker."""
-    found = account and router_owner("host_policy", "legacy_cause")(account, accounts)
-    if not found:
-        return None
-    return (f"[Router Gate] 拦截向残留旧计量字段的账号上的 worker 续派任务 (agent_id={target['agent_id']})：{found[1]}。"
-            "父会话仍可向自己明确运行中的 worker 发控制消息以收尾。否则请收取已有输出，把进展写进 <task.md>，"
-            f"运行 {ROUTER_CMD} roll --brief <task.md> 改派；{ROUTER_CMD} setup 会清除旧计量字段。")
 
 
 def check_route_authority(row: dict, trigger: str) -> str | None:
@@ -1991,24 +1974,19 @@ def _decide_checked(
         for target in targets:
             try:
                 account, candidates = resolve_target(target, accounts)
-                disabled = check_target_disabled(target, account, candidates, accounts) if trigger else None
-                if disabled and disabled[0] == "bundles":
-                    unchecked, disabled = disabled[1], None
+                if trigger and (found := check_target_disabled(account, candidates)):
+                    unchecked = found
                     if (name in CLAUDE_AGENT_TOOLS or name == "spawn_agent") and target.get("model"):
                         native_unchecked = (account, target["model"])
                 own = native_own_account(name, target, accounts) if trigger else None
                 if own and own != account:
                     own_target = dict(target, account=own)
-                    found = check_target_disabled(own_target, own, resolve_target(own_target, accounts)[1], accounts)
-                    if found and found[0] == "bundles":
-                        unchecked, native_unchecked = found[1], (own, target["model"])
-                reason = (
-                    (disabled[1] if disabled else None if trigger else check_own_worker_legacy(target, account, accounts))
-                    or check_account_quota_exhausted(
-                        account or target.get("provider"), usage_cache_path=usage_cache_path, now=now, accounts=accounts,
-                        windows=target_windows(candidates, accounts), bundles=candidates, model=target.get("model"),
-                        exclude_dispatch_id=dispatch_id or target.get("dispatch_id"), exclude_agent_id=target.get("agent_id"),
-                    )
+                    if found := check_target_disabled(own, resolve_target(own_target, accounts)[1]):
+                        unchecked, native_unchecked = found, (own, target["model"])
+                reason = check_account_quota_exhausted(
+                    account or target.get("provider"), usage_cache_path=usage_cache_path, now=now, accounts=accounts,
+                    windows=target_windows(candidates, accounts), bundles=candidates, model=target.get("model"),
+                    exclude_dispatch_id=dispatch_id or target.get("dispatch_id"), exclude_agent_id=target.get("agent_id"),
                 )
             except ValueError as exc:
                 if str(exc).startswith("invalid_model_pin:"):

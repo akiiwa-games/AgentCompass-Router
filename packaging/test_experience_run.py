@@ -146,3 +146,25 @@ def test_each_answer_keeps_the_blocked_candidates_of_its_plan_with_their_reasons
     assert [c["available_in_hours"] for c in xp.compact_ranking([snapshot[0], waiting])] == [None, 2.6]
     assert xp.compact_exclusions(snapshot) == [
         {"id": "b", "model": "m2", "account": "y", "effort": "max", "excluded": ["five_hour is empty for 3.0h", "weekly short"]}]
+
+
+def test_a_waiting_candidate_keeps_the_routers_own_sentence_of_why_it_waits():
+    """A candidate that waits keeps, copied as recorded, the notes in which the router says which window holds it and
+    when it can start; its other notes are not taken for that sentence. A ready candidate has none (None); a waiting one
+    whose snapshot kept no such note has [] ("not recorded"). Rows past the snapshot's best ones are not `detail`."""
+    said = "seven_day renews in 50.4h; start then (assumes a full renewal)"
+    row = {"id": "w", "bundle": {"model": "m", "account": "x", "effort": "high"}, "score": 0.5, "excluded": [],
+           "components": {"fit": 0.2}, "available_in_hours": 50.4, "notes": ["time at high: 0.15h from the estimate", said]}
+    ready = dict(row, id="r", available_in_hours=None)
+    silent = dict(row, id="s", notes=["time at high: 0.15h from the estimate"])
+    kept = xp.compact_ranking([row, ready, silent] + [dict(ready, id=f"c{i}") for i in range(xp.snapshot_full())])
+    assert [(c["wait_reason"], c["detail"]) for c in kept[:3]] == [([said], True), (None, True), ([], True)]
+    assert kept[-1]["detail"] is False
+
+
+def test_the_router_still_writes_the_wait_sentence_the_run_looks_for():
+    """WAIT_SENTENCE is candidate_eval's wording for a candidate that starts after a reset; if that wording moves, the run
+    would say "not recorded" for every wait, so this reads the router's source for it."""
+    source = (xp.ROOT / "skills" / "agent-compass" / "scripts" / "candidate_eval.py").read_text(encoding="utf-8")
+    notes = [line for line in source.splitlines() if "notes'].append" in line]
+    assert sum(xp.WAIT_SENTENCE in line for line in notes) >= 2

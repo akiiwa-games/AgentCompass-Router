@@ -2056,7 +2056,7 @@ def unavailable_reason(inventory, account, provider=None):
         return f'provider discovery: {account_state.unavailable_text(row)}'
     reason = (row.get('reason') or row.get('status')) if row.get('status') is not None and not account_state.dispatchable(row) else launcher.get('status')
     if reason and reason != 'ready':
-        return f'provider discovery: {reason}; restore the account in its local product or sign in again, then reroute'
+        return f'provider discovery: {reason}; restore the account in its local product or sign in again'
     return None
 
 

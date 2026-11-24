@@ -119,7 +119,7 @@ def reason(bundle, entries, now=None):
             left = max(1, round((until - now).total_seconds() / 60)) if until else COOLDOWN_MINUTES
             scope = 'account' if k == key(account) else 'model'
             return (f"host refused to create a worker on this {scope} ({entry.get('failure_class') or 'unknown'}); "
-                    f"cooling down {left} more min, then reroute")
+                    f"cooling down {left} more min")
     return None
 
 

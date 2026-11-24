@@ -694,22 +694,40 @@ def compact_ranking(ranking: list) -> list:
     """The eligible candidates of a plan's recorded snapshot (score not None), best first, with the router's own numbers
     copied as recorded: score N, fit, opportunity_cost (the quota cost N subtracts), quota_price, decided_by, the
     candidate's expected_usd and expected_pct, and available_in_hours (a candidate held back only by windows that reset
-    stays eligible and waits that long; recorded for the best 6 only, where its absence means it can start now). A field
+    stays eligible and waits that long; recorded for the best 6 only, `detail`, where its absence means it can start now)
+    with the router's own sentence of why it waits, `wait_reason` (its recorded notes of that kind; [] when the snapshot
+    kept none, None when it does not wait). A field
     the snapshot did not record stays None (ledger_snapshot keeps every component for the best 6 eligible candidates and
     fewer for the next 8, which have no usd, pct or wait)."""
     out = []
+    full = snapshot_full()
     for candidate in ranking:
         if candidate.get("score") is None:
             continue
         bundle = candidate.get("bundle") or {}
         components = candidate.get("components") or {}
+        waits = candidate.get("available_in_hours")
         out.append({"id": candidate.get("id"), "model": bundle.get("model"), "account": bundle.get("account"), "provider": bundle.get("provider"),
                     "effort": bundle.get("effort"), "score": candidate.get("score"), "fit": components.get("fit"),
                     "opportunity_cost": components.get("opportunity_cost"), "quota_price": components.get("quota_price"),
                     "decided_by": components.get("decided_by"), "level": components.get("five_axis_level"),
                     "usd": candidate.get("expected_usd"), "pct": candidate.get("expected_pct"),
-                    "available_in_hours": candidate.get("available_in_hours")})
+                    "available_in_hours": waits, "detail": len(out) < full,
+                    "wait_reason": [n for n in candidate.get("notes") or [] if WAIT_SENTENCE in n] if waits else None})
     return out
+
+
+# The router's own sentence of why a candidate waits (candidate_eval.evaluate_bundle notes: "<window> renews in N h; start then
+# ...", "<window> <state> for N h; start after its reset", "cadence frees ... in N h; start then"), told apart from its other
+# notes by this wording; test_experience_run checks candidate_eval still writes it.
+WAIT_SENTENCE = "; start "
+
+
+def snapshot_full() -> int:
+    """How many eligible candidates a plan's snapshot keeps with every field (usd, pct, wait, notes): ledger_snapshot's own."""
+    sys.path.insert(0, str(ROOT / "skills" / "agent-compass" / "scripts"))
+    import ledger_snapshot
+    return ledger_snapshot.SNAPSHOT_FULL
 
 
 TERMINAL = ("completed", "failed", "canceled", "create_failed", "released", "retry_expired")
