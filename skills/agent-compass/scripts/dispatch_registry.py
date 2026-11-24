@@ -174,23 +174,30 @@ class RouteFactRefused(Refused):
 
     def timed_by(self, candidate, accounts, now):
         """This launch-fact refusal with its time taken from the route's own plan row (`candidate`): the row's binding
-        wait on the refusing windows, the time an automatic plan of the same reading defers to, else no time. The one
-        source of a refusal's time wherever a plan row is read (the record of a classified task, `prepare`);
-        `allocator.refusal_schedule` gives it only where there is none (a record with no task)."""
+        wait over everything that holds it (`plan_row_holds`), the time an automatic plan of the same reading defers to,
+        when the row waits on every refusing window and nothing it excludes on has no time; else no time. A binding
+        window the fact does not name is added to the cause in the row's words. The one source of a refusal's time
+        wherever a plan row is read (the record of a classified task, `prepare`); `allocator.refusal_schedule` gives it
+        only where there is none (a record with no task)."""
         import allocator
         import quota_pools
         if not self.windows or candidate is None:
             return self
-        hours_by = {w: h for w, h in (candidate.get('waits') or {}).items() if h and w in self.windows}
+        exclusions, waits = plan_row_holds(candidate, True)
+        hours_by = {w: candidate['waits'][w] for w in waits}
         account = candidate['bundle']['account']
         self.start_after_hours = self.retry_at = self.waiting_on = self.waiting_end = None
-        if hours_by:
-            self.waiting_on = max(hours_by, key=hours_by.get)
-            hours = hours_by[self.waiting_on]
-            self.start_after_hours = allocator.advised_hours(hours)
-            self.retry_at = (now + timedelta(hours=hours)).isoformat()
-            if self.waiting_on in quota_pools.latched_windows(accounts, account):
-                self.waiting_end = quota_pools.latched_end_kind(accounts, account)
+        if exclusions or not set(self.windows) <= set(hours_by):
+            return self
+        self.waiting_on = max(hours_by, key=hours_by.get)
+        hours = hours_by[self.waiting_on]
+        self.start_after_hours = allocator.advised_hours(hours)
+        self.retry_at = (now + timedelta(hours=hours)).isoformat()
+        if self.waiting_on in quota_pools.latched_windows(accounts, account):
+            self.waiting_end = quota_pools.latched_end_kind(accounts, account)
+        if self.waiting_on not in self.windows:
+            self.cause = f"{self.cause}; {(candidate.get('wait_reasons') or {}).get(self.waiting_on, self.waiting_on)}"
+            self.args = (self.cause,)
         return self
 
     def answer(self, base=None, *, for_roll=False):

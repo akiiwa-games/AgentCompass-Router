@@ -1041,6 +1041,77 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
                                     - datetime.fromisoformat(at_prepare.retry_at)), timedelta(seconds=1))
                 self.assertIn(wid, at_prepare.cause)
 
+    def test_f_a_named_route_two_windows_hold_is_refused_with_the_later_wait_at_the_plan_and_before_launch(self):
+        """Rule (D1 a wait the router offers is a promise; D2 one source of a refusal's time: the named route's own plan
+        row, RouteFactRefused.timed_by and named_route_refusal): when two windows hold the route, the refusal's time is
+        the row's binding wait, the later of the two, with that window named in `cause` and as `waiting_on`, at the
+        record and at the re-check before launch alike, also when the earlier window is a launch fact whose own schedule
+        (allocator.refusal_schedule) is the earlier reset."""
+        import account_fleet
+        import allocator
+        import provider_inventory
+        import usage_reading
+        from router_test_support import profile
+        healthy = [{'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+                   {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()}]
+        short_reset = self.now + timedelta(hours=1, minutes=12)
+        long_reset = self.now + timedelta(hours=20, minutes=12)
+        seven_short = {'id': 'seven_day', 'used_pct': 88.0, 'resets_at': long_reset.isoformat()}
+        cases = (
+            # (label, windows, the earlier window is a launch fact)
+            ('a launch fact and a later wait of the row', [{'id': 'five_hour', 'used_pct': 100.0,
+                                                            'resets_at': short_reset.isoformat()}, seven_short], True),
+        )
+        args = route_judge.build_parser().parse_args(['record', '--constraint', 'user_override', *self.NAMED_FLAGS])
+        for n, (label, windows, fact_first) in enumerate(cases):
+            with self.subTest(case=label):
+                self.write_usage_cache(healthy)
+                task = {'parent_agent_id': 'parent-named', 'task_id': f't-two-{n}', 'objective': 'Review',
+                        'expected_hours': 4.0, 'profile': profile()}
+                decision = route_judge.record_constraint(args, task=task, classified={'task': task, 'scorer': None})
+                self.assertTrue(decision.get('decision_id'), decision)
+                self.write_usage_cache(windows)
+                accounts = account_fleet.load_accounts()
+                usage = provider_inventory.merge_usage(usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                                                       accounts, self.now)
+                bundle = dict(decision['selected_bundle'], account='claude')
+                fact = registry.launch_fact_refusal(bundle, accounts, usage, self.now, user_named=True,
+                                                    records=lambda: [])
+                self.assertEqual(fact is not None, fact_first, fact and fact.cause)
+                if fact_first:
+                    # The fact's own schedule is the earlier reset: the refusal must not promise it.
+                    _, own_retry, own_window = allocator.refusal_schedule(bundle, accounts, usage, self.now,
+                                                                          blocked_wids=fact.windows, records=[])
+                    self.assertEqual(own_window, 'five_hour')
+                    self.assertLess(abs(datetime.fromisoformat(own_retry) - short_reset), timedelta(seconds=1))
+                at_record, at_prepare = self.named_refusal_at_record_and_prepare(decision, task, args)
+                for refused in (at_record, at_prepare):
+                    self.assertEqual(refused.waiting_on, 'seven_day', refused.cause)
+                    self.assertLess(abs(datetime.fromisoformat(refused.retry_at) - long_reset), timedelta(seconds=1))
+                    self.assertGreaterEqual(refused.start_after_hours,
+                                            (long_reset - self.now).total_seconds() / 3600 - 0.01)
+                    self.assertIn('five_hour', refused.cause)
+                    self.assertIn('seven_day', refused.cause)
+                self.assertEqual(at_record.cause, at_prepare.cause)
+                self.assertEqual(at_record.start_after_hours, at_prepare.start_after_hours)
+
+    def test_g_a_plan_row_with_two_waits_refuses_with_the_later_ones_window_and_hours(self):
+        """Rule (D1 a wait the router offers is a promise: at its end every gate passes; named_route_refusal): a row two
+        windows hold refuses the named route with the binding wait, the later one: its window as `waiting_on`, its hours
+        (advised) and the time they end, whichever order the row lists them in."""
+        bundle = {'account': 'claude', 'bundle_id': 'opus', 'id': 'opus'}
+        for waits in ({'five_hour': 1.2, 'seven_day': 20.2}, {'seven_day': 20.2, 'five_hour': 1.2}):
+            with self.subTest(order=list(waits)):
+                row = {'bundle': bundle, 'excluded': [], 'waits': waits,
+                       'wait_reasons': {w: f'{w} holds it for {h}h' for w, h in waits.items()}}
+                exclusions, held = registry.plan_row_holds(row, True)
+                refused = registry.named_route_refusal(row, exclusions, held, {'accounts': {}}, self.now,
+                                                       user_named=True)
+                self.assertEqual(refused.waiting_on, 'seven_day')
+                self.assertEqual(refused.start_after_hours, __import__('allocator').advised_hours(20.2))
+                self.assertEqual(datetime.fromisoformat(refused.retry_at), self.now + timedelta(hours=20.2))
+                self.assertTrue(refused.cause.startswith('seven_day holds it'), refused.cause)
+
     def test_c_request_input_refusals_stay_error_with_present_next_action(self):
         import live_models
         self.write_usage_cache([

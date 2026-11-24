@@ -747,15 +747,16 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertTrue(warned, 'expected a named route past the full capacity among the sizes')
 
 
-    def named_free_route(self, task_id, usage_edit=None, hours=0.3, capacity_usd=None):
+    def named_free_route(self, task_id, usage_edit=None, hours=0.3, capacity_usd=None, period_hours=None):
         """(automatic row, the plan check's refusal or None, prepare's refusal or row) of a route the user named on the
         free allowance the local store reads as used up; `usage_edit` changes the usage reading first; `capacity_usd`
         replaces the fixture measurement's capacity."""
         import dispatch_registry
         import route_judge
         from types import SimpleNamespace
-        acc = self.only(POOL, acc=self.with_measured(self.accounts, {**MEASURED, 'capacity_usd': capacity_usd})
-                        if capacity_usd else None)
+        measured = {**MEASURED, **({'capacity_usd': capacity_usd} if capacity_usd else {}),
+                    **({'period_hours': period_hours} if period_hours else {})}
+        acc = self.only(POOL, acc=self.with_measured(self.accounts, measured) if measured != MEASURED else None)
         bid, bundle = next(iter(acc['accounts'][POOL]['bundles'].items()))
         quota_bundle = {**bundle, 'id': bid, 'bundle_id': bid, 'account': POOL}
         task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': hours, 'parent_agent_id': 'parent-named',
@@ -793,17 +794,24 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         axis_scores.with_local_readings `local_estimate`): the local spend estimate is not the vendor's reading, so the
         free allowance it alone reads as used up refuses nothing the user named: the check at the plan passes and the
         prepared row carries one warning that it reads as used up by the local estimate and may stop at the vendor's
-        limit. Automatic routing still waits on it."""
+        limit. Automatic routing still waits on it. The same on a period long enough to be a long window (24 h) and
+        on one short enough to be a short window (5 h, below `short_window_hours`)."""
         import dispatch_registry
-        automatic, at_plan, prepared = self.named_free_route('named-free-estimate')
-        self.assertFalse(automatic['excluded'], automatic['excluded'])
-        self.assertEqual(automatic['waiting_on'], 'allowance')
-        self.assertIsNone(at_plan)
-        self.assertNotIsInstance(prepared, dispatch_registry.RouteFactRefused, getattr(prepared, 'cause', None))
-        warnings = [w for w in prepared.get('warnings') or () if 'local estimate' in w]
-        self.assertEqual(len(warnings), 1, prepared.get('warnings'))
-        self.assertIn('allowance reads as used up by the local estimate', warnings[0])
-        self.assertIn("may stop at the vendor's limit", warnings[0])
+        import quota_pools
+        for period in (24, 5):
+            with self.subTest(period_hours=period):
+                automatic, at_plan, prepared = self.named_free_route(f'named-free-estimate-{period}', period_hours=period)
+                spec = {'hours': period}
+                self.assertEqual(quota_pools.window_is_short(spec, self.accounts['scoring']), period == 5)
+                if period == 24:    # a pool with only a short window is out of automatic routing (no weekly window)
+                    self.assertFalse(automatic['excluded'], automatic['excluded'])
+                    self.assertEqual(automatic['waiting_on'], 'allowance')
+                self.assertIsNone(at_plan)
+                self.assertNotIsInstance(prepared, dispatch_registry.RouteFactRefused, getattr(prepared, 'cause', None))
+                warnings = [w for w in prepared.get('warnings') or () if 'local estimate' in w]
+                self.assertEqual(len(warnings), 1, prepared.get('warnings'))
+                self.assertIn('allowance reads as used up by the local estimate', warnings[0])
+                self.assertIn("may stop at the vendor's limit", warnings[0])
 
     def test_a_named_route_on_the_allowance_the_vendor_reads_at_0_is_refused_with_its_time_at_the_plan_and_before_launch(self):
         """Rule (owner 2026-11-24; route_judge._check_named_plan_row, dispatch_registry.prepare, named_route_refusal):
