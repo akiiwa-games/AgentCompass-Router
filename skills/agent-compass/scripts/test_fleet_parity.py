@@ -127,9 +127,15 @@ class CleanInstallParityTests(unittest.TestCase):
                 self.assertNotIn('plan_unknown', applied['accounts']['antigravity'])
 
     def test_intrinsic_unmetered_accounts_and_the_pro_web_cadence(self):
-        for name in ('opencode', 'dot'):
-            self.assertTrue(self.specs[name]['unmetered'] and self.specs[name]['unlimited'], name)
-            self.assertTrue(self.specs[name]['verified'], name)
+        dot = self.specs['dot']
+        self.assertTrue(dot['unmetered'] and dot['unlimited'] and dot['verified'])
+        # OpenCode's discovered free plan has a shipped template (plan-templates `opencode.free`), whose template keys
+        # replace the row's (provider_inventory._settle_plan): the free allowance is a quota, not an unmetered channel.
+        opencode = self.specs['opencode']
+        self.assertEqual(opencode['plan'], 'free')
+        self.assertFalse(opencode.get('unmetered'))
+        self.assertFalse(opencode.get('unlimited'))      # neither flag survives anywhere: the allowance is a quota
+        self.assertTrue(opencode['verified'])
         web = self.specs['chatgpt-web']
         self.assertEqual(web['cadence'], {'window_seconds': 43200, 'limit': 5})
         self.assertTrue(web['unmetered'])

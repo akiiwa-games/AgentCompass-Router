@@ -167,9 +167,18 @@ class RouterGateHookTests(unittest.TestCase):
             self.assertIn('weekly', said)
             self.assertNotIn('monthly', said)    # recorded windows only, and only those this launch draws
             self.assertNotIn('five_hour', said)
-            # What lifts a record is a newer successful reading (quota_exhaustion.py): time alone never does.
+            # No hold waits for a person (quota_exhaustion.due_at): the deny says when the record ends by itself, and the
+            # clear is only a way to end it early.
+            row = exhaustion._read(exhaustion.store_path())['accounts']['lab-acct']
+            self.assertEqual(exhaustion.ends('lab-acct'), (exhaustion.due_at(row), False))
+            self.assertIn(exhaustion.end_text('lab-acct'), said)       # the one sentence of when the latch ends
             self.assertIn('newer successful usage reading', said)
-            self.assertIn('does not lift it', said)
+            exhaustion.clear('lab-acct')
+            exhaustion.record('lab-acct', 'Usage limit reached. It resets at 15:00 UTC', windows=['weekly'])
+            row = exhaustion._read(exhaustion.store_path())['accounts']['lab-acct']
+            text = gate.check_account_quota_exhausted('lab-acct', missing, T0, windows=['weekly'])
+            self.assertEqual(exhaustion.ends('lab-acct'), (exhaustion.stated_reset_of(row), True))
+            self.assertIn(exhaustion.end_text('lab-acct'), text)
             exhaustion.clear('lab-acct')
             exhaustion.record('lab-acct', 'Individual quota reached')
             text = gate.check_account_quota_exhausted('lab-acct', missing, T0, windows=['weekly'])
@@ -1913,9 +1922,11 @@ process.stdout.write(JSON.stringify(out));
 
         @contextmanager
         def latched_exhaustion():
+            # A latch ends by itself at its re-probe time (quota_exhaustion.due_at, read on the real clock), so it
+            # is recorded now: one at T0 has long ended.
             exhaustion = gate.router_module("quota_exhaustion")
             with mock.patch.dict(os.environ, {"ROUTER_STATE_DIR": str(self.state)}):
-                self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+                self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=dt.datetime.now(UTC).isoformat()))
                 try:
                     yield
                 finally:
@@ -2136,7 +2147,7 @@ process.stdout.write(JSON.stringify(out));
             ("self-labelled", "sess-self", False),          # a record naming itself as parent: the caller is the target
         )
         with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "", "ROUTER_STATE_DIR": str(self.state)}):
-            self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+            self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=dt.datetime.now(UTC).isoformat()))
             try:
                 for target, session, owned in cases:
                     payload = {"tool_name": "mcp__paseo__send_agent_prompt",
@@ -2149,6 +2160,37 @@ process.stdout.write(JSON.stringify(out));
                             self.assertIn("confirmed quota failure is recorded for every window of claude-lab", result["reason"])
             finally:
                 exhaustion.clear("claude-lab")
+
+    def test_a_latch_refuses_the_own_turn_until_its_end_and_not_after(self):
+        # Rule (quota_exhaustion.due_at, owner 2026-11-24 "no hold needs a person"): a confirmed quota failure with no
+        # stated reset ends by itself at its re-probe time (observed + account_state.LATCH_RETRY_HOURS). The gate refuses
+        # the caller's own turn to a worker on that account while the latch is younger than its end, and lets it through
+        # once the latch is older than its end, with nothing cleared by hand.
+        directory = self.state / "agents" / "project"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "worker-of-session.json").write_text(json.dumps({
+            "provider": "claude-lab", "config": {"model": "claude-sonnet-5-5", "thinkingOptionId": "high"},
+            "labels": {"router.account": "claude-lab", "router.parent_id": "sess-direct"}}), encoding="utf-8")
+        ledger = self.write_ledger(str(self.state), [self.route("claude-lab", "claude-sonnet-5-5", "high")])
+        exhaustion = gate.router_module("quota_exhaustion")
+        retry = dt.timedelta(hours=gate.router_module("account_state").LATCH_RETRY_HOURS)
+        payload = {"tool_name": "mcp__paseo__send_agent_prompt", "session_id": "sess-direct",
+                   "tool_input": {"agentId": "worker-of-session", "prompt": "continue"}}
+        now = dt.datetime.now(UTC)
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "", "ROUTER_STATE_DIR": str(self.state)}):
+            # Each latch on a fresh store: a cleared one refuses the replay of an older observation (record).
+            for age, refused in ((retry * 3, False),                               # long past its end
+                                 (retry + dt.timedelta(minutes=5), False),         # just past its end
+                                 (retry - dt.timedelta(minutes=5), True),          # just before its end
+                                 (dt.timedelta(minutes=1), True)):                 # younger than its end
+                with self.subTest(age=age):
+                    self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached",
+                                                      at=(now - age).isoformat()))
+                    try:
+                        result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0)
+                        self.assertEqual("reason" in result, refused, result)
+                    finally:
+                        exhaustion.store_path().unlink(missing_ok=True)
 
     def test_a_native_launch_on_a_refused_record_is_blocked_and_a_named_one_passes(self):
         # Gate contract (parent-address-gate.md): `record` writes `host_policy_violation` only on constraints other

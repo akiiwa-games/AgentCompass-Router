@@ -789,6 +789,8 @@ def account_cards() -> list[dict]:
         usage = usage_reading.usage_snapshot(None, None, now, quota_sources=sources, inventory=inventory)
     else:
         usage = usage_reading.usage_snapshot(None, None, now)
+    # A free allowance's current period, read from local spend, is its window's reading as in a plan.
+    usage = axis_scores.with_local_readings(usage, accounts, now)
     capacity = _read_json(STATE_DIR / "capacity.json")
     observed = capacity.get("observed") or {}
     try:
@@ -892,6 +894,24 @@ def account_cards() -> list[dict]:
                     refill if refill is not None else window.get("seconds_until_reset"))),
                 **({"metered_usd": True, "spent_text": spent_text} if metered_usd else {}),
                 "stale": reset_passed or usage_row.get("status") != "fresh" or reading_failed})
+        if spec.get("capacity_unpublished"):
+            # A free allowance the vendor sizes nowhere: its capacity is the larger of this machine's observation and the
+            # shipped measurement (both lower bounds), either alone, else unknown (axis_scores.free_allowance_period); a latch shows as the window at 0 until its
+            # end. The details are hover text, not card prose.
+            usage_hover = _tr("供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用")
+            if spec.get("local_spend_unreadable"):
+                # The store its spend is read from failed: the reading is a lower bound and the pool still routes on it.
+                usage_hover += "\n" + _tr("本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由").format(spec["local_spend_unreadable"])
+            reset_at = quota_pools.parse_time((row or {}).get("exhausted_resets_at"))
+            for wid in sorted(latched - {w["id"] for w in windows}):
+                windows.append({
+                    "id": wid, "hours": None, "remaining_pct": 0.0, "used_pct": 100.0, "accounts": 1,
+                    "remaining_usd": None, "reserved_pct": 0.0, "reserved_usd": 0.0, "reserved_workers": [],
+                    "rate_3h": None, "rate_24h": None,
+                    "reset_in": countdown((reset_at - now).total_seconds() if reset_at else None),
+                    # The latch's end is the reset the provider stated, else the time it is re-probed (never a reset).
+                    "reset_stated": bool((row or {}).get("exhausted_reset_stated")),
+                    "stale": False})
         bundle_pills = []
         for bid, bspec in (spec.get("bundles") or {}).items():
             b_prov = bspec.get("provider")
@@ -1893,32 +1913,32 @@ def retry_clear_pool(holds: dict, account: str) -> str | None:
     return min((p for p in map(retry_hold_pool, entries) if p), default=None)
 
 
+def _retry_due(entry: dict) -> str:
+    """When a provider-failure hold ends by itself (provider_retry.due_at), as read-time text."""
+    import provider_retry
+    due = provider_retry.due_at(entry)
+    return read_time_text(due.isoformat() if due else None)
+
+
 def retry_hold_text(holds: dict, account: str) -> str | None:
     """The account list's note for an account (or a quota pool or model of it) held for a provider failure: the
-    provider's own message and when the router tries again, or how to clear an account or pool hold. None when nothing
-    of the account is held."""
+    provider's own message and when the router tries again (every hold ends by itself; the card's clear button is a
+    shortcut). None when nothing of the account is held."""
     notes = []
     for entry in sorted((v for v in holds.values() if v.get("account") == account),
                         key=lambda v: (v.get("model") is not None, retry_hold_pool(v) is not None,
                                        retry_hold_pool(v) or v.get("model") or "")):
         message = entry.get("message") or _tr("无提供方消息")
         pool = retry_hold_pool(entry)
-        if pool and entry.get("retry_at"):
+        if pool:
             notes.append(_tr("{0}，额度池 {1} 已排除派发：{2}（下次重试 {3}，或点卡片上的“清除 {1}”）").format(
-                _retry_what(entry), pool, message, read_time_text(entry.get("retry_at"))))
-        elif pool:
-            notes.append(_tr("{0}，额度池 {1} 已排除派发：{2}（点卡片上的“清除 {1}”或运行 agentcompass hold --clear {3} 后再派发）").format(
-                _retry_what(entry), pool, message, f"{account}#{pool}"))
-        elif entry.get("model") is None and entry.get("retry_at"):
-            # Widened from guesses, not an `account` answer: it backs off like a model hold.
-            notes.append(_tr("{0}，整个账号已排除派发：{1}（下次重试 {2}，或点卡片上的“清除”）").format(
-                _retry_what(entry), message, read_time_text(entry.get("retry_at"))))
+                _retry_what(entry), pool, message, _retry_due(entry)))
         elif entry.get("model") is None:
-            notes.append(_tr("{0}，整个账号已排除派发：{1}（点卡片上的“清除”或运行 agentcompass hold --clear {2} 后再派发）").format(
-                _retry_what(entry), message, account))
+            notes.append(_tr("{0}，整个账号已排除派发：{1}（下次重试 {2}，或点卡片上的“清除”）").format(
+                _retry_what(entry), message, _retry_due(entry)))
         else:
             notes.append(_tr("{0} {1}，已排除派发：{2}（下次重试 {3}）").format(
-                model_label(entry["model"]), _retry_what(entry), message, read_time_text(entry.get("retry_at"))))
+                model_label(entry["model"]), _retry_what(entry), message, _retry_due(entry)))
     return "；".join(notes) or None
 
 
@@ -1944,10 +1964,9 @@ def retry_model_text(holds: dict, account: str, bundles: list) -> str | None:
                 continue
             pool = retry_hold_pool(entry)
             if pool:
-                when = (_tr("下次重试 {0}").format(read_time_text(entry.get("retry_at"))) if entry.get("retry_at")
-                        else _tr("点卡片上的“清除 {0}”后再派发").format(pool))
-                return _tr("额度池 {0} {1}，已排除派发，{2}").format(pool, _retry_what(entry), when)
-            return _tr("{0}，已排除派发，下次重试 {1}").format(_retry_what(entry), read_time_text(entry.get("retry_at")))
+                return _tr("额度池 {0} {1}，已排除派发，{2}").format(
+                    pool, _retry_what(entry), _tr("下次重试 {0}").format(_retry_due(entry)))
+            return _tr("{0}，已排除派发，下次重试 {1}").format(_retry_what(entry), _retry_due(entry))
     return None
 
 

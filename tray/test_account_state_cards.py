@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import router_data
 import panel_quota
+import i18n_catalog
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'agent-compass' / 'scripts'))
 import account_fleet
@@ -279,6 +280,76 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertIn('额度上限未知', card['usage_note'])
         self.assertNotIn('capacity_unknown', card['usage_note'])   # an internal flag is not interface text
         self.assertIn('$1.85', card['usage_note'])
+
+    def test_a_free_pool_with_no_published_capacity_is_a_state_with_its_details_in_the_hover(self):
+        # Owner, 2026-11-24 (addendum 2): an ordinary quota pool. With no capacity (never observed, nothing shipped) it is
+        # out of automatic routing as on main; with one it is a state like any pool; a latch shows the allowance as a
+        # window at 0 until its end. The explanation is only in the hover.
+        from datetime import datetime, timedelta, timezone
+        # Interface text is asserted through its catalog key (review round 3 N-e): the key is in the language table and
+        # the card shows its translation.
+        out_key, hover_key = '额度上限未知（不参与自动路由）', '供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用'
+        self.assertTrue({out_key, hover_key} <= set(i18n_catalog.EN))
+        out_text, hover_text = router_data._tr(out_key), router_data._tr(hover_key)
+        declared = {'kind': 'vendor', 'url': 'https://example.invalid/free', 'as_of': '2026-11-24',
+                    'statement': 'no limit published', 'plan': 'free'}
+        unknown = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={
+            'five_axis_free_pool': True, 'windows': {'allowance': {'hours': None}}, 'bundles': {}, 'capacity_usd': {},
+            'capacity_unknown': True, 'capacity_unpublished': declared})
+        self.assertEqual(unknown['kind'], 'warn')
+        self.assertEqual(unknown['badge'], out_text)
+        self.assertIn(hover_text, unknown['usage_hover'])
+        spec = {'five_axis_free_pool': True, 'windows': {'allowance': {'hours': 24}}, 'bundles': {},
+                'capacity_usd': {'allowance': 2.5}, 'capacity_unpublished': declared}
+        free = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec=spec)
+        self.assertEqual((free['kind'], free['windows']), ('ok', []))
+        self.assertNotIn(out_text, free['badge'])
+        # Its period read from local spend (axis_scores.with_local_readings) is the window's reading, as in a plan.
+        read = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={**spec, 'local_period': {
+            'window': 'allowance', 'used_usd': 1.0,
+            'resets_at': (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat()}})
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in read['windows']], [('allowance', 100 - 100 * 1.0 / 2.5)])
+        self.assertIn(hover_text, free['usage_hover'])
+        self.assertNotIn('capacity_unknown', free)
+        # Review round 3 S1: a failed read of opencode.db is carried to the hover; the card stays a priced, routable one.
+        unread = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode',
+                           spec={**spec, 'local_spend_unreadable': 'OperationalError: database is locked'})
+        failed = router_data._tr('本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由').format('OperationalError: database is locked')
+        self.assertIn('本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由', i18n_catalog.EN)
+        self.assertIn(failed, unread['usage_hover'])
+        self.assertNotIn(failed, free['usage_hover'])
+        self.assertEqual(unread['kind'], free['kind'])
+        reset = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        held = self.card({'family': 'opencode', 'status': 'ready', 'exhausted_windows': ['allowance'],
+                          'exhausted_resets_at': reset.isoformat(), 'exhausted_reset_stated': True},
+                         name='opencode', spec=spec)
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in held['windows']], [('allowance', 0.0)])
+        self.assertIn('5', held['windows'][0]['reset_in'])
+        # Review round 2 N4: a reset the provider stated reads as the window's countdown to its reset, like any window.
+        stated = held['windows'][0]
+        self.assertIs(stated['reset_stated'], True)
+        self.assertEqual(panel_quota.window_countdown(stated), panel_quota.short_countdown(stated['reset_in']))
+        self.assertIn(hover_text, held['usage_hover'])
+        # A limit sentence with no reset: the card shows the latch's re-probe time, as discovery publishes it.
+        import tempfile
+        from pathlib import Path
+        import quota_exhaustion
+        with tempfile.TemporaryDirectory() as state:
+            quota_exhaustion.record('opencode', 'Free usage limit reached. Connect a provider or subscribe to OpenCode Go.',
+                                    windows=['allowance'], path=Path(state) / 'quota-exhaustion.json')
+            rows = {'opencode': {'family': 'opencode', 'status': 'ready'}}
+            real_inventory._latch_exhausted_quota(rows, Path(state), {})
+        probed = self.card(rows['opencode'], name='opencode', spec=spec)
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in probed['windows']], [('allowance', 0.0)])
+        self.assertTrue(probed['windows'][0]['reset_in'] not in ('', '—', None), probed['windows'][0])
+        # ... and a re-probe time never reads as a reset: the card says it is the time the quota is re-probed.
+        reprobe = probed['windows'][0]
+        self.assertIs(reprobe['reset_stated'], False)
+        bare = panel_quota.short_countdown(reprobe['reset_in'])
+        shown = panel_quota.window_countdown(reprobe)
+        self.assertNotEqual(shown, bare)
+        self.assertIn(bare, shown)
+        self.assertIn(shown, panel_quota.quota_tooltip_text(probed))
 
     def test_a_plan_without_capacity_says_whether_the_tier_was_read(self):
         # Owner, 2026-11-19: the card said "套餐未知（Mode B）", an internal name. No tier read is a failed reading;

@@ -9,7 +9,7 @@ import contextlib
 import io
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -874,7 +874,10 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         import launch_failures
         import model_latch
         import quota_exhaustion
-        # 1. Window latched in quota-exhaustion.json without any observed reset timestamp for five_hour.
+        # 1. A window latched in quota-exhaustion.json, with no reset its error stated and none observed for five_hour.
+        # Its latch still ends by itself (quota_exhaustion.due_at: the re-probe time), and that end is the schedule, as
+        # the automatic path waits for it (candidate_eval, allocator.refusal_schedule; free-pool branch, addendum 3
+        # point 2); the answer names it as a re-probe, never a reset.
         self.write_usage_cache([
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
         ])
@@ -882,15 +885,16 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             'claude', 'Individual quota reached', windows=['five_hour'], at=(self.now + timedelta(seconds=1)).isoformat(),
         ))
         try:
+            due, stated = quota_exhaustion.ends('claude')
+            self.assertFalse(stated)
             code, ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
             self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
             self.assertIn('five_hour', ans['cause'])
-            self.assertNotIn('start_after_hours', ans)
-            self.assertNotIn('retry_at', ans)
+            self.assertEqual(datetime.fromisoformat(ans['retry_at']), due)
+            self.assertGreaterEqual(ans['start_after_hours'], (due - self.now).total_seconds() / 3600 - 0.1)
+            self.assertIn(quota_exhaustion.end_kind(False), ans['next_action'])
+            self.assertNotIn('five_hour resets', ans['next_action'])
             self.assertNotIn('cannot start now', ans['next_action'])
-            detail_doc = full(ans)
-            self.assertNotIn('start_after_hours', detail_doc)
-            self.assertNotIn('retry_at', detail_doc)
         finally:
             quota_exhaustion.clear('claude')
 
@@ -1354,7 +1358,9 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             code, ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
             self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
             self.assertIn('cwd_regex', ans['cause'])
-            self.assertIn('a named route does not reach past it', ans['cause'])
+            # The whole cause is in the details file: the compact one is cut at 300 characters, which a long worker
+            # directory in the sentence reaches (roll._compact_cause).
+            self.assertIn('a named route does not reach past it', full(ans)['cause'])
             self.assertNotIn('substitute', ans['cause'].lower())
             self.assertNotIn('cannot start now', ans['next_action'])
             self.assertNotIn('Change what cause names', ans['next_action'])

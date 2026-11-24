@@ -207,6 +207,82 @@ class ProvenanceTests(unittest.TestCase):
         write_json(self.folder / 'plan-templates.json', templates)
         self.assertRejected('plan-templates.json', 'price_source')
 
+    def test_an_unpublished_capacity_declaration_is_a_vendor_citation_on_a_free_plan_with_no_capacity_beside_it(self):
+        """Rule (reference_provenance.validate_plan_templates_provenance): `capacity_unpublished` says the vendor
+        publishes no capacity, so no capacity figure or declared window may stand beside it; it needs its dated vendor
+        citation with the statement read, a $0 cited price, and a launch prefix that names one."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        reference_provenance.validate_plan_templates_provenance(shipped)
+        free = shipped['opencode']['free']
+        for label, change in (
+                ('a capacity figure', {'capacity_usd': {'allowance': 3.0}}),
+                ('a declared window', {'windows': {'allowance': {'hours': 5}}}),
+                ('a window capacity', {'windows': {'allowance': {'capacity_usd': 3.0}}}),
+                ('no vendor citation', {'capacity_unpublished': {'statement': 'none published'}}),
+                ('a community citation', {'capacity_unpublished': {**free['capacity_unpublished'], 'kind': 'community'}}),
+                ('no statement', {'capacity_unpublished': {**free['capacity_unpublished'], 'statement': ''}}),
+                ('a price', {'price_usd_per_month': 5}),
+                ('an empty prefix', {'allowance_launch_prefix': ''}),
+                ('a prefix that is no text', {'allowance_launch_prefix': 3})):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(shipped))
+                doc['opencode']['free'].update(change)
+                with self.assertRaisesRegex(ValueError, "plan-templates\\['opencode'\\]\\['free'\\]"):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+
+    def test_a_measured_capacity_stands_only_as_a_dated_maintainer_measurement_beside_the_vendors_declaration(self):
+        """Rule (reference_provenance.valid_measured_capacity): the vendor publishes no capacity and the maintainer measured
+        one; both are true, so `capacity_measured` may stand beside `capacity_unpublished` with its full provenance (dated
+        maintainer statement, USD at list price, period, measurement or lower bound, model and request count) and
+        nowhere else; a bare figure is still refused. The value below is a fixture, not shipped data."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        measured = {'kind': 'maintainer', 'as_of': '2026-11-24', 'capacity_usd': 2.5, 'period_hours': 24,
+                    'bound': 'lower_bound', 'model': 'example-free-model', 'requests': 100, 'statement': 'fixture'}
+        accepted = json.loads(json.dumps(shipped))
+        accepted['opencode']['free']['capacity_measured'] = dict(measured)
+        reference_provenance.validate_plan_templates_provenance(accepted)
+        drop = object()
+        for label, field, value in (
+                ('a vendor kind', 'kind', 'vendor'), ('no date', 'as_of', drop), ('no statement', 'statement', ''),
+                ('no figure', 'capacity_usd', drop), ('a zero figure', 'capacity_usd', 0), ('a text figure', 'capacity_usd', '2.5'),
+                ('no period', 'period_hours', drop), ('an unknown bound', 'bound', 'estimate'), ('no model', 'model', ''),
+                ('no request count', 'requests', drop), ('a fractional request count', 'requests', 1.5)):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(accepted))
+                entry = doc['opencode']['free']['capacity_measured']
+                entry.pop(field) if value is drop else entry.update({field: value})
+                with self.assertRaisesRegex(ValueError, 'capacity_measured'):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+        with self.subTest('beside no vendor declaration'):
+            doc = json.loads(json.dumps(accepted))
+            del doc['opencode']['free']['capacity_unpublished']
+            with self.assertRaisesRegex(ValueError, 'capacity_measured stands only beside'):
+                reference_provenance.validate_plan_templates_provenance(doc)
+        with self.subTest('a bare figure beside the declaration'):
+            doc = json.loads(json.dumps(accepted))
+            doc['opencode']['free']['capacity_usd'] = {'allowance': 2.5}
+            with self.assertRaises(ValueError):
+                reference_provenance.validate_plan_templates_provenance(doc)
+
+    def test_an_allowance_declaration_names_the_launch_prefix_its_free_models_draw_it_under(self):
+        """Rule (reference_provenance.validate_plan_templates_provenance, review round 2 N5): without
+        `allowance_launch_prefix` the allowance would be drawn by every bundle of the provider, a paid one launched
+        under another prefix included (axis_scores.five_axis_overlay), and a measured capacity would size that whole
+        provider. So the declaration needs it, alone and beside a measurement."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        measured = {'kind': 'maintainer', 'as_of': '2026-11-24', 'capacity_usd': 2.5, 'period_hours': 24,
+                    'bound': 'lower_bound', 'model': 'example-free-model', 'requests': 100, 'statement': 'fixture'}
+        for label, extra in (('the declaration alone', {}), ('beside a measurement', {'capacity_measured': measured})):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(shipped))
+                free = doc['opencode']['free']
+                free.pop('capacity_measured', None)
+                free.update(extra)
+                reference_provenance.validate_plan_templates_provenance(doc)
+                del free['allowance_launch_prefix']
+                with self.assertRaisesRegex(ValueError, r"plan-templates\['opencode'\]\['free'\]\.allowance_launch_prefix"):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+
     def test_public_user_scores_reject_a_local_kind(self):
         write_json(self.folder / 'user-scores.json', {
             'schema_version': user_scores.SCHEMA_VERSION,

@@ -136,6 +136,41 @@ class DispatchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'requires a new route'):
                 self.prepare(refused, task=dict(self.task, task_id='project-rule'))
 
+    def test_the_full_capacity_rule_holds_automatic_and_project_routes_and_warns_a_route_the_user_named(self):
+        """Rule (candidate_eval.renewal_capacity_refusal, owner's answer 2026-11-24): a window whose full capacity is short
+        of the work's estimate plus its margin keeps the bundle out of automatic routing and out of a project rule
+        (hard_constraint); a route the user named (user_override) launches past it with one warning that states the
+        rule's own estimate. Same task, same window, same reading."""
+        task = found = None
+        for hours in (1, 2, 4, 8, 16, 40, 120):     # the first length of work this window's full capacity cannot hold
+            task = dict(self.task, task_id=f'long-work-{hours}', expected_hours=hours)
+            task['profile'] = profile_for(task)
+            plan = allocator.plan(copy.deepcopy(task), self.usage, self.now, accounts=copy.deepcopy(self.accounts),
+                                  host_policy_config={'allowed_accounts': ['claude-lab']}, read_local_state=False)
+            row = next(c for c in plan['ranking'] if c['id'] == 'lab_sonnet55_high')
+            found = row.get('full_capacity_short')
+            if found:
+                break
+        self.assertIsNotNone(found, 'no length of work reaches the full-capacity rule on this window')
+        self.assertTrue(row['excluded'])
+        automatic = dict(task, task_id='automatic')
+        with self.assertRaises(registry.CapacityChanged):
+            self.prepare(self.issue(task=automatic), task=automatic)
+        project = dict(task, task_id='project-rule')
+        with self.assertRaises(registry.CapacityChanged):
+            self.prepare(self.issue(stage='record', choice='constraint', constraint='hard_constraint',
+                                    basis='Project rule', task=project), task=project)
+        named = dict(task, task_id='user-named')
+        row = self.prepare(self.issue(stage='record', choice='constraint', constraint='user_override',
+                                      basis='User named it', task=named), task=named)
+        self.assertEqual(row['bundle']['bundle_id'], 'lab_sonnet55_high')
+        # The one warning states the rule's own estimate of the same windows: each window of the structured shortfall the
+        # automatic plan was refused on, with its estimate (no sentence parsed: the window and the number are looked for).
+        self.assertEqual(len(row['warnings']), 1, row.get('warnings'))
+        for wid, short in found.items():
+            self.assertIn(wid, row['warnings'][0])
+            self.assertIn(f"{short['need_pct']:.0f}%", row['warnings'][0])
+
     def test_the_re_plan_counts_the_cadence_from_the_records_the_plan_read(self):
         # Rule (quota_pools.cadence_dispatches): a `record` row with no registry row is a launch outside roll and counts;
         # the re-plan in prepare reads the ledger as the plan does, without counting the decision it prepares. The
@@ -3012,6 +3047,63 @@ class PinnedRollTests(unittest.TestCase):
         self.assertGreater(quota_pools.inflight_reserved_usd('claude-lab', spec, 'five_hour', spec['windows']['five_hour'],
                            {'remaining': 100}, 1000, held, self.accounts, self.accounts['scoring'], self.now), 0)
 
+    def test_the_full_capacity_rule_is_no_fact_of_the_named_route_path(self):
+        """Merged with the named-route refusals (addendum 3, points 1 and 3). The full-capacity rule
+        (candidate_eval.renewal_capacity_refusal) is an estimate, not a fact of the account: record's fact checks
+        (route_judge._check_record_launch, RouteFactRefused -> blocked / tell_user) never apply it. A route the user
+        named (user_override) is recorded and launches with its one warning; a project rule (hard_constraint) is recorded
+        and refused at prepare with CapacityChanged, a Refused that is no RouteFactRefused, so its answer is the request
+        refused as given (route_judge.failure_answer: status error), with no schedule since no renewal could hold it."""
+        import route_judge
+        judge, _ = self.judged((profile_for(self.task), {'source': 'system_one', 'model': 'fixture-scorer'}))
+        task = found = None
+        for hours in (1, 2, 4, 8, 16, 40, 120):     # the first length of work this window's full capacity cannot hold
+            task = dict(self.task, task_id=f'named-long-{hours}', expected_hours=hours)
+            task['profile'] = profile_for(task)
+            plan = allocator.plan(copy.deepcopy(task), self.usage, self.now, accounts=copy.deepcopy(self.accounts),
+                                  host_policy_config={'allowed_accounts': ['claude-lab']}, read_local_state=False)
+            found = next(c for c in plan['ranking'] if c['id'] == 'lab_sonnet55_high').get('full_capacity_short')
+            if found:
+                break
+        self.assertIsNotNone(found, 'no length of work reaches the full-capacity rule on this window')
+        import scorer_client
+        import usage_reading
+        answers = {}
+        # The project rule first: it reserves nothing, where the named launch's reservation would leave the windows
+        # below their floors for a record after it.
+        for constraint in ('hard_constraint', 'user_override'):
+            named = dict(task, task_id=f'named-{constraint}')
+            args = self.args(constraint=constraint, hours=named['expected_hours'])
+            with patch.object(account_fleet, 'load_accounts', return_value=self.accounts), \
+                    patch.object(usage_reading, 'usage_snapshot', return_value=copy.deepcopy(self.usage)), \
+                    patch.object(scorer_client, 'score_task',
+                                 return_value=(named['profile'], {'source': 'system_one', 'model': 'fixture-scorer'})):
+                decision = judge.record_constraint(args, named, judge.classify_pinned(named, args))
+            self.assertNotEqual(decision.get('status'), 'blocked', decision)
+            try:
+                answers[constraint] = registry.prepare(decision['decision_id'], named, self.launch, self.usage,
+                                                       accounts=self.accounts, now=self.now)
+            except registry.Refused as refused:
+                answers[constraint] = refused
+        launched = answers['user_override']
+        self.assertIsInstance(launched, dict)
+        self.assertEqual(len(launched['warnings']), 1, launched.get('warnings'))
+        refused = answers['hard_constraint']
+        self.assertIsInstance(refused, registry.CapacityChanged)
+        self.assertNotIsInstance(refused, registry.RouteFactRefused)
+        answer = route_judge.failure_answer(refused, 'dispatch')
+        self.assertEqual(answer['status'], 'error')
+        self.assertNotIn('start_after_hours', answer)
+        # Review round 4 N2: the answer itself says what refused, in the rule's numbers (each short window and its
+        # estimate), and a way out of its own, not the generic error and next action of a failed run.
+        generic = route_judge.failure_answer(registry.CapacityChanged('fixture'), 'dispatch')
+        for wid, short in found.items():
+            self.assertIn(wid, answer['cause'])
+            self.assertIn(f"{short['need_pct']:.0f}%", answer['cause'])
+        self.assertTrue(answer['next_action'].strip())
+        self.assertNotEqual(answer['next_action'], generic['next_action'])
+        self.assertNotEqual(answer['error'], generic['error'])
+
     def test_no_classifier_and_no_hours_says_so_and_never_prints_none(self):
         import roll
         judge, patches = self.judged((None, {'source': 'scorer_unavailable', 'fallback_reason': 'all_classifiers_failed'}))
@@ -4354,9 +4446,11 @@ class ProviderRetryTests(unittest.TestCase):
     decides what it blocks."""
     setUp_dispatch, snapshot = DispatchTests.setUp, DispatchTests.snapshot
     issue, prepare = DispatchTests.issue, DispatchTests.prepare
-    MESSAGE = 'Free usage exceeded, subscribe to Go'
+    # Provider failures that are not quotas: a confirmed used-up quota is a quota latch, not a hold (the last test here).
+    MESSAGE = 'Provider overloaded: this model is temporarily unavailable'
+    V2_MESSAGE = 'This account is not permitted to use these models right now.'
     # opencode 2.2.6 on LS, daemon log `handleStreamEvent: turn_failed`, 2026-11-09.
-    V2_MESSAGE = ('Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, '
+    FREE_LIMIT = ('Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, '
                   'or switch models.')
 
     def setUp(self):
@@ -4413,7 +4507,7 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertTrue(any(self.MESSAGE in e for e in excluded), excluded)
         self.assertNotIn(plan['choice'], ('lab_sonnet55_high', 'lab_sonnet55_medium'))
         self.assertTrue(any(w.startswith('claude-lab/claude-sonnet-5-5: provider failure hold') and self.MESSAGE in w
-                            and 'agentcompass hold --clear' in w for w in plan['decision']['warnings']), plan['decision'])
+                            and 'next retry at' in w for w in plan['decision']['warnings']), plan['decision'])
         # Observing the same terminal again records nothing more.
         registry.observe(row['dispatch_id'], self.snapshot(row, status='idle'), now=self.now + timedelta(seconds=40),
                          terminal=self.stuck(at))
@@ -4444,12 +4538,52 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual((done['state'], done['failure_code']), ('failed', 'provider_turn_failed'))
         self.assertEqual(flow.public(done)['next_action'], flow.TURN_FAILED_NEXT)
         self.assertEqual(self.asked[0][3:], (self.V2_MESSAGE, 'provider_turn_failed'))
-        held = provider_retry.active(now=self.now + timedelta(days=30))
+        held = provider_retry.active(now=self.now + timedelta(seconds=20))
         self.assertEqual(list(held), ['claude-lab'])
         self.assertEqual((held['claude-lab']['failure_code'], held['claude-lab']['message']),
                          ('provider_turn_failed', self.V2_MESSAGE))
         _, excluded = self.excluded('lab_opus55_high')
         self.assertTrue(any('provider turn failed' in e and self.V2_MESSAGE in e for e in excluded), excluded)
+
+    def test_a_turn_that_failed_on_a_used_up_quota_latches_the_windows_it_draws_and_holds_nothing(self):
+        """A confirmed used-up quota (quota_exhaustion.confirmed) is the exhaustion of the windows the model draws, recorded
+        where exhausted windows are (quota_exhaustion), not a provider hold; with no reset in the sentence it is due at the
+        latches' re-probe period (account_state.LATCH_RETRY_HOURS) from the observation."""
+        import account_state
+        import provider_retry
+        import quota_exhaustion
+        self.scopes = ['account']
+        row = self.launched()
+        registry.observe(row['dispatch_id'], self.snapshot(row), now=self.now)
+        at = self.now + timedelta(seconds=15)
+        terminal = {'reason': 'error', 'status': 'error', 'attentionReason': 'error', 'at': at.isoformat(),
+                    'failure_code': 'provider_turn_failed', 'provider_message': self.FREE_LIMIT}
+        done = registry.observe(row['dispatch_id'], self.snapshot(row, status='error'),
+                                now=self.now + timedelta(seconds=20), terminal=terminal)
+        self.assertEqual((done['state'], done['failure_code']), ('failed', 'provider_turn_failed'))
+        self.assertEqual(provider_retry.active(now=at), {})
+        account = self.bundle['account']
+        windows = set(registry.bundle_windows(self.bundle, self.accounts)) or {quota_exhaustion.ALL}
+        self.assertEqual(quota_exhaustion.exhausted_windows(account, now=at, read_only=True), windows)
+        due = at + timedelta(hours=account_state.LATCH_RETRY_HOURS)
+        self.assertTrue(quota_exhaustion.exhausted_windows(account, now=due - timedelta(minutes=1), read_only=True))
+        self.assertEqual(quota_exhaustion.exhausted_windows(account, now=due + timedelta(minutes=1), read_only=True), set())
+
+    def test_a_used_up_quota_the_classifier_scoped_to_the_model_is_held_as_answered_and_latches_nothing(self):
+        """Classifier authority (provider_retry docstring): the quota pattern decides only for an `account` answer or
+        none; a `model` answer holds the model, on the watcher's path and on the observation's own reading alike."""
+        import provider_retry
+        import quota_exhaustion
+        self.scopes = ['model']
+        row = self.launched()
+        registry.observe(row['dispatch_id'], self.snapshot(row), now=self.now)
+        at = self.now + timedelta(seconds=15)
+        registry.observe(row['dispatch_id'], self.snapshot(row, status='error', lastError=self.FREE_LIMIT,
+                                                          updatedAt=at.isoformat()),
+                         now=self.now + timedelta(seconds=20))
+        self.assertEqual(self.asked[0][3], self.FREE_LIMIT)
+        self.assertEqual(quota_exhaustion.exhausted_windows(self.bundle['account'], now=at, read_only=True), set())
+        self.assertEqual(set(provider_retry.active(now=at)), {f"{self.bundle['account']}/{self.bundle['model']}"})
 
     def test_an_error_the_classifier_reads_as_not_the_provider_holds_nothing(self):
         import provider_retry
@@ -4461,16 +4595,17 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertIsNone(provider_retry.record(self.bundle, terminal, dispatch_id='d-none'))   # read once
         self.assertEqual(len(self.asked), 1)
 
-    def test_an_account_scope_holds_every_model_until_cleared_or_a_named_model_there_completes(self):
+    def test_an_account_scope_holds_every_model_until_its_retry_time_or_a_named_model_there_completes(self):
         import provider_retry
         self.scopes = ['account']
         at = self.now - timedelta(minutes=1)
         entry = provider_retry.record(self.bundle, self.stuck(at), dispatch_id='d-stuck')
-        self.assertEqual((entry['model'], entry['scope_source'], entry['retry_at']), (None, 'classifier', None))
-        # A quota that blocks the whole account does not lift by waiting.
-        later = self.now + timedelta(days=30)
-        self.assertEqual(set(provider_retry.active(now=later)), {'claude-lab'})
-        self.assertIn(self.MESSAGE, provider_retry.reason(self.other, provider_retry.active(now=later)))
+        self.assertEqual((entry['model'], entry['scope_source']), (None, 'classifier'))
+        # Every hold ends by itself (owner, 2026-11-24): held until its retry time, free after it.
+        due = provider_retry.due_at(entry)
+        self.assertEqual(set(provider_retry.active(now=due - timedelta(seconds=1))), {'claude-lab'})
+        self.assertEqual(provider_retry.active(now=due + timedelta(seconds=1)), {})
+        self.assertIn(self.MESSAGE, provider_retry.reason(self.other, provider_retry.active(now=self.now)))
         _, excluded = self.excluded('lab_opus55_high')
         self.assertTrue(any('on this account' in e for e in excluded), excluded)
         with self.assertRaisesRegex(ValueError, 'provider failure hold'):
@@ -4572,7 +4707,7 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual(widened['models'], ['claude-opus-5-5', 'claude-sonnet-5-5'])
         # Review 2 R2: two guesses are still guesses: a widened account hold backs off like a model hold.
         self.assertEqual(widened['retry_at'], (at + timedelta(minutes=1, seconds=120)).isoformat())
-        self.assertFalse(provider_retry.indefinite(widened))
+        self.assertFalse(provider_retry.account_scoped(widened))   # a widened guess keeps the short cap
         self.assertIn('next retry at', provider_retry.retry_text(widened))
         self.assertIn('claude-lab', provider_retry.active(now=at + timedelta(minutes=2)))
         self.assertNotIn('claude-lab', provider_retry.active(now=at + timedelta(days=1)))

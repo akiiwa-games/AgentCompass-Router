@@ -50,9 +50,10 @@ def advised_hours(hours):
 
 def refusal_schedule(bundle, accounts, usage, now, *, blocked_wids=None, latched=None, records=None):
     """`(start_after_hours, retry_at, waiting_on)` when every refusing quota window (`blocked_wids`, else
-    `quota_pools.launch_blockers`) has an observed reset (`quota_pools.after_reset`), computed by the same owners the
-    automatic deferral path uses (`quota_pools.window_state`, `quota_pools.after_reset`, `candidate_eval.binding_wait`,
-    `advised_hours`); `(None, None, None)` otherwise."""
+    `quota_pools.launch_blockers`) has an observed reset (`quota_pools.after_reset`; for a latched window, the latch's
+    own end, `quota_pools.latched_reset`: the reset the latching error stated, else its re-probe time), computed by the
+    same owners the automatic deferral path uses (`quota_pools.window_state`, `quota_pools.after_reset`,
+    `candidate_eval.binding_wait`, `advised_hours`); `(None, None, None)` otherwise."""
     accounts = accounts if isinstance(accounts, dict) else {}
     if '_five_axis' not in accounts:
         accounts = axis_scores.five_axis_overlay(accounts)
@@ -80,7 +81,16 @@ def refusal_schedule(bundle, accounts, usage, now, *, blocked_wids=None, latched
             continue
         seen.add(wid)
         if wid in latched_set:
-            return None, None, None
+            # 0 left until the latch's known end, as the automatic path waits for it (candidate_eval); none known: no
+            # schedule.
+            reset_dt = quota_pools.latched_reset(accounts, bundle['account'])
+            if reset_dt is None or reset_dt <= now:
+                return None, None, None
+            available_at, waiting_on = candidate_eval.binding_wait(
+                available_at, waiting_on, (reset_dt - now).total_seconds() / 3600, wid, waits,
+            )
+            reset_times[wid] = reset_dt.isoformat()
+            continue
         observed = quota_pools.cycle_observation(wspec, observed, row, now)
         state = quota_pools.window_state(
             wid, wspec, observed, spec, now, policy.get('short_window_hours', 24), account_stale=stale,
@@ -156,7 +166,8 @@ def plan(raw_task, usage, now=None, unavailable=(), records=None, accounts=None,
     usage = provider_inventory.merge_usage(usage, accounts, now)
     active_overrides = (quota_overrides.load_overrides(now) if read_local_state else []) if overrides is None else overrides
     usage, accounts, applied = quota_overrides.apply_overrides(active_overrides, usage, accounts, now)
-    accounts = axis_scores.five_axis_overlay(accounts, read_local_state=read_local_state)
+    accounts = axis_scores.five_axis_overlay(accounts, read_local_state=read_local_state, now=now)
+    usage = axis_scores.with_local_readings(usage, accounts, now)      # a free allowance's period, read from local spend
     policy = accounts['scoring']
     task = task_intake.normalize_task(raw_task, policy, capabilities, accounts, route=route)
     if task['worker'] is None and task['chain_id'] and records:

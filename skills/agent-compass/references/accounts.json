@@ -4111,7 +4111,7 @@
    "capacity_status": "unknown"
   },
   "opencode": {
-   "plan": "OpenCode",
+   "plan": "free",
    "billing": "subscription",
    "verified": false,
    "expires_at": null,
@@ -4126,8 +4126,6 @@
     }
    },
    "capacity_status": "unknown",
-   "unmetered": true,
-   "unlimited": true,
    "free_allowance": true
   },
   "pi": {

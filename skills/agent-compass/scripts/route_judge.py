@@ -474,7 +474,7 @@ def quota_unobserved(accounts, usage, bundle):
     account = bundle['account']
     spec = (accounts.get('accounts') or {}).get(account) or {}
     if spec.get('unmetered') or spec.get('five_axis_free_pool'):
-        return None     # a purpose-limited channel or a free starter allowance never blocks a launch (launch_blockers)
+        return None     # a purpose-limited channel or a free allowance has no reading to miss (launch_blockers)
     row = (usage.get('accounts') or {}).get(account) or {}
     fresh = bool(usage.get('read_ok')) and row.get('status') == 'fresh'
     windows = quota_pools.applicable_windows(spec, bundle.get('model'), row if fresh else {}, bundle=bundle,
@@ -563,12 +563,14 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
         )
         if waiting_on in reasons:
             ordered_wids = [waiting_on, *(wid for wid in ordered_wids if wid != waiting_on)]
+        latched = waiting_on is not None and waiting_on in quota_pools.latched_windows(accounts, args.account)
         raise dispatch_registry.RouteFactRefused(
             '; '.join(reasons[wid] for wid in ordered_wids),
             user_named=user_named,
             start_after_hours=start_after_hours,
             retry_at=retry_at,
             waiting_on=waiting_on,
+            waiting_end=quota_pools.latched_end_kind(accounts, args.account) if latched else None,
         )
     if launch_failures.enabled():
         import candidate_eval
@@ -1257,6 +1259,10 @@ def failure_answer(exc, stage):
         f'{fix} roll again. A task that already has a Paseo dispatch comes back as that worker (pending), not as a second launch.'
         if stage == 'roll' else
         f'{fix} check the reviewed input and the usage cache, and continue feasible parent work.')
+    if isinstance(exc, dispatch_registry.Refused) and callable(getattr(exc, 'next_action', None)):
+        # A refusal that knows its own way out (dispatch_registry.FullCapacityRefused) says it, and what refused.
+        failure['error'] = getattr(exc, 'error', None) or failure['error']
+        failure['next_action'] = exc.next_action()
     return failure
 
 

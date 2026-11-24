@@ -20,7 +20,8 @@ import provider_inventory as real_inventory
 import usage_reading
 import provider_retry
 
-MESSAGE = 'Free usage exceeded, subscribe to Go'
+# Not a quota: a confirmed used-up quota is a quota latch (tray/test_quota_latch_cards.py), not a provider hold.
+MESSAGE = 'Provider overloaded: this model is temporarily unavailable'
 
 
 class ProviderRetryCardTests(unittest.TestCase):
@@ -39,12 +40,17 @@ class ProviderRetryCardTests(unittest.TestCase):
             return router_data.account_cards()[0]
 
     def test_an_account_hold_marks_the_ready_account_unavailable_with_the_provider_message(self):
-        card = self.card({'opencode': {'account': 'opencode', 'model': None, 'message': MESSAGE, 'retry_at': None}})
+        observed = datetime.now(timezone.utc) - timedelta(minutes=1)
+        card = self.card({'opencode': {'account': 'opencode', 'model': None, 'message': MESSAGE, 'retry_at': None,
+                                       'scope': 'account', 'observed_at': observed.isoformat()}})
         self.assertEqual(card['kind'], 'warn')
         self.assertTrue(card['retry_hold'])
         self.assertIn(MESSAGE, card['badge'])
         self.assertIn('提供方持续重试，整个账号已排除派发', card['badge'])
-        self.assertIn('agentcompass hold --clear opencode', card['badge'])   # no retry time: it says how to clear it
+        # A hold written without a retry time (v0.7.x) still ends by itself: the card says when, never that a clear is needed.
+        due = provider_retry.due_at({'model': None, 'scope': 'account', 'observed_at': observed.isoformat()})
+        self.assertIn(due.astimezone().strftime('%m-%d %H:%M'), card['badge'])
+        self.assertNotIn('hold --clear', card['badge'])
         self.assertNotIn('成功派发', card['badge'])
         self.assertNotEqual(panel_quota.card_title(card), card['label'])   # the card itself says it is in trouble
 
@@ -107,7 +113,8 @@ class ProviderRetryCardTests(unittest.TestCase):
         card = self.card(holds)
         self.assertEqual((card['kind'], card['retry_hold'], card['retry_clear_pool']), ('warn', True, 'opencode'))
         self.assertIn('提供方报错，额度池 opencode 已排除派发', card['badge'])
-        self.assertIn('agentcompass hold --clear opencode#opencode', card['badge'])
+        self.assertIn('下次重试', card['badge'])
+        self.assertNotIn('hold --clear', card['badge'])
         self.assertNotIn('整个账号', card['badge'])
         retry = datetime.now(timezone.utc) + timedelta(minutes=2)
         go = {'id': 'opencode-go', 'prefix': 'opencode-go', 'provider': 'opencode', 'models': []}
@@ -186,7 +193,7 @@ def test_the_model_list_marks_a_held_model_and_badges_a_held_account(tmp_path, m
                           dispatch_id='d2', classify=lambda *args: ('account', {'source': 'system_one'}))
     row = next(row for row in router_data.harness_model_rows() if row['harness'] == 'codex')
     assert row['kind'] == 'warn' and MESSAGE in row['badge']
-    assert json.loads(store.read_text(encoding='utf-8'))['entries']['codex']['retry_at'] is None
+    assert json.loads(store.read_text(encoding='utf-8'))['entries']['codex']['retry_at']   # every hold ends by itself
 
 
 def test_account_cards_and_model_rows_surface_live_model_exclusions_and_unreadable_lists(tmp_path, monkeypatch):

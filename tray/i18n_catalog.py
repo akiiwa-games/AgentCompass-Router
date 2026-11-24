@@ -86,19 +86,14 @@ EN = {
     '无提供方消息': 'no provider message',
     '提供方报错': 'Provider error',
     '提供方持续重试': 'Provider kept retrying',
-    '{0}，整个账号已排除派发：{1}（点卡片上的“清除”或运行 agentcompass hold --clear {2} 后再派发）':
-        '{0}, whole account excluded from dispatch: {1} (press Clear on the card or run agentcompass hold --clear {2} to dispatch again)',
     '{0} {1}，已排除派发：{2}（下次重试 {3}）': '{0}: {1}, excluded from dispatch: {2} (next retry {3})',
     '{0}，已排除派发，下次重试 {1}': '{0}, excluded from dispatch, next retry {1}',
     '清除': 'Clear',
     '清除 {0}': 'Clear {0}',
     '{0}，额度池 {1} 已排除派发：{2}（下次重试 {3}，或点卡片上的“清除 {1}”）':
         '{0}, quota pool {1} excluded from dispatch: {2} (next retry {3}, or press Clear {1} on the card)',
-    '{0}，额度池 {1} 已排除派发：{2}（点卡片上的“清除 {1}”或运行 agentcompass hold --clear {3} 后再派发）':
-        '{0}, quota pool {1} excluded from dispatch: {2} (press Clear {1} on the card or run agentcompass hold --clear {3} to dispatch again)',
     '额度池 {0} {1}，已排除派发，{2}': 'Quota pool {0}: {1}, excluded from dispatch, {2}',
     '下次重试 {0}': 'next retry {0}',
-    '点卡片上的“清除 {0}”后再派发': 'press Clear {0} on the card to dispatch again',
     '正在清除提供方失败标记…': 'Clearing the provider failure hold…',
     '已清除提供方失败标记': 'Provider failure hold cleared',
     '没有需要清除的提供方失败标记': 'No provider failure hold to clear',
@@ -367,6 +362,7 @@ EN = {
     '{0}小时{1}分': '{0}h {1}m',
     '{0}分': '{0}m',
     '已重置': 'Reset',
+    '{0}后复查': 're-probed in {0}',
     '{0}前读': 'read {0} ago',
     '旧读数 {0}': 'Stale {0}',
     '旧读数': 'Stale',
@@ -860,6 +856,12 @@ EN = {
     '套餐读取失败，不参与自动路由：{0}': 'Plan reading failed, out of automatic routing: {0}',
     '套餐无额度数据，不参与自动路由：{0}': 'No capacity data for this plan, out of automatic routing: {0}',
     '额度上限未知（不参与自动路由）': 'Quota limit unknown (out of automatic routing)',
+    '本机 opencode.db 无法读取（{0}）：本期消耗按下界计，仍参与路由':
+        "opencode.db could not be read ({0}): this period's spend is a lower bound and the pool still routes",
+    '供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用':
+        ("The vendor publishes no quota limit: the limit is the larger of this machine's spend before its latest limit "
+         "error and the shipped measurement (both lower bounds); with neither it is out of automatic routing and usable "
+         "by name"),
     '额度上限未知，不参与自动路由': 'Quota limit unknown, out of automatic routing',
     '额度上限未知，不参与自动路由；本地累计消耗下界 U ≥ ${0:.2f}（{1:,} tokens，{2}）':
         'Quota limit unknown, out of automatic routing; local spend so far at least ${0:.2f} ({1:,} tokens, {2})',

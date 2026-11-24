@@ -75,6 +75,15 @@ def short_countdown(text: str | None) -> str:
     return raw
 
 
+def window_countdown(window: dict) -> str:
+    """A window's countdown as the card shows it: to its reset, or, for a latched window whose end is not a reset the
+    provider stated (`reset_stated` False), to the time its quota is re-probed, said as such."""
+    short = short_countdown(window.get("reset_in"))
+    if window.get("reset_stated") is False and short != "—":
+        return _tr("{0}后复查").format(short)
+    return short
+
+
 def short_window_name(window: dict, multi: bool = True) -> str:
     """Short window tag ('5h', '7d', 'fable 7d', 'gemini 7d', 'credits') without verbose labels."""
     wid = str(window.get("id") or "").strip()
@@ -185,7 +194,7 @@ def quota_tooltip_text(card: dict, window: dict | None = None, refreshable: bool
             continue
         text = f"{tag} {'—' if rem is None else f'{rem:.0f}%'}"
         if reset_in and reset_in != "—":
-            text += f" · {short_countdown(reset_in)}"
+            text += f" · {window_countdown(w_item)}"
         reserved = float(w_item.get("reserved_pct") or 0.0)
         if reserved > 0:
             text += " · " + _tr("在途 {0}%").format(f"{reserved:.0f}")
@@ -691,7 +700,8 @@ class QuotaPage:
         return widgets
 
     def build_unmetered_chip(self, index, card, refreshable):
-        """Compact 1-line status strip item for unmetered accounts (OpenCode, Dot, ChatGPT Web)."""
+        """Compact 1-line status strip item for an account with no window to show: an unmetered channel (Dot, ChatGPT
+        Web), or a free allowance whose vendor publishes no capacity and that has no reading of its own (OpenCode)."""
         tk = self.tk
         outer = tk.Frame(self.quota_unmetered, bg=theme.BORDER, padx=1, pady=1)
         outer.pack(side="left", padx=(0, theme.px(6)), pady=(0, theme.px(2)))
@@ -814,7 +824,7 @@ class QuotaPage:
                 continue
             w_name.configure(text=card_window_name(card, window))
             # A pool counts down to its next partial refill; each account's own reset is on the hover.
-            w_detail.configure(text=short_countdown(window.get("reset_in")))
+            w_detail.configure(text=window_countdown(window))
             # remaining_pct is in percent of one account (a fresh pool of two reads 200%); the bar and colour
             # describe the whole pool.
             count = window.get("accounts") if isinstance(window.get("accounts"), int) and window["accounts"] > 1 else 1

@@ -19,14 +19,39 @@ import provider_inventory
 import public_data
 
 
-def bundle_windows(bundle):
-    """Quota windows a dispatched bundle draws; None (whole account) when they cannot be resolved."""
+def _overlaid(accounts=None):
+    import account_fleet
+    import axis_scores
+    fleet = accounts if accounts is not None else account_fleet.load_accounts()
+    return fleet if '_five_axis' in fleet else axis_scores.five_axis_overlay(fleet)
+
+
+def bundle_windows(bundle, accounts=None):
+    """Quota windows a dispatched bundle draws, as routing sees them (the five-axis overlay gives a free pool its
+    allowance window); None (whole account) when they cannot be resolved."""
     try:
-        import account_fleet
         import quota_pools
-        return quota_pools.bundle_pools(bundle, account_fleet.load_accounts()) or None
+        return quota_pools.bundle_pools(bundle, _overlaid(accounts)) or None
     except Exception:
         return None
+
+
+def quota_latch(bundle, accounts=None):
+    """(latch?, windows) for a used-up quota the bundle's provider reported: the windows the bundle draws; the whole
+    account (None) when its account declares no quota window at all, so no narrower window exists to latch, or when
+    the accounts cannot be read; nothing (False) when the account declares windows and the bundle draws none of them
+    (a model launched under another prefix of the account, such as OpenCode Go beside the free allowance: its quota
+    is none of those windows, and the classifier's hold of its own pool is the smallest true scope)."""
+    try:
+        import quota_pools
+        fleet = _overlaid(accounts)
+        drawn = quota_pools.bundle_pools(bundle, fleet)
+        if drawn:
+            return True, list(drawn)
+        spec = (fleet.get('accounts') or {}).get((bundle or {}).get('account')) or {}
+        return (False, None) if spec.get('windows') else (True, None)
+    except Exception:
+        return True, None
 
 ACTIVE = ('prepared', 'launching', 'launched', 'started')
 TERMINAL = ('completed', 'failed', 'create_failed', 'canceled', 'expired')
@@ -65,6 +90,27 @@ class CapacityChanged(Refused):
     model list that dropped it): the attempt failed before anything was sent, so the brief may go to the next candidate."""
 
 
+class FullCapacityRefused(CapacityChanged):
+    """A recorded constraint the user did not name (a project rule) whose work the router estimates beyond a quota
+    window's full capacity plus its margin (candidate_eval.renewal_capacity_refusal): no renewal holds it, so there is
+    no time to wait for. Its text is the rule's numbers per window (`shortfalls`, the candidate's `full_capacity_short`)
+    and its `next_action` the two ways out."""
+
+    error = 'The route was refused by the full-capacity rule'
+
+    def __init__(self, account, model, shortfalls):
+        parts = '; '.join(f"{wid}: the router estimates the work at about {s['need_pct']:.0f}% of this window, whose "
+                          f"full capacity is {s['full']:.0f}% and keeps a {s['margin_pct']:g}% margin"
+                          for wid, s in shortfalls.items())
+        super().__init__(f'{account}/{model} cannot hold the work: {parts} (an estimate of the router, not a reading)')
+        self.shortfalls = shortfalls
+
+    def next_action(self):
+        return ('Nothing was launched. Roll again without the constraint so the router picks a route whose quota holds '
+                "the work; or, if the user names this route (roll --provider/--account/--model --basis \"<the user's "
+                'words>"), it launches past the estimate with a warning.')
+
+
 class WorkspaceBusy(Refused):
     """The workspace already has a writer; `holders` names each one."""
 
@@ -93,20 +139,23 @@ class RouteFactRefused(Refused):
     """A named or forced route cannot start because of a fact of the account, model or host (quota window, launch
     protection, cooldown, latch, missing credentials / sign-in, `cwd_regex`, or unreadable live model list), rather than
     an invalid flag or input. Carries `start_after_hours`, `retry_at` and `waiting_on` when every refusing quota window
-    has an observed reset (`allocator.refusal_schedule`)."""
+    has an observed reset or, latched, a known end (`allocator.refusal_schedule`); `waiting_end` names a latch's end
+    (`quota_pools.latched_end_kind`), which a re-probe time never calls a reset."""
 
-    def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None):
+    def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None, waiting_end=None):
         super().__init__(cause)
         self.cause = str(cause)
         self.user_named = bool(user_named)
         self.start_after_hours = start_after_hours
         self.retry_at = retry_at
         self.waiting_on = waiting_on
+        self.waiting_end = waiting_end
 
     def next_action(self):
         who = 'the route the user named' if self.user_named else 'the forced route'
         if self.start_after_hours is not None and self.retry_at:
-            when_reset = f', when {self.waiting_on} resets' if self.waiting_on else ''
+            when_reset = (f', {self.waiting_on}: {self.waiting_end}' if self.waiting_on and self.waiting_end else
+                          f', when {self.waiting_on} resets' if self.waiting_on else '')
             return (f'Nothing was recorded or launched: {who} cannot start ({self.cause}); it can start in '
                     f'{self.start_after_hours}h (at {self.retry_at}{when_reset}). Tell the user why and when it can '
                     'start; the user may wait until then, name another route, or let the router choose (roll without '
@@ -1890,6 +1939,12 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             waits = [w for w in waits if w not in candidate_eval.AUTOMATIC_ROUTING_WAITS]
         if bundle.get('fast') and not candidate['bundle'].get('fast') and not exclusions:
             exclusions.append('fast mode quota is no longer sufficient')
+        short = candidate.get('full_capacity_short') or {}
+        if (decision.get('constraint') and not named and exclusions and not waits
+                and set(exclusions) <= {s.get('text') for s in short.values()}):
+            # A constraint held only by the full-capacity rule: the rule's numbers and the ways out, not "changed".
+            raise FullCapacityRefused(bundle['account'], bundle['model'],
+                                      {wid: s for wid, s in short.items() if s.get('text') in exclusions})
         if exclusions or (resume_bundle is None and waits):
             raise CapacityChanged('Capacity/availability changed: ' + '; '.join(exclusions or ['reset not yet observed']))
         if resume_agent_id is None and candidate.get('action') == 'resume':
@@ -1928,7 +1983,9 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                **({'brief_path': task['brief_path']} if task.get('brief_path') else {}),
                **({'chain_id': chain_id} if chain_id else {}),
                **({k: attempt[k] for k in ('attempt_of', 'attempt', 'previous_attempt') if attempt.get(k) is not None}
-                  if attempt else {})}
+                  if attempt else {}),
+               # A route the user named launches past the full-capacity rule with its warning (candidate_eval).
+               **({'warnings': [candidate['capacity_warning']]} if candidate.get('capacity_warning') else {})}
         event(row, 'prepared', now)
         save(connection, row)
         return row
@@ -2413,9 +2470,13 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             if isinstance(updated_error, str) and parse(updated_error) >= parse(row['launched_at']):
                 import account_state
                 import quota_exhaustion
+                # The classifier decides when it read this failure (provider_retry.record); with no answer at all the
+                # quota pattern may record the windows the bundle draws.
+                latch, windows = quota_latch(row['bundle']) if scope is None else (False, None)
                 try:
-                    quota_exhaustion.record(row['bundle']['account'], snapshot.get('lastError'),
-                                            windows=bundle_windows(row['bundle']), at=updated_error, source=agent_id)
+                    if latch:
+                        quota_exhaustion.record(row['bundle']['account'], snapshot.get('lastError'),
+                                                windows=windows, at=updated_error, source=agent_id)
                 except OSError:
                     pass  # Best effort: a busy store must not stop this observation or the reconcile that made it.
                 try:

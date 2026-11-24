@@ -65,14 +65,15 @@ WORKER_FAILED_NEXT = ('Paseo created this worker and it ended in error, so it no
                       'relaunches the brief on the next candidate (this model is left out for the rest of the dispatch) '
                       'and notifies the parent of the final outcome: do not roll it again.')
 RETRY_STUCK_NEXT = ('Its provider kept retrying one request without progress, so AgentCompass stopped the turn and holds '
-                    'that model (with backoff) or its whole account (until cleared with the tray clear button or '
-                    '`agentcompass hold --clear`) out of dispatch; plan/roll warnings and the tray account list show the '
-                    'provider message. ')
+                    "that model or its account's quota pool out of dispatch until its retry time (a backoff, or the "
+                    "provider's own retry time), after which routing may pick it again; plan/roll warnings and the tray "
+                    'account list show the provider message and the next retry. ')
 TURN_FAILED_NEXT = ('Its provider ended the turn with an error. AgentCompass had its classifier read the provider message: '
                     'when it means the provider refuses this model or account, that model or account is held out of '
-                    'dispatch (plan/roll warnings and the tray account list show it; clear with the tray clear button or '
-                    '`agentcompass hold --clear`). AgentCompass retries a transient error or relaunches the brief on the '
-                    'next candidate by itself and notifies the parent of the final outcome: do not roll it again.')
+                    'dispatch until its retry time; a used-up quota is that quota at 0 until the reset the error states '
+                    '(plan/roll warnings and the tray account list say when). AgentCompass retries a transient error '
+                    'or relaunches the brief on the next candidate by itself and notifies the parent of the final '
+                    'outcome: do not roll it again.')
 WORKER_TURN_FAILED_NEXT = ('Paseo created this worker and its turn ended in error. AgentCompass\'s classifier read the '
                            'error as coming from the worker\'s own work, not from its provider, so nothing is held. Read '
                            'its error (get_agent_activity on agent_id) and check whether it did part of the work before '
@@ -98,8 +99,8 @@ MANUAL_NEXT = {
                       'error text, so it may choose the same model again.'),
     'turn_failed': ('Its provider ended the turn with an error. AgentCompass had its classifier read the provider message: '
                     'when it means the provider refuses this model or account, that model or account is held out of '
-                    'dispatch (plan/roll warnings and the tray account list show it; clear with the tray clear button or '
-                    '`agentcompass hold --clear`). Read its error (get_agent_activity on agent_id) and check whether it '
+                    'dispatch until its retry time; a used-up quota is that quota at 0 until the reset the error states '
+                    '(plan/roll warnings and the tray account list say when). Read its error (get_agent_activity on agent_id) and check whether it '
                     'did part of the work before rolling this brief again.'),
     'retry_stuck_clean': 'The worker did no work before it got stuck: roll this brief again and the router picks another model.',
     'retry_stuck_partial': ('The worker had already done part of the work (it is stopped, not removed): check its activity '
@@ -978,7 +979,7 @@ def cli(args):
         reconcile()
         row = registry.prepare(document['decision_id'], document['task'], document['launch'],
                                usage_reading.usage_snapshot(args.usage_cache))
-        return {**public(row), 'create_agent': row['request']}
+        return {**public(row), 'create_agent': row['request'], **({'warnings': row['warnings']} if row.get('warnings') else {})}
     if action == 'start' and not args.dispatch_id:
         raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
     if action in ('reconcile', 'start'):

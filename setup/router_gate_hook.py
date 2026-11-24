@@ -1394,14 +1394,14 @@ def check_account_quota_exhausted(
     # This applies to new launches and resumed turns, never to read-only investigation.
     held = latched_windows(account, windows, usage_cache_path, HOME)
     if held:
-        every, script = router_owner("quota_exhaustion", "ALL", "__file__")
+        every, script, end_text = router_owner("quota_exhaustion", "ALL", "__file__", "end_text")
         drawn = f"every window of {account}" if every in held else f"window {', '.join(sorted(held))} of {account}"
         clear = (f'{"agentcompass" if getattr(sys, "frozen", False) else "python"} -X utf8 '
                  f'"{Path(script).resolve().as_posix()}" --clear {account}')
         return (
-            f'[Router Gate] A confirmed quota failure is recorded for {drawn}, which this launch draws. The record '
-            'lifts when a newer successful usage reading shows the window under 100% used or past its reset time; the passing '
-            f'of time alone does not lift it. To clear it by hand run: {clear}. While the owned worker is running, send a control message with completion '
+            f'[Router Gate] A confirmed quota failure is recorded for {drawn}, which this launch draws: '
+            f'{end_text(account) or "0 left until it is re-probed"}, or until a newer successful usage reading shows the '
+            f'window under 100% used. `{clear}` ends it early. While the owned worker is running, send a control message with completion '
             f'notifications enabled; otherwise collect existing output, cancel_agent if needed, and run {ROUTER_CMD} roll --brief <task.md>.'
         )
     if records is None:

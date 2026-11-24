@@ -978,9 +978,9 @@ if __name__ == '__main__':
 
 
 class ProviderHoldReloginTests(Machine):
-    """Review 2 R8: a subscription that got logged out fails its worker with a message the classifier scopes `account`,
-    an indefinite hold. Logging back in shows as a good usage reading newer than the hold, or another credential, and
-    lifts it the way it lifts the plan-inactive latch; an account without a usage reader keeps the clear."""
+    """Review 2 R8: a subscription that got logged out fails its worker with a message the classifier scopes `account`.
+    Logging back in shows as a good usage reading newer than the hold, or another credential, and lifts it before its
+    retry time the way it lifts the plan-inactive latch."""
     MESSAGE = 'Your session has expired. Please log in again.'
 
     def setUp(self):
@@ -1007,7 +1007,6 @@ class ProviderHoldReloginTests(Machine):
         self.codex_login('plus')
         self.cache(age_hours=1, codex={'plan_label': 'plus'})   # the last good reading predates the hold
         entry = self.hold('account', 'gpt-6.1-sol', 'd1')
-        self.assertIsNone(entry['retry_at'])
         self.assertTrue(entry.get('credential_key'))   # the login it was taken under
         self.hold('model', 'gpt-6.1-terra', 'd2')
         self.assertEqual(self.held(), {'codex', 'codex/gpt-6.1-terra'})
