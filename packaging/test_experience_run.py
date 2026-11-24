@@ -142,5 +142,7 @@ def test_each_answer_keeps_the_blocked_candidates_of_its_plan_with_their_reasons
          "excluded": ["five_hour is empty for 3.0h", "weekly short"], "components": {}},
     ]
     assert [c["id"] for c in xp.compact_ranking(snapshot)] == ["a"]
+    waiting = dict(snapshot[0], id="w", available_in_hours=2.6)
+    assert [c["available_in_hours"] for c in xp.compact_ranking([snapshot[0], waiting])] == [None, 2.6]
     assert xp.compact_exclusions(snapshot) == [
         {"id": "b", "model": "m2", "account": "y", "effort": "max", "excluded": ["five_hour is empty for 3.0h", "weekly short"]}]

@@ -693,8 +693,10 @@ def compact_exclusions(ranking: list) -> list:
 def compact_ranking(ranking: list) -> list:
     """The eligible candidates of a plan's recorded snapshot (score not None), best first, with the router's own numbers
     copied as recorded: score N, fit, opportunity_cost (the quota cost N subtracts), quota_price, decided_by, the
-    candidate's expected_usd and expected_pct. A field the snapshot did not record stays None (ledger_snapshot keeps every
-    component for the best 6 eligible candidates and fewer for the next 8)."""
+    candidate's expected_usd and expected_pct, and available_in_hours (a candidate held back only by windows that reset
+    stays eligible and waits that long; recorded for the best 6 only, where its absence means it can start now). A field
+    the snapshot did not record stays None (ledger_snapshot keeps every component for the best 6 eligible candidates and
+    fewer for the next 8, which have no usd, pct or wait)."""
     out = []
     for candidate in ranking:
         if candidate.get("score") is None:
@@ -705,7 +707,8 @@ def compact_ranking(ranking: list) -> list:
                     "effort": bundle.get("effort"), "score": candidate.get("score"), "fit": components.get("fit"),
                     "opportunity_cost": components.get("opportunity_cost"), "quota_price": components.get("quota_price"),
                     "decided_by": components.get("decided_by"), "level": components.get("five_axis_level"),
-                    "usd": candidate.get("expected_usd"), "pct": candidate.get("expected_pct")})
+                    "usd": candidate.get("expected_usd"), "pct": candidate.get("expected_pct"),
+                    "available_in_hours": candidate.get("available_in_hours")})
     return out
 
 
