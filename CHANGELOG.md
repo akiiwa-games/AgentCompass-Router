@@ -2,6 +2,21 @@
 
 One entry per released tag, newest first. The full notes of each release are on the [Releases](https://github.com/akiiwa-games/AgentCompass-Router/releases) page.
 
+## v0.7.7 - 2026-11-24
+
+- A route the user names is refused only by a fact: a window used up, a confirmed latch, the launch floor, a missing price. The answer is `status: blocked`, `caller_action: tell_user`, exit 2, and names the window, its state and, when known, the time it ends (the row's binding wait over every window that holds it). An estimate never refuses a named route: the full-capacity estimate, the local estimate of a free allowance, a stale or missing reading and the fast-spend estimate launch with one warning. `record` and the re-check before launch read one set of blockers.
+- Fast mode: Claude has no fast mode in the product (the paid-usage-credit contract, its data rows and its `+fast` bundles are removed). A named `--fast` on a route that cannot run fast launches in its plain mode with one note; a worker that was started fast on such a route is not resumed, and the answer says to start a fresh one.
+- A free pool is an ordinary quota pool: its capacity is the larger of the account's own observation and the shipped maintainer measurement (`plan-templates.json` `opencode.free`), its use is read from `opencode.db` over the bundles that draw it, and the vendor's free-limit error latches the allowance until the reset the vendor states. No hold waits for a person to clear it: every hold ends by a time or an observed fact.
+- An account pool (a Magpie pool of several accounts) is priced by each member's own window: own capacity, use and reset, the work split by room, the members as each other's substitutes. The pool is used up only when every member is, and its wait is the earliest refill that holds the work. A cached pooled reading without members is fetched again.
+- A wait the router offers is one it can keep: a latched window passes the full-capacity rule before a wait is offered. A candidate held back only by quota waits, `--can-wait-hours` is the one limit, and a wait longer than allowed is a deferral, not a question to the user. A blocked chain owner gives way to the next route.
+- Native launches are authorized by a one-use hand-over from `roll` or a standalone record; the gate fails closed on an unreadable registry, matches sessions and audit spawns on recorded facts, and has no model-name rule left.
+- The fallback chain: a claim ends with the step that holds it, a relaunch plans the task AgentCompass stored, a relaunch that cannot be made says so to the parent, and a refusal of the local state reaches the parent with its fix.
+- Local state of earlier versions: legacy meter fields and `verified: false` are upgraded on read instead of excluding the account.
+- The dispatch watcher recovers a lock left by a dead watcher and retries a store that is busy for a moment.
+- Tray: a hover text is destroyed with its widget (a line could stay on screen after its list was rebuilt). Both executables and the installer carry the compass icon.
+- Removed: the unused `self` dispatch answer, dead helpers and constants in the router scripts, the tray, the audit and the packaging.
+- Maintainers: `packaging/experience_run.py` plays a main session's working day through the public entry under account situations, with `audit/experience_report.py` as its report; `AGENTS.md` says what a change within a version carries and what runs once at the release.
+
 ## v0.7.6 - 2026-11-22
 
 - `sync_host_globals`: the setup of v0.7.5 stopped with `shutil.Error` when the backup of an Antigravity skill copy it was retiring held a directory link to a folder that no longer exists (found on a machine that had used a checkout). A backup's links are restored as links (`_restore_materialized_skill`) and a link to nothing is left out.
