@@ -298,6 +298,18 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertEqual([(w['id'], w['remaining_pct']) for w in held['windows']], [('allowance', 0.0)])
         self.assertIn('5', held['windows'][0]['reset_in'])
         self.assertIn('供应商未公布额度上限', held['usage_hover'])
+        # A limit sentence with no reset: the card shows the latch's re-probe time, as discovery publishes it.
+        import tempfile
+        from pathlib import Path
+        import quota_exhaustion
+        with tempfile.TemporaryDirectory() as state:
+            quota_exhaustion.record('opencode', 'Free usage limit reached. Connect a provider or subscribe to OpenCode Go.',
+                                    windows=['allowance'], path=Path(state) / 'quota-exhaustion.json')
+            rows = {'opencode': {'family': 'opencode', 'status': 'ready'}}
+            real_inventory._latch_exhausted_quota(rows, Path(state), {})
+        probed = self.card(rows['opencode'], name='opencode', spec=spec)
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in probed['windows']], [('allowance', 0.0)])
+        self.assertTrue(probed['windows'][0]['reset_in'] not in ('', '—', None), probed['windows'][0])
 
     def test_a_plan_without_capacity_says_whether_the_tier_was_read(self):
         # Owner, 2026-11-19: the card said "套餐未知（Mode B）", an internal name. No tier read is a failed reading;

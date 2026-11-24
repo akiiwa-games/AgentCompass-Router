@@ -1649,9 +1649,11 @@ def _latch_exhausted_quota(accounts, state_dir, cache_rows):
         elif latched:
             # Only these windows are out; the account's other windows stay routable.
             row['exhausted_windows'] = sorted(latched)
-            if stated:
-                # The reset the provider's own error stated: these windows have 0 left until then (an observed reset).
-                row['exhausted_resets_at'] = stated.isoformat()
+            if due:
+                # These windows have 0 left until the latch ends by itself: the reset the provider's own error stated,
+                # else its re-probe time (quota_exhaustion.due_at); a quota wait with a known end either way.
+                row['exhausted_resets_at'] = due.isoformat()
+                row['exhausted_reset_stated'] = stated is not None
 
 
 def _assign_quota_owners(accounts):

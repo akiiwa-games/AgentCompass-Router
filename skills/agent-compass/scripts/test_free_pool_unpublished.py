@@ -292,18 +292,52 @@ class UnpublishedFreePoolTests(unittest.TestCase):
                 self.assertTrue(all(not c['excluded'] and not c['available_in_hours']
                                     for c in self.rows(self.plan(freed, now=after))))
 
-    def test_a_sentence_with_no_readable_reset_holds_until_the_latches_re_probe_period(self):
+    def test_a_sentence_with_no_readable_reset_waits_until_the_latches_re_probe_time(self):
+        """Rule (quota_exhaustion.due_at, brief point 5): a pool at 0 with no stated reset is still a quota-held
+        candidate with a known time, its re-probe time. The plan defers to it, the launch blocker and the named route
+        say it, and no text says "refresh quota or replan"."""
+        import quota_pools
         for message in (LIMIT, UNREADABLE):
             with self.subTest(message=message):
                 (self.state / 'quota-exhaustion.json').unlink(missing_ok=True)   # a fresh latch per sentence
                 acc = self.only(POOL)
                 self.fail_turn(acc, message, f'd-{len(message)}')
                 held = self.discovered(acc)
-                self.assertEqual(held['_discovery']['accounts'][POOL]['exhausted_windows'], ['allowance'])
-                self.assertNotIn('exhausted_resets_at', held['_discovery']['accounts'][POOL])
-                self.assertTrue(all(any('allowance: quota confirmed exhausted' in e for e in c['excluded'])
-                                    for c in self.rows(self.plan(held))))
                 due = self.now + timedelta(hours=account_state.LATCH_RETRY_HOURS)
+                row = held['_discovery']['accounts'][POOL]
+                self.assertEqual(row['exhausted_windows'], ['allowance'])
+                self.assertEqual(datetime.fromisoformat(row['exhausted_resets_at']), due)
+                decision = self.plan(held)
+                hours = account_state.LATCH_RETRY_HOURS
+                self.assertEqual(decision['decision']['action'], 'defer')
+                self.assertGreaterEqual(decision['decision']['start_after_hours'], hours - 0.01)
+                self.assertEqual(decision['decision']['wait_for']['window'], 'allowance')
+                for c in self.rows(decision):
+                    self.assertFalse(c['excluded'], c['excluded'])
+                    self.assertAlmostEqual(c['available_in_hours'], hours, places=3)
+                    self.assertFalse([n for n in c['notes'] if 'replan' in n], c['notes'])
+                    self.assertTrue([n for n in c['notes'] if 're-probed' in n and quota_exhaustion.moment_text(due) in n],
+                                    c['notes'])
+                bid, bundle = next(iter(held['accounts'][POOL]['bundles'].items()))
+                with tf._synthetic_doc_ctx(self.doc):
+                    blockers = quota_pools.launch_blockers({**bundle, 'id': bid, 'account': POOL}, held, {}, self.now)
+                self.assertEqual([w for w, _ in blockers], ['allowance'])
+                self.assertIn(quota_exhaustion.moment_text(due), blockers[0][1])
+                self.assertIn('re-probed', blockers[0][1])
+                self.assertNotIn('replan', blockers[0][1])
+                named = self.plan(held, constraint_bundle=bid)
+                self.assertEqual(named['decision']['action'], 'defer')
+                self.assertGreaterEqual(named['decision']['start_after_hours'], hours - 0.01)
+                # A forced route checked at record (route_judge._check_record_launch) says the same time.
+                import route_judge
+                from types import SimpleNamespace
+                with tf._synthetic_doc_ctx(self.doc), self.assertRaises(ValueError) as refused:
+                    route_judge._check_record_launch(SimpleNamespace(account=POOL), SimpleNamespace(model=bundle['model']),
+                                                     {**bundle, 'id': bid, 'account': POOL}, held, {'accounts': {}}, self.now)
+                said = str(refused.exception)
+                self.assertIn(quota_exhaustion.moment_text(due), said)
+                self.assertIn('start_after_hours', said)
+                self.assertNotIn('remaining capacity', said)
                 for moment, latched in ((due - timedelta(minutes=1), True), (due + timedelta(minutes=1), False)):
                     with patch.object(quota_exhaustion, 'datetime', wraps=datetime) as clock:
                         clock.now.side_effect = lambda tz=None, m=moment: m
@@ -331,7 +365,8 @@ class UnpublishedFreePoolTests(unittest.TestCase):
             blockers = quota_pools.launch_blockers({**bundle, 'id': bid, 'account': POOL}, held, {}, self.now)
             free = quota_pools.launch_blockers({**bundle, 'id': bid, 'account': POOL}, self.only(POOL), {}, self.now)
         self.assertEqual([wid for wid, _ in blockers], ['allowance'])
-        self.assertIn(reset.isoformat(), blockers[0][1])
+        self.assertIn(quota_exhaustion.moment_text(reset), blockers[0][1])
+        self.assertIn('the reset the provider stated', blockers[0][1])
         self.assertEqual(free, [])
 
 

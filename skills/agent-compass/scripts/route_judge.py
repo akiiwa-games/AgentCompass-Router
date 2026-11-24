@@ -516,6 +516,12 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
             quota_bundle, accounts, usage, now, records=dispatch_flow.reservation_records(read_only=True))
         if blockers:
             wid, reason = blockers[0]
+            reset = quota_pools.latched_reset(accounts, args.account) if wid in quota_pools.latched_windows(
+                accounts, args.account) else None
+            if reset is not None and reset > now:
+                # A latched window with a known end is a quota wait (wait_for_reset), named or not.
+                raise ValueError(f"Account {args.account!r} window {wid!r}: {reason} "
+                                 f"(wait_for_reset, start_after_hours={(reset - now).total_seconds() / 3600:.2f}).")
             raise ValueError(
                 f"Account {args.account!r} window {wid!r} is exhausted or below safety floor ({reason}). "
                 f"Do not dispatch {args.account}; run `{router_command()} plan` to pick an account with remaining capacity."

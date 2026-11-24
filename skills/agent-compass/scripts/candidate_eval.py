@@ -535,14 +535,13 @@ def evaluate_bundle(bundle, task, ctx):
             long_applicable = long_applicable or not is_short
             observed = quota_pools.cycle_observation(wspec, observed, acct_usage, now, read_failed_ok=True)
             if wid in latched and latched_reset is not None and latched_reset > now:
-                # The provider's own error stated when this window resets: 0 left until then, a quota wait like any
-                # window used up with a known reset (the merged quota-wait rule), not an exclusion.
+                # 0 left until the latch ends by itself (the reset the provider's error stated, else its re-probe
+                # time): a quota wait like any window used up with a known reset (the merged quota-wait rule).
                 result['_five_long_wait'] = True
                 if not pool:
                     wait = (latched_reset - now).total_seconds() / 3600
                     available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
-                    result['notes'].append(f'{wid} has 0 left until its reset at {latched_reset.isoformat()} '
-                                           f"(stated by the provider's limit error); start after its reset")
+                    result['notes'].append(quota_pools.latched_wait_text(accounts, bundle['account'], wid))
                 continue
             if wid in latched:
                 (short_exclude if is_short else exclude)(f'{wid}: quota confirmed exhausted; refresh quota or replan')
