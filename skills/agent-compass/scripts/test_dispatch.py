@@ -4477,6 +4477,22 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertTrue(quota_exhaustion.exhausted_windows(account, now=due - timedelta(minutes=1), read_only=True))
         self.assertEqual(quota_exhaustion.exhausted_windows(account, now=due + timedelta(minutes=1), read_only=True), set())
 
+    def test_a_used_up_quota_the_classifier_scoped_to_the_model_is_held_as_answered_and_latches_nothing(self):
+        """Classifier authority (provider_retry docstring): the quota pattern decides only for an `account` answer or
+        none; a `model` answer holds the model, on the watcher's path and on the observation's own reading alike."""
+        import provider_retry
+        import quota_exhaustion
+        self.scopes = ['model']
+        row = self.launched()
+        registry.observe(row['dispatch_id'], self.snapshot(row), now=self.now)
+        at = self.now + timedelta(seconds=15)
+        registry.observe(row['dispatch_id'], self.snapshot(row, status='error', lastError=self.FREE_LIMIT,
+                                                          updatedAt=at.isoformat()),
+                         now=self.now + timedelta(seconds=20))
+        self.assertEqual(self.asked[0][3], self.FREE_LIMIT)
+        self.assertEqual(quota_exhaustion.exhausted_windows(self.bundle['account'], now=at, read_only=True), set())
+        self.assertEqual(set(provider_retry.active(now=at)), {f"{self.bundle['account']}/{self.bundle['model']}"})
+
     def test_an_error_the_classifier_reads_as_not_the_provider_holds_nothing(self):
         import provider_retry
         self.scopes = ['none']

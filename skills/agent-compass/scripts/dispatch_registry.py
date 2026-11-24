@@ -19,19 +19,39 @@ import provider_inventory
 import public_data
 
 
+def _overlaid(accounts=None):
+    import account_fleet
+    import axis_scores
+    fleet = accounts if accounts is not None else account_fleet.load_accounts()
+    return fleet if '_five_axis' in fleet else axis_scores.five_axis_overlay(fleet)
+
+
 def bundle_windows(bundle, accounts=None):
     """Quota windows a dispatched bundle draws, as routing sees them (the five-axis overlay gives a free pool its
     allowance window); None (whole account) when they cannot be resolved."""
     try:
-        import account_fleet
-        import axis_scores
         import quota_pools
-        fleet = accounts if accounts is not None else account_fleet.load_accounts()
-        if '_five_axis' not in fleet:
-            fleet = axis_scores.five_axis_overlay(fleet)
-        return quota_pools.bundle_pools(bundle, fleet) or None
+        return quota_pools.bundle_pools(bundle, _overlaid(accounts)) or None
     except Exception:
         return None
+
+
+def quota_latch(bundle, accounts=None):
+    """(latch?, windows) for a used-up quota the bundle's provider reported: the windows the bundle draws; the whole
+    account (None) when its account declares no quota window at all, so no narrower window exists to latch, or when
+    the accounts cannot be read; nothing (False) when the account declares windows and the bundle draws none of them
+    (a model launched under another prefix of the account, such as OpenCode Go beside the free allowance: its quota
+    is none of those windows, and the classifier's hold of its own pool is the smallest true scope)."""
+    try:
+        import quota_pools
+        fleet = _overlaid(accounts)
+        drawn = quota_pools.bundle_pools(bundle, fleet)
+        if drawn:
+            return True, list(drawn)
+        spec = (fleet.get('accounts') or {}).get((bundle or {}).get('account')) or {}
+        return (False, None) if spec.get('windows') else (True, None)
+    except Exception:
+        return True, None
 
 ACTIVE = ('prepared', 'launching', 'launched', 'started')
 TERMINAL = ('completed', 'failed', 'create_failed', 'canceled', 'expired')
@@ -2366,9 +2386,13 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             if isinstance(updated_error, str) and parse(updated_error) >= parse(row['launched_at']):
                 import account_state
                 import quota_exhaustion
+                # The classifier decides when it read this failure (provider_retry.record); with no answer at all the
+                # quota pattern may record the windows the bundle draws.
+                latch, windows = quota_latch(row['bundle']) if scope is None else (False, None)
                 try:
-                    quota_exhaustion.record(row['bundle']['account'], snapshot.get('lastError'),
-                                            windows=bundle_windows(row['bundle']), at=updated_error, source=agent_id)
+                    if latch:
+                        quota_exhaustion.record(row['bundle']['account'], snapshot.get('lastError'),
+                                                windows=windows, at=updated_error, source=agent_id)
                 except OSError:
                     pass  # Best effort: a busy store must not stop this observation or the reconcile that made it.
                 try:

@@ -63,25 +63,71 @@ def confirmed(error):
 _RESET_DATE = re.compile(r'resets? at\s+([A-Za-z]{3,9}\.? \d{1,2},? \d{4},? \d{1,2}:\d{2}\s?[AaPp][Mm])')
 _RESET_CLOCK = re.compile(r'resets? at\s+(\d{1,2}):(\d{2})(?:\s?([AaPp][Mm]))?(?![\d:])')
 _RESET_COUNTDOWN = re.compile(r'(?:retrying in|reintentando en)\s+(\d+)\s*s\b', re.I)
+# A zone written right after the time: an IANA name ("(America/New_York)") or UTC/GMT with an optional offset.
+_ZONE = re.compile(r'\s*\(?\s*(?:(?P<iana>[A-Za-z]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)|'
+                   r'(?P<utc>UTC|GMT)(?![A-Za-z])\s*(?P<off>[+-]\d{1,2}(?::?\d{2})?)?)')
+_UNKNOWN_ZONE = object()
 
 
-def stated_reset(error, at):
-    """The reset time a limit error states, as an aware datetime, else None. The boundary parse of the vendor's sentence,
-    in one place: a sentence in none of the forms above gives None (the latch's re-probe period applies), never a guess.
-    `at` is when the error was observed: a countdown counts from it, and a bare clock time is its next occurrence."""
-    if not isinstance(error, str):
+def _stated_zone(error, end):
+    """The zone the sentence states right after a time ending at `end`: a tzinfo, None when it states none, or
+    _UNKNOWN_ZONE for a zone name no zone database knows (the sentence is then unreadable)."""
+    m = _ZONE.match(error, end)
+    if not m:
         return None
-    at = _time(at) if isinstance(at, str) else at
-    if at is None:
-        return None
+    if m.group('iana'):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            return ZoneInfo(m.group('iana'))
+        except (ZoneInfoNotFoundError, ValueError):
+            return _UNKNOWN_ZONE
+    offset = m.group('off')
+    if not offset:
+        return timezone.utc
+    sign = -1 if offset[0] == '-' else 1
+    digits = offset[1:].replace(':', '')
+    hours, minutes = (digits[:-2], digits[-2:]) if len(digits) > 2 else (digits, '0')
+    if int(hours) > 14 or int(minutes) > 59:
+        return _UNKNOWN_ZONE
+    return timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
+
+
+def longest_reset_hours():
+    """The longest reset period any window of the shipped plan templates declares (hours), the furthest a quota can
+    reset from now; None when the templates cannot be read."""
+    import provider_inventory
+    periods = []
+    for plans in provider_inventory.shipped_plan_templates().values():
+        for template in (plans.values() if isinstance(plans, dict) else ()):
+            if not isinstance(template, dict):
+                continue
+            for window in (template.get('windows') or {}).values():
+                hours = window.get('hours') if isinstance(window, dict) else None
+                if isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0:
+                    periods.append(hours)
+            seconds = (template.get('cadence') or {}).get('window_seconds') if isinstance(template.get('cadence'), dict) else None
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
+                periods.append(seconds / 3600)
+    return max(periods) if periods else None
+
+
+def _parsed_reset(error, at):
+    """The time the sentence states, before the plausibility bounds of `stated_reset`."""
     if (m := _RESET_DATE.search(error)):
+        zone = _stated_zone(error, m.end())
+        if zone is _UNKNOWN_ZONE:
+            return None
         words = re.findall(r'[A-Za-z]+|\d+', m.group(1))     # month, day, year, hour, minute, AM/PM
         text = f'{words[0][:3].title()} {words[1]} {words[2]} {words[3]}:{words[4]} {words[5].upper()}'
         try:
-            return datetime.strptime(text, '%b %d %Y %I:%M %p').astimezone()
+            moment = datetime.strptime(text, '%b %d %Y %I:%M %p')
         except ValueError:
             return None
+        return moment.replace(tzinfo=zone) if zone else moment.astimezone()
     if (m := _RESET_CLOCK.search(error)):
+        zone = _stated_zone(error, m.end())
+        if zone is _UNKNOWN_ZONE:
+            return None
         hour, minute, half = int(m.group(1)), int(m.group(2)), (m.group(3) or '').upper()
         if half:
             if not 1 <= hour <= 12:
@@ -89,15 +135,40 @@ def stated_reset(error, at):
             hour = hour % 12 + (12 if half == 'PM' else 0)
         if hour > 23 or minute > 59:
             return None
-        local = at.astimezone()
-        moment = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if moment <= local:
-            moment = (local.replace(tzinfo=None) + timedelta(days=1)).replace(
-                hour=hour, minute=minute, second=0, microsecond=0).astimezone()
-        return moment
+        # The next occurrence of that wall time in the stated zone, else in the machine's local time.
+        wall = at.astimezone(zone) if zone else at.astimezone()
+        day = wall.replace(tzinfo=None)
+        for days in (0, 1, 2):
+            naive = (day + timedelta(days=days)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            moment = naive.replace(tzinfo=zone) if zone else naive.astimezone()
+            if moment > at:
+                return moment
+        return None
     if (m := _RESET_COUNTDOWN.search(error)):
-        return at + timedelta(seconds=int(m.group(1)))
+        try:
+            return at + timedelta(seconds=int(m.group(1)))
+        except OverflowError:
+            return None
     return None
+
+
+def stated_reset(error, at):
+    """The reset time a limit error states, as an aware datetime, else None. The boundary parse of the vendor's sentence,
+    in one place: a sentence in none of the forms above gives None (the latch's re-probe period applies), never a guess.
+    `at` is when the error was observed: a countdown counts from it, and a bare clock time is its next occurrence. A
+    zone the sentence states is used; a time with none is the machine's local time (the vendor's client prints wall
+    time for its user). A reset not after `at`, or further from it than the longest reset period any shipped plan
+    window has (`longest_reset_hours`), is unreadable too."""
+    if not isinstance(error, str):
+        return None
+    at = _time(at) if isinstance(at, str) else at
+    if at is None:
+        return None
+    moment = _parsed_reset(error, at)
+    longest = longest_reset_hours()
+    if moment is None or longest is None or not at < moment <= at + timedelta(hours=longest):
+        return None
+    return moment
 
 
 def record(account, error, *, windows=None, at=None, source=None, path=None):
@@ -140,6 +211,31 @@ def due_at(row):
 def stated_reset_of(row):
     """The reset the latch's error stated, else None."""
     return _time((row or {}).get('resets_at'))
+
+
+def moment_text(moment):
+    """A latch's end as a person reads it: local time to the minute with its offset."""
+    return moment.astimezone().isoformat(timespec='minutes') if moment else 'the next roll'
+
+
+def ends(account, *, path=None):
+    """(when the account's latch ends by itself, whether that is the reset its error stated), or None when it has no
+    latch. The one answer every text about a latch gives (`due_at`)."""
+    row = (_read(path or store_path()).get('accounts') or {}).get(account) or {}
+    if not row.get('blocked'):
+        return None
+    return due_at(row), stated_reset_of(row) is not None
+
+
+def end_text(account, *, path=None):
+    """The sentence that says when the account's latch ends by itself: at the reset its error stated, else when it is
+    re-probed. None when it has no latch."""
+    found = ends(account, path=path)
+    if found is None:
+        return None
+    due, stated = found
+    return (f'0 left until {moment_text(due)} (the reset the provider stated)' if stated
+            else f'0 left until {moment_text(due)}, when it is re-probed')
 
 
 def exhausted_windows(account, usage=None, *, path=None, now=None, read_only=False):

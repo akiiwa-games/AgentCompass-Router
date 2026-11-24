@@ -244,11 +244,18 @@ def test_an_account_hold_with_no_stated_time_ends_by_itself_at_its_retry_time(ac
     assert held_out(accounts, ZEN[0], due + timedelta(seconds=1)) is None     # nothing was cleared
 
 
-def test_an_account_answer_backs_off_to_the_latches_period_not_past_it(accounts, store):
+def test_an_account_answer_lasts_the_latches_period_from_the_first_hold_and_other_scopes_back_off(accounts, store):
+    """Rule (provider_retry docstring): a hold the classifier scoped `account` is about a subscription, a balance or
+    credentials: it lasts account_state.LATCH_RETRY_HOURS from its observation, from the first hold on (no ramp of
+    probes); model and transient holds keep the doubling backoff."""
     import account_state
-    cap = account_state.LATCH_RETRY_HOURS * 3600
-    assert max(provider_retry.retry_seconds(n, True) for n in range(1, 30)) == cap
-    assert all(provider_retry.retry_seconds(n, True) >= provider_retry.retry_seconds(n) for n in range(1, 30))
+    period = timedelta(hours=account_state.LATCH_RETRY_HOURS)
+    first = hold(accounts, ZEN[0], 'account', 'd1', message=REFUSED)
+    assert provider_retry.due_at(first) == NOW + period
+    again = hold(accounts, ZEN[0], 'account', 'd2', at=NOW + period + timedelta(seconds=1), message=REFUSED)
+    assert again['streak'] == 2 and provider_retry.due_at(again) == NOW + 2 * period + timedelta(seconds=1)
+    one, two = (provider_retry.retry_seconds(n) for n in (1, 2))
+    assert one < two <= provider_retry.retry_seconds(30)
 
 
 def test_a_provider_stated_time_later_than_the_backoff_wins(accounts, store):

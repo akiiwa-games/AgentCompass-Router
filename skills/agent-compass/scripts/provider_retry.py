@@ -6,14 +6,17 @@ Contract: the Paseo bridge's watcher records a terminal sighting carrying the pr
     auto-retry status line), with the provider's next retry time when it gave one, or
   - `provider_turn_failed`: the worker's turn ended in error with the provider's error text (agent.lastError; opencode
     2.x fails a free model at once: "Free usage limit reached. Connect a provider or subscribe to OpenCode Go ...").
-None is special-cased here, except that a message quota_exhaustion confirms as a used-up quota is its fact, not a hold
-(below). This module records each such dispatch once in <state dir>/provider-retry.json:
+None is special-cased here. Who decides what, once: the classifier decides the scope from the message; the quota
+pattern (quota_exhaustion.confirmed) decides only whether an `account` answer, or no answer (`unknown`), is a used-up
+quota, which is then recorded as the exhaustion of the windows the bundle draws instead of a hold (below); a `model`,
+`transient`, `none` or `task_input` answer stands as answered whatever the message says. This module records each such
+dispatch once in <state dir>/provider-retry.json:
   - Scope: the configured System-One classifier reads the provider's message and answers `model` (this model only),
     `account` (every model of the account, e.g. rejected credentials or a limit shared by its models), `transient`, `none` (not
     the provider refusing or failing to serve, e.g. a tool or code error), `task_input` (this task's own input was
     refused, e.g. a prompt too long for the model), or `unknown`. `none` and `task_input` hold nothing, and a failed
     turn read that way is the worker's error, not the provider's (`outcome_code`).
-    No code here reads the message (quota_exhaustion.confirmed does). `unknown`, or no classifier answer, holds the model and widens to its pool once a
+    No code here reads the message for the scope. `unknown`, or no classifier answer, holds the model and widens to its pool once a
     second model of the same pool is held the same way, i.e. a recent hold whose scope was also `unknown` (a
     `transient` or `model` hold never widens anything); `transient` and `model` hold only the model.
   - Pools: one account (one Paseo provider) can hold several independent quotas, so an `account` answer, or a widened
@@ -26,16 +29,20 @@ None is special-cased here, except that a message quota_exhaustion confirms as a
     a pool: a guess about one quota says nothing about another. An account hold taken while the account had one pool
     becomes a hold of its failed models' pools once the account has several (`scope_account_holds`).
   - Every hold ends by itself at its retry time; past it the next roll may pick the candidate again and so re-probes
-    it. The retry time backs off like a failing usage reading (usage_core.failure_retry_seconds): 2 minutes, doubling
-    with each consecutive hold of the same key, capped at the idle poll interval; an account or pool hold the
-    classifier itself scoped `account` (a quota or a credential refused for every model) caps at the re-probe period
-    the latches share (account_state.LATCH_RETRY_HOURS) instead, since each re-probe of such a quota costs the caller a
-    failed launch and a relaunch. A later `next` from the provider wins. No hold waits for a person (owner,
+    it. A model, transient or widened hold backs off like a failing usage reading (usage_core.failure_retry_seconds):
+    2 minutes, doubling with each consecutive hold of the same key, capped at the idle poll interval. An account or
+    pool hold the classifier itself scoped `account` is about a subscription, a balance or credentials, which do not
+    change in minutes: it lasts the re-probe period the latches share (account_state.LATCH_RETRY_HOURS) from its
+    observation, from the first hold on, since each re-probe costs the caller a failed launch. A later `next` from the
+    provider wins. No hold waits for a person (owner,
     2026-11-24): a hold written without a retry time (by v0.7.x, which held a classifier `account` answer until
     cleared) is due by the same rule, counted from its `observed_at` (`due_at`).
-  - A failed turn whose message is a confirmed quota failure (`quota_exhaustion.confirmed`) is not a provider hold: it
-    is recorded as the exhaustion of the windows its model draws, with the reset the message states
-    (`quota_exhaustion.record`), and the dispatch keeps the classifier's scope for the fall-back.
+  - A failed turn the classifier answered `account` or not at all whose message is a confirmed quota failure is not a
+    provider hold: it is recorded as the exhaustion of the windows the bundle draws (dispatch_registry.quota_latch:
+    the whole account only when it declares no window at all), with the reset the message states
+    (`quota_exhaustion.record`), and the dispatch keeps the classifier's scope for the fall-back. A bundle drawing none
+    of its account's windows (another launch prefix of the account) has no window to latch: the classifier's hold of
+    its own pool stands.
   - Lifting early: the tray's clear button (one pool at a time when pools are held), `agentcompass hold --clear ACCOUNT`
     (every hold of it), `ACCOUNT#POOL` (that pool's hold and its models') or `ACCOUNT/MODEL` (that model's hold only);
     a probe: routing never picks a held bundle, but a model the user names explicitly (`roll --model`) is dispatched
@@ -300,11 +307,13 @@ def classify_scope(account, provider, model, message, failure=FAILURE_CODE):
 
 
 def retry_seconds(streak, account_scoped=False):
-    """Seconds a hold lasts after `streak` consecutive holds of its key: the usage reader's failure backoff, capped at the
-    idle poll interval, or at the latches' re-probe period for a hold the classifier scoped `account` (`account_scoped`)."""
+    """Seconds a hold lasts after `streak` consecutive holds of its key: the latches' re-probe period for a hold the
+    classifier scoped `account` (`account_scoped`: a subscription, balance or credential, which does not change in
+    minutes), from the first hold on; otherwise the usage reader's failure backoff, capped at the idle poll interval."""
     import usage_core
-    cap = int(account_state.LATCH_RETRY_HOURS * 3600) if account_scoped else usage_core.IDLE_REFRESH_SECONDS
-    return usage_core.failure_retry_seconds(streak, cap)
+    if account_scoped:
+        return int(account_state.LATCH_RETRY_HOURS * 3600)
+    return usage_core.failure_retry_seconds(streak, usage_core.IDLE_REFRESH_SECONDS)
 
 
 def _account_hold(entry):
@@ -312,7 +321,7 @@ def _account_hold(entry):
 
 
 def account_scoped(entry):
-    """An account or pool hold the classifier itself scoped `account` (its backoff caps at the latches' period)."""
+    """An account or pool hold the classifier itself scoped `account` (it lasts the latches' re-probe period)."""
     return _account_hold(entry) and entry.get('scope') == 'account'
 
 
@@ -374,14 +383,16 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
     scope, meta = (classify or classify_scope)(account, provider, model, message, code)
     scope = scope if scope in SCOPES else 'unknown'
     at = _time(at) or _time(failure.get('at')) or datetime.now(timezone.utc)
-    # A used-up quota is not a provider hold: it is the exhaustion of the windows the model draws, latched with the reset
-    # the message states (quota_exhaustion owns both). The dispatch keeps the classifier's scope for the fall-back.
+    # A used-up quota the classifier scoped `account` (or did not scope) is not a provider hold: it is the exhaustion of
+    # the windows the bundle draws, latched with the reset the message states (quota_exhaustion owns both). The dispatch
+    # keeps the classifier's scope for the fall-back. Any other answer stands as answered.
     import quota_exhaustion
-    quota = quota_exhaustion.confirmed(message)
+    quota = scope in ('account', 'unknown') and quota_exhaustion.confirmed(message)
     if quota:
         import dispatch_registry
-        quota_exhaustion.record(account, message, windows=dispatch_registry.bundle_windows(bundle, accounts),
-                                at=at.isoformat(), source=dispatch_id)
+        quota, windows = dispatch_registry.quota_latch(bundle, accounts)
+        if quota:
+            quota_exhaustion.record(account, message, windows=windows, at=at.isoformat(), source=dispatch_id)
     # Reading the accounts can take a moment too, and a scope that holds nothing needs no pool.
     pool = resolve_pool(bundle, accounts) if scope not in NO_HOLD and not quota else None
     nxt = _time(failure.get('next'))
@@ -407,7 +418,7 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
         held = (pool_key(account, pool['id']) if pool else key(account)) if wide else key(account, model)
         previous = entries.get(held) if isinstance(entries.get(held), dict) else {}
         streak = int(previous.get('streak') or 0) + 1 if _recent(previous, at) else 1
-        # Every hold has a retry time; the classifier's own `account` answer backs off to the latches' period.
+        # Every hold has a retry time; the classifier's own `account` answer lasts the latches' re-probe period.
         retry = at + timedelta(seconds=retry_seconds(streak, wide and scope == 'account'))
         if nxt and nxt > retry:
             retry = nxt

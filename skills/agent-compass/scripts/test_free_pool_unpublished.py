@@ -168,6 +168,82 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertTrue(rows[go]['excluded'])
         self.assertNotIn('cost_basis', rows[go].get('economy') or {})
 
+    # -- who decides, and what a quota message latches -----------------------------------------------------------------
+
+    ZEN, GO = 'opencode/deepseek-v4.1-flash-free', 'opencode-go/glm-5.3'
+
+    def with_go(self):
+        import auto_bundles
+        from router_test_support import fleet_with_derived_bundles
+        acc = self.only(POOL)
+        catalog = {'providers': {POOL: {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
+                                        'models': [{'id': self.ZEN}, {'id': self.GO}]}}}
+        return fleet_with_derived_bundles(acc, auto_bundles.derive(acc, catalog, 2))
+
+    def bundle_of(self, acc, launch):
+        bid, b = next((i, b) for i, b in acc['accounts'][POOL]['bundles'].items() if b.get('launch_model') == launch)
+        return {**b, 'id': bid, 'account': POOL}
+
+    def fail_bundle(self, acc, launch, message, dispatch_id, scope='account'):
+        with tf._synthetic_doc_ctx(self.doc):
+            return provider_retry.record(self.bundle_of(acc, launch), {
+                'failure_code': provider_retry.TURN_FAILED_CODE, 'provider_message': message,
+                'at': self.now.isoformat()}, dispatch_id=dispatch_id, accounts=acc,
+                classify=lambda *args: (scope, {'source': 'system_one'}))
+
+    def latch(self):
+        return (quota_exhaustion._read(quota_exhaustion.store_path()).get('accounts') or {}).get(POOL) or {}
+
+    def test_a_quota_message_latches_only_the_windows_the_failing_bundle_draws(self):
+        """Rule (provider_retry.record, dispatch_registry.quota_latch): a used-up quota latches the windows the failing
+        bundle draws. A Go bundle draws none of the account's windows, so its limit takes nothing of the free allowance
+        out (the classifier's hold of its own prefix pool stands), and the allowance's limit takes nothing of Go out."""
+        acc = self.with_go()
+        self.fail_bundle(acc, self.GO, 'Go plan: monthly limit reached, resets Dec 1', 'g1')
+        self.assertFalse(self.latch().get('blocked'), self.latch())
+        self.assertEqual(set(provider_retry.active()), {f'{POOL}#opencode-go'})
+        zen = next(c for c in self.rows(self.plan(self.discovered(acc))) if c['bundle'].get('launch_model') == self.ZEN)
+        self.assertFalse(zen['excluded'], zen['excluded'])
+        self.assertFalse(zen.get('available_in_hours'))
+        provider_retry.clear_key(f'{POOL}#opencode-go')
+        self.fail_bundle(acc, self.ZEN, LIMIT, 'z1')
+        self.assertEqual(self.latch().get('windows'), ['allowance'])
+        held = self.discovered(acc)
+        import quota_pools
+        with tf._synthetic_doc_ctx(self.doc):
+            self.assertEqual(quota_pools.launch_blockers(self.bundle_of(acc, self.GO), held, {'accounts': {}}, self.now), [])
+            self.assertTrue(quota_pools.launch_blockers(self.bundle_of(acc, self.ZEN), held, {'accounts': {}}, self.now))
+
+    def test_an_account_that_declares_no_window_latches_as_a_whole(self):
+        """Where the failing bundle's windows are unknown because its account declares no quota window at all, the
+        whole account is the smallest true scope (dispatch_registry.quota_latch); where the account declares windows
+        the bundle does not draw, nothing is latched."""
+        import dispatch_registry
+        acc = self.with_go()
+        with tf._synthetic_doc_ctx(self.doc):
+            self.assertEqual(dispatch_registry.quota_latch(self.bundle_of(acc, self.ZEN), acc), (True, ['allowance']))
+            self.assertEqual(dispatch_registry.quota_latch(self.bundle_of(acc, self.GO), acc), (False, None))
+            bare = copy.deepcopy(acc)
+            bare['accounts']['meter'] = {'plan': 'API', 'billing': 'metered', 'verified': True, 'windows': {},
+                                         'bundles': {'m': {'provider': 'claude', 'harness': 'claude', 'model': 'claude-sonnet-5-5'}}}
+            self.assertEqual(dispatch_registry.quota_latch({**bare['accounts']['meter']['bundles']['m'], 'account': 'meter'},
+                                                           bare), (True, None))
+
+    def test_the_quota_pattern_decides_only_where_the_classifier_answered_account_or_nothing(self):
+        """Classifier authority (provider_retry docstring): the quota pattern turns an `account` answer or no answer
+        (`unknown`) into a quota record of the windows the bundle draws; `model`, `transient`, `none` and `task_input`
+        stand as answered."""
+        acc = self.with_go()
+        for n, (scope, latched, held) in enumerate((('account', True, False), ('unknown', True, False),
+                                                    ('model', False, True), ('transient', False, True),
+                                                    ('none', False, False), ('task_input', False, False))):
+            with self.subTest(scope=scope):
+                (self.state / 'quota-exhaustion.json').unlink(missing_ok=True)
+                (self.state / provider_retry.FILE).unlink(missing_ok=True)
+                self.fail_bundle(acc, self.ZEN, LIMIT, f's{n}', scope=scope)
+                self.assertEqual(bool(self.latch().get('blocked')), latched, self.latch())
+                self.assertEqual(bool(provider_retry.active()), held, provider_retry.active())
+
     # -- the limit error ------------------------------------------------------------------------------------------------
 
     def expected_resets(self):
@@ -269,7 +345,7 @@ class StatedResetParseTests(unittest.TestCase):
         if at_21 <= local:
             at_21 = (local.replace(tzinfo=None) + timedelta(days=1)).replace(hour=21, minute=0).astimezone()
         cases = {"They reset at 21:00": at_21,
-                 "They reset at Oct 28, 2026, 12:59AM": datetime(2026, 10, 28, 0, 59).astimezone(),
+                 "They reset at Nov 26, 2026, 12:59AM": datetime(2026, 11, 26, 0, 59).astimezone(),
                  'reintentando en 74000s - intento n.º 1': self.AT + timedelta(seconds=74000),
                  'retrying in 120s': self.AT + timedelta(seconds=120)}
         for text, expected in cases.items():
@@ -281,6 +357,42 @@ class StatedResetParseTests(unittest.TestCase):
                      'They reset at Foo 28, 2026, 12:59AM', 'They reset at Oct 32, 2026, 12:59AM'):
             with self.subTest(text=text):
                 self.assertIsNone(quota_exhaustion.stated_reset(text, self.AT))
+
+    def test_a_zone_the_sentence_states_is_used(self):
+        """A clock or date followed by a zone (UTC, GMT+8, an IANA name) is that zone's wall time; with none it is the
+        machine's local time (the vendor's client prints wall-clock time for its user)."""
+        from zoneinfo import ZoneInfo
+        new_york = ZoneInfo('America/New_York')
+        cases = {'Usage limit reached. It resets at 15:00 UTC': datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc),
+                 'Usage limit reached. It resets at 09:00 UTC': datetime(2026, 11, 25, 9, 0, tzinfo=timezone.utc),
+                 'Usage limit reached. It resets at 23:30 GMT+8': datetime(2026, 11, 24, 23, 30,
+                                                                         tzinfo=timezone(timedelta(hours=8))),
+                 'It resets at 3:00 PM (America/New_York)': datetime(2026, 11, 24, 15, 0, tzinfo=new_york),
+                 'They reset at Nov 26, 2026, 12:59AM UTC': datetime(2026, 11, 26, 0, 59, tzinfo=timezone.utc)}
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(quota_exhaustion.stated_reset(text, self.AT), expected)
+        with self.subTest('a zone name no zone database knows is unreadable'):
+            self.assertIsNone(quota_exhaustion.stated_reset('It resets at 3:00 PM (Nowhere/Atlantis)', self.AT))
+
+    def test_a_reset_not_in_the_future_or_beyond_every_quota_period_is_unreadable(self):
+        """A stated reset must lie after the observation and no further than the longest reset period any window of
+        the shipped plan templates has (declared data); otherwise the latch's re-probe period applies."""
+        longest = quota_exhaustion.longest_reset_hours()
+        self.assertIsNotNone(longest)
+        templates = provider_inventory.shipped_plan_templates()
+        self.assertEqual(longest, max(w['hours'] for plans in templates.values() for t in plans.values()
+                                      if isinstance(t, dict) for w in (t.get('windows') or {}).values()
+                                      if isinstance(w.get('hours'), (int, float))))
+        beyond = self.AT + timedelta(hours=longest) + timedelta(days=1)
+        for text in ('They reset at Oct 28, 2025, 12:59AM', 'Free usage limit reached, retrying in 0s',
+                     'Free usage limit reached, retrying in 99999999999s',
+                     f"They reset at {beyond.strftime('%b')} {beyond.day}, {beyond.year}, 12:59AM UTC",
+                     f'retrying in {int(longest * 3600) + 60}s'):
+            with self.subTest(text=text):
+                self.assertIsNone(quota_exhaustion.stated_reset(text, self.AT))
+        self.assertEqual(quota_exhaustion.stated_reset(f'retrying in {int(longest * 3600) - 60}s', self.AT),
+                         self.AT + timedelta(seconds=int(longest * 3600) - 60))
 
     def test_the_limit_sentences_are_confirmed_quota_failures(self):
         for text in (LIMIT, CLOCK, COUNTDOWN, UNREADABLE):

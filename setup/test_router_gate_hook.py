@@ -167,9 +167,20 @@ class RouterGateHookTests(unittest.TestCase):
             self.assertIn('weekly', said)
             self.assertNotIn('monthly', said)    # recorded windows only, and only those this launch draws
             self.assertNotIn('five_hour', said)
-            # What lifts a record is a newer successful reading (quota_exhaustion.py): time alone never does.
+            # No hold waits for a person (quota_exhaustion.due_at): the deny says when the record ends by itself, and the
+            # clear is only a way to end it early.
+            row = exhaustion._read(exhaustion.store_path())['accounts']['lab-acct']
+            self.assertIn(exhaustion.moment_text(exhaustion.due_at(row)), said)
             self.assertIn('newer successful usage reading', said)
-            self.assertIn('does not lift it', said)
+            for claim in ('does not lift', 'time alone', 'by hand'):
+                self.assertNotIn(claim, text)
+            self.assertIn('ends it early', text)
+            exhaustion.clear('lab-acct')
+            exhaustion.record('lab-acct', 'Usage limit reached. It resets at 15:00 UTC', windows=['weekly'])
+            row = exhaustion._read(exhaustion.store_path())['accounts']['lab-acct']
+            text = gate.check_account_quota_exhausted('lab-acct', missing, T0, windows=['weekly'])
+            self.assertIn(exhaustion.moment_text(exhaustion.stated_reset_of(row)), text)     # the reset the provider stated
+            self.assertIn('stated', text)
             exhaustion.clear('lab-acct')
             exhaustion.record('lab-acct', 'Individual quota reached')
             text = gate.check_account_quota_exhausted('lab-acct', missing, T0, windows=['weekly'])
