@@ -254,6 +254,19 @@ def harder_on_weaker(answer: dict) -> dict | None:
     return {"chosen": chosen, "stronger": best, "gap": round(best["fit"] - chosen["fit"], 3)}
 
 
+def waiting(candidate: dict) -> str:
+    """Whether a ranked candidate could start when the plan was made, as the run recorded it: "can start now", or how long
+    it waits with the router's own sentence of why (`wait_reason`, copied as recorded), or "not recorded" (below the
+    snapshot's best rows, which keep no wait, or a wait whose sentence the snapshot did not keep)."""
+    if not candidate.get("detail"):
+        return "wait not recorded"
+    hours = candidate.get("available_in_hours")
+    if not hours:
+        return "can start now"
+    said = "; ".join(candidate.get("wait_reason") or []) or "why: not recorded"
+    return f"waits {hours:g} h: {said}"
+
+
 def cost_check(answer: dict) -> dict | None:
     """For routine work (THRESHOLDS routine_level): the chosen candidate's cost against the other eligible candidates', where
     cost is the router's own ranking cost, `components.opportunity_cost` (what the score N subtracts for the quota the work
@@ -523,7 +536,8 @@ def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
     weaker = [q | {"scenario": s["name"]} for s in summary["scenarios"] for q in s["questions"]["hard_on_weaker"]]
     if weaker:
         items.append({"weight": 25 + len(weaker), "title": f"{len(weaker)} hard brief(s) launched while an eligible candidate had a clearly higher fit",
-                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": q["chosen"]["id"], "stronger": q["stronger"]["id"], "gap": q["gap"]}
+                      "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": q["chosen"]["id"], "stronger": q["stronger"]["id"], "gap": q["gap"],
+                                "stronger waits": waiting(q["stronger"])}
                                for q in weaker[:shown]]})
     dearer = [q | {"scenario": s["name"]} for s in summary["scenarios"] for q in s["questions"]["routine_on_dearer"]]
     costs = Counter()
@@ -534,7 +548,8 @@ def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
                       f"opportunity_cost (the router's ranking cost) was {limit('dearer_cost_ratio'):g}x or more another eligible candidate's; "
                       f"{costs['lowest recorded cost']} went to the lowest recorded cost, {costs['chosen cost not recorded']} not recorded",
                       "rows": [{"scenario": q["scenario"], **q["answer"], "chosen": f"{q['chosen']['id']}@{q['chosen']['account']} ({q['chosen']['opportunity_cost']})",
-                                "cheaper": f"{q['cheaper']['id']}@{q['cheaper']['account']} ({q['cheaper']['opportunity_cost']})", "ratio": q["ratio"]}
+                                "cheaper": f"{q['cheaper']['id']}@{q['cheaper']['account']} ({q['cheaper']['opportunity_cost']})", "ratio": q["ratio"],
+                                "cheaper waits": waiting(q["cheaper"])}
                                for q in dearer[:shown]]})
     unused = [(s["name"], r) for s in summary["scenarios"] for r in s["resets"]
               if r["unused"] >= limit("unused_at_reset_pp") and r["window"] not in ("five_hour",) and not r["overnight"]]
@@ -688,18 +703,20 @@ def render_scenario(scenario: dict, s: dict, run: dict) -> list[str]:
             out.append(f"Models {what} (not counted above): {', '.join(nothing[kind])}.")
     if s["questions"]["hard_on_weaker"]:
         out += ["", "Questions: hard work launched while an eligible candidate had a clearly higher fit (the plan's reason given):", ""]
-        out += md_table(["chain", "brief", "chosen (fit)", "higher fit", "plan's reason"],
-                        [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['fit']})", f"{q['stronger']['id']} ({q['stronger']['fit']})", clip(q["reason"], 220)]
+        out += md_table(["chain", "brief", "chosen (fit)", "higher fit", "higher fit could start", "plan's reason"],
+                        [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['fit']})", f"{q['stronger']['id']} ({q['stronger']['fit']})",
+                          clip(waiting(q["stronger"]), 220), clip(q["reason"], 220)]
                          for q in s["questions"]["hard_on_weaker"]])
     if s["routine_cost"]:
         out += ["", "Routine (L1) launches by the router's ranking cost (components.opportunity_cost) of the chosen candidate against the other "
                 "eligible ones: " + ", ".join(f"{k} {v}" for k, v in s["routine_cost"].items()) + "."]
     if s["questions"]["routine_on_dearer"]:
         out += ["", f"Questions: routine work launched on a candidate whose opportunity_cost was {limit('dearer_cost_ratio'):g}x or more another eligible one's:", ""]
-        out += md_table(["chain", "brief", "chosen (account, opportunity_cost, score)", "cheaper (account, opportunity_cost, score)", "ratio", "plan's reason"],
+        out += md_table(["chain", "brief", "chosen (account, opportunity_cost, score)", "cheaper (account, opportunity_cost, score)", "cheaper could start", "ratio",
+                         "plan's reason"],
                         [[q["answer"]["chain"], q["brief"], f"{q['chosen']['id']} ({q['chosen']['account']}, {q['chosen']['opportunity_cost']}, {q['chosen']['score']})",
                           f"{q['cheaper']['id']} ({q['cheaper']['account']}, {q['cheaper']['opportunity_cost']}, {q['cheaper']['score']})",
-                          q["ratio"] if q["ratio"] is not None else "above zero", clip(q["reason"], 220)]
+                          clip(waiting(q["cheaper"]), 220), q["ratio"] if q["ratio"] is not None else "above zero", clip(q["reason"], 220)]
                          for q in s["questions"]["routine_on_dearer"]])
     out += ["", "### What it cost", ""]
     timelines = window_timelines(scenario)

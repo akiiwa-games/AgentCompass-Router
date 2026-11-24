@@ -180,3 +180,11 @@ def test_a_reset_after_the_days_last_act_is_overnight():
     scenario = {"timeline": [{"at": 1.0}, {"at": 9.5}, {"at": 25.0}],
                 "resets": [{"at": 4.0, "unused": 10}, {"at": 13.0, "unused": 100}, {"at": 26.0, "unused": 50}]}
     assert [r["overnight"] for r in report.overnight(scenario)] == [False, True, True]
+
+
+def test_a_ranked_candidates_wait_is_shown_with_the_routers_sentence_or_not_recorded():
+    said = "usage renews in 50.4h; start then (assumes a full renewal)"
+    assert report.waiting({"detail": True, "available_in_hours": 50.4, "wait_reason": [said]}) == f"waits 50.4 h: {said}"
+    assert report.waiting({"detail": True, "available_in_hours": 2.6, "wait_reason": []}) == "waits 2.6 h: why: not recorded"
+    assert report.waiting({"detail": True, "available_in_hours": None, "wait_reason": None}) == "can start now"
+    assert report.waiting({"detail": False, "available_in_hours": None}) == "wait not recorded"
