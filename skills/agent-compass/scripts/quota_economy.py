@@ -440,6 +440,15 @@ class FiveAxisEconomy:
                 out.append((m, rec, share))
         return out
 
+    @staticmethod
+    def substitutes(recs, spend):
+        """For each serving window of `member_records`, the other members of its pool as its substitutes: each one's
+        slack (`five_axis_substitute_slack`) for its own share of `spend`. A member's displaced dollars find room in
+        another member of the same account with that probability, at the account's own best fit, so they enter the
+        member's ladder as outside alternatives (`ladder`). One window alone has none."""
+        slacks = [five_axis_substitute_slack(rec, spend * share) for _, rec, share in recs]
+        return [tuple(a for j, a in enumerate(slacks) if j != i) for i in range(len(recs))]
+
     def lump(self, wkey, reset_hours=None):
         """q_w, the window's burst size (advisor v3.1, option A, owner round 15): the average over the demand grid of what one
         task like the current one spends of this window on the account's own best candidate for that demand (the cheapest
@@ -480,19 +489,22 @@ class FiveAxisEconomy:
     def _outside(self, wkey, gi):
         return [self._alt(u, gi) for u in self.units if wkey not in self.unit_wkeys[u]]
 
-    def ladder(self, wkey):
-        """The account's value ladder for window `wkey`, averaged over the demand grid (owner D1)."""
-        got = self._ladders.get(wkey)
+    def ladder(self, wkey, substitutes=()):
+        """The account's value ladder for window `wkey`, averaged over the demand grid (owner D1). `substitutes`: the slack
+        of each other member of the window's pool (`substitutes`), each an outside alternative at the account's own best
+        fit, tried with the other units' best candidates by `five_axis_outside_value`."""
+        subs = tuple(sorted(substitutes))
+        got = self._ladders.get((wkey, subs))
         if got is None:
             own = self.points.get(wkey) or []
             hulls = []
             for gi in range(len(self.grid)):
                 pts = [(e['spend'], e['fits'][gi]) for e in own if e['spend'] > 0]
                 if pts:
-                    outside = five_axis_outside_value([(f, a) for f, a in self._outside(wkey, gi) if f > 0],
-                                                      max(f for _, f in pts))
-                    hulls.append(five_axis_upper_hull(pts, outside))
-            got = self._ladders[wkey] = five_axis_value_ladder(hulls)
+                    best = max(f for _, f in pts)
+                    alts = [(f, a) for f, a in self._outside(wkey, gi) if f > 0] + [(best, a) for a in subs if best > 0]
+                    hulls.append(five_axis_upper_hull(pts, five_axis_outside_value(alts, best)))
+            got = self._ladders[(wkey, subs)] = five_axis_value_ladder(hulls)
         return got
 
     def outside_at_task(self, wkey):
@@ -505,14 +517,15 @@ class FiveAxisEconomy:
             none_open *= (1.0 - a)
         return five_axis_outside_value(alts, best), best, 1.0 - none_open
 
-    def window_cost(self, wkey, rec, spend, econ_hours, start_offset_hours=0.0, share=1.0):
+    def window_cost(self, wkey, rec, spend, econ_hours, start_offset_hours=0.0, share=1.0, substitutes=()):
         """The cost of `spend` on window record `rec`; a pool member (`share` < 1) prices its share of the work on its
-        own record, with the largest spend and the fresh period's burst at that share too."""
+        own record, with the largest spend and the fresh period's burst at that share too, on its ladder with the other
+        members as its substitutes (`substitutes`)."""
         spend_max = self.spend_max.get(wkey, spend / share) * share
         tables = self._tables.setdefault((wkey, round(rec['used_usd'], 6), round(rec['elapsed_frac'], 9),
                                           round(rec['capacity_usd'], 6), round(rec['lump_usd'], 6),
-                                          round(spend_max, 6)), {})
-        return five_axis_spend_cost(rec, self.ladder(wkey), spend, econ_hours, spend_max, tables,
+                                          round(spend_max, 6), tuple(sorted(substitutes))), {})
+        return five_axis_spend_cost(rec, self.ladder(wkey, substitutes), spend, econ_hours, spend_max, tables,
                                     fresh_lump=self.lump(wkey) * share, start_offset_hours=start_offset_hours)
 
     def report(self):
@@ -527,9 +540,10 @@ class FiveAxisEconomy:
                 continue
             ladder = self.ladder(wkey)
             outside, best, slack = self.outside_at_task(wkey)
+            ladders = [self.ladder(wkey, subs) for subs in self.substitutes(recs, e['spend'])]
             terms = [{'need_probability': five_axis_need_probability(rec, rec['used_usd']),
-                      'quota_price': five_axis_quota_price(rec, ladder, rec['used_usd']) if ladder['steps'] else 0.0}
-                     for _, rec, _ in recs]
+                      'quota_price': five_axis_quota_price(rec, lad, rec['used_usd']) if lad['steps'] else 0.0}
+                     for (_, rec, _), lad in zip(recs, ladders)]
             agg = pool_record(st, cap, recs)
             period = agg['period_hours']
             out.append({
@@ -648,8 +662,8 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                 gots = [econ.window_cost((own_qsrc, wid), m_rec, spend * share, econ_h,
                                          start_offset_hours=max(float(m.get('start_offset_hours') or 0.0),
                                                                 float(st.get('start_offset_hours') or 0.0)),
-                                         share=share)
-                        for m, m_rec, share in recs]
+                                         share=share, substitutes=subs)
+                        for (m, m_rec, share), subs in zip(recs, econ.substitutes(recs, spend))]
                 unit_cost = float((1.0 + sum(float(g['cost']) for g in gots)) - 1.0)
                 row.update(priced=True, cost=unit_cost, opportunity_cost=unit_cost,
                            quota_price=round(sum(g['lambda_start'] * r[2] for g, r in zip(gots, recs)), 6),
