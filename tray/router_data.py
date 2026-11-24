@@ -906,6 +906,8 @@ def account_cards() -> list[dict]:
                     "remaining_usd": None, "reserved_pct": 0.0, "reserved_usd": 0.0, "reserved_workers": [],
                     "rate_3h": None, "rate_24h": None,
                     "reset_in": countdown((reset_at - now).total_seconds() if reset_at else None),
+                    # The latch's end is the reset the provider stated, else the time it is re-probed (never a reset).
+                    "reset_stated": bool((row or {}).get("exhausted_reset_stated")),
                     "stale": False})
         bundle_pills = []
         for bid, bspec in (spec.get("bundles") or {}).items():

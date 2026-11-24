@@ -307,9 +307,14 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertNotIn('capacity_unknown', free)
         reset = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         held = self.card({'family': 'opencode', 'status': 'ready', 'exhausted_windows': ['allowance'],
-                          'exhausted_resets_at': reset.isoformat()}, name='opencode', spec=spec)
+                          'exhausted_resets_at': reset.isoformat(), 'exhausted_reset_stated': True},
+                         name='opencode', spec=spec)
         self.assertEqual([(w['id'], w['remaining_pct']) for w in held['windows']], [('allowance', 0.0)])
         self.assertIn('5', held['windows'][0]['reset_in'])
+        # Review round 2 N4: a reset the provider stated reads as the window's countdown to its reset, like any window.
+        stated = held['windows'][0]
+        self.assertIs(stated['reset_stated'], True)
+        self.assertEqual(panel_quota.window_countdown(stated), panel_quota.short_countdown(stated['reset_in']))
         self.assertIn('供应商未公布额度上限', held['usage_hover'])
         # A limit sentence with no reset: the card shows the latch's re-probe time, as discovery publishes it.
         import tempfile
@@ -323,6 +328,14 @@ class AccountStateCardTests(unittest.TestCase):
         probed = self.card(rows['opencode'], name='opencode', spec=spec)
         self.assertEqual([(w['id'], w['remaining_pct']) for w in probed['windows']], [('allowance', 0.0)])
         self.assertTrue(probed['windows'][0]['reset_in'] not in ('', '—', None), probed['windows'][0])
+        # ... and a re-probe time never reads as a reset: the card says it is the time the quota is re-probed.
+        reprobe = probed['windows'][0]
+        self.assertIs(reprobe['reset_stated'], False)
+        bare = panel_quota.short_countdown(reprobe['reset_in'])
+        shown = panel_quota.window_countdown(reprobe)
+        self.assertNotEqual(shown, bare)
+        self.assertIn(bare, shown)
+        self.assertIn(shown, panel_quota.quota_tooltip_text(probed))
 
     def test_a_plan_without_capacity_says_whether_the_tier_was_read(self):
         # Owner, 2026-11-19: the card said "套餐未知（Mode B）", an internal name. No tier read is a failed reading;
