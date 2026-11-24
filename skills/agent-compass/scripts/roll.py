@@ -992,6 +992,8 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
             f'Nothing was launched: the turn for worker {explicit_id!r} could not be prepared: {refused}. That is a fault '
             'of the request or of the local data, not a state of the worker: fix it and roll --resume again.',
         )
+    if row.get('warnings'):
+        out = dict(out, warnings=[*out.get('warnings', []), *row['warnings']])
     receipt = dispatch_flow.launch(row['dispatch_id'], parent, watch_seconds=0)
     if explicit_id and receipt.get('state') in ('failed', 'create_failed'):
         # The named worker did not take the turn (the host refused the resume) or failed on it: nothing was started in

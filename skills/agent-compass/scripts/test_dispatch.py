@@ -136,6 +136,40 @@ class DispatchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'requires a new route'):
                 self.prepare(refused, task=dict(self.task, task_id='project-rule'))
 
+    def test_the_full_capacity_rule_holds_automatic_and_project_routes_and_warns_a_route_the_user_named(self):
+        """Rule (candidate_eval.renewal_capacity_refusal, owner's answer 2026-11-24): a window whose full capacity is short
+        of the work's estimate plus its margin keeps the bundle out of automatic routing and out of a project rule
+        (hard_constraint); a route the user named (user_override) launches past it with one warning that states the
+        rule's own estimate. Same task, same window, same reading."""
+        import re
+        short = re.compile(r'(\w+) full capacity \(\d+%\) is short of the ~([\d.]+)%')
+        task = found = None
+        for hours in (1, 2, 4, 8, 16, 40, 120):     # the first length of work this window's full capacity cannot hold
+            task = dict(self.task, task_id=f'long-work-{hours}', expected_hours=hours)
+            task['profile'] = profile_for(task)
+            plan = allocator.plan(copy.deepcopy(task), self.usage, self.now, accounts=copy.deepcopy(self.accounts),
+                                  host_policy_config={'allowed_accounts': ['claude-lab']}, read_local_state=False)
+            row = next(c for c in plan['ranking'] if c['id'] == 'lab_sonnet55_high')
+            found = next((m for e in row['excluded'] if (m := short.search(e))), None)
+            if found:
+                break
+        self.assertIsNotNone(found, 'no length of work reaches the full-capacity rule on this window')
+        window, need = found.group(1), float(found.group(2))
+        automatic = dict(task, task_id='automatic')
+        with self.assertRaisesRegex(registry.CapacityChanged, f'{window} full capacity'):
+            self.prepare(self.issue(task=automatic), task=automatic)
+        project = dict(task, task_id='project-rule')
+        with self.assertRaisesRegex(registry.CapacityChanged, f'{window} full capacity'):
+            self.prepare(self.issue(stage='record', choice='constraint', constraint='hard_constraint',
+                                    basis='Project rule', task=project), task=project)
+        named = dict(task, task_id='user-named')
+        row = self.prepare(self.issue(stage='record', choice='constraint', constraint='user_override',
+                                      basis='User named it', task=named), task=named)
+        self.assertEqual(row['bundle']['bundle_id'], 'lab_sonnet55_high')
+        self.assertEqual(len(row['warnings']), 1, row.get('warnings'))
+        stated = re.findall(r"about (\d+)% of (\w+)'s full capacity", row['warnings'][0])
+        self.assertIn((f'{need:.0f}', window), stated)
+
     def test_the_re_plan_counts_the_cadence_from_the_records_the_plan_read(self):
         # Rule (quota_pools.cadence_dispatches): a `record` row with no registry row is a launch outside roll and counts;
         # the re-plan in prepare reads the ledger as the plan does, without counting the decision it prepares. The
@@ -2612,10 +2646,6 @@ class RollTests(unittest.TestCase):
 
     def test_opencode_deepseek_explicit_override_prepares_paseo_request(self):
         (self.root / 'host.json').write_text(json.dumps({'allowed_accounts': ['claude-lab', 'codex', 'antigravity', 'opencode']}))
-        # The request's shape, not the allowance's size: the free plan as declared with no measured capacity beside it
-        # (with the shipped one this brief's estimate exceeds the window, and the full-capacity rule refuses it).
-        self.accounts['plan_templates'] = {'opencode': {'free': {
-            k: v for k, v in provider_inventory.shipped_plan_templates()['opencode']['free'].items() if k != 'capacity_measured'}}}
         for effort in ('high', 'default'):
             with self.subTest(effort=effort):
                 task = dict(self.task, task_id=f'opencode-{effort}')

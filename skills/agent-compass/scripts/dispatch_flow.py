@@ -979,7 +979,7 @@ def cli(args):
         reconcile()
         row = registry.prepare(document['decision_id'], document['task'], document['launch'],
                                usage_reading.usage_snapshot(args.usage_cache))
-        return {**public(row), 'create_agent': row['request']}
+        return {**public(row), 'create_agent': row['request'], **({'warnings': row['warnings']} if row.get('warnings') else {})}
     if action == 'start' and not args.dispatch_id:
         raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
     if action in ('reconcile', 'start'):

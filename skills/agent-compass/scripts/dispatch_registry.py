@@ -1901,7 +1901,9 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                **({'brief_path': task['brief_path']} if task.get('brief_path') else {}),
                **({'chain_id': chain_id} if chain_id else {}),
                **({k: attempt[k] for k in ('attempt_of', 'attempt', 'previous_attempt') if attempt.get(k) is not None}
-                  if attempt else {})}
+                  if attempt else {}),
+               # A route the user named launches past the full-capacity rule with its warning (candidate_eval).
+               **({'warnings': [candidate['capacity_warning']]} if candidate.get('capacity_warning') else {})}
         event(row, 'prepared', now)
         save(connection, row)
         return row

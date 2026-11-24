@@ -84,7 +84,8 @@ def binding_wait(available_at, waiting_on, hours, window, waits):
 def renewal_capacity_refusal(wid, wspec, state, spec, policy, now, unit, context_burn, econ_hours, econ_chain_hours,
                              coupling, work_hours=None):
     """Why `wid`'s full renewed capacity cannot cover `work_hours` (default: the full post-reset task/chain demand)
-    plus the window's safety margin, or None when it fits (or when `work_hours <= 0` enters no renewed period)."""
+    plus the window's safety margin, as `{'text', 'need_pct', 'full', 'margin_pct'}`, or None when it fits (or when
+    `work_hours <= 0` enters no renewed period)."""
     if unit is None or (work_hours is not None and work_hours <= 0):
         return None
     full = state.get('full', 100.0)
@@ -93,20 +94,28 @@ def renewal_capacity_refusal(wid, wspec, state, spec, policy, now, unit, context
         hours_needed = econ_hours if work_hours is None else work_hours
         need_pct = min(hours_needed, w_len) * unit * context_burn
         margin_pct = quota_pools.short_window_limits(spec, wid, policy, now)[2]
-        if full - need_pct < margin_pct:
-            return f'{wid} full capacity ({full:.0f}%) is short of the ~{need_pct:.1f}% the work needs plus {margin_pct}% margin'
-        return None
-    w_len = wspec.get('hours')
-    if w_len is None:
-        return None
-    req_hours = econ_chain_hours if coupling == 'high' else econ_hours
-    hours_needed = req_hours if work_hours is None else work_hours
-    need_pct = min(hours_needed, float(w_len)) * unit * context_burn
-    margin_pct = policy['safety_margin_pct']
-    if full - need_pct < margin_pct:
-        return (f'{wid} full capacity ({full:.0f}%) is short of the ~{need_pct:.1f}% '
+        text = f'{wid} full capacity ({full:.0f}%) is short of the ~{need_pct:.1f}% the work needs plus {margin_pct}% margin'
+    else:
+        w_len = wspec.get('hours')
+        if w_len is None:
+            return None
+        req_hours = econ_chain_hours if coupling == 'high' else econ_hours
+        hours_needed = req_hours if work_hours is None else work_hours
+        need_pct = min(hours_needed, float(w_len)) * unit * context_burn
+        margin_pct = policy['safety_margin_pct']
+        text = (f'{wid} full capacity ({full:.0f}%) is short of the ~{need_pct:.1f}% '
                 f'the work needs per period plus {margin_pct}% margin')
-    return None
+    if full - need_pct >= margin_pct:
+        return None
+    return {'text': text, 'need_pct': need_pct, 'full': full, 'margin_pct': margin_pct}
+
+
+def full_capacity_warning(account, model, shortfalls):
+    """The one warning a route the user named launches with past the full-capacity rule (`renewal_capacity_refusal`),
+    in the rule's own numbers: each short window's estimate against its full capacity."""
+    parts = ', '.join(f"about {s['need_pct']:.0f}% of {wid}'s full capacity" for wid, s in shortfalls.items())
+    return (f'{account}/{model}: the work is estimated at {parts}, so it may stop at the limit before it finishes; '
+            'launched because the user named it')
 
 
 def pin_matched_ids(task, ctx):
@@ -512,6 +521,11 @@ def evaluate_bundle(bundle, task, ctx):
     result['_five_unmetered'] = bool(spec.get('unmetered') or spec.get('unlimited'))
     # A metered (API) account is a last resort: it has a ladder of its own but is never another window's substitute.
     result['_five_metered'] = billing == 'metered'
+    # The full-capacity rule does not refuse a route the user named in this request (`user_override`: prepare sets
+    # `pinned_bundle` for it only; a project rule and an explicit resume do not): it launches with one warning in the
+    # rule's numbers. Facts (a window at 0 or latched, below its launch floor) still hold it as they hold any route.
+    override_named = not pool and task.get('pinned_bundle') == bundle['id']
+    past_full = {}      # window -> the rule's estimate this named route launches past
     if not spec.get('unmetered'):
         def exclude_if_renewal_short(wid_k, wspec_k, st_k, unit_k, work_hours=None):
             refusal = renewal_capacity_refusal(
@@ -520,8 +534,18 @@ def evaluate_bundle(bundle, task, ctx):
             )
             if refusal is None:
                 return False
-            (short_exclude if st_k.get('short') else task_exclude)(refusal)
+            if override_named:
+                past_full.setdefault(wid_k, refusal)
+                return False
+            (short_exclude if st_k.get('short') else task_exclude)(refusal['text'])
             return True
+
+        def launches_past_full(wid_k, wspec_k, st_k, unit_k):
+            """No renewal would hold this named route's work either, so it starts now rather than wait for one."""
+            if not override_named:
+                return False
+            exclude_if_renewal_short(wid_k, wspec_k, st_k, unit_k)
+            return wid_k in past_full
 
         acct_usage = ctx['usage'].get('accounts', {}).get(bundle['account']) or {}
         acct_stale = acct_usage.get('status') == 'stale' or acct_usage.get('stale') is True
@@ -600,7 +624,8 @@ def evaluate_bundle(bundle, task, ctx):
                 _, floor_pct, margin_pct = quota_pools.short_window_limits(spec, wid, policy, now)
                 eff_floor = max(floor_pct, launch_floor) if launch_floor is not None else floor_pct
                 empty = below_floor or state['remaining'] <= eff_floor
-                if empty or (step is not None and state['remaining'] - step < margin_pct):
+                if empty or (step is not None and state['remaining'] - step < margin_pct
+                             and not launches_past_full(wid, wspec, state, unit)):
                     wait = state['reset_hours']
                     what = 'is empty' if empty else f'has {state["remaining"]:.0f}%, short of the ~{step:.1f}% the work needs,'
                     full = state.get('full', 100.0)
@@ -648,6 +673,9 @@ def evaluate_bundle(bundle, task, ctx):
                 elif launch_floor is not None and full <= launch_floor:
                     task_exclude(floor_refusal or f'{wid}: launch floor ({launch_floor:g}%) reaches full capacity ({full:.0f}%)')
                 elif exclude_if_renewal_short(wid, wspec, state, unit):
+                    pass
+                elif (not below_floor and not (launch_floor is not None and state['remaining'] <= launch_floor)
+                      and launches_past_full(wid, wspec, state, unit)):
                     pass
                 elif (not state.get('unstarted') and not state['stale'] and 0 < wait < float('inf')
                       and wait >= state.get('natural_reset_hours', wait)
@@ -797,6 +825,9 @@ def evaluate_bundle(bundle, task, ctx):
                     if exclude_if_renewal_short(wid, wspec, st, unit, work_hours=req_hours - h_bef):
                         continue
                     five_window_states[wid] = (wspec, {**st, 'start_offset_hours': available_at}, cap_usd_w, unit)
+    if past_full:
+        result['capacity_warning'] = full_capacity_warning(bundle['account'], model, past_full)
+        result['notes'].append(result['capacity_warning'])
     if (pool or (not task.get('disable_fast') and available_at is None)) and not result['excluded'] and not result.get('_five_long_wait'):
         fast_info = ((info.get('five_axis') or {}).get('fast_mode')) or {}
         if fast_info.get('status') == 'ok' and fast_modes.supported(harness, model, info):
