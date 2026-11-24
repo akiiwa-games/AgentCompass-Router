@@ -675,6 +675,9 @@ def step_paseo_host(z: Zero):
         op.check(f"[{scenario}] the failed dispatch no longer holds a reservation", not [r for r in reservations if r.get("dispatch_id") == did], reservations)
         mail = [m for m in z.inbox(PARENT) if scenario in m["text"]]
         op.check(f"[{scenario}] no success report was sent", not mail, mail)
+        # A failed turn holds its provider until the retry time (provider_retry); the next case needs the account now.
+        for key in list(parse(z.call(op, "hold", **env).stdout) or {}):
+            z.call(op, "hold", "--clear", key, **env)
 
     op = run.operation("Paseo host: hang, cancel and release", "a running dispatch cannot be released; once the agent is stopped on the host, observation ends it and frees the reservation")
     result = z.call(op, "roll", "--task", z.task("hang", "paseo"), **env)
@@ -831,7 +834,7 @@ def step_quota_and_recovery(z: Zero):
         result = z.call(op, "roll", "--task", z.task("ok", marker) + marker + "\n", "--parent-host", "paseo", "--parent-id", PARENT)
         doc = parse(result.stdout) or {}
         op.check(f"[{marker}] it refuses mechanical fallback (status blocked, reason scorer_unavailable) and launches no worker",
-                 doc.get("status") == "blocked" and doc.get("reason") == "scorer_unavailable" and len(z.workers()) == before_workers and "parent" in (doc.get("next_action") or "").lower(),
+                 doc.get("status") == "blocked" and doc.get("reason") == "scorer_unavailable" and len(z.workers()) == before_workers and "yourself in this session" in (doc.get("next_action") or ""),
                  json.dumps(doc)[:500] + result.stderr[-200:])
 
 
@@ -903,8 +906,12 @@ def step_hooks_and_crash(z: Zero):
         orca_env = {"ORCA_AGENT_SESSION_ID": "orca-zero-sess", "ORCA_TERMINAL_HANDLE": "term_zero", "CLAUDECODE": "1",
                     "CLAUDE_CODE_SESSION_ID": "claude-zero-uuid", "PASEO_AGENT_ID": None}
         # Opus, so the unparented Sonnet record above cannot answer for this launch.
-        z.call(op, "roll", "--task", z.task("ok", "orca-terminal"), "--provider", "claude", "--account", "claude",
-               "--model", "claude-opus-5-5", "--effort", "high", "--basis", "from-zero orca gate test", **orca_env)
+        handed = parse(z.call(op, "roll", "--task", z.task("ok", "orca-terminal"), "--provider", "claude", "--account", "claude",
+                              "--model", "claude-opus-5-5", "--effort", "high", "--basis", "from-zero orca gate test", **orca_env).stdout) or {}
+        op.check("the roll hands the launch over as the Orca command", handed.get("native_tool") == "shell:orca worker launch" and handed.get("launch_fields"),
+                 {k: handed.get(k) for k in ("status", "native_tool", "launch_fields")})
+        launch = " ".join(["orca orchestration worker-start --spec \"orca work\" --worktree current",
+                           *(f"{flag} {value}" for flag, value in (handed.get("launch_fields") or {}).items()), "--json"])
         ledger = box.state / "router-ledger.jsonl"
         rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()] if ledger.is_file() else []
         routed = next((r for r in reversed(rows) if (r.get("bundle") or {}).get("model") == "claude-opus-5-5"), {})
@@ -912,16 +919,17 @@ def step_hooks_and_crash(z: Zero):
                  {k: routed.get(k) for k in ("stage", "parent_id", "host_session_id", "bundle")})
 
         def orca_gate(session):
-            body = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Agent", "session_id": session,
-                               "tool_input": {"subagent_type": "general-purpose", "prompt": "orca work", "model": "opus"}})
+            body = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": session,
+                               "tool_input": {"command": launch}})
             done = subprocess.run([GIT_BASH, "-c", command], input=body, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                   env=box.env(**z.env()), cwd=str(z.work), timeout=60)
             op.log([command], f"installed gate command, Claude session {session}", done)
             return ((parse(done.stdout) or {}).get("hookSpecificOutput") or {}).get("permissionDecision"), done.stdout
-        verdict, out = orca_gate("claude-zero-uuid")
-        op.check("the Claude session that ran the roll may launch the routed worker", verdict != "deny", out[:400])
+        # The hand-over is for one launch, so the session it is not for goes first.
         verdict, out = orca_gate("claude-someone-else")
-        op.check("an unrelated Claude session is still denied", verdict == "deny", out[:400])
+        op.check("an unrelated Claude session is denied the handed-over launch", verdict == "deny", out[:400])
+        verdict, out = orca_gate("claude-zero-uuid")
+        op.check("the Claude session that ran the roll may launch the routed worker with the command roll handed over", verdict != "deny", out[:400])
 
     op = run.operation("roll killed while it creates", "the dispatch outlives its roll process; the continuation finds the same agent and finishes it with no second create")
     env = z.paseo_env()
