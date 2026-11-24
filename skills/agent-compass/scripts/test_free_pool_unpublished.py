@@ -8,6 +8,8 @@ Rules under test (skills/agent-compass/references/router-internals.md, section 2
   - with C the pool is priced by the same function as any window from C, U, t0 and T: equal inputs give an equal
     term, the term is non-decreasing in the used share, and a pool that never resets (T = inf) has a recovery line of 0;
   - with no observed boundary the reading is the conservative one (U over the last T hours, the reset T hours away);
+  - a reset the vendor gives as data (OpenCode's retry-after, read back from its own store) beats the sentence's own
+    and the latches' re-probe period; an observed reset with no stated period reads the measurement's period;
   - the vendor's limit error, recorded by the real writer (provider_retry.record -> quota_exhaustion.record), is the
     exhaustion of the allowance window with the reset the error states; held until that reset, a quota wait like any
     used-up window; eligible again after it; a sentence with no readable reset falls to the latches' re-probe period.
@@ -15,9 +17,11 @@ The measured figure here is a fixture value, not shipped data. No winner, share 
 """
 import copy
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -256,6 +260,25 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertTrue(plain['opencode-b'].get('capacity_unknown'))
         self.assertEqual(measured['opencode-b']['capacity_usd'], {'allowance': MEASURED['capacity_usd']})
         self.assertEqual(measured['opencode-b']['capacity_source']['allowance']['status'], 'maintainer')
+
+    def test_an_observation_with_no_stated_period_reads_the_period_of_the_shipped_measurement(self):
+        """Rule (free_allowance_period): the period of an observed reset is the error's own, else the shipped
+        measurement's; with neither there is no period to read the spend over, so no C."""
+        given = self.now + timedelta(hours=20)
+        self.assertTrue(quota_exhaustion.record(POOL, LIMIT, windows=['allowance'], at=self.now.isoformat(),
+                                                resets_at=given))
+        calls = []
+        with patch.object(axis_scores, 'opencode_local_spend', spend_of(0.25, calls=calls)):
+            measured = self.overlay(self.with_measured(self.only(POOL, acc=self.bare)))['accounts'][POOL]
+            plain = self.overlay(self.only(POOL, acc=self.bare))['accounts'][POOL]
+        period = timedelta(hours=MEASURED['period_hours'])
+        self.assertIn((given - period, self.now), calls)
+        self.assertEqual((measured['capacity_usd'], measured['capacity_source']['allowance']['status']),
+                         ({'allowance': 0.25}, 'observed'))
+        self.assertEqual(measured['local_period']['boundary'], 'observed')
+        self.assertEqual(datetime.fromisoformat(measured['local_period']['resets_at']), given)
+        self.assertTrue(plain.get('capacity_unknown'))
+        self.assertIn('no period', plain['capacity_source']['allowance']['reason'])
 
     def test_without_an_observed_boundary_the_reading_is_the_conservative_one(self):
         """Rule (free_allowance_period): with no observed reset, U is the spend of the last T hours and the reset is T
@@ -578,15 +601,103 @@ class ObservationStoreTests(unittest.TestCase):
         self.assertEqual(quota_exhaustion.observation(POOL, path=self.path), seen)
         self.assertIsNone(quota_exhaustion.observation('another', path=self.path))
 
-    def test_a_sentence_without_reset_or_period_observes_nothing_and_the_next_observation_replaces_the_last(self):
-        for n, text in enumerate((LIMIT, COUNTDOWN, UNREADABLE)):
+    def test_an_error_with_no_reset_observes_nothing_and_the_next_observation_replaces_the_last(self):
+        for n, text in enumerate((LIMIT, UNREADABLE)):
             self.assertTrue(quota_exhaustion.record(POOL, text, at=(self.at + timedelta(minutes=n)).isoformat(),
                                                     path=self.path), text)
             self.assertIsNone(quota_exhaustion.observation(POOL, path=self.path), text)
+        # A reset with no stated period is an observation without one (the period then comes from the measurement).
+        quota_exhaustion.record(POOL, COUNTDOWN, at=(self.at + timedelta(minutes=5)).isoformat(), path=self.path)
+        seen = quota_exhaustion.observation(POOL, path=self.path)
+        self.assertEqual(seen['resets_at'], self.at + timedelta(minutes=5, seconds=74000))
+        self.assertNotIn('period_hours', seen)
         first, second = self.at + timedelta(hours=1), self.at + timedelta(hours=2)
         quota_exhaustion.record(POOL, CLOCK, at=first.isoformat(), path=self.path)
         quota_exhaustion.record(POOL, CLOCK, at=second.isoformat(), path=self.path)
         self.assertEqual(quota_exhaustion.observation(POOL, path=self.path)['observed_at'], second)
+
+    def test_a_reset_given_as_data_beats_the_sentence_and_the_default_within_the_same_bounds(self):
+        """Rule (quota_exhaustion.record): a reset the vendor gave as data (`resets_at`) beats the sentence's own and the
+        latches' re-probe period; it is held to the bounds of a stated reset (after the error, within the longest plan
+        period), else the sentence or the default applies."""
+        given = self.at + timedelta(hours=20, minutes=4)
+        for n, text in enumerate((LIMIT, CLOCK, COUNTDOWN)):
+            with self.subTest(text=text):
+                at = self.at + timedelta(minutes=n)
+                quota_exhaustion.record(POOL, text, at=at.isoformat(), path=self.path, resets_at=given)
+                row = quota_exhaustion._read(self.path)['accounts'][POOL]
+                self.assertEqual(quota_exhaustion.due_at(row), given)
+                self.assertEqual(quota_exhaustion.observation(POOL, path=self.path)['resets_at'], given)
+        longest = quota_exhaustion.longest_reset_hours()
+        for n, bad in enumerate((self.at - timedelta(hours=1), self.at + timedelta(hours=longest + 1))):
+            with self.subTest(bad=bad):
+                at = self.at + timedelta(minutes=10 + n)
+                quota_exhaustion.record(POOL, COUNTDOWN, at=at.isoformat(), path=self.path, resets_at=bad)
+                row = quota_exhaustion._read(self.path)['accounts'][POOL]
+                self.assertEqual(quota_exhaustion.due_at(row), at + timedelta(seconds=74000))
+
+
+class OpenCodeFailureResetTests(unittest.TestCase):
+    """axis_scores.opencode_failure_reset: OpenCode keeps a failed turn's error object, retry-after included, in its own
+    session store; Paseo's turn failure keeps only the text. The reset is read back for the text the router got."""
+    # The client's error object, verbatim from a live run on 2026-11-24 (parent's message; fixture data, no turn is run).
+    ERROR = {"type": "provider.free-limit", "message": LIMIT, "status": 429, "response": {"body": json.dumps(
+        {"type": "error", "error": {"type": "FreeUsageLimitError", "message": "Free usage limit reached. Free models work in "
+                                    "OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: "
+                                    "https://opencode.ai/go"}})}, "retryAfterMs": 72230000}
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix='opencode-store-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.db = root / 'opencode.db'
+        self.at = datetime(2026, 11, 24, 4, 2, 40, tzinfo=timezone.utc)
+        env = patch.dict(os.environ, {'OPENCODE_DB_PATH': str(self.db)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def store(self, rows):
+        conn = sqlite3.connect(self.db)
+        conn.execute('CREATE TABLE IF NOT EXISTS session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, '
+                     'time_created INTEGER, time_updated INTEGER, data TEXT)')
+        for n, (stamp, error) in enumerate(rows):
+            ms = int(stamp.timestamp() * 1000)
+            conn.execute('INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)', (
+                f'm{n}', 's', 'idle', n, ms, ms, json.dumps({'time': {'created': ms}, 'outcome': 'failed', 'error': error})))
+        conn.commit()
+        conn.close()
+
+    def test_the_newest_row_with_the_same_text_gives_its_stamp_plus_the_retry_after(self):
+        failed = self.at - timedelta(seconds=11)
+        self.store([(self.at - timedelta(days=12), self.ERROR),                               # an earlier failure
+                    (failed, self.ERROR),
+                    (failed + timedelta(seconds=2), {**self.ERROR, 'message': 'another error', 'retryAfterMs': 5}),
+                    (self.at + timedelta(minutes=5), {**self.ERROR, 'retryAfterMs': 1})])     # after this failure
+        expected = failed + timedelta(milliseconds=self.ERROR['retryAfterMs'])
+        self.assertEqual(axis_scores.opencode_failure_reset(LIMIT, self.at), expected)
+        self.assertIsNone(axis_scores.opencode_failure_reset('Free usage', self.at, cut_at=2000))   # not a cut text
+        self.assertEqual(axis_scores.opencode_failure_reset(LIMIT[:20], self.at, cut_at=20), expected)
+        self.assertIsNone(axis_scores.opencode_failure_reset('another error, not stored', self.at))
+        self.assertIsNone(axis_scores.opencode_failure_reset(LIMIT, self.at, read_local_db=False))
+
+    def test_a_turn_failure_latches_the_pool_until_the_reset_given_as_data(self):
+        """End to end through the real writer (provider_retry.record -> quota_exhaustion.record): the sentence states
+        no time, the store holds the retry-after, and the latch ends at it, not at the re-probe period."""
+        tf.setUpModule()
+        accounts = sim.fresh_accounts(shipped_template(), snapshot())
+        acc = copy.deepcopy(accounts)
+        acc['accounts'] = {POOL: acc['accounts'][POOL]}
+        state = Path(tempfile.mkdtemp(prefix='latch-'))
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.store([(now - timedelta(seconds=5), self.ERROR)])
+        bid, bundle = next(iter(acc['accounts'][POOL]['bundles'].items()))
+        with patch.dict(os.environ, {'ROUTER_STATE_DIR': str(state), 'ROUTER_PROVIDER_RETRY': str(state / provider_retry.FILE)}), \
+                tf._synthetic_doc_ctx(tf.document(accounts['models'])):
+            self.assertIsNone(provider_retry.record({**bundle, 'id': bid, 'account': POOL}, {
+                'failure_code': provider_retry.TURN_FAILED_CODE, 'provider_message': LIMIT, 'at': now.isoformat()},
+                dispatch_id='d-data', accounts=acc, classify=lambda *args: ('account', {'source': 'system_one'})))
+            found = quota_exhaustion.ends(POOL)
+        self.assertEqual(found, (now - timedelta(seconds=5) + timedelta(milliseconds=self.ERROR['retryAfterMs']), True))
 
 
 class BoundedSpendTests(unittest.TestCase):
@@ -594,8 +705,6 @@ class BoundedSpendTests(unittest.TestCase):
     after `since` and before `until`, at the model's list price; discovery's totals carry no time and are left out."""
 
     def test_a_bounded_read_sums_only_the_messages_inside_the_period(self):
-        import json
-        import sqlite3
         root = Path(tempfile.mkdtemp(prefix='opencode-db-'))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         db = root / 'opencode.db'

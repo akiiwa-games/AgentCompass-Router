@@ -132,6 +132,50 @@ def opencode_token_usd(price, tok_in, tok_out, tok_cache_read, tok_cache_write):
             + float(tok_out or 0) * value['output']) / 1e6
 
 
+def opencode_db_path():
+    """OpenCode's own local database: `OPENCODE_DB_PATH`, else its default place under the home directory."""
+    return Path(os.environ.get('OPENCODE_DB_PATH') or (Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db'))
+
+
+def opencode_failure_reset(message, at, *, cut_at=None, read_local_db=True):
+    """The reset OpenCode gave as data for a failed turn whose error text is `message`, as an aware datetime, else None.
+
+    OpenCode keeps a failed turn's error object in its session store (`session_message.data.error`, read 2026-11-24 from
+    opencode v2.2.6): {type, message, status, response, retryAfterMs}. Paseo's turn failure keeps only `message`
+    (@getpaseo/server opencode/v2/turns.js, `finish`), so the router reads the field here: the newest row stamped no
+    later than a minute after `at` whose error text is `message` (a text cut at `cut_at` characters matches as a prefix) and
+    whose `retryAfterMs` is a positive number gives its stamp plus that delay. The caller bounds it like any stated reset
+    (quota_exhaustion.record), so a row of an earlier failure, whose reset has passed, gives nothing."""
+    import sqlite3
+    text = message.strip() if isinstance(message, str) else ''
+    db_path = opencode_db_path() if read_local_db else None
+    if not text or at is None or db_path is None or not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=1.0)
+        try:
+            rows = conn.execute(
+                "SELECT time_created, data FROM session_message WHERE time_created <= ? AND data LIKE '%retryAfterMs%' "
+                "ORDER BY time_created DESC LIMIT 200", (int((at + timedelta(minutes=1)).timestamp() * 1000),)).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    for stamp, raw in rows:
+        try:
+            error = json.loads(raw).get('error')
+        except (TypeError, ValueError, AttributeError):
+            continue
+        said = error.get('message') if isinstance(error, dict) else None
+        delay = error.get('retryAfterMs') if isinstance(error, dict) else None
+        said = said.strip() if isinstance(said, str) else None
+        if (said is not None and (said == text or bool(cut_at) and len(text) >= cut_at and said.startswith(text))
+                and isinstance(stamp, (int, float))
+                and isinstance(delay, (int, float)) and not isinstance(delay, bool) and delay > 0):
+            return datetime.fromtimestamp((stamp + delay) / 1000, timezone.utc)
+    return None
+
+
 def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, since=None, until=None):
     """(spend, unpriced): lower-bound USD per model from local `opencode.db` token counts at the model's public list
     price, and the sorted ids of models with tokens but no list price in the data (round 12 S6). A model id matches a
@@ -153,9 +197,7 @@ def opencode_local_spend(models_table, discovery=None, *, read_local_db=True, si
             readings.append(('discovery', model_id, m_row.get('input'),
                              float(m_row.get('output') or 0) + float(m_row.get('reasoning') or 0),
                              m_row.get('cache_read'), m_row.get('cache_write')))
-    db_path = (Path(os.environ.get('OPENCODE_DB_PATH')
-                    or (Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db'))
-               if read_local_db else None)
+    db_path = opencode_db_path() if read_local_db else None
     if db_path is not None and db_path.exists():
         try:
             conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=1.0)
@@ -366,11 +408,19 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
     obs = quota_exhaustion.observation(name) if read_local_state else None
     measured = (unpublished or {}).get('measured')
     found, gap_reason = None, None
-    if obs:
-        period = obs['period_hours']
+    # The period between resets: stated by the error ("today's"), else the one the shipped measurement was taken over.
+    obs_period = (obs or {}).get('period_hours') or (float(measured['period_hours']) if measured else None)
+    if obs and not obs_period:
+        gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} gave its reset but no period, and no "
+                      'measurement ships one: no period to read its spend over')
+    elif obs:
+        period = obs_period
         start = obs['resets_at'] - timedelta(hours=period)
-        used, gap = spent(start, obs['observed_at'])
-        if gap:
+        used, gap = (None, ()) if start > obs['observed_at'] else spent(start, obs['observed_at'])
+        if used is None:
+            gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} gave a reset more than {period:g} h "
+                          'away: it does not end a period of that length')
+        elif gap:
             gap_reason = (f"the limit error at {obs['observed_at'].isoformat()} ended a period in which models with no "
                           f"list price spent ({', '.join(gap)}): its capacity cannot be priced")
         elif used <= 0:
@@ -380,8 +430,10 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
             found = (round(used, 4), {
                 'status': 'observed', 'as_of': obs['observed_at'].isoformat(), 'period_hours': period,
                 'evidence': (f"spent ${used:.4f} at public list price (opencode.db) from {start.isoformat()} to the "
-                             f"limit error at {obs['observed_at'].isoformat()}; the error stated the reset "
-                             f"{obs['resets_at'].isoformat()} of a {period:g} h allowance")}, period)
+                             f"limit error at {obs['observed_at'].isoformat()}, which gave the reset "
+                             f"{obs['resets_at'].isoformat()}; a {period:g} h period "
+                             f"({'stated by the error' if obs.get('period_hours') else 'of the shipped measurement'})")},
+                     period)
     if found is None and measured:
         found = (float(measured['capacity_usd']), {
             'status': 'maintainer', 'as_of': measured['as_of'], 'period_hours': float(measured['period_hours']),
@@ -389,7 +441,7 @@ def free_allowance_period(name, spec, family, unpublished, accounts, *, read_loc
     if found is None:
         return {'gap': gap_reason} if gap_reason else None
     capacity, source, period = found
-    if obs and obs['period_hours'] == period:
+    if obs and obs_period == period and obs['resets_at'] - timedelta(hours=period) <= obs['observed_at']:
         resets = obs['resets_at']
         if resets <= now:
             resets += timedelta(hours=period) * (int((now - resets) / timedelta(hours=period)) + 1)

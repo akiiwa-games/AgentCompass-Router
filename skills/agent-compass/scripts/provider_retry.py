@@ -392,7 +392,11 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
         import dispatch_registry
         quota, windows = dispatch_registry.quota_latch(bundle, accounts)
         if quota:
-            quota_exhaustion.record(account, message, windows=windows, at=at.isoformat(), source=dispatch_id)
+            # The reset the vendor gave as data beats the sentence: OpenCode's retry-after, which Paseo's turn
+            # failure drops, read back from OpenCode's own store (axis_scores.opencode_failure_reset).
+            import axis_scores
+            quota_exhaustion.record(account, message, windows=windows, at=at.isoformat(), source=dispatch_id,
+                                    resets_at=axis_scores.opencode_failure_reset(message, at, cut_at=MESSAGE_LIMIT))
     # Reading the accounts can take a moment too, and a scope that holds nothing needs no pool.
     pool = resolve_pool(bundle, accounts) if scope not in NO_HOLD and not quota else None
     nxt = _time(failure.get('next'))
