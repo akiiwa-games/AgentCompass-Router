@@ -272,11 +272,14 @@ def record_constraint(args, task=None, classified=None):
     if chosen:
         quota_bundle['id'] = chosen
         quota_bundle.setdefault('bundle_id', chosen)
-    _check_record_launch(args, pin, quota_bundle, accounts, usage, now)
-    if user_named and classified and chosen and (isinstance(classified['task'].get('profile'), dict)
-                                                 or classified.get('unclassified')):
-        # A preview (`--dry-run`) classifies nothing: with no profile and no --hours there is no plan to read.
-        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, bool(getattr(args, 'fast', False)))
+    planned = bool(user_named and classified and chosen and (isinstance(classified['task'].get('profile'), dict)
+                                                             or classified.get('unclassified')))
+    # A preview (`--dry-run`) classifies nothing: with no profile and no --hours there is no plan to read, and a launch
+    # fact keeps allocator.refusal_schedule's time; with a plan row the time is the row's, as at `prepare`.
+    fact = _check_record_launch(args, pin, quota_bundle, accounts, usage, now, timed_by_plan=planned)
+    if planned:
+        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, bool(getattr(args, 'fast', False)),
+                              fact=fact)
     unobserved = quota_unobserved(accounts, usage, quota_bundle)
     # A model the user names on a held account or model is the probe that can lift the hold: it goes, with a warning.
     retrying = provider_retry.reason(quota_bundle, provider_retry.active(now=now))
@@ -525,14 +528,18 @@ def _record_task(args, task):
     return task
 
 
-def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
+def _check_record_launch(args, pin, quota_bundle, accounts, usage, now, timed_by_plan=False):
     """Refuse a forced route that cannot launch now: no quota left in a window it draws, a launch cooling down, or a
-    latched model. External runners dispatch directly after record, so this is the protection prepared dispatches get."""
+    latched model. External runners dispatch directly after record, so this is the protection prepared dispatches get.
+    `timed_by_plan`: a quota window's refusal is returned, not raised, for `_check_named_plan_row` to time by the
+    route's plan row."""
     import launch_failures
     import model_latch
     user_named = getattr(args, 'constraint', None) == 'user_override'
     refused = dispatch_registry.launch_fact_refusal(quota_bundle, accounts, usage, now, user_named=user_named,
                                                     records=lambda: dispatch_flow.reservation_records(read_only=True))
+    if refused and timed_by_plan and refused.windows:
+        return refused
     if refused:
         raise refused
     if launch_failures.enabled():
@@ -545,10 +552,11 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
     latched_model = model_latch.reason(quota_bundle, model_latch.active(now=now))
     if latched_model:
         raise dispatch_registry.RouteFactRefused(f"{args.account}/{pin.model}: {latched_model}", user_named=user_named)
+    return None
 
 
-def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast):
-    """Refuse a route the user named that a quota wait of its own plan row holds (dispatch_registry.named_route_refusal):
+def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast, fact=None):
+    """Refuse a route the user named that its own plan row holds (dispatch_registry.named_route_refusal):
     the task planned as `prepare` plans it before launch (pinned, past what only automatic routing is held to and past
     the full-capacity rule), so the record and the re-check before launch give one refusal for one reading."""
     plan_task = {**classified['task'], **({'parent_agent_id': task['parent_agent_id']} if task.get('parent_agent_id') else {})}
@@ -563,12 +571,14 @@ def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, 
     records = ((decision_ledger.read_ledger() if (plan_task.get('chain') or {}).get('id') or has_cadence else [])
                + dispatch_flow.reservation_records(read_only=True) + dispatch_registry.launch_records(accounts, now))
     row = dispatch_registry.plan_row(plan_task, bundle, usage, now, accounts, records, route, True)
+    if fact:
+        raise fact.timed_by(row, accounts, now)     # a launch fact, timed by the row (`prepare` does the same)
     if row is None:
         return      # nothing of it ranked: the re-check before launch answers it (no longer matches)
     exclusions, waits = dispatch_registry.plan_row_holds(row, True)
-    if waits and not exclusions:
-        # A quota wait of this work: the refusal with the row's time. The row's exclusions are what the launch facts
-        # above do not count (a stale reading among them); a launch through `prepare` is refused on them there.
+    if exclusions or waits:
+        # The same holds `prepare` refuses on (a stale reading holds no named route: candidate_eval), so the record
+        # lets through exactly what the re-check before launch lets through.
         raise dispatch_registry.named_route_refusal(row, exclusions, waits, accounts, now, user_named=True)
 
 

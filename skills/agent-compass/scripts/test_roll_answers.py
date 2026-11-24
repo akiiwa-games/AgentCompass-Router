@@ -980,6 +980,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         healthy = [{'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
                    {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()}]
         reset = self.now + timedelta(hours=20, minutes=12)
+        short_reset = self.now + timedelta(hours=2, minutes=12)
         facts = (
             # (label, windows, held window, work hours, held only by the size of the work)
             ('used up with an observed reset', [healthy[0], {'id': 'seven_day', 'used_pct': 100.0,
@@ -987,6 +988,11 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             ('short of the work with an observed reset', [healthy[0], {'id': 'seven_day', 'used_pct': 88.0,
                                                                        'resets_at': reset.isoformat()}],
              'seven_day', 4.0, True),
+            # Work beyond the window's full capacity: a named route launches past that estimate with its warning
+            # (full_capacity_warning), so the window at 0 holds it until its reset, not without a time.
+            ('used up with an observed reset, the work beyond full capacity',
+             [{'id': 'five_hour', 'used_pct': 100.0, 'resets_at': short_reset.isoformat()}, healthy[1]], 'five_hour',
+             400.0, False),
         )   # used up with no observed reset: test_free_pool_unpublished (the cache reader pairs a used-up reading with its reset)
         args = route_judge.build_parser().parse_args(['record', '--constraint', 'user_override', *self.NAMED_FLAGS])
         for n, (label, windows, wid, hours, by_size) in enumerate(facts):
@@ -1001,9 +1007,10 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
                 self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
                 self.assertIn(wid, ans['cause'])
                 self.assertNotIn('reset not yet observed', ans['cause'] + ans['next_action'])
-                self.assertGreaterEqual(datetime.fromisoformat(ans['retry_at']), reset - timedelta(seconds=1))
-                self.assertLessEqual(datetime.fromisoformat(ans['retry_at']), reset + timedelta(seconds=1))
-                self.assertGreaterEqual(ans['start_after_hours'], (reset - self.now).total_seconds() / 3600 - 0.01)
+                held_reset = short_reset if wid == 'five_hour' else reset
+                self.assertGreaterEqual(datetime.fromisoformat(ans['retry_at']), held_reset - timedelta(seconds=1))
+                self.assertLessEqual(datetime.fromisoformat(ans['retry_at']), held_reset + timedelta(seconds=1))
+                self.assertGreaterEqual(ans['start_after_hours'], (held_reset - self.now).total_seconds() / 3600 - 0.01)
                 # What holds it: a fact of the window whatever the task's size, or only this work's size (the named
                 # route's own plan row, which the record now reads as the re-check before launch does).
                 import account_fleet

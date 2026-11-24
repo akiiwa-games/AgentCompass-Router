@@ -135,6 +135,16 @@ def full_capacity_warning(account, model, shortfalls):
             'launched because the user named it')
 
 
+def local_estimate_warning(account, model, wid, remaining, need_pct, margin_pct):
+    """The one warning a route the user named launches with on a free allowance that only the local spend estimate
+    holds (`with_local_readings`): the estimate is not the vendor's reading, so it refuses nothing the user named; the
+    vendor's limit error (a latch) or a vendor reading at 0 does."""
+    what = ('reads as used up' if remaining <= 0 else
+            f'reads {remaining:.0f}% left, short of the ~{need_pct:.1f}% the work needs plus a {margin_pct:g}% margin,')
+    return (f"{account}/{model}: {wid} {what} by the local estimate (this machine's spend at list price, not the "
+            "vendor's reading), so it may stop at the vendor's limit; launched because the user named it")
+
+
 def pin_matched_ids(task, ctx):
     """Bundle ids in `ctx['bundles']` named by `task`'s model/bundle constraint over `account_fleet.pin_pool` (every bundle
     existing on the addressed accounts, before any filter of preference, availability, discovery state, modality or effort,
@@ -544,6 +554,7 @@ def evaluate_bundle(bundle, task, ctx):
     # rule's numbers. Facts (a window at 0 or latched, below its launch floor) still hold it as they hold any route.
     override_named = not pool and task.get('pinned_bundle') == bundle['id']
     past_full = {}      # window -> the rule's estimate this named route launches past
+    estimate_warning = None     # a named route a free allowance's local estimate alone would hold (local_estimate_warning)
     full_short = {}     # window -> the rule's estimate, refused or launched past (structured, for readers and tests)
     if not spec.get('unmetered'):
         def exclude_if_renewal_short(wid_k, wspec_k, st_k, unit_k, work_hours=None):
@@ -614,6 +625,13 @@ def evaluate_bundle(bundle, task, ctx):
                                  account_stale=acct_stale, expected_reset_at=expected)
             unit = quota_economy.unit_rate(spec, wid, model, info)
             cap_usd_w = quota_economy.capacity_usd(spec, wid)
+            if override_named and state['stale']:
+                # A stale reading is not "used up" (dispatch_registry.check_launch_quota: only fresh, active-window
+                # observations hard-block), so it holds no route the user named: the record and the re-check before
+                # launch let the same route through, which launches with the "quota not observed" warning.
+                if cap_usd_w is not None and unit is not None:
+                    exclude_if_renewal_short(wid, wspec, state, unit)
+                continue
             if cap_usd_w is None:
                 if floor_refusal:
                     (short_exclude if is_short else exclude)(floor_refusal)
@@ -659,8 +677,13 @@ def evaluate_bundle(bundle, task, ctx):
                 _, floor_pct, margin_pct = quota_pools.short_window_limits(spec, wid, policy, now)
                 eff_floor = max(floor_pct, launch_floor) if launch_floor is not None else floor_pct
                 empty = below_floor or state['remaining'] <= eff_floor
-                if empty or (step is not None and state['remaining'] - step < margin_pct
-                             and not launches_past_full(wid, wspec, state, unit)):
+                if ((empty or (step is not None and state['remaining'] - step < margin_pct))
+                        and override_named and spec.get('five_axis_free_pool') and (observed or {}).get('local_estimate')):
+                    # A free allowance only the local spend reads as held (as on a long window below).
+                    estimate_warning = local_estimate_warning(bundle['account'], model, wid, state['remaining'],
+                                                              step or 0.0, margin_pct)
+                elif empty or (step is not None and state['remaining'] - step < margin_pct
+                               and not launches_past_full(wid, wspec, state, unit)):
                     wait = state['reset_hours']
                     what = 'is empty' if empty else f'has {state["remaining"]:.0f}%, short of the ~{step:.1f}% the work needs,'
                     full = state.get('full', 100.0)
@@ -705,6 +728,12 @@ def evaluate_bundle(bundle, task, ctx):
                             or state['remaining'] - need < policy['safety_margin_pct'])
             if pool and (below_floor or (launch_floor is not None and state['remaining'] <= launch_floor)):
                 result['_five_long_wait'] = True
+            elif (held_on_long and override_named and spec.get('five_axis_free_pool')
+                  and (observed or {}).get('local_estimate')):
+                # A free allowance only the local spend reads as held is not a fact for a route the user named: it
+                # launches with one warning (owner, 2026-11-24). Automatic routing keeps waiting or excluding on it.
+                estimate_warning = local_estimate_warning(bundle['account'], model, wid, state['remaining'], need,
+                                                          policy['safety_margin_pct'])
             elif not pool and held_on_long:
                 wait = state['reset_hours']
                 full = state.get('full', 100.0)
@@ -881,6 +910,9 @@ def evaluate_bundle(bundle, task, ctx):
     if past_full:
         result['capacity_warning'] = full_capacity_warning(bundle['account'], model, past_full)
         result['notes'].append(result['capacity_warning'])
+    if estimate_warning:
+        result['estimate_warning'] = estimate_warning
+        result['notes'].append(estimate_warning)
     if (pool or (not task.get('disable_fast') and available_at is None)) and not result['excluded'] and not result.get('_five_long_wait'):
         fast_info = ((info.get('five_axis') or {}).get('fast_mode')) or {}
         if fast_info.get('status') == 'ok' and fast_modes.supported(harness, model, info):

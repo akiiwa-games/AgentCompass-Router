@@ -747,46 +747,116 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertTrue(warned, 'expected a named route past the full capacity among the sizes')
 
 
-    def test_a_named_route_on_the_allowance_read_as_used_up_is_refused_with_its_time_at_the_plan_and_before_launch(self):
-        """Rule (brief D2; route_judge._check_named_plan_row, dispatch_registry.prepare, named_route_refusal): the free
-        allowance the local store reads as used up holds a route the user named as a fact: `blocked` / `tell_user` with
-        the window and its state, and the time the automatic plan of the same reading defers to; the check at the plan
-        and the re-check before launch give the same refusal."""
+    def named_free_route(self, task_id, usage_edit=None, hours=0.3, capacity_usd=None):
+        """(automatic row, the plan check's refusal or None, prepare's refusal or row) of a route the user named on the
+        free allowance the local store reads as used up; `usage_edit` changes the usage reading first; `capacity_usd`
+        replaces the fixture measurement's capacity."""
         import dispatch_registry
         import route_judge
-        acc = self.only(POOL)
+        from types import SimpleNamespace
+        acc = self.only(POOL, acc=self.with_measured(self.accounts, {**MEASURED, 'capacity_usd': capacity_usd})
+                        if capacity_usd else None)
         bid, bundle = next(iter(acc['accounts'][POOL]['bundles'].items()))
         quota_bundle = {**bundle, 'id': bid, 'bundle_id': bid, 'account': POOL}
-        task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': 0.3, 'parent_agent_id': 'parent-named',
-                'task_id': 'named-free'}
+        task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': hours, 'parent_agent_id': 'parent-named',
+                'task_id': task_id}
         with tf._synthetic_doc_ctx(self.doc), patch.object(axis_scores, 'opencode_local_spend',
                                                            spend_of(MEASURED['capacity_usd'])):
             usage = sim.snapshot(sim.synthetic_document(acc, self.now, sim.STATES['ample']), acc, self.now)
+            if usage_edit:
+                usage_edit(usage)
             automatic = next(c for c in self.rows(allocator.plan(
                 copy.deepcopy(task), usage, self.now, accounts=copy.deepcopy(acc), overrides=[], records=[],
                 host_policy_config={'allowed_accounts': [POOL]})) if c['id'] == bid)
-            self.assertFalse(automatic['excluded'], automatic['excluded'])
-            self.assertEqual(automatic['waiting_on'], 'allowance')
-            with self.assertRaises(dispatch_registry.RouteFactRefused) as at_plan:
+            outcomes = []
+            try:       # the record's two checks, in its order: the launch facts, timed by the named route's plan row
+                fact = route_judge._check_record_launch(SimpleNamespace(account=POOL, constraint='user_override'),
+                                                        SimpleNamespace(model=bundle['model']), quota_bundle,
+                                                        copy.deepcopy(acc), usage, self.now, timed_by_plan=True)
                 route_judge._check_named_plan_row(task, {'task': task}, quota_bundle, copy.deepcopy(acc), usage,
-                                                  self.now, False)
+                                                  self.now, False, fact=fact)
+                outcomes.append(None)
+            except dispatch_registry.RouteFactRefused as exc:
+                outcomes.append(exc)
             decision = dispatch_registry.issue({'stage': 'record', 'choice': 'constraint', 'constraint': 'user_override',
                                                 'basis': 'the user said: use the free model', 'selected_bundle': quota_bundle},
                                                task, self.now)
-            with self.assertRaises(dispatch_registry.RouteFactRefused) as at_prepare:
-                dispatch_registry.prepare(decision['decision_id'], task, {'title': 't', 'initialPrompt': 't'}, usage,
-                                          accounts=copy.deepcopy(acc), now=self.now)
-        for fact in (at_plan.exception, at_prepare.exception):
+            try:
+                outcomes.append(dispatch_registry.prepare(decision['decision_id'], task, {'title': 't', 'initialPrompt': 't'},
+                                                          usage, accounts=copy.deepcopy(acc), now=self.now))
+            except dispatch_registry.RouteFactRefused as exc:
+                outcomes.append(exc)
+        return automatic, *outcomes
+
+    def test_a_named_route_on_the_allowance_only_the_local_estimate_reads_as_used_up_launches_with_one_warning(self):
+        """Rule (owner 2026-11-24, round 2 of the deferral review; candidate_eval.local_estimate_warning,
+        axis_scores.with_local_readings `local_estimate`): the local spend estimate is not the vendor's reading, so the
+        free allowance it alone reads as used up refuses nothing the user named: the check at the plan passes and the
+        prepared row carries one warning that it reads as used up by the local estimate and may stop at the vendor's
+        limit. Automatic routing still waits on it."""
+        import dispatch_registry
+        automatic, at_plan, prepared = self.named_free_route('named-free-estimate')
+        self.assertFalse(automatic['excluded'], automatic['excluded'])
+        self.assertEqual(automatic['waiting_on'], 'allowance')
+        self.assertIsNone(at_plan)
+        self.assertNotIsInstance(prepared, dispatch_registry.RouteFactRefused, getattr(prepared, 'cause', None))
+        warnings = [w for w in prepared.get('warnings') or () if 'local estimate' in w]
+        self.assertEqual(len(warnings), 1, prepared.get('warnings'))
+        self.assertIn('allowance reads as used up by the local estimate', warnings[0])
+        self.assertIn("may stop at the vendor's limit", warnings[0])
+
+    def test_a_named_route_on_the_allowance_the_vendor_reads_at_0_is_refused_with_its_time_at_the_plan_and_before_launch(self):
+        """Rule (owner 2026-11-24; route_judge._check_named_plan_row, dispatch_registry.prepare, named_route_refusal):
+        a vendor reading of the allowance at 0 with an observed reset is the fact that holds a route the user named:
+        `blocked` / `tell_user` with the window, and the time the automatic plan of the same reading defers to; the
+        check at the plan and the re-check before launch give the same refusal."""
+        import usage_reading
+        reset = self.now + timedelta(hours=7)
+
+        def vendor_at_zero(usage):
+            row = usage['accounts'].setdefault(POOL, {})
+            row.update(status='fresh', available=True, fetched_at=self.now.isoformat())
+            row['windows'] = [*(w for w in row.get('windows') or () if w.get('id') != 'allowance'),
+                              usage_reading.window_state({'id': 'allowance', 'used_pct': 100.0,
+                                                          'resets_at': reset.isoformat()}, self.now)]
+
+        automatic, at_plan, at_prepare = self.named_free_route('named-free-vendor', vendor_at_zero)
+        self.assertEqual(automatic['waiting_on'], 'allowance')
+        for fact in (at_plan, at_prepare):
+            self.assertIsInstance(fact, __import__('dispatch_registry').RouteFactRefused, fact)
             answer = fact.answer({'stage': 'roll'}, for_roll=True)
             self.assertEqual((answer['status'], answer['caller_action']), ('blocked', 'tell_user'))
             self.assertIn('allowance', fact.cause)
-            self.assertNotIn('reset not yet observed', fact.cause)
+            self.assertNotIn('local estimate', fact.cause)
             self.assertEqual(fact.waiting_on, 'allowance')
             self.assertEqual(answer['start_after_hours'], allocator.advised_hours(automatic['available_in_hours']))
             self.assertAlmostEqual((datetime.fromisoformat(answer['retry_at']) - self.now).total_seconds() / 3600,
                                    automatic['available_in_hours'], places=4)
-        self.assertEqual(at_plan.exception.cause, at_prepare.exception.cause)
-        self.assertEqual(at_plan.exception.retry_at, at_prepare.exception.retry_at)
+        self.assertEqual(at_plan.cause, at_prepare.cause)
+        self.assertEqual(at_plan.retry_at, at_prepare.retry_at)
+
+    def test_a_named_route_beyond_the_allowances_full_capacity_is_held_by_a_vendor_reading_at_0_until_its_reset(self):
+        """Rule (candidate_eval full_capacity_warning: a route the user named launches past the full-capacity estimate;
+        D1: a wait the router offers is a promise): work beyond the allowance's full capacity, on an allowance the vendor
+        reads at 0 with an observed reset, is held until that reset (when it launches past the estimate with its
+        warning), with that time at the plan and before launch, not refused without a time."""
+        import usage_reading
+        reset = self.now + timedelta(hours=7)
+
+        def vendor_at_zero(usage):
+            row = usage['accounts'].setdefault(POOL, {})
+            row.update(status='fresh', available=True, fetched_at=self.now.isoformat())
+            row['windows'] = [*(w for w in row.get('windows') or () if w.get('id') != 'allowance'),
+                              usage_reading.window_state({'id': 'allowance', 'used_pct': 100.0,
+                                                          'resets_at': reset.isoformat()}, self.now)]
+
+        automatic, at_plan, at_prepare = self.named_free_route('named-free-beyond', vendor_at_zero, hours=6.0, capacity_usd=0.05)
+        self.assertIn('allowance', automatic.get('full_capacity_short') or {}, (automatic['excluded'], automatic['notes']))
+        for fact in (at_plan, at_prepare):
+            self.assertIsInstance(fact, __import__('dispatch_registry').RouteFactRefused, fact)
+            self.assertEqual(fact.waiting_on, 'allowance')
+            self.assertLess(abs(datetime.fromisoformat(fact.retry_at) - reset), timedelta(seconds=1))
+        self.assertEqual(at_plan.cause, at_prepare.cause)
 
     def test_a_named_route_on_a_window_used_up_with_no_observed_reset_is_refused_without_a_time_naming_the_window(self):
         """Rule (brief D2; dispatch_registry.launch_fact_refusal, RouteFactRefused): a window whose reading shows it used
@@ -828,6 +898,81 @@ class UnpublishedFreePoolTests(unittest.TestCase):
             self.assertNotIn('start_after_hours', answer)
             self.assertNotIn('retry_at', answer)
         self.assertEqual(at_record.exception.cause, at_prepare.exception.cause)
+
+    def test_a_named_route_on_a_stale_reading_is_let_through_alike_by_the_record_and_the_re_check_before_launch(self):
+        """Rule (owner 2026-11-24, round 2 of the deferral review; dispatch_registry.check_launch_quota "unknown/stale is
+        not exhausted", candidate_eval): a stale reading is not "used up", so a route the user named on a window whose
+        only reading is stale, at 0 or short of the work, with or without a reset ahead, is refused neither by the record
+        (its launch facts and its plan row) nor by the re-check before launch."""
+        import dispatch_registry
+        import route_judge
+        import usage_reading
+        from types import SimpleNamespace
+        acc = self.only('claude')
+        bid, bundle = next((b, row) for b, row in acc['accounts']['claude']['bundles'].items() if 'opus' in b)
+        quota_bundle = {**bundle, 'id': bid, 'bundle_id': bid, 'account': 'claude', 'provider': 'claude'}
+        for n, (wid, used, hours) in enumerate((('five_hour', 100.0, 2), ('seven_day', 100.0, 50),
+                                                ('seven_day', 98.0, 50), ('five_hour', 100.0, -1))):
+            with self.subTest(window=wid, used=used, reset_in=hours):
+                task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': 0.3,
+                        'parent_agent_id': 'parent-named', 'task_id': f'named-stale-{n}'}
+                with tf._synthetic_doc_ctx(self.doc):
+                    usage = sim.snapshot(sim.synthetic_document(acc, self.now, sim.STATES['ample']), acc, self.now)
+                    row = usage['accounts']['claude']
+                    row.update(status='stale', stale=True, fetched_at=(self.now - timedelta(hours=3)).isoformat())
+                    row['windows'] = [w if w['id'] != wid else usage_reading.window_state(
+                        {'id': wid, 'used_pct': used, 'resets_at': (self.now + timedelta(hours=hours)).isoformat()},
+                        self.now) for w in row['windows']]
+                    route_judge._check_record_launch(SimpleNamespace(account='claude', constraint='user_override'),
+                                                     SimpleNamespace(model=bundle['model']), quota_bundle,
+                                                     copy.deepcopy(acc), usage, self.now)
+                    route_judge._check_named_plan_row(task, {'task': task}, quota_bundle, copy.deepcopy(acc), usage,
+                                                      self.now, False)
+                    decision = dispatch_registry.issue({'stage': 'record', 'choice': 'constraint',
+                                                        'constraint': 'user_override', 'basis': 'the user said: use Opus',
+                                                        'selected_bundle': quota_bundle}, task, self.now)
+                    prepared = dispatch_registry.prepare(decision['decision_id'], task,
+                                                         {'title': 't', 'initialPrompt': 't'}, usage,
+                                                         accounts=copy.deepcopy(acc), now=self.now)
+                self.assertEqual(prepared['state'], 'prepared')
+
+    def test_a_named_route_its_plan_row_excludes_is_refused_alike_by_the_record_and_the_re_check_before_launch(self):
+        """Rule (owner 2026-11-24, one source of a refusal: the re-check before launch does not refuse what the record
+        lets through; route_judge._check_named_plan_row, dispatch_registry.prepare): a hold of the named route's own plan
+        row that the launch facts do not count (here the subscription ends before the work would finish after the
+        window's reset) refuses it at the record as at the re-check before launch, with the same words."""
+        import dispatch_registry
+        import route_judge
+        import usage_reading
+        from types import SimpleNamespace
+        acc = self.only('claude')
+        acc['accounts']['claude']['expires_at'] = (self.now + timedelta(hours=10)).isoformat()
+        bid, bundle = next((b, row) for b, row in acc['accounts']['claude']['bundles'].items() if 'opus' in b)
+        quota_bundle = {**bundle, 'id': bid, 'bundle_id': bid, 'account': 'claude', 'provider': 'claude'}
+        task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': 8.0, 'parent_agent_id': 'parent-named',
+                'task_id': 'named-excluded'}
+        with tf._synthetic_doc_ctx(self.doc):
+            usage = sim.snapshot(sim.synthetic_document(acc, self.now, sim.STATES['ample']), acc, self.now)
+            row = usage['accounts']['claude']
+            row['windows'] = [w if w['id'] != 'seven_day' else usage_reading.window_state(
+                {'id': 'seven_day', 'used_pct': 88.0, 'resets_at': (self.now + timedelta(hours=20)).isoformat()},
+                self.now) for w in row['windows']]
+            with self.assertRaises(dispatch_registry.RouteFactRefused) as at_record:
+                fact = route_judge._check_record_launch(SimpleNamespace(account='claude', constraint='user_override'),
+                                                        SimpleNamespace(model=bundle['model']), quota_bundle,
+                                                        copy.deepcopy(acc), usage, self.now, timed_by_plan=True)
+                self.assertIsNone(fact)         # no launch fact: the plan row alone holds it
+                route_judge._check_named_plan_row(task, {'task': task}, quota_bundle, copy.deepcopy(acc), usage,
+                                                  self.now, False, fact=fact)
+            decision = dispatch_registry.issue({'stage': 'record', 'choice': 'constraint', 'constraint': 'user_override',
+                                                'basis': 'the user said: use Opus', 'selected_bundle': quota_bundle},
+                                               task, self.now)
+            with self.assertRaises(dispatch_registry.RouteFactRefused) as at_prepare:
+                dispatch_registry.prepare(decision['decision_id'], task, {'title': 't', 'initialPrompt': 't'}, usage,
+                                          accounts=copy.deepcopy(acc), now=self.now)
+        self.assertIn('subscription ends before the work would finish', at_record.exception.cause)
+        self.assertEqual(at_record.exception.cause, at_prepare.exception.cause)
+        self.assertIsNone(at_record.exception.retry_at)
 
 class PaidLatchReadingTests(unittest.TestCase):
     """Review round 2 N2. Rule (quota_exhaustion.exhausted_windows, candidate_eval.evaluate_bundle): where the account has

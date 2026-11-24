@@ -141,11 +141,13 @@ class RouteFactRefused(Refused):
     an invalid flag or input. Carries `start_after_hours`, `retry_at` and `waiting_on` when every refusing quota window
     has an observed reset or, latched, a known end (`allocator.refusal_schedule`); `waiting_end` names a latch's end
     (`quota_pools.latched_end_kind`), which a re-probe time never calls a reset. `recorded`: refused at the re-check
-    before launch (`prepare`), after the route's record was written."""
+    before launch (`prepare`), after the route's record was written. `windows`: the quota windows a launch fact refuses
+    on (`launch_fact_refusal`), whose time the route's own plan row gives when there is one (`timed_by`)."""
 
     def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None, waiting_end=None,
-                 recorded=False):
+                 recorded=False, windows=()):
         super().__init__(cause)
+        self.windows = tuple(windows)
         self.recorded = bool(recorded)
         self.cause = str(cause)
         self.user_named = bool(user_named)
@@ -170,6 +172,27 @@ class RouteFactRefused(Refused):
     def nothing(self):
         return 'Nothing was launched' if self.recorded else 'Nothing was recorded or launched'
 
+    def timed_by(self, candidate, accounts, now):
+        """This launch-fact refusal with its time taken from the route's own plan row (`candidate`): the row's binding
+        wait on the refusing windows, the time an automatic plan of the same reading defers to, else no time. The one
+        source of a refusal's time wherever a plan row is read (the record of a classified task, `prepare`);
+        `allocator.refusal_schedule` gives it only where there is none (a record with no task)."""
+        import allocator
+        import quota_pools
+        if not self.windows or candidate is None:
+            return self
+        hours_by = {w: h for w, h in (candidate.get('waits') or {}).items() if h and w in self.windows}
+        account = candidate['bundle']['account']
+        self.start_after_hours = self.retry_at = self.waiting_on = self.waiting_end = None
+        if hours_by:
+            self.waiting_on = max(hours_by, key=hours_by.get)
+            hours = hours_by[self.waiting_on]
+            self.start_after_hours = allocator.advised_hours(hours)
+            self.retry_at = (now + timedelta(hours=hours)).isoformat()
+            if self.waiting_on in quota_pools.latched_windows(accounts, account):
+                self.waiting_end = quota_pools.latched_end_kind(accounts, account)
+        return self
+
     def answer(self, base=None, *, for_roll=False):
         out = dict(base or {}, status='blocked', caller_action='tell_user', cause=self.cause,
                    next_action=self.next_action())
@@ -188,7 +211,8 @@ def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records, re
     latch, a window used up in this cycle), with `allocator.refusal_schedule`'s time when every such window has an
     observed reset or a known end; None when nothing stops it. `records` reads the in-flight reservations, only when a
     reading needs them. One source for the record (route_judge._check_record_launch) and, for a route the user named,
-    the re-check before launch (`prepare`)."""
+    the re-check before launch (`prepare`); where either reads the route's plan row, the time is the row's
+    (`RouteFactRefused.timed_by`)."""
     import allocator
     import quota_pools
     account = bundle['account']
@@ -229,7 +253,7 @@ def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records, re
     return RouteFactRefused('; '.join(reasons[wid] for wid in ordered_wids), user_named=user_named,
                             start_after_hours=start_after_hours, retry_at=retry_at, waiting_on=waiting_on,
                             waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None,
-                            recorded=recorded)
+                            recorded=recorded, windows=ordered_wids)
 
 
 def plan_row_holds(candidate, named):
@@ -1982,12 +2006,14 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             if old.get('agent_id'):
                 busy_agents.add(old['agent_id'])
         user_named = decision.get('constraint') == 'user_override' and resume_bundle is None
+        fact = None
         if user_named:
-            # A route the user named is held by the facts its record checked, with the same words and time.
-            refused = launch_fact_refusal(bundle, accounts, usage, now, user_named=True,
-                                          records=lambda: active_records(connection, now), recorded=True)
-            if refused:
-                raise refused
+            # A route the user named is held by the facts its record checked, with the same words; a quota window's
+            # time comes from the route's plan row below (RouteFactRefused.timed_by), as at its record.
+            fact = launch_fact_refusal(bundle, accounts, usage, now, user_named=True,
+                                       records=lambda: active_records(connection, now), recorded=True)
+            if fact and not fact.windows:
+                raise fact
         else:
             try:
                 check_launch_quota(bundle, accounts, usage, now)
@@ -2038,6 +2064,8 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             import decision_ledger
             records += [r for r in decision_ledger.read_ledger() if r.get('decision_id') != decision_id]
         candidate = plan_row(alloc_task, bundle, usage, now, accounts, records, route, named)
+        if fact:
+            raise fact.timed_by(candidate, accounts, now)
         if candidate is None or any(candidate['bundle'].get(k) != bundle.get(k) for k in ('provider', 'account', 'model', 'effort')):
             raise CapacityChanged('Decision bundle no longer matches installed account configuration')
         exclusions, waits = plan_row_holds(candidate, named)
@@ -2092,8 +2120,10 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                **({'chain_id': chain_id} if chain_id else {}),
                **({k: attempt[k] for k in ('attempt_of', 'attempt', 'previous_attempt') if attempt.get(k) is not None}
                   if attempt else {}),
-               # A route the user named launches past the full-capacity rule with its warning (candidate_eval).
-               **({'warnings': [candidate['capacity_warning']]} if candidate.get('capacity_warning') else {})}
+               # A route the user named launches past the full-capacity rule, and past a free allowance's local
+               # estimate, with its warning (candidate_eval).
+               **({'warnings': warned} if (warned := [candidate[k] for k in ('capacity_warning', 'estimate_warning')
+                                                       if candidate.get(k)]) else {})}
         event(row, 'prepared', now)
         save(connection, row)
         return row
