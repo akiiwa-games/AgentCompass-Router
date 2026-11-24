@@ -320,8 +320,9 @@ class Chain:
                                              provider_retry.active())
         except OSError:
             entry = None
-        if entry and isinstance(entry.get('retry_at'), str):
-            return max(0.0, (registry.parse(entry['retry_at']) - registry.utcnow()).total_seconds())
+        due = provider_retry.due_at(entry) if entry else None
+        if due is not None:
+            return max(0.0, (due - registry.utcnow()).total_seconds())
         return float(provider_retry.retry_seconds(1))
 
     def ledger(self, action, attempt, **extra):

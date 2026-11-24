@@ -60,12 +60,11 @@ def test_discovery_places_go_models_beside_zen_ones_and_the_prefix_splits_the_po
 
 def test_an_opencode_zen_quota_hold_leaves_go_models_dispatchable(accounts, store):
     entry = hold(accounts, ZEN[0], 'account', 'd1')
-    assert (entry['model'], entry['retry_at'], entry['pool']['id']) == (None, None, 'opencode')
+    assert (entry['model'], entry['pool']['id']) == (None, 'opencode')
     assert set(provider_retry.active(now=NOW)) == {'opencode#opencode'}
-    assert provider_retry.indefinite(entry)
     for zen in ZEN:
-        reason = held_out(accounts, zen, NOW + timedelta(days=30))
-        assert reason and 'quota pool opencode' in reason and 'agentcompass hold --clear opencode#opencode' in reason
+        reason = held_out(accounts, zen, NOW)
+        assert reason and 'quota pool opencode' in reason and 'next retry at' in reason
     for go in GO:
         assert held_out(accounts, go) is None
     # A Zen model that appears after the hold draws on the same pool: its prefix says so.
@@ -195,11 +194,12 @@ def test_an_account_hold_from_a_single_pool_account_narrows_to_its_pool_once_go_
                                           'models': [{'id': m} for m in (*ZEN, *GO)]}}}
     with_go = fleet_with_derived_bundles(fleet, auto_bundles.derive(fleet, catalog, 2))
     assert provider_retry.scope_account_holds(with_go) == ['opencode#opencode']
-    held = provider_retry.active(now=NOW + timedelta(days=30))
-    assert set(held) == {'opencode#opencode'}   # still indefinite; the model hold elsewhere has expired
+    held = provider_retry.active(now=NOW)
+    assert 'opencode#opencode' in held and 'opencode' not in held
     scoped = held['opencode#opencode']
-    assert (scoped['scope'], scoped['retry_at'], scoped['source'], scoped['scoped_from']) == ('account', None, 'd1',
-                                                                                              'opencode')
+    # Rewritten with its scope, retry time and source kept.
+    assert (scoped['scope'], scoped['retry_at'], scoped['source'], scoped['scoped_from']) == (
+        'account', entry['retry_at'], 'd1', 'opencode')
     assert all(held_out(with_go, m) for m in ZEN)
     assert not any(held_out(with_go, m) for m in GO)
     assert provider_retry.scope_account_holds(with_go) == []   # once
@@ -226,3 +226,55 @@ def test_unreadable_accounts_hold_the_whole_account(store):
                                    'at': NOW.isoformat()},
                                   dispatch_id='d1', accounts={}, classify=lambda *args: ('account', {}))
     assert 'pool' not in entry and set(provider_retry.active(now=NOW)) == {'opencode'}
+
+
+# No hold waits for a person (owner, 2026-11-24): every hold ends by itself at its retry time; a clear is a shortcut.
+REFUSED = 'The provider refused every model of this login.'
+
+
+def test_an_account_hold_with_no_stated_time_ends_by_itself_at_its_retry_time(accounts, store):
+    entry = hold(accounts, ZEN[0], 'account', 'd1', message=REFUSED)
+    due = provider_retry.due_at(entry)
+    assert due is not None and due > NOW
+    # Rule: the backoff of the first hold (provider_retry.retry_seconds), from the observation.
+    assert due == NOW + timedelta(seconds=provider_retry.retry_seconds(1, True))
+    assert held_out(accounts, ZEN[0], due - timedelta(seconds=1))
+    assert held_out(accounts, ZEN[0], due + timedelta(seconds=1)) is None     # nothing was cleared
+
+
+def test_an_account_answer_backs_off_to_the_latches_period_not_past_it(accounts, store):
+    import account_state
+    cap = account_state.LATCH_RETRY_HOURS * 3600
+    assert max(provider_retry.retry_seconds(n, True) for n in range(1, 30)) == cap
+    assert all(provider_retry.retry_seconds(n, True) >= provider_retry.retry_seconds(n) for n in range(1, 30))
+
+
+def test_a_provider_stated_time_later_than_the_backoff_wins(accounts, store):
+    stated = NOW + timedelta(hours=9)
+    entry = provider_retry.record(bundle(accounts, ZEN[0]), {
+        'failure_code': 'provider_retry_stuck', 'provider_message': REFUSED, 'at': NOW.isoformat(),
+        'next': stated.isoformat()}, dispatch_id='d1', accounts=accounts,
+        classify=lambda *args: ('account', {'source': 'system_one'}))
+    assert provider_retry.due_at(entry) == stated
+    assert held_out(accounts, ZEN[0], stated - timedelta(seconds=1))
+    assert held_out(accounts, ZEN[0], stated + timedelta(seconds=1)) is None
+
+
+def test_a_hold_written_without_a_retry_time_ends_by_the_same_rule(accounts, store):
+    # v0.7.x wrote a classifier `account` answer with `retry_at: null` (held until cleared).
+    old = {'account': 'opencode', 'provider': 'opencode', 'model': None, 'scope': 'account', 'message': REFUSED,
+           'observed_at': NOW.isoformat(), 'streak': 1, 'retry_at': None,
+           'pool': provider_retry.pool_of(bundle(accounts, ZEN[0]), accounts)}
+    store.write_text(json.dumps({'entries': {'opencode#opencode': old}, 'dispatches': {}}), encoding='utf-8')
+    due = NOW + timedelta(seconds=provider_retry.retry_seconds(1, True))
+    assert provider_retry.due_at(old) == due
+    assert held_out(accounts, ZEN[0], due - timedelta(seconds=1))
+    assert 'next retry at' in held_out(accounts, ZEN[0], due - timedelta(seconds=1))
+    assert held_out(accounts, ZEN[0], due + timedelta(seconds=1)) is None
+
+
+def test_a_clear_still_lifts_a_hold_at_once(accounts, store):
+    hold(accounts, ZEN[0], 'account', 'd1', message=REFUSED)
+    assert held_out(accounts, ZEN[0])
+    assert provider_retry.clear_key('opencode#opencode')
+    assert held_out(accounts, ZEN[0]) is None

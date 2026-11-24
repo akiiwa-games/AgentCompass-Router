@@ -1,12 +1,16 @@
 from datetime import datetime, timedelta, timezone
 import quota_exhaustion as q
 
+# A latch observed an hour ago: inside the latches' re-probe period (quota_exhaustion.due_at).
+RECENT = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+BEFORE = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
 
 def test_only_confirmed_quota_errors_latch_and_persist(tmp_path):
     path = tmp_path / 'quota.json'
     assert not q.record('account', 'HTTP 429: temporary rate limit', path=path)
     assert not q.record('account', 'Network timeout', path=path)
-    assert q.record('account', 'Individual quota reached', at='2026-10-30T13:00:00Z', path=path)
+    assert q.record('account', 'Individual quota reached', at=RECENT, path=path)
     assert q.stopping('account', path=path) == {q.ALL}    # no window known: the whole account
     assert 'Individual quota' not in path.read_text()
     assert q.stopping('another', path=path) == set()
@@ -14,8 +18,8 @@ def test_only_confirmed_quota_errors_latch_and_persist(tmp_path):
 
 def test_old_or_failed_quota_cannot_release_but_fresh_positive_can(tmp_path):
     path = tmp_path / 'quota.json'
-    q.record('account', 'quota_exceeded', at='2026-10-30T13:00:00Z', path=path)
-    usage = {'available': True, 'fetched_at': '2026-10-30T12:00:00Z', 'windows': [{'id': 'usage', 'used_pct': 30}]}
+    q.record('account', 'quota_exceeded', at=RECENT, path=path)
+    usage = {'available': True, 'fetched_at': BEFORE, 'windows': [{'id': 'usage', 'used_pct': 30}]}
     assert q.stopping('account', usage, path=path) == {q.ALL}    # a reading older than the latch releases nothing
     usage['fetched_at'] = datetime.now(timezone.utc).isoformat()
     usage['stale'] = True
@@ -40,7 +44,7 @@ def test_manual_clear_does_not_replay_an_old_failure(tmp_path):
 def test_only_the_exhausted_window_latches_and_a_fresh_reading_releases_it(tmp_path):
     path = tmp_path / 'quota.json'
     assert q.record('agy', 'Individual quota reached', windows=['3p-5h', '3p-weekly'],
-                    at='2026-10-30T13:00:00Z', path=path)
+                    at=RECENT, path=path)
     gemini, claude = ['gemini-5h', 'gemini-weekly'], ['3p-5h', '3p-weekly']
     assert q.stopping('agy', path=path) == set() and q.stopping('agy', path=path, windows=gemini) == set()
     assert q.stopping('agy', path=path, windows=claude) == set(claude)    # only the recorded windows a launch draws
@@ -60,7 +64,7 @@ def test_only_the_exhausted_window_latches_and_a_fresh_reading_releases_it(tmp_p
 
 def test_account_wide_latch_narrows_to_exhausted_windows_and_reset_releases(tmp_path):
     path = tmp_path / 'quota.json'
-    q.record('agy', 'quota exhausted', at='2026-10-30T13:00:00Z', path=path)
+    q.record('agy', 'quota exhausted', at=RECENT, path=path)
     assert q.stopping('agy', path=path, windows=['gemini-5h']) == {q.ALL}
     past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     reading = {'available': True, 'fetched_at': datetime.now(timezone.utc).isoformat(), 'windows': [
@@ -94,3 +98,18 @@ def test_routing_excludes_only_bundles_drawing_a_latched_window():
     assert latched in rows['agy_opus55_high']['excluded']
     assert latched not in rows['argon_high']['excluded']
     assert latched not in rows['flash_high']['excluded']
+
+
+def test_a_latch_with_no_reading_ends_by_itself_at_the_latches_period(tmp_path):
+    # No latch waits for a person (owner, 2026-11-24): with no reading and no clear, it is due after the latches'
+    # re-probe period (account_state.LATCH_RETRY_HOURS), counted from the observation.
+    import account_state
+    path = tmp_path / 'quota.json'
+    at = datetime(2026, 11, 24, 8, 0, tzinfo=timezone.utc)
+    assert q.record('acme', 'quota exhausted', windows=['allowance'], at=at.isoformat(), path=path)
+    due = at + timedelta(hours=account_state.LATCH_RETRY_HOURS)
+    before, after = due - timedelta(seconds=1), due + timedelta(seconds=1)
+    assert q.stopping('acme', path=path, windows=['allowance'], now=before, read_only=True) == {'allowance'}
+    assert q.stopping('acme', path=path, windows=['allowance'], now=after, read_only=True) == set()
+    assert q.stopping('acme', path=path, windows=['allowance'], now=before) == {'allowance'}   # read_only or not
+    assert q.stopping('acme', path=path, windows=['allowance'], now=after) == set()

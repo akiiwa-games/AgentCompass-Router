@@ -1640,8 +1640,10 @@ def _latch_exhausted_quota(accounts, state_dir, cache_rows):
         if not obj(exhausted_accounts.get(name)).get('blocked'):
             continue
         latched = quota_exhaustion.exhausted_windows(name, cache_rows.get(name), path=exhaustion_path)
+        due = quota_exhaustion.due_at(exhausted_accounts.get(name))
         if quota_exhaustion.ALL in latched:
-            row.update(status='quota_exhausted', reason='confirmed quota exhausted; refresh quota after recovery')
+            row.update(status='quota_exhausted',
+                       reason=f"confirmed quota exhausted; re-probed at {due.isoformat() if due else 'the next roll'}")
         elif latched:
             # Only these windows are out; the account's other windows stay routable.
             row['exhausted_windows'] = sorted(latched)

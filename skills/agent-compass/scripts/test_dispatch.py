@@ -4413,7 +4413,7 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertTrue(any(self.MESSAGE in e for e in excluded), excluded)
         self.assertNotIn(plan['choice'], ('lab_sonnet55_high', 'lab_sonnet55_medium'))
         self.assertTrue(any(w.startswith('claude-lab/claude-sonnet-5-5: provider failure hold') and self.MESSAGE in w
-                            and 'agentcompass hold --clear' in w for w in plan['decision']['warnings']), plan['decision'])
+                            and 'next retry at' in w for w in plan['decision']['warnings']), plan['decision'])
         # Observing the same terminal again records nothing more.
         registry.observe(row['dispatch_id'], self.snapshot(row, status='idle'), now=self.now + timedelta(seconds=40),
                          terminal=self.stuck(at))
@@ -4444,7 +4444,7 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual((done['state'], done['failure_code']), ('failed', 'provider_turn_failed'))
         self.assertEqual(flow.public(done)['next_action'], flow.TURN_FAILED_NEXT)
         self.assertEqual(self.asked[0][3:], (self.V2_MESSAGE, 'provider_turn_failed'))
-        held = provider_retry.active(now=self.now + timedelta(days=30))
+        held = provider_retry.active(now=self.now + timedelta(seconds=20))
         self.assertEqual(list(held), ['claude-lab'])
         self.assertEqual((held['claude-lab']['failure_code'], held['claude-lab']['message']),
                          ('provider_turn_failed', self.V2_MESSAGE))
@@ -4461,16 +4461,17 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertIsNone(provider_retry.record(self.bundle, terminal, dispatch_id='d-none'))   # read once
         self.assertEqual(len(self.asked), 1)
 
-    def test_an_account_scope_holds_every_model_until_cleared_or_a_named_model_there_completes(self):
+    def test_an_account_scope_holds_every_model_until_its_retry_time_or_a_named_model_there_completes(self):
         import provider_retry
         self.scopes = ['account']
         at = self.now - timedelta(minutes=1)
         entry = provider_retry.record(self.bundle, self.stuck(at), dispatch_id='d-stuck')
-        self.assertEqual((entry['model'], entry['scope_source'], entry['retry_at']), (None, 'classifier', None))
-        # A quota that blocks the whole account does not lift by waiting.
-        later = self.now + timedelta(days=30)
-        self.assertEqual(set(provider_retry.active(now=later)), {'claude-lab'})
-        self.assertIn(self.MESSAGE, provider_retry.reason(self.other, provider_retry.active(now=later)))
+        self.assertEqual((entry['model'], entry['scope_source']), (None, 'classifier'))
+        # Every hold ends by itself (owner, 2026-11-24): held until its retry time, free after it.
+        due = provider_retry.due_at(entry)
+        self.assertEqual(set(provider_retry.active(now=due - timedelta(seconds=1))), {'claude-lab'})
+        self.assertEqual(provider_retry.active(now=due + timedelta(seconds=1)), {})
+        self.assertIn(self.MESSAGE, provider_retry.reason(self.other, provider_retry.active(now=self.now)))
         _, excluded = self.excluded('lab_opus55_high')
         self.assertTrue(any('on this account' in e for e in excluded), excluded)
         with self.assertRaisesRegex(ValueError, 'provider failure hold'):
@@ -4572,7 +4573,7 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual(widened['models'], ['claude-opus-5-5', 'claude-sonnet-5-5'])
         # Review 2 R2: two guesses are still guesses: a widened account hold backs off like a model hold.
         self.assertEqual(widened['retry_at'], (at + timedelta(minutes=1, seconds=120)).isoformat())
-        self.assertFalse(provider_retry.indefinite(widened))
+        self.assertFalse(provider_retry.account_scoped(widened))   # a widened guess keeps the short cap
         self.assertIn('next retry at', provider_retry.retry_text(widened))
         self.assertIn('claude-lab', provider_retry.active(now=at + timedelta(minutes=2)))
         self.assertNotIn('claude-lab', provider_retry.active(now=at + timedelta(days=1)))

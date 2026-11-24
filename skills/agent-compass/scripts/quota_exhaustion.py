@@ -5,15 +5,19 @@ model draws (the whole account when they are unknown); other windows stay usable
 Network errors and generic 429s do not qualify. A latched window is released by a
 successful reading newer than the latch that shows it under 100% used, by that
 reading's reset time passing, or by an explicit clear; an account-wide latch narrows
-to the windows such a reading shows exhausted. Elapsed time and estimated reset dates
-alone never prove recovery. No remote error text is stored.
+to the windows such a reading shows exhausted. No latch waits for a person (owner,
+2026-11-24): every latch is also due at a time (`due_at`), after which the next roll
+may pick its candidates again and so re-probes the quota. That time is not a guess
+at recovery: it is the latches' shared re-probe period (account_state.LATCH_RETRY_HOURS)
+counted from the observation. No remote error text is stored.
 """
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import account_state
 import override_store
 
 
@@ -63,6 +67,12 @@ def record(account, error, *, windows=None, at=None, source=None, path=None):
 ALL = '*'
 
 
+def due_at(row):
+    """When a latch ends by itself: its observation plus the latches' re-probe period. None for a row with no time."""
+    observed = _time((row or {}).get('observed_at'))
+    return observed + timedelta(hours=account_state.LATCH_RETRY_HOURS) if observed else None
+
+
 def exhausted_windows(account, usage=None, *, path=None, now=None, read_only=False):
     """Window ids still latched for this account; {ALL} for an account-wide latch, empty when free. A fresh reading that
     shows recovery clears or narrows the latch on disk; `read_only` returns the same answer and writes nothing."""
@@ -73,6 +83,12 @@ def exhausted_windows(account, usage=None, *, path=None, now=None, read_only=Fal
     latched = set(row.get('windows') or []) or {ALL}
     usage = usage or {}
     now = now or datetime.now(timezone.utc)
+    due = due_at(row)
+    if due is not None and due <= now:
+        # Due: the next roll re-probes the quota (a launch that meets the limit again latches it again).
+        if read_only:
+            return set()
+        return set() if clear(account, path=path, expected_observed_at=row['observed_at']) else latched
     fetched = _time(usage.get('fetched_at'))
     observed = _time(row.get('observed_at'))
     readings = {w['id']: w for w in usage.get('windows') or [] if isinstance(w, dict) and isinstance(w.get('id'), str)}

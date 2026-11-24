@@ -1893,32 +1893,32 @@ def retry_clear_pool(holds: dict, account: str) -> str | None:
     return min((p for p in map(retry_hold_pool, entries) if p), default=None)
 
 
+def _retry_due(entry: dict) -> str:
+    """When a provider-failure hold ends by itself (provider_retry.due_at), as read-time text."""
+    import provider_retry
+    due = provider_retry.due_at(entry)
+    return read_time_text(due.isoformat() if due else None)
+
+
 def retry_hold_text(holds: dict, account: str) -> str | None:
     """The account list's note for an account (or a quota pool or model of it) held for a provider failure: the
-    provider's own message and when the router tries again, or how to clear an account or pool hold. None when nothing
-    of the account is held."""
+    provider's own message and when the router tries again (every hold ends by itself; the card's clear button is a
+    shortcut). None when nothing of the account is held."""
     notes = []
     for entry in sorted((v for v in holds.values() if v.get("account") == account),
                         key=lambda v: (v.get("model") is not None, retry_hold_pool(v) is not None,
                                        retry_hold_pool(v) or v.get("model") or "")):
         message = entry.get("message") or _tr("无提供方消息")
         pool = retry_hold_pool(entry)
-        if pool and entry.get("retry_at"):
+        if pool:
             notes.append(_tr("{0}，额度池 {1} 已排除派发：{2}（下次重试 {3}，或点卡片上的“清除 {1}”）").format(
-                _retry_what(entry), pool, message, read_time_text(entry.get("retry_at"))))
-        elif pool:
-            notes.append(_tr("{0}，额度池 {1} 已排除派发：{2}（点卡片上的“清除 {1}”或运行 agentcompass hold --clear {3} 后再派发）").format(
-                _retry_what(entry), pool, message, f"{account}#{pool}"))
-        elif entry.get("model") is None and entry.get("retry_at"):
-            # Widened from guesses, not an `account` answer: it backs off like a model hold.
-            notes.append(_tr("{0}，整个账号已排除派发：{1}（下次重试 {2}，或点卡片上的“清除”）").format(
-                _retry_what(entry), message, read_time_text(entry.get("retry_at"))))
+                _retry_what(entry), pool, message, _retry_due(entry)))
         elif entry.get("model") is None:
-            notes.append(_tr("{0}，整个账号已排除派发：{1}（点卡片上的“清除”或运行 agentcompass hold --clear {2} 后再派发）").format(
-                _retry_what(entry), message, account))
+            notes.append(_tr("{0}，整个账号已排除派发：{1}（下次重试 {2}，或点卡片上的“清除”）").format(
+                _retry_what(entry), message, _retry_due(entry)))
         else:
             notes.append(_tr("{0} {1}，已排除派发：{2}（下次重试 {3}）").format(
-                model_label(entry["model"]), _retry_what(entry), message, read_time_text(entry.get("retry_at"))))
+                model_label(entry["model"]), _retry_what(entry), message, _retry_due(entry)))
     return "；".join(notes) or None
 
 
@@ -1944,10 +1944,9 @@ def retry_model_text(holds: dict, account: str, bundles: list) -> str | None:
                 continue
             pool = retry_hold_pool(entry)
             if pool:
-                when = (_tr("下次重试 {0}").format(read_time_text(entry.get("retry_at"))) if entry.get("retry_at")
-                        else _tr("点卡片上的“清除 {0}”后再派发").format(pool))
-                return _tr("额度池 {0} {1}，已排除派发，{2}").format(pool, _retry_what(entry), when)
-            return _tr("{0}，已排除派发，下次重试 {1}").format(_retry_what(entry), read_time_text(entry.get("retry_at")))
+                return _tr("额度池 {0} {1}，已排除派发，{2}").format(
+                    pool, _retry_what(entry), _tr("下次重试 {0}").format(_retry_due(entry)))
+            return _tr("{0}，已排除派发，下次重试 {1}").format(_retry_what(entry), _retry_due(entry))
     return None
 
 

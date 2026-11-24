@@ -24,14 +24,18 @@ None is special-cased here. This module records each such dispatch once in <stat
     and `opencode-go/...` Go models: OpenCode's own provider ids), each prefix is its own pool. Widening never crosses
     a pool: a guess about one quota says nothing about another. An account hold taken while the account had one pool
     becomes a hold of its failed models' pools once the account has several (`scope_account_holds`).
-  - Every hold backs off like a failing usage reading (usage_core.failure_retry_seconds): 2 minutes, doubling with
-    each consecutive hold of the same key, capped at the idle poll interval; a later `next` from the provider wins.
-    Past its retry time the next roll may pick it again and so re-probes it. That includes an account hold widened
-    from two `unknown` answers: guesses never hold an account for good.
-  - Only an account or pool hold the classifier itself scoped `account` has no retry time (`indefinite`): a quota that
-    blocks the whole account (2026-11-09: opencode "Free usage exceeded" on a free model never used before, after a long
-    idle) does not lift by waiting.
-  - Lifting: the tray's clear button (one pool at a time when pools are held), `agentcompass hold --clear ACCOUNT`
+  - Every hold ends by itself at its retry time; past it the next roll may pick the candidate again and so re-probes
+    it. The retry time backs off like a failing usage reading (usage_core.failure_retry_seconds): 2 minutes, doubling
+    with each consecutive hold of the same key, capped at the idle poll interval; an account or pool hold the
+    classifier itself scoped `account` (a quota or a credential refused for every model) caps at the re-probe period
+    the latches share (account_state.LATCH_RETRY_HOURS) instead, since each re-probe of such a quota costs the caller a
+    failed launch and a relaunch. A later `next` from the provider wins. No hold waits for a person (owner,
+    2026-11-24): a hold written without a retry time (by v0.7.x, which held a classifier `account` answer until
+    cleared) is due by the same rule, counted from its `observed_at` (`due_at`).
+  - A failed turn whose message is a confirmed quota failure (`quota_exhaustion.confirmed`) is not a provider hold: it
+    is recorded as the exhaustion of the windows its model draws, with the reset the message states
+    (`quota_exhaustion.record`), and the dispatch keeps the classifier's scope for the fall-back.
+  - Lifting early: the tray's clear button (one pool at a time when pools are held), `agentcompass hold --clear ACCOUNT`
     (every hold of it), `ACCOUNT#POOL` (that pool's hold and its models') or `ACCOUNT/MODEL` (that model's hold only);
     a probe: routing never picks a held bundle, but a model the user names explicitly (`roll --model`) is dispatched
     anyway, and a dispatch launched after the hold whose turn ended on the model's reply clears the account's hold,
@@ -294,18 +298,33 @@ def classify_scope(account, provider, model, message, failure=FAILURE_CODE):
     return answer['scope'], {**meta, **({'reason': answer['reason']} if answer.get('reason') else {})}
 
 
-def retry_seconds(streak):
+def retry_seconds(streak, account_scoped=False):
+    """Seconds a hold lasts after `streak` consecutive holds of its key: the usage reader's failure backoff, capped at the
+    idle poll interval, or at the latches' re-probe period for a hold the classifier scoped `account` (`account_scoped`)."""
     import usage_core
-    return usage_core.failure_retry_seconds(streak, usage_core.IDLE_REFRESH_SECONDS)
+    cap = int(account_state.LATCH_RETRY_HOURS * 3600) if account_scoped else usage_core.IDLE_REFRESH_SECONDS
+    return usage_core.failure_retry_seconds(streak, cap)
 
 
 def _account_hold(entry):
     return isinstance(entry, dict) and entry.get('model') is None
 
 
-def indefinite(entry):
-    """Held until lifted, never by waiting: only an account or pool hold the classifier itself scoped `account`."""
+def account_scoped(entry):
+    """An account or pool hold the classifier itself scoped `account` (its backoff caps at the latches' period)."""
     return _account_hold(entry) and entry.get('scope') == 'account'
+
+
+def due_at(entry):
+    """When the hold ends by itself: its retry time, else (a hold written without one) its `observed_at` plus the
+    backoff of its streak and scope. None only for an entry with neither time, which holds nothing."""
+    retry = _time((entry or {}).get('retry_at'))
+    if retry is not None:
+        return retry
+    observed = _time((entry or {}).get('observed_at'))
+    if observed is None:
+        return None
+    return observed + timedelta(seconds=retry_seconds(int(entry.get('streak') or 1), account_scoped(entry)))
 
 
 def outcome_code(code, scope):
@@ -331,9 +350,7 @@ def dispatch_scope(dispatch_id, path=None):
 
 
 def _recent(entry, now):
-    if indefinite(entry):
-        return True
-    retry = _time((entry or {}).get('retry_at'))
+    retry = due_at(entry)
     return retry is not None and retry > now - timedelta(hours=STREAK_HOURS)
 
 
@@ -380,12 +397,10 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
         held = (pool_key(account, pool['id']) if pool else key(account)) if wide else key(account, model)
         previous = entries.get(held) if isinstance(entries.get(held), dict) else {}
         streak = int(previous.get('streak') or 0) + 1 if _recent(previous, at) else 1
-        retry = None
-        # Only the classifier's own `account` answer holds without a retry time; a widened guess backs off.
-        if not (wide and scope == 'account'):
-            retry = at + timedelta(seconds=retry_seconds(streak))
-            if nxt and nxt > retry:
-                retry = nxt
+        # Every hold has a retry time; the classifier's own `account` answer backs off to the latches' period.
+        retry = at + timedelta(seconds=retry_seconds(streak, wide and scope == 'account'))
+        if nxt and nxt > retry:
+            retry = nxt
         entry = {'account': account, 'provider': provider, 'model': None if wide else model,
                  'failure_code': code, 'scope': scope,
                  'scope_source': 'widened' if widened else ('classifier' if scope != 'unknown' else 'unknown_default'),
@@ -393,7 +408,7 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
                                                           'fallback_reason') if meta.get(k)},
                  'message': message, 'next': nxt.isoformat() if nxt else None,
                  'attempts': failure.get('attempts'), 'retrying_since': failure.get('retrying_since'),
-                 'observed_at': at.isoformat(), 'streak': streak, 'retry_at': retry.isoformat() if retry else None,
+                 'observed_at': at.isoformat(), 'streak': streak, 'retry_at': retry.isoformat(),
                  'source': dispatch_id}
         if pool:
             # A pool hold covers the pool; a model hold remembers its pool, so lifting the pool lifts it too.
@@ -482,7 +497,7 @@ def active(*, now=None, path=None):
     except PermissionError:
         return {}
     return {k: v for k, v in entries.items()
-            if isinstance(v, dict) and (indefinite(v) or (_time(v.get('retry_at')) or now) > now)}
+            if isinstance(v, dict) and (due_at(v) or now) > now}
 
 
 def pool_holds(entries, account):
@@ -516,11 +531,9 @@ def entry_for(bundle, entries):
 
 
 def retry_text(entry):
-    """When the router tries the held key again; an indefinite hold waits for a lift."""
-    if indefinite(entry):
-        return (f'held until cleared (tray clear button or `{CLEAR_COMMAND} {entry_key(entry)}`), a model named on '
-                'it completes, or (accounts with a usage reader) a good usage reading after it or a re-login')
-    return f"next retry at {(entry or {}).get('retry_at') or 'unknown'}"
+    """When the router tries the held key again (`due_at`): every hold ends by itself."""
+    due = due_at(entry)
+    return f"next retry at {due.isoformat() if due else 'unknown'}"
 
 
 def describe(entry):
@@ -536,12 +549,12 @@ def reason(bundle, entries):
     entry = entry_for(bundle, entries)
     if not entry:
         return None
-    return describe(entry) + f"; clear with `{CLEAR_COMMAND} {entry_key(entry)}`"
+    return describe(entry)
 
 
 def warnings(entries, allowed=None):
     """One `plan`/`roll` line per hold. `allowed(account)` skips accounts this host does not use."""
-    return [f"{k}: {describe(v)}; excluded from dispatch; clear with `{CLEAR_COMMAND} {k}`"
+    return [f"{k}: {describe(v)}; excluded from dispatch until then"
             for k, v in sorted((entries or {}).items()) if allowed is None or allowed(v.get('account'))]
 
 
