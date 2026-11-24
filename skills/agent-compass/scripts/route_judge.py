@@ -374,7 +374,7 @@ def record_resume(args, task, classified, bundle, agent_id):
     """`roll --resume <agent_id>`: the caller named a worker, so the route is that worker's own bundle, whatever an
     automatic plan would choose for the task (an account out of automatic routing included). The task is classified
     like any roll (`classify_pinned`) so the turn is priced and reserved; the facts about the worker (busy, worn, a
-    refusing window, leftover meter fields, a model its account no longer offers) are decided where they live: roll's
+    refusing window, a model its account no longer offers) are decided where they live: roll's
     resume checks, the gate's turn check and `dispatch_registry.prepare`. Returns the finalized decision."""
     started = time.monotonic()
     import account_fleet

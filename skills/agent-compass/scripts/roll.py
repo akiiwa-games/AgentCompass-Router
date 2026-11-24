@@ -339,7 +339,7 @@ def _auto_resumable(worker, policy, usage_cache_path=None, accounts=None):
             return False
     rows = [r for r in account_fleet.bundle_rows(accounts, bundle.get('bundle_id') or bundle.get('id'))
             if r['account'] == bundle.get('account')]
-    if host_policy.disabled_cause(bundle['account'], rows, accounts):
+    if host_policy.unchecked_bundles(rows):
         return False
     return not _worker_gate_refusal(worker, usage_cache_path=usage_cache_path, accounts=accounts)
 

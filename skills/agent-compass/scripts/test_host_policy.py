@@ -542,6 +542,15 @@ class HostPolicyTests(unittest.TestCase):
             account_fleet.load_accounts(read_only=True)
             self.assertEqual(self.path.read_bytes(), before_pol)
 
+    def test_unchecked_bundles_reports_only_when_every_candidate_is_disabled(self):
+        self.assertEqual(host_policy.unchecked_bundles([]), [])
+        self.assertEqual(host_policy.unchecked_bundles([{'bundle_id': 'a', 'disabled': True},
+                                                        {'bundle_id': 'b', 'disabled': False}]), [])
+        found = host_policy.unchecked_bundles([{'bundle_id': 'a', 'disabled': True},
+                                               {'bundle_id': 'b', 'disabled': True}])
+        self.assertEqual(found, ['a', 'b'])
+        self.assertEqual(host_policy.unchecked_bundles_text(found), '档位 a, b 在模型管理中未勾选（不参与自动派发）')
+
 
 if __name__ == '__main__':
     unittest.main()
