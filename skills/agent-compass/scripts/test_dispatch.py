@@ -3094,6 +3094,15 @@ class PinnedRollTests(unittest.TestCase):
         answer = route_judge.failure_answer(refused, 'dispatch')
         self.assertEqual(answer['status'], 'error')
         self.assertNotIn('start_after_hours', answer)
+        # Review round 4 N2: the answer itself says what refused, in the rule's numbers (each short window and its
+        # estimate), and a way out of its own, not the generic error and next action of a failed run.
+        generic = route_judge.failure_answer(registry.CapacityChanged('fixture'), 'dispatch')
+        for wid, short in found.items():
+            self.assertIn(wid, answer['cause'])
+            self.assertIn(f"{short['need_pct']:.0f}%", answer['cause'])
+        self.assertTrue(answer['next_action'].strip())
+        self.assertNotEqual(answer['next_action'], generic['next_action'])
+        self.assertNotEqual(answer['error'], generic['error'])
 
     def test_no_classifier_and_no_hours_says_so_and_never_prints_none(self):
         import roll

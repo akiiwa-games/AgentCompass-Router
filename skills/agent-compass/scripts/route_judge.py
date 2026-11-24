@@ -1259,6 +1259,10 @@ def failure_answer(exc, stage):
         f'{fix} roll again. A task that already has a Paseo dispatch comes back as that worker (pending), not as a second launch.'
         if stage == 'roll' else
         f'{fix} check the reviewed input and the usage cache, and continue feasible parent work.')
+    if isinstance(exc, dispatch_registry.Refused) and callable(getattr(exc, 'next_action', None)):
+        # A refusal that knows its own way out (dispatch_registry.FullCapacityRefused) says it, and what refused.
+        failure['error'] = getattr(exc, 'error', None) or failure['error']
+        failure['next_action'] = exc.next_action()
     return failure
 
 

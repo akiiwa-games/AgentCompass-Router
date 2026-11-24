@@ -90,6 +90,27 @@ class CapacityChanged(Refused):
     model list that dropped it): the attempt failed before anything was sent, so the brief may go to the next candidate."""
 
 
+class FullCapacityRefused(CapacityChanged):
+    """A recorded constraint the user did not name (a project rule) whose work the router estimates beyond a quota
+    window's full capacity plus its margin (candidate_eval.renewal_capacity_refusal): no renewal holds it, so there is
+    no time to wait for. Its text is the rule's numbers per window (`shortfalls`, the candidate's `full_capacity_short`)
+    and its `next_action` the two ways out."""
+
+    error = 'The route was refused by the full-capacity rule'
+
+    def __init__(self, account, model, shortfalls):
+        parts = '; '.join(f"{wid}: the router estimates the work at about {s['need_pct']:.0f}% of this window, whose "
+                          f"full capacity is {s['full']:.0f}% and keeps a {s['margin_pct']:g}% margin"
+                          for wid, s in shortfalls.items())
+        super().__init__(f'{account}/{model} cannot hold the work: {parts} (an estimate of the router, not a reading)')
+        self.shortfalls = shortfalls
+
+    def next_action(self):
+        return ('Nothing was launched. Roll again without the constraint so the router picks a route whose quota holds '
+                "the work; or, if the user names this route (roll --provider/--account/--model --basis \"<the user's "
+                'words>"), it launches past the estimate with a warning.')
+
+
 class WorkspaceBusy(Refused):
     """The workspace already has a writer; `holders` names each one."""
 
@@ -1918,6 +1939,12 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             waits = [w for w in waits if w not in candidate_eval.AUTOMATIC_ROUTING_WAITS]
         if bundle.get('fast') and not candidate['bundle'].get('fast') and not exclusions:
             exclusions.append('fast mode quota is no longer sufficient')
+        short = candidate.get('full_capacity_short') or {}
+        if (decision.get('constraint') and not named and exclusions and not waits
+                and set(exclusions) <= {s.get('text') for s in short.values()}):
+            # A constraint held only by the full-capacity rule: the rule's numbers and the ways out, not "changed".
+            raise FullCapacityRefused(bundle['account'], bundle['model'],
+                                      {wid: s for wid, s in short.items() if s.get('text') in exclusions})
         if exclusions or (resume_bundle is None and waits):
             raise CapacityChanged('Capacity/availability changed: ' + '; '.join(exclusions or ['reset not yet observed']))
         if resume_agent_id is None and candidate.get('action') == 'resume':

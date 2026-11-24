@@ -535,7 +535,7 @@ def evaluate_bundle(bundle, task, ctx):
             )
             if refusal is None:
                 return False
-            full_short.setdefault(wid_k, {k: refusal[k] for k in ('need_pct', 'full', 'margin_pct')})
+            full_short.setdefault(wid_k, {k: refusal[k] for k in ('text', 'need_pct', 'full', 'margin_pct')})
             if override_named:
                 past_full.setdefault(wid_k, refusal)
                 return False
