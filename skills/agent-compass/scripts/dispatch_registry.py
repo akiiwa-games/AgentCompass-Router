@@ -176,6 +176,114 @@ class RouteFactRefused(Refused):
         return out
 
 
+def launch_fact_refusal(bundle, accounts, usage, now, *, user_named, records):
+    """The fact refusal of a recorded route that a window it draws stops whatever the task's size (an account
+    protection of `check_launch_quota`: its launch floors, an unavailable account; `quota_pools.launch_blockers`: a
+    latch, a window used up in this cycle), with `allocator.refusal_schedule`'s time when every such window has an
+    observed reset or a known end; None when nothing stops it. `records` reads the in-flight reservations, only when a
+    reading needs them. One source for the record (route_judge._check_record_launch) and, for a route the user named,
+    the re-check before launch (`prepare`)."""
+    import allocator
+    import quota_pools
+    account = bundle['account']
+    floors = []
+    try:
+        check_launch_quota(bundle, accounts, usage, now)
+    except LaunchFloorRefused as exc:
+        floors = list(exc.floors)
+    except Refused as exc:
+        return RouteFactRefused(str(exc), user_named=user_named)
+    acc_usage = (usage.get('accounts') or {}).get(account) or {}
+    blockers = []
+    read = None
+    if (floors or acc_usage.get('status') == 'fresh' or acc_usage.get('rate_limited_until')
+            or quota_pools.latched_windows(accounts, account)):
+        read = records()
+        blockers = quota_pools.launch_blockers(bundle, accounts, usage, now, records=read)
+    if not floors and not blockers:
+        return None
+    spec_windows = ((accounts.get('accounts') or {}).get(account) or {}).get('windows') or {}
+    floor_by_wid = dict(floors)
+    blocker_by_wid = {wid: f"Account {account!r} window {wid!r} is exhausted or below safety floor ({reason})"
+                      for wid, reason in blockers}
+    ordered_wids = list(dict.fromkeys([*(wid for wid, _ in floors), *(wid for wid, _ in blockers)]))
+    reasons = {
+        wid: (floor_by_wid[wid]
+              if wid in floor_by_wid and ((spec_windows.get(wid) or {}).get('launch_min_remaining_pct')
+                                          or wid not in blocker_by_wid)
+              else blocker_by_wid[wid])
+        for wid in ordered_wids
+    }
+    start_after_hours, retry_at, waiting_on = allocator.refusal_schedule(
+        bundle, accounts, usage, now, blocked_wids=ordered_wids, records=read,
+    )
+    if waiting_on in reasons:
+        ordered_wids = [waiting_on, *(wid for wid in ordered_wids if wid != waiting_on)]
+    latched = waiting_on is not None and waiting_on in quota_pools.latched_windows(accounts, account)
+    return RouteFactRefused('; '.join(reasons[wid] for wid in ordered_wids), user_named=user_named,
+                            start_after_hours=start_after_hours, retry_at=retry_at, waiting_on=waiting_on,
+                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None)
+
+
+def plan_row_holds(candidate, named):
+    """What holds a decision's bundle in its own plan row at launch: `(exclusions, waits)`, each wait a window with a
+    known time. A recorded route (`named`: a route the user named, an explicit resume) is not the router's choice, so
+    what only automatic routing is held to does not stop it: an account out of automatic routing, a model unchecked (an
+    explicit resume continues a worker whose model was unchecked after its launch), the account's dispatch cadence, the
+    ability fit and the constraint filters, and a provider hold (a named model on a held account or model is the probe
+    that can lift it, provider_retry)."""
+    import candidate_eval
+    import provider_retry
+    exclusions = list(candidate['excluded'])
+    waits = [w for w, hours in (candidate.get('waits') or {}).items() if hours]
+    if named:
+        exclusions = [e for e in exclusions if e not in candidate_eval.AUTOMATIC_ROUTING_EXCLUSIONS
+                      and not e.startswith(('ability ', 'explicit model constraint', 'explicit effort constraint',
+                                            provider_retry.EXCLUSION_PREFIX))]
+        waits = [w for w in waits if w not in candidate_eval.AUTOMATIC_ROUTING_WAITS]
+    return exclusions, waits
+
+
+def hold_cause(candidate, exclusions, waits):
+    """The words of what holds a plan row: its exclusions, then each wait as the row states it (the window and its
+    state, the binding one first; candidate_eval `wait_reasons`)."""
+    reasons, hours = candidate.get('wait_reasons') or {}, candidate.get('waits') or {}
+    return '; '.join([*exclusions, *(reasons[w] for w in sorted(waits, key=lambda w: -hours[w]))])
+
+
+def named_route_refusal(candidate, exclusions, waits, accounts, now, *, user_named):
+    """The fact refusal of a route the user named whose own plan row cannot start now (`plan_row_holds`): the row's
+    words for each window and its state and, when only waits hold it, the row's own time (its binding wait, the time an
+    automatic plan of the same reading defers to). An exclusion has no time, so a refusal with one carries none. One
+    source for the check at record (route_judge.record_constraint) and the re-check before launch (`prepare`)."""
+    import allocator
+    import quota_pools
+    cause = hold_cause(candidate, exclusions, waits)
+    if exclusions:
+        return RouteFactRefused(cause, user_named=user_named)
+    waiting_on = max(waits, key=lambda w: candidate['waits'][w])
+    hours = candidate['waits'][waiting_on]
+    account = candidate['bundle']['account']
+    latched = waiting_on in quota_pools.latched_windows(accounts, account)
+    return RouteFactRefused(cause, user_named=user_named, start_after_hours=allocator.advised_hours(hours),
+                            retry_at=(now + timedelta(hours=hours)).isoformat(), waiting_on=waiting_on,
+                            waiting_end=quota_pools.latched_end_kind(accounts, account) if latched else None)
+
+
+def plan_row(alloc_task, bundle, usage, now, accounts, records, route, named):
+    """The decision's bundle as `allocator.plan` ranks it for `alloc_task` under `route` (task_intake.ROUTE_FIELDS),
+    or None when the ranking has no row of it."""
+    import allocator
+    import candidate_ranking
+    plan = allocator.plan(alloc_task, usage, now, records=records, accounts=accounts,
+                          named_accounts={bundle['account']} if named else (), route=route)
+    # A fast route with no fast variant in the ranking is answered by its plain row: its exclusions (the fast-mode
+    # refusal among them) say why, not "no longer matches".
+    return (candidate_ranking.candidate_for_bundle(plan['ranking'], bundle['bundle_id'], bundle.get('fast'))
+            or (bundle.get('fast') and candidate_ranking.candidate_for_bundle(plan['ranking'], bundle['bundle_id']))
+            or None)
+
+
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -340,7 +448,8 @@ def check_launch_quota(bundle, accounts, usage, now):
             floor = window.get('launch_min_remaining_pct', 0)
             floors.append((
                 wid,
-                f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor)",
+                f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor)"
+                + ('' if quota_pools.observed_reset(observed, now) else '; no reset of it is observed'),
             ))
     if floors:
         raise LaunchFloorRefused(floors)
@@ -1808,9 +1917,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
     cwd = canon_ws or cwd
     if canon_ws and isinstance(launch, dict):
         launch = dict(launch, cwd=canon_ws)
-    import allocator
     import account_fleet
-    import candidate_ranking
     import dispatch_ground_truth
     import quota_pools
     import task_intake
@@ -1866,10 +1973,18 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                 raise Refused('This parent/task already has an active dispatch; reconcile it first')
             if old.get('agent_id'):
                 busy_agents.add(old['agent_id'])
-        try:
-            check_launch_quota(bundle, accounts, usage, now)
-        except ValueError as exc:
-            raise CapacityChanged(str(exc)) from exc
+        user_named = decision.get('constraint') == 'user_override' and resume_bundle is None
+        if user_named:
+            # A route the user named is held by the facts its record checked, with the same words and time.
+            refused = launch_fact_refusal(bundle, accounts, usage, now, user_named=True,
+                                          records=lambda: active_records(connection, now))
+            if refused:
+                raise refused
+        else:
+            try:
+                check_launch_quota(bundle, accounts, usage, now)
+            except ValueError as exc:
+                raise CapacityChanged(str(exc)) from exc
         if resume_bundle is None and decision.get('listed_rows'):
             accounts = provider_inventory.with_listed_rows(accounts, decision['listed_rows'])
         if resume_bundle is None and decision.get('effort_override'):
@@ -1914,29 +2029,10 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
         if quota_pools.cadence_horizon(accounts) is not None or (alloc_task.get('chain') or {}).get('id'):
             import decision_ledger
             records += [r for r in decision_ledger.read_ledger() if r.get('decision_id') != decision_id]
-        plan = allocator.plan(alloc_task, usage, now, records=records, accounts=accounts,
-                              named_accounts={bundle['account']} if named else (), route=route)
-        # A fast route with no fast variant in the ranking is answered by its plain row: its exclusions (the fast-mode
-        # refusal among them) say why, not "no longer matches".
-        candidate = (candidate_ranking.candidate_for_bundle(plan['ranking'], bundle['bundle_id'], bundle.get('fast'))
-                     or (bundle.get('fast') and candidate_ranking.candidate_for_bundle(plan['ranking'], bundle['bundle_id']))
-                     or None)
+        candidate = plan_row(alloc_task, bundle, usage, now, accounts, records, route, named)
         if candidate is None or any(candidate['bundle'].get(k) != bundle.get(k) for k in ('provider', 'account', 'model', 'effort')):
             raise CapacityChanged('Decision bundle no longer matches installed account configuration')
-        exclusions = list(candidate['excluded'])
-        waits = [w for w, hours in (candidate.get('waits') or {}).items() if hours]
-        if named:
-            import candidate_eval
-            import provider_retry
-            # A named model on a held account or model is the probe that can lift the hold (provider_retry);
-            # an explicit --resume continues the worker's own bundle regardless of ability/model-latch exclusions.
-            # Neither is the router's choice, so what only automatic routing is held to does not stop them: an account
-            # out of automatic routing, a model unchecked (an explicit resume continues a worker whose model was
-            # unchecked after its launch), and the account's dispatch cadence, at its limit or freeing a seat soon.
-            exclusions = [e for e in exclusions if e not in candidate_eval.AUTOMATIC_ROUTING_EXCLUSIONS
-                          and not e.startswith(('ability ', 'explicit model constraint', 'explicit effort constraint',
-                                                provider_retry.EXCLUSION_PREFIX))]
-            waits = [w for w in waits if w not in candidate_eval.AUTOMATIC_ROUTING_WAITS]
+        exclusions, waits = plan_row_holds(candidate, named)
         if bundle.get('fast') and not candidate['bundle'].get('fast') and not exclusions:
             exclusions.append('fast mode quota is no longer sufficient')
         short = candidate.get('full_capacity_short') or {}
@@ -1945,8 +2041,12 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
             # A constraint held only by the full-capacity rule: the rule's numbers and the ways out, not "changed".
             raise FullCapacityRefused(bundle['account'], bundle['model'],
                                       {wid: s for wid, s in short.items() if s.get('text') in exclusions})
+        if user_named and (exclusions or waits):
+            # A route the user named held by a fact: the refusal its record gives for the same reading.
+            raise named_route_refusal(candidate, exclusions, waits, accounts, now, user_named=True)
         if exclusions or (resume_bundle is None and waits):
-            raise CapacityChanged('Capacity/availability changed: ' + '; '.join(exclusions or ['reset not yet observed']))
+            raise CapacityChanged('Capacity/availability changed: '
+                                  + hold_cause(candidate, exclusions, waits if resume_bundle is None else []))
         if resume_agent_id is None and candidate.get('action') == 'resume':
             chain_worker = ((alloc_task.get('chain') or {}).get('worker')
                             if isinstance(alloc_task.get('chain'), dict) else None) or {}

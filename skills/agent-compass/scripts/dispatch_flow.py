@@ -977,8 +977,11 @@ def cli(args):
         require_actual_parent(document['task'].get('parent_agent_id'))
         import usage_reading
         reconcile()
-        row = registry.prepare(document['decision_id'], document['task'], document['launch'],
-                               usage_reading.usage_snapshot(args.usage_cache))
+        try:
+            row = registry.prepare(document['decision_id'], document['task'], document['launch'],
+                                   usage_reading.usage_snapshot(args.usage_cache))
+        except registry.RouteFactRefused as refused:      # a route the user named, held by a fact: nothing prepared
+            return refused.answer({'stage': 'dispatch', 'dispatch_action': 'prepare'})
         return {**public(row), 'create_agent': row['request'], **({'warnings': row['warnings']} if row.get('warnings') else {})}
     if action == 'start' and not args.dispatch_id:
         raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')

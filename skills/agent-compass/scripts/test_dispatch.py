@@ -187,7 +187,7 @@ class DispatchTests(unittest.TestCase):
         registry.release(prepared['dispatch_id'], 'parent-a', 'fixture: never launched', now=self.now)
         ledger.write_text(json.dumps(outside) + '\n', encoding='utf-8')
         automatic = dict(self.task, task_id='after-the-named-launch')
-        with self.assertRaisesRegex(registry.CapacityChanged, 'reset not yet observed'):
+        with self.assertRaisesRegex(registry.CapacityChanged, 'cadence frees'):    # the wait in words, never "not observed"
             self.prepare(self.issue(task=automatic), task=automatic)
 
     def test_pi_request_omits_unsupported_mode_including_saved_legacy_value(self):
@@ -378,7 +378,7 @@ class DispatchTests(unittest.TestCase):
              'seconds_until_reset': 86400, 'resets_at': (self.now + timedelta(days=1)).isoformat()}]}}}
         for allowed in (['codex'], ['claude-lab']):
             (self.root / 'host.json').write_text(json.dumps({'allowed_accounts': allowed}))
-            with self.subTest(allowed=allowed), self.assertRaisesRegex(ValueError, 'Capacity/availability'):
+            with self.subTest(allowed=allowed), self.assertRaisesRegex(registry.RouteFactRefused, "window 'usage'"):
                 registry.prepare(decision['decision_id'], self.task, self.launch, exhausted, now=self.now)
         self.assertEqual(self.prepare(decision)['bundle']['account'], 'codex')
 
@@ -4958,7 +4958,7 @@ class LiveModelCheckTests(unittest.TestCase):
                 self.assertEqual('claude-lab' in polled, 'claude-lab' in allowed, self.fetched_providers)
                 named = self.issue(task=task, stage='record', choice='constraint', constraint='user_override',
                                    basis='User named it')
-                with self.assertRaisesRegex(registry.CapacityChanged, 'provider no longer offers claude-sonnet-5-5'):
+                with self.assertRaisesRegex(registry.RouteFactRefused, 'provider no longer offers claude-sonnet-5-5'):
                     self.prepare(named, task=task)
 
     def test_a_named_route_on_an_unchecked_model_launches_and_reads_the_live_list_a_plan_does_not(self):
@@ -4984,7 +4984,7 @@ class LiveModelCheckTests(unittest.TestCase):
                 if offered:
                     self.assertEqual(self.prepare(named, task=task)['bundle']['bundle_id'], 'lab_sonnet55_high')
                 else:
-                    with self.assertRaisesRegex(registry.CapacityChanged, 'provider no longer offers claude-sonnet-5-5'):
+                    with self.assertRaisesRegex(registry.RouteFactRefused, 'provider no longer offers claude-sonnet-5-5'):
                         self.prepare(named, task=task)
                 self.assertIn('claude-lab', {p for batch in self.fetched_providers for p in batch})
 

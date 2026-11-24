@@ -171,13 +171,19 @@ def applicable_windows(account_spec, model, usage_row, bundle=None, accounts=Non
     return [(wid, windows[wid], observed.get(wid)) for wid in ids if wid in windows]
 
 
+def observed_reset(observed, now):
+    """Whether the reading shows a reset still ahead (a future `resets_at`, else a countdown whose reset has not passed)."""
+    reset = parse_time((observed or {}).get('resets_at'))
+    seconds = (observed or {}).get('seconds_until_reset')
+    return (reset is not None and reset > now) or (
+        reset is None and isinstance(seconds, (int, float)) and seconds > 0 and (observed or {}).get('reset_time_passed') is not True)
+
+
 def below_launch_floor(window, observed, usage_row, now):
     """Existing launch protection, shared by ranking and dispatch."""
     floor = window.get('launch_min_remaining_pct')
     reset = parse_time((observed or {}).get('resets_at'))
-    seconds = (observed or {}).get('seconds_until_reset')
-    active_reset = (reset is not None and reset > now) or (
-        reset is None and isinstance(seconds, (int, float)) and seconds > 0 and (observed or {}).get('reset_time_passed') is not True)
+    active_reset = observed_reset(observed, now)
     if floor is not None and (observed or {}).get('rate_limited') is True and active_reset:
         return True
     fetched = parse_time(usage_row.get('fetched_at'))
@@ -278,7 +284,9 @@ def window_refusal(wid, window, observed, usage_row, now, latched=()):
     if wid in latched:
         return f'{wid}: quota confirmed exhausted'
     if below_launch_floor(window, observed, usage_row, now):
-        return f'{wid}: confirmed exhausted or below launch floor'
+        # With no reset ahead in the reading there is no time to start at: the refusal says so.
+        return f'{wid}: confirmed exhausted or below launch floor' + (
+            '' if observed_reset(observed, now) else '; no reset of it is observed')
     return None
 
 

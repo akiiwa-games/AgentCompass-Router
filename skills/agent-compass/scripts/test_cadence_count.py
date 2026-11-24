@@ -385,7 +385,7 @@ class NamedRoutesReachPastTheCadence(unittest.TestCase):
                                           'selected_bundle': dict(row['bundle'])}, automatic, self.now)
                 with self.assertRaises(registry.CapacityChanged) as refused:
                     registry.prepare(planned['decision_id'], automatic, launch, self.usage, self.fleet)
-                self.assertRegex(str(refused.exception), 'reset not yet observed')
+                self.assertRegex(str(refused.exception), 'cadence frees')     # the wait in words, never "not observed"
 
     def test_a_named_resume_takes_the_turn_with_the_warning(self):
         import usage_reading

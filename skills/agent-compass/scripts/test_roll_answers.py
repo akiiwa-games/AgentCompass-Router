@@ -957,6 +957,81 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         self.assertNotIn('cannot start now', list_ans['next_action'])
         live_models.invalidate()
 
+    def named_refusal_at_record_and_prepare(self, decision, task, args):
+        """(record's refusal, prepare's refusal) of the same named route for the current usage cache."""
+        import account_fleet
+        import usage_reading
+        with self.assertRaises(registry.RouteFactRefused) as at_record:
+            route_judge.record_constraint(args, task=dict(task, task_id=task['task_id'] + '-again'),
+                                          classified={'task': task, 'scorer': None})
+        with self.assertRaises(registry.RouteFactRefused) as at_prepare:
+            registry.prepare(decision['decision_id'], task, {'title': 'Review', 'initialPrompt': 'Review'},
+                             usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                             accounts=account_fleet.load_accounts(), now=self.now)
+        return at_record.exception, at_prepare.exception
+
+    def test_e_a_named_route_a_quota_fact_holds_is_one_fact_refusal_at_the_plan_and_before_launch(self):
+        """Rule (brief D2; dispatch_registry.launch_fact_refusal, named_route_refusal, RouteFactRefused): a route the
+        user named that a quota window with an observed reset holds answers `blocked` / `tell_user`, exit 2, with a cause
+        naming the window and its state, and the schedule of that reset; the check at record and the re-check before
+        launch read the same facts (the task-independent launch facts, then the named route's own plan row) and give the
+        same refusal for the same reading; no text says "reset not yet observed"."""
+        from router_test_support import profile
+        healthy = [{'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+                   {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()}]
+        reset = self.now + timedelta(hours=20, minutes=12)
+        facts = (
+            # (label, windows, held window, work hours, held only by the size of the work)
+            ('used up with an observed reset', [healthy[0], {'id': 'seven_day', 'used_pct': 100.0,
+                                                             'resets_at': reset.isoformat()}], 'seven_day', 0.5, False),
+            ('short of the work with an observed reset', [healthy[0], {'id': 'seven_day', 'used_pct': 88.0,
+                                                                       'resets_at': reset.isoformat()}],
+             'seven_day', 4.0, True),
+        )   # used up with no observed reset: test_free_pool_unpublished (the cache reader pairs a used-up reading with its reset)
+        args = route_judge.build_parser().parse_args(['record', '--constraint', 'user_override', *self.NAMED_FLAGS])
+        for n, (label, windows, wid, hours, by_size) in enumerate(facts):
+            with self.subTest(fact=label):
+                self.write_usage_cache(healthy)
+                task = {'parent_agent_id': 'parent-named', 'task_id': f't-fact-{n}', 'objective': 'Review',
+                        'expected_hours': hours, 'profile': profile()}
+                decision = route_judge.record_constraint(args, task=task, classified={'task': task, 'scorer': None})
+                self.assertTrue(decision.get('decision_id'), decision)
+                self.write_usage_cache(windows)
+                code, ans = self.run_cli('roll', '--task', 'Review architecture', '--hours', str(hours), *self.NAMED_FLAGS)
+                self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
+                self.assertIn(wid, ans['cause'])
+                self.assertNotIn('reset not yet observed', ans['cause'] + ans['next_action'])
+                self.assertGreaterEqual(datetime.fromisoformat(ans['retry_at']), reset - timedelta(seconds=1))
+                self.assertLessEqual(datetime.fromisoformat(ans['retry_at']), reset + timedelta(seconds=1))
+                self.assertGreaterEqual(ans['start_after_hours'], (reset - self.now).total_seconds() / 3600 - 0.01)
+                # What holds it: a fact of the window whatever the task's size, or only this work's size (the named
+                # route's own plan row, which the record now reads as the re-check before launch does).
+                import account_fleet
+                import provider_inventory
+                import usage_reading
+                accounts = account_fleet.load_accounts()
+                usage = provider_inventory.merge_usage(usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                                                       accounts, self.now)
+                task_free = registry.launch_fact_refusal(dict(decision['selected_bundle'], account='claude'), accounts,
+                                                         usage, self.now, user_named=True, records=lambda: [])
+                self.assertEqual(task_free is None, by_size, task_free and task_free.cause)
+                if by_size:
+                    # The reading changed between the record and the launch: roll answers the re-check's refusal the same
+                    # way (prepare raises it; nothing is launched).
+                    with patch.object(route_judge, '_check_named_plan_row'):
+                        code_p, ans_p = self.run_cli('roll', '--task', 'Review architecture', '--hours', str(hours),
+                                                     *self.NAMED_FLAGS)
+                    self.assertEqual((code_p, ans_p['status'], ans_p.get('caller_action')), (2, 'blocked', 'tell_user'),
+                                     ans_p)
+                    self.assertEqual((ans_p['cause'], ans_p['start_after_hours']), (ans['cause'], ans['start_after_hours']))
+                at_record, at_prepare = self.named_refusal_at_record_and_prepare(decision, task, args)
+                self.assertEqual(at_record.cause, at_prepare.cause)
+                self.assertEqual((at_record.start_after_hours, at_record.waiting_on),
+                                 (at_prepare.start_after_hours, at_prepare.waiting_on))
+                self.assertLess(abs(datetime.fromisoformat(at_record.retry_at)
+                                    - datetime.fromisoformat(at_prepare.retry_at)), timedelta(seconds=1))
+                self.assertIn(wid, at_prepare.cause)
+
     def test_c_request_input_refusals_stay_error_with_present_next_action(self):
         import live_models
         self.write_usage_cache([
@@ -1014,38 +1089,36 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
         ])
         launch = {'title': 'Review', 'initialPrompt': 'Review'}
-        with self.assertRaises(registry.CapacityChanged) as caught:
-            registry.prepare(
-                decision['decision_id'], task, launch,
-                usage_reading.usage_snapshot(self.cache_path, now=self.now),
-                accounts=account_fleet.load_accounts(), now=self.now,
-            )
-        outcome = dispatch_fallback.after_refusal(decision['decision_id'], launch, caught.exception, judge=route_judge)
-        res, code = roll.fallback_result({'stage': 'roll'}, outcome, decision, 'parent-named', args)
-        self.assertEqual((code, res['caller_action'], res['error']), (2, 'tell_user', 'owner_named_model_failed'))
-        combined = (res['next'] + '\n' + '\n'.join(res.get('attempts') or ())).lower()
-        self.assertNotIn('replan', combined)
-        self.assertNotIn('reroute', combined)
 
-        # Path 2: candidate exclusion inside prepare (Capacity/availability changed) — model_latch and latched quota window
+        def named_fact(decision_item, task_item):
+            """A route the user named, held by a fact at prepare: the fact refusal (brief D2), never a failed attempt."""
+            with self.assertRaises(registry.RouteFactRefused) as caught:
+                registry.prepare(
+                    decision_item['decision_id'], task_item, launch,
+                    usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                    accounts=account_fleet.load_accounts(), now=self.now,
+                )
+            answer = caught.exception.answer({'stage': 'roll'}, for_roll=True)
+            self.assertEqual((answer['status'], answer['caller_action']), ('blocked', 'tell_user'))
+            combined = (answer['cause'] + '\n' + answer['next_action']).lower()
+            for forbidden in ('replan', 'reroute', 'refresh quota', 'transient'):
+                self.assertNotIn(forbidden, combined)
+            return caught.exception
+
+        floor = named_fact(decision, task)
+        self.assertIn('five_hour', floor.cause)
+        self.assertIsNotNone(floor.retry_at)       # the floor's window has an observed reset
+
+        # Path 2: candidate exclusion inside prepare — model_latch and latched quota window
         self.write_usage_cache([
             {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
         ])
         model_latch.record({'account': 'claude', 'provider': 'claude', 'model': 'claude-opus-5-5'}, 'INVALID_MODEL', at=self.now)
         try:
-            with self.assertRaises(registry.CapacityChanged) as caught2:
-                registry.prepare(
-                    decision2['decision_id'], task2, launch,
-                    usage_reading.usage_snapshot(self.cache_path, now=self.now),
-                    accounts=account_fleet.load_accounts(), now=self.now,
-                )
-            outcome2 = dispatch_fallback.after_refusal(decision2['decision_id'], launch, caught2.exception, judge=route_judge)
-            res2, code2 = roll.fallback_result({'stage': 'roll'}, outcome2, decision2, 'parent-named', args)
-            self.assertEqual((code2, res2['caller_action'], res2['error']), (2, 'tell_user', 'owner_named_model_failed'))
-            combined2 = (res2['next'] + '\n' + '\n'.join(res2.get('attempts') or ())).lower()
-            self.assertNotIn('replan', combined2)
-            self.assertNotIn('reroute', combined2)
+            latched_model = named_fact(decision2, task2)
+            self.assertIn('INVALID_MODEL', latched_model.cause)
+            self.assertIsNone(latched_model.retry_at)
         finally:
             model_latch.clear('claude')
 
@@ -1064,8 +1137,9 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             'claude', 'Individual quota reached', windows=['five_hour'], at=(self.now + timedelta(seconds=1)).isoformat(),
         ))
         try:
+            latched = named_fact(dec_uo, task_uo)
+            self.assertIn('five_hour', latched.cause)
             for label, dec_item, task_item, args_item, expected_err in (
-                ('user_override', dec_uo, task_uo, args, 'owner_named_model_failed'),
                 ('hard_constraint', dec_hc, task_hc, args_hc, 'relaunch_not_started'),
             ):
                 with self.subTest(label=label):
@@ -1139,13 +1213,13 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         usage_low = usage_reading.usage_snapshot(self.cache_path, now=self.now)
         accounts_low = account_fleet.load_accounts()
 
-        for label, dec_item, task_item in (
-            ('automatic', dec_auto, t_auto),
-            ('forced', dec_forced, t_forced),
+        for label, dec_item, task_item, refusal in (
+            ('automatic', dec_auto, t_auto, registry.CapacityChanged),
+            ('forced', dec_forced, t_forced, registry.RouteFactRefused),     # a route the user named: a fact (brief D2)
         ):
             with self.subTest(kind=label):
                 t0 = time.monotonic()
-                with self.assertRaises(registry.CapacityChanged):
+                with self.assertRaises(refusal):
                     registry.prepare(
                         dec_item['decision_id'], task_item, {'title': label, 'initialPrompt': label},
                         usage_low, accounts=accounts_low, now=self.now,

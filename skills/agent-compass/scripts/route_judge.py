@@ -273,6 +273,8 @@ def record_constraint(args, task=None, classified=None):
         quota_bundle['id'] = chosen
         quota_bundle.setdefault('bundle_id', chosen)
     _check_record_launch(args, pin, quota_bundle, accounts, usage, now)
+    if user_named and classified and chosen:
+        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, bool(getattr(args, 'fast', False)))
     unobserved = quota_unobserved(accounts, usage, quota_bundle)
     # A model the user names on a held account or model is the probe that can lift the hold: it goes, with a warning.
     retrying = provider_retry.reason(quota_bundle, provider_retry.active(now=now))
@@ -526,52 +528,11 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
     latched model. External runners dispatch directly after record, so this is the protection prepared dispatches get."""
     import launch_failures
     import model_latch
-    import quota_pools
     user_named = getattr(args, 'constraint', None) == 'user_override'
-    floors = []
-    try:
-        dispatch_registry.check_launch_quota(quota_bundle, accounts, usage, now)
-    except dispatch_registry.LaunchFloorRefused as exc:
-        floors = list(exc.floors)
-    except dispatch_registry.Refused as exc:
-        raise dispatch_registry.RouteFactRefused(str(exc), user_named=user_named) from exc
-    acc_usage = (usage.get('accounts') or {}).get(args.account) or {}
-    blockers = []
-    records = None
-    if (floors or acc_usage.get('status') == 'fresh' or acc_usage.get('rate_limited_until')
-            or quota_pools.latched_windows(accounts, args.account)):
-        records = dispatch_flow.reservation_records(read_only=True)
-        blockers = quota_pools.launch_blockers(quota_bundle, accounts, usage, now, records=records)
-    if floors or blockers:
-        import allocator
-        spec_windows = ((accounts.get('accounts') or {}).get(args.account) or {}).get('windows') or {}
-        floor_by_wid = dict(floors)
-        blocker_by_wid = {
-            wid: f"Account {args.account!r} window {wid!r} is exhausted or below safety floor ({reason})"
-            for wid, reason in blockers
-        }
-        ordered_wids = list(dict.fromkeys([*(wid for wid, _ in floors), *(wid for wid, _ in blockers)]))
-        reasons = {
-            wid: (floor_by_wid[wid]
-                  if wid in floor_by_wid and ((spec_windows.get(wid) or {}).get('launch_min_remaining_pct')
-                                              or wid not in blocker_by_wid)
-                  else blocker_by_wid[wid])
-            for wid in ordered_wids
-        }
-        start_after_hours, retry_at, waiting_on = allocator.refusal_schedule(
-            quota_bundle, accounts, usage, now, blocked_wids=ordered_wids, records=records,
-        )
-        if waiting_on in reasons:
-            ordered_wids = [waiting_on, *(wid for wid in ordered_wids if wid != waiting_on)]
-        latched = waiting_on is not None and waiting_on in quota_pools.latched_windows(accounts, args.account)
-        raise dispatch_registry.RouteFactRefused(
-            '; '.join(reasons[wid] for wid in ordered_wids),
-            user_named=user_named,
-            start_after_hours=start_after_hours,
-            retry_at=retry_at,
-            waiting_on=waiting_on,
-            waiting_end=quota_pools.latched_end_kind(accounts, args.account) if latched else None,
-        )
+    refused = dispatch_registry.launch_fact_refusal(quota_bundle, accounts, usage, now, user_named=user_named,
+                                                    records=lambda: dispatch_flow.reservation_records(read_only=True))
+    if refused:
+        raise refused
     if launch_failures.enabled():
         import candidate_eval
         cooling = candidate_eval.cooling_reason(quota_bundle, launch_failures.active(), accounts)
@@ -582,6 +543,29 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
     latched_model = model_latch.reason(quota_bundle, model_latch.active(now=now))
     if latched_model:
         raise dispatch_registry.RouteFactRefused(f"{args.account}/{pin.model}: {latched_model}", user_named=user_named)
+
+
+def _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast):
+    """Refuse a route the user named that its own plan row holds (dispatch_registry.named_route_refusal): the task
+    planned as `prepare` plans it before launch (pinned, past what only automatic routing is held to and past the
+    full-capacity rule), so the record and the re-check before launch give one refusal for one reading."""
+    plan_task = {**classified['task'], **({'parent_agent_id': task['parent_agent_id']} if task.get('parent_agent_id') else {})}
+    route = {**({'unclassified': classified['unclassified']} if classified.get('unclassified') else {}),
+             'user_named_bundle': quota_bundle['bundle_id'], 'pinned_bundle': quota_bundle['bundle_id']}
+    if fast:
+        route['force_fast'] = True
+    else:
+        plan_task['disable_fast'] = True
+    bundle = {**quota_bundle, **({'fast': True} if fast else {})}
+    has_cadence = any(isinstance((spec or {}).get('cadence'), dict) for spec in (accounts.get('accounts') or {}).values())
+    records = ((decision_ledger.read_ledger() if (plan_task.get('chain') or {}).get('id') or has_cadence else [])
+               + dispatch_flow.reservation_records(read_only=True) + dispatch_registry.launch_records(accounts, now))
+    row = dispatch_registry.plan_row(plan_task, bundle, usage, now, accounts, records, route, True)
+    if row is None:
+        return      # nothing of it ranked: the re-check before launch answers it (no longer matches)
+    exclusions, waits = dispatch_registry.plan_row_holds(row, True)
+    if exclusions or waits:
+        raise dispatch_registry.named_route_refusal(row, exclusions, waits, accounts, now, user_named=True)
 
 
 def _compare_with_router(result, task, usage, now, chosen, fast_requested, classified):
@@ -1357,7 +1341,7 @@ def _stage_result(args):
             result, code = roll.run(args, sys.modules[__name__])
     elif args.stage in ('dispatch', 'launch'):
         result = dispatch_flow.cli(args)
-        code = 1 if result.get('state') in ('failed', 'create_failed') else 0
+        code = 1 if result.get('state') in ('failed', 'create_failed') else 2 if result.get('status') == 'blocked' else 0
     elif args.stage == 'providers':
         accounts = account_fleet.load_accounts(read_only=True) if getattr(args, 'dry_run', False) else account_fleet.load_accounts()
         result = {**accounts['_discovery'], 'host_policy_sync': accounts.get('_host_policy_sync'),

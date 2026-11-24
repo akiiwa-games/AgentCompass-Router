@@ -972,6 +972,9 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
             'Wait for that dispatch to finish (its next_argv, or `agentcompass dispatch --dispatch-action reconcile`), '
             'then roll --resume again.',
         )
+    except registry.RouteFactRefused as refused:
+        # The route the user named is held by a fact at the re-check before launch: the refusal its record gives.
+        return refused.answer(out, for_roll=True), 2
     except registry.CapacityChanged as refused:
         if explicit_id:
             return _resume_refusal(out, explicit_id, 'resume_worker_gated', gate_refusal_text(explicit_id, str(refused)))

@@ -509,6 +509,7 @@ def evaluate_bundle(bundle, task, ctx):
     available_at = None
     waiting_on = None               # the window whose reset sets available_at
     waits = {}                      # every window that holds the candidate back (binding_wait)
+    wait_reasons = {}               # window -> why it holds the candidate back, with its state (what a refusal at launch says)
     five_window_states = {}
     orig_window_states = {}
     long_applicable = False         # the bundle draws at least one long reset-period window (read or not)
@@ -598,7 +599,8 @@ def evaluate_bundle(bundle, task, ctx):
                 if not pool:
                     wait = (latched_reset - now).total_seconds() / 3600
                     available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
-                    result['notes'].append(quota_pools.latched_wait_text(accounts, bundle['account'], wid))
+                    wait_reasons[wid] = quota_pools.latched_wait_text(accounts, bundle['account'], wid)
+                    result['notes'].append(wait_reasons[wid])
                 continue
             if wid in latched:
                 (short_exclude if is_short else exclude)(quota_pools.window_refusal(wid, wspec, observed, acct_usage, now, latched))
@@ -677,8 +679,8 @@ def evaluate_bundle(bundle, task, ctx):
                         # A pool's wait is its next partial refill that holds the work (quota_pools.after_reset).
                         wait = renewed['deferred_hours']
                         available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
-                        result['notes'].append(f'{wid} {what} for {wait:.1f}h; start after its reset'
-                                               + refill_note(renewed))
+                        wait_reasons[wid] = f'{wid} {what} for {wait:.1f}h; start after its reset' + refill_note(renewed)
+                        result['notes'].append(wait_reasons[wid])
                         renewed['unstarted'] = True
                         five_window_states[wid] = (wspec, renewed, cap_usd_w, unit)
                     elif not pool:
@@ -724,6 +726,8 @@ def evaluate_bundle(bundle, task, ctx):
                 elif w_len is not None and (renewed := quota_pools.after_reset(
                         state, w_len, holds=lambda r: (r['remaining'] - renewed_horizon(r, req_hours, req_hours * unit * context_burn) * unit * context_burn
                                                        >= policy['safety_margin_pct']))) is not None:
+                    wait_reasons[wid] = (f'{wid} has {state["remaining"]:.0f}% left; the work needs ~{need:.1f}% plus a '
+                                         f'{policy["safety_margin_pct"]}% margin; it renews in {renewed["deferred_hours"]:.1f}h')
                     state = renewed
                     available_at, waiting_on = binding_wait(available_at, waiting_on, renewed['deferred_hours'], wid,
                                                             waits)
@@ -804,10 +808,9 @@ def evaluate_bundle(bundle, task, ctx):
                     available_at, waiting_on = binding_wait(available_at, waiting_on, renewed['deferred_hours'], CADENCE,
                                                            waits)
                     result['_five_long_wait'] = True
-                    result['notes'].append(
-                        f'cadence frees {renewed["remaining"] * cap_count / 100.0:g} of {cap_count:g} dispatches in '
-                        f'{renewed["deferred_hours"]:.1f}h; start then'
-                    )
+                    wait_reasons[CADENCE] = (f'cadence frees {renewed["remaining"] * cap_count / 100.0:g} of {cap_count:g} '
+                                             f'dispatches in {renewed["deferred_hours"]:.1f}h; start then')
+                    result['notes'].append(wait_reasons[CADENCE])
         if spec.get('unmetered') and not spec.get('unlimited'):
             result.setdefault('_five_axis_windows', []).append('cadence')
             five_window_states['cadence'] = (wspec, state, cap_count, None)
@@ -980,6 +983,8 @@ def evaluate_bundle(bundle, task, ctx):
     result['waiting_on'] = waiting_on if available_at else None
     if waits:
         result['waits'] = waits     # what dispatch_registry.prepare reaches past for a named route (AUTOMATIC_ROUTING_WAITS)
+    if wait_reasons:
+        result['wait_reasons'] = wait_reasons   # each wait in words: what a refusal at launch says (dispatch_registry.hold_cause)
     action = 'start'
     if worker:
         if worn:
