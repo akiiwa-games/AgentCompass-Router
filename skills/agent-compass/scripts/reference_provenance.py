@@ -54,8 +54,9 @@ MEASURED_BOUNDS = ('measurement', 'lower_bound')
 def valid_measured_capacity(entry):
     """True for a plan's `capacity_measured`: the maintainer's dated measurement of an allowance the vendor sizes nowhere
     (kind maintainer, ISO as_of, a statement), in USD at public list price (`capacity_usd` > 0), over the period it was
-    measured (`period_hours` > 0), saying whether it is the measurement or a lower bound (`bound`, MEASURED_BOUNDS), and
-    the model and request count it rests on."""
+    measured (`period_hours` > 0), saying whether it is the measurement or a lower bound (`bound`, MEASURED_BOUNDS:
+    `measurement` when the spend reached the vendor's limit, `lower_bound` when it did not), and the model and request
+    count it rests on. The statement says the rest (the client, how the period is known, the reset the limit gave)."""
     if not valid_public_declaration(entry) or entry.get('kind') != 'maintainer':
         return False
     def positive(value):
