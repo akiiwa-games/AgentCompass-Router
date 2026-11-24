@@ -14,14 +14,8 @@ import urllib.request
 
 # Also support the path-loaded allocator and python -I entrypoints.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import account_fleet
 import account_state
-import allocator
-import auto_bundles
-import axis_scores
 import caller_input
-import candidate_eval
-import candidate_ranking
 import cwd_policy
 import antigravity_plan
 import decision_ledger
@@ -30,15 +24,9 @@ import dispatch_registry
 import entry
 import fast_modes
 import host_policy
-import launch_failures
-import live_models
-import model_latch
-import model_resolution
 import provider_inventory
-import provider_retry
 import public_data
 import quota_overrides
-import quota_pools
 import roll
 import scorer_client
 import stage_help
@@ -171,6 +159,11 @@ def record_constraint(args, task=None, classified=None):
                          f'{WORKFLOW_CONSTRAINT} (the user asked for the Workflow in this request, in their words in '
                          f'--basis); a {args.constraint} record does not authorize it. Record it with --constraint '
                          f'{WORKFLOW_CONSTRAINT} when the user asked for the Workflow, or drop --trigger.')
+    import account_fleet
+    import auto_bundles
+    import axis_scores
+    import model_resolution
+    import provider_retry
     model_resolution.check_model_pin(args.model, '--model')
     started = time.monotonic()
     task = _record_task(args, task)
@@ -206,6 +199,7 @@ def record_constraint(args, task=None, classified=None):
     if not own_rows:
         # No row of this model on the account: the account's provider decides, from its live model list (read once, as
         # every named route reads it). What a name resembles is another model, never a substitute.
+        import live_models
         live_doc = live_models.load_or_refresh([args.provider], named=(args.account,))
         rows, why = provider_inventory.listed_rows(
             accounts, args.account, args.provider, raw_spelled, pin.effort, live_doc)
@@ -446,15 +440,24 @@ NO_TASK_COMPARED = ("No task was given (record reads one only from --input), so 
 
 def named_pair_refusal(accounts, account, provider):
     """Why `account` / `provider` names no route on this machine, before any model list is read; None when it does: an
-    account the fleet does not have, or a provider the account does not launch through (`auto_bundles.launch_providers`,
-    and the providers of its bundles)."""
+    account neither the fleet nor discovery knows, or a provider the account does not launch through
+    (`auto_bundles.launch_providers`, its discovered provider, and the providers of its bundles)."""
+    import account_fleet
+    import auto_bundles
     specs = accounts.get('accounts') or {}
+    disc_accounts = ((accounts.get('_discovery') or {}).get('accounts')) or {}
     spec = specs.get(account)
-    if not isinstance(spec, dict):
-        names = ', '.join(sorted(name for name, row in specs.items() if isinstance(row, dict)))
+    disc_row = disc_accounts.get(account)
+    if not isinstance(spec, dict) and not isinstance(disc_row, dict):
+        names = ', '.join(sorted({
+            *(name for name, row in specs.items() if isinstance(row, dict)),
+            *(name for name, row in disc_accounts.items() if isinstance(row, dict)),
+        }))
         return (f'account {account} is not configured on this machine (its accounts: {names}). Ask the user which one '
                 'they meant; do not substitute another account.')
-    served = auto_bundles.launch_providers(account, spec)
+    served = (auto_bundles.launch_providers(account, spec)
+              if isinstance(spec, dict)
+              else sorted({p for p in (disc_row.get('provider'), account) if isinstance(p, str) and p}))
     if provider in served or account_fleet.pin_pool(accounts, account=account, provider=provider):
         return None
     return (f"account {account} does not launch through provider {provider} (it launches through {', '.join(served)}). "
@@ -521,6 +524,9 @@ def _record_task(args, task):
 def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
     """Refuse a forced route that cannot launch now: no quota left in a window it draws, a launch cooling down, or a
     latched model. External runners dispatch directly after record, so this is the protection prepared dispatches get."""
+    import launch_failures
+    import model_latch
+    import quota_pools
     user_named = getattr(args, 'constraint', None) == 'user_override'
     floors = []
     try:
@@ -537,6 +543,7 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
         records = dispatch_flow.reservation_records(read_only=True)
         blockers = quota_pools.launch_blockers(quota_bundle, accounts, usage, now, records=records)
     if floors or blockers:
+        import allocator
         spec_windows = ((accounts.get('accounts') or {}).get(args.account) or {}).get('windows') or {}
         floor_by_wid = dict(floors)
         blocker_by_wid = {
@@ -563,8 +570,11 @@ def _check_record_launch(args, pin, quota_bundle, accounts, usage, now):
             retry_at=retry_at,
             waiting_on=waiting_on,
         )
-    cooling = (candidate_eval.cooling_reason(quota_bundle, launch_failures.active(), accounts)
-               if launch_failures.enabled() else None)
+    if launch_failures.enabled():
+        import candidate_eval
+        cooling = candidate_eval.cooling_reason(quota_bundle, launch_failures.active(), accounts)
+    else:
+        cooling = None
     if cooling:
         raise dispatch_registry.RouteFactRefused(f"{args.account}/{pin.model} is cooling down ({cooling})", user_named=user_named)
     latched_model = model_latch.reason(quota_bundle, model_latch.active(now=now))
@@ -579,6 +589,9 @@ def _compare_with_router(result, task, usage, now, chosen, fast_requested, class
         # caller profile there is nothing to compare the user's choice with.
         result.update({'router_choice': None, 'agrees': None, 'classifier_skipped': True})
     elif task:
+        import account_fleet
+        import allocator
+        import candidate_ranking
         try:
             loaded_accounts = account_fleet.load_accounts() if decision_ledger.LEDGER_WRITES else account_fleet.load_accounts(read_only=True)
             has_cadence = any(

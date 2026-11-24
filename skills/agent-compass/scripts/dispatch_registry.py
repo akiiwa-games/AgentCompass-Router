@@ -96,11 +96,9 @@ class RouteFactRefused(Refused):
     has an observed reset (`allocator.refusal_schedule`)."""
 
     def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None):
-        if not isinstance(user_named, bool):
-            raise TypeError('user_named must be a bool')
         super().__init__(cause)
         self.cause = str(cause)
-        self.user_named = user_named
+        self.user_named = bool(user_named)
         self.start_after_hours = start_after_hours
         self.retry_at = retry_at
         self.waiting_on = waiting_on

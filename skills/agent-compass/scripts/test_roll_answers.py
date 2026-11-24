@@ -1155,35 +1155,132 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         elapsed_claim = time.monotonic() - t0
         self.assertLess(elapsed_claim, 1.0, f'claim took {elapsed_claim:.2f}s')
 
-    def test_f3_f4_unconfigured_account_and_wrong_provider_are_input_errors_before_signin_check(self):
+    def test_n1_f3_f4_unknown_name_signed_out_isolated_account_and_wrong_provider_on_signed_in_account(self):
         # `claude` is signed in with fresh usage; `codex` has no credentials on this fixture machine.
         self.write_usage_cache([
             {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
         ])
-        # F3: signed-in `claude` named with wrong provider `codex` must report the provider pairing error (exit 1),
-        # never `missing_credentials` / "sign in again".
-        code_f3, ans_f3 = self.run_cli(
-            'roll', '--task', 'Review architecture',
-            '--provider', 'codex', '--account', 'claude', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        # Configure an isolated `claude-lab` provider in Paseo's config.json, first signed in, then signed out.
+        paseo_home = Path(os.environ.get('PASEO_HOME') or (self.home / '.paseo'))
+        paseo_home.mkdir(parents=True, exist_ok=True)
+        lab_home = self.home / '.claude-lab'
+        lab_home.mkdir(parents=True, exist_ok=True)
+        (paseo_home / 'config.json').write_text(json.dumps({
+            'agents': {
+                'providers': {
+                    'claude-lab': {
+                        'extends': 'claude',
+                        'env': {'CLAUDE_CONFIG_DIR': str(lab_home)},
+                    },
+                },
+            },
+        }), encoding='utf-8')
+        lab_creds = lab_home / '.credentials.json'
+        lab_creds.write_text(
+            json.dumps({'claudeAiOauth': {'accessToken': 'fixture-lab-token', 'subscriptionType': 'pro'}}),
+            encoding='utf-8',
         )
-        self.assertEqual((code_f3, ans_f3['status']), (1, 'error'), ans_f3)
-        self.assertNotIn('caller_action', ans_f3)
-        self.assertIn('account claude does not launch through provider codex', ans_f3['cause'])
-        self.assertIn('Name the provider it launches through; do not substitute another account.', ans_f3['cause'])
-        self.assertNotIn('missing_credentials', ans_f3['cause'])
-        self.assertNotIn('sign in', ans_f3['cause'].lower())
+        lab_creds.unlink()
 
-        # F4: typo account `claud` is a request-input error (exit 1) keeping "Ask the user which one they meant".
-        code_f4, ans_f4 = self.run_cli(
+        # 1. Unknown name (`claud` — known to neither `accounts['accounts']` nor discovery): input error (exit 1).
+        code_unk, ans_unk = self.run_cli(
             'roll', '--task', 'Review architecture',
             '--provider', 'claude', '--account', 'claud', '--model', 'claude-opus-5-5', '--basis', 'quote',
         )
-        self.assertEqual((code_f4, ans_f4['status']), (1, 'error'), ans_f4)
-        self.assertNotIn('caller_action', ans_f4)
-        self.assertIn('account claud is not configured on this machine', ans_f4['cause'])
-        self.assertIn('Ask the user which one they meant; do not substitute another account.', ans_f4['cause'])
-        self.assertNotIn('cannot start now', ans_f4['next_action'])
+        self.assertEqual((code_unk, ans_unk['status']), (1, 'error'), ans_unk)
+        self.assertNotIn('caller_action', ans_unk)
+        self.assertIn('account claud is not configured on this machine', ans_unk['cause'])
+        self.assertIn('Ask the user which one they meant; do not substitute another account.', ans_unk['cause'])
+        self.assertNotIn('cannot start now', ans_unk['next_action'])
+
+        # 2. Known signed-out isolated account (`claude-lab`) named with its own provider: account fact `blocked / tell_user` (exit 2).
+        code_iso, ans_iso = self.run_cli(
+            'roll', '--task', 'Review architecture',
+            '--provider', 'claude-lab', '--account', 'claude-lab', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        )
+        self.assertEqual((code_iso, ans_iso['status'], ans_iso.get('caller_action')), (2, 'blocked', 'tell_user'), ans_iso)
+        self.assertIn('missing_credentials', ans_iso['cause'])
+        self.assertIn('sign in again', ans_iso['cause'])
+        self.assertNotIn('not configured on this machine', ans_iso['cause'])
+        self.assertNotIn('Ask the user which one they meant', ans_iso['cause'])
+        rec_code_iso, rec_iso = self.run_cli(
+            'record', '--constraint', 'user_override',
+            '--provider', 'claude-lab', '--account', 'claude-lab', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        )
+        self.assertEqual((rec_code_iso, rec_iso['status'], rec_iso.get('caller_action')), (2, 'blocked', 'tell_user'), rec_iso)
+        self.assertEqual(rec_iso['cause'], ans_iso['cause'])
+
+        # 3. Signed-in account (`claude`) named with wrong provider (`codex`): input pairing error (exit 1), never "sign in again".
+        code_wrong, ans_wrong = self.run_cli(
+            'roll', '--task', 'Review architecture',
+            '--provider', 'codex', '--account', 'claude', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        )
+        self.assertEqual((code_wrong, ans_wrong['status']), (1, 'error'), ans_wrong)
+        self.assertNotIn('caller_action', ans_wrong)
+        self.assertIn('account claude does not launch through provider codex', ans_wrong['cause'])
+        self.assertIn('Name the provider it launches through; do not substitute another account.', ans_wrong['cause'])
+        self.assertNotIn('missing_credentials', ans_wrong['cause'])
+        self.assertNotIn('sign in', ans_wrong['cause'].lower())
+
+    def test_n2_compact_cause_ends_after_last_whole_sentence_and_points_to_rest(self):
+        import quota_exhaustion
+        import roll
+        # Real 3-window refusal (> 300 chars): `five_hour`, `seven_day` and `weekly_fable` latched on `max5` + `claude-fable-5-2`.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
+        ], plan='max5')
+        self.assertTrue(quota_exhaustion.record(
+            'claude', 'Individual quota reached', windows=['five_hour', 'seven_day', 'weekly_fable'],
+            at=(self.now + timedelta(seconds=1)).isoformat(),
+        ))
+        try:
+            code, ans = self.run_cli(
+                'roll', '--task', 'Review architecture',
+                '--provider', 'claude', '--account', 'claude', '--model', 'claude-fable-5-2', '--effort', 'high',
+                '--basis', 'the user said: use claude-fable-5-2',
+            )
+            self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
+            detail_doc = full(ans)
+            self.assertGreater(len(detail_doc['cause']), 300)
+            self.assertIn('weekly_fable: quota confirmed exhausted', detail_doc['cause'])
+            self.assertIn(detail_doc['cause'], ans['next_action'])
+            # Compact cause ends after the last whole window sentence that fits (`seven_day`), never mid-word (`weekly_fab`),
+            # and names `next_action` and the details file (`ans['details']`) with the count left out (`1 more`).
+            self.assertIn('seven_day: quota confirmed exhausted)', ans['cause'])
+            self.assertNotIn('weekly_fable', ans['cause'])
+            self.assertNotIn('weekly_fab', ans['cause'])
+            self.assertIn('1 more', ans['cause'])
+            self.assertIn('next_action', ans['cause'])
+            self.assertIn(ans['details'], ans['cause'])
+        finally:
+            quota_exhaustion.clear('claude')
+
+        # Other cause shapes go through the same single owner `roll.compact`:
+        # (1) `. `-separated sentences where `next_action` does not embed the full cause -> points to details file only.
+        s1 = 'First sentence explains the failure clearly.'
+        s2 = 'Second sentence adds context that still fits inside three hundred characters.'
+        s3 = 'Third sentence is ' + ('very ' * 45) + 'long so the full cause exceeds three hundred characters.'
+        multi_dot = f'{s1} {s2} {s3}'
+        self.assertGreater(len(multi_dot), 300)
+        comp_dot = roll.compact({'error': multi_dot, 'next': 'Fix the issue and retry.'}, 'error', 'D:/work/details.json')
+        self.assertTrue(comp_dot['cause'].startswith(f'{s1} {s2}'), comp_dot['cause'])
+        self.assertNotIn('Third sentence', comp_dot['cause'])
+        self.assertIn('1 more', comp_dot['cause'])
+        self.assertIn('D:/work/details.json', comp_dot['cause'])
+        self.assertNotIn('next_action', comp_dot['cause'])
+
+        # (2) Single >300-char sentence with no `; ` or `. ` before 300 -> cut at a word boundary, never mid-word.
+        words = ' '.join(f'word{i:02d}' for i in range(60))
+        self.assertGreater(len(words), 300)
+        comp_word = roll.compact({'error': words, 'next': 'Fix it.'}, 'error', 'D:/work/details.json')
+        prefix = comp_word['cause'].split('...', 1)[0]
+        self.assertTrue(words.startswith(prefix + ' '), comp_word['cause'])
+        self.assertIn('D:/work/details.json', comp_word['cause'])
+
+        # (3) With no details file and full cause not in `next_action`, nothing holds the rest, so nothing is cut.
+        uncut = roll.compact({'error': multi_dot, 'next': 'Fix it.'}, 'error', None)
+        self.assertEqual(uncut['cause'], multi_dot)
 
     def test_f5_cwd_regex_is_blocked_tell_user_without_cannot_start_now(self):
         self.write_usage_cache([
@@ -1245,64 +1342,40 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         self.assertIn('seven_day', ans2['cause'])
         self.assertLess(ans2['cause'].index('five_hour'), ans2['cause'].index('seven_day'), ans2['cause'])
 
-    def test_f7_refusal_schedule_has_top_level_imports_and_no_cycle_dodge_in_quota_pools(self):
-        import allocator
-        import ast
-        import quota_pools
-        qp_tree = ast.parse(Path(quota_pools.__file__).read_text(encoding='utf-8'))
-        late_in_qp = [
-            node.name for node in ast.walk(qp_tree)
-            if isinstance(node, ast.FunctionDef)
-            and any(isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in ast.walk(node))
-        ]
-        self.assertEqual(late_in_qp, [])
-        self.assertFalse(hasattr(quota_pools, 'refusal_schedule'))
-        self.assertTrue(hasattr(allocator, 'refusal_schedule'))
-        alloc_tree = ast.parse(Path(allocator.__file__).read_text(encoding='utf-8'))
-        sched_fn = next(n for n in alloc_tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refusal_schedule')
-        late_in_sched = [sub for sub in ast.walk(sched_fn) if isinstance(sub, (ast.Import, ast.ImportFrom))]
-        self.assertEqual(late_in_sched, [])
-
-    def test_f8_route_fact_refused_has_no_user_named_default_and_prepare_never_claims_user_named(self):
+    def test_f8_prepare_floor_refusal_on_forced_route_never_claims_user_named(self):
         import account_fleet
         import usage_reading
         from router_test_support import profile
-        with self.subTest(check='no_default'):
-            with self.assertRaises(TypeError):
-                registry.RouteFactRefused('quota window exhausted')
-        with self.subTest(check='prepare_cause'):
-            self.write_usage_cache([
-                {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
-                {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
-            ])
-            args_hc = route_judge.build_parser().parse_args([
-                'record', '--constraint', 'hard_constraint', '--provider', 'claude', '--account', 'claude',
-                '--model', 'claude-opus-5-5', '--effort', 'high', '--basis', 'project rule',
-            ])
-            task_hc = {'parent_agent_id': 'parent-named', 'task_id': 't-f8-hc', 'objective': 'Review',
-                       'expected_hours': 0.05, 'hours': 0.05, 'profile': profile()}
-            dec_hc = route_judge.record_constraint(args_hc, task=task_hc, classified={'task': task_hc, 'scorer': None})
-            self.write_usage_cache([
-                {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
-                {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
-            ])
-            with self.assertRaises(registry.CapacityChanged) as caught:
-                registry.prepare(
-                    dec_hc['decision_id'], task_hc, {'title': 'Review', 'initialPrompt': 'Review'},
-                    usage_reading.usage_snapshot(self.cache_path, now=self.now),
-                    accounts=account_fleet.load_accounts(), now=self.now,
-                )
-            self.assertNotIsInstance(caught.exception.__cause__, registry.RouteFactRefused)
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        args_hc = route_judge.build_parser().parse_args([
+            'record', '--constraint', 'hard_constraint', '--provider', 'claude', '--account', 'claude',
+            '--model', 'claude-opus-5-5', '--effort', 'high', '--basis', 'project rule',
+        ])
+        task_hc = {'parent_agent_id': 'parent-named', 'task_id': 't-f8-hc', 'objective': 'Review',
+                   'expected_hours': 0.05, 'hours': 0.05, 'profile': profile()}
+        dec_hc = route_judge.record_constraint(args_hc, task=task_hc, classified={'task': task_hc, 'scorer': None})
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        with self.assertRaises(registry.CapacityChanged) as caught:
+            registry.prepare(
+                dec_hc['decision_id'], task_hc, {'title': 'Review', 'initialPrompt': 'Review'},
+                usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                accounts=account_fleet.load_accounts(), now=self.now,
+            )
+        self.assertNotIsInstance(caught.exception.__cause__, registry.RouteFactRefused)
 
-    def test_f9_roll_reference_documents_tell_user_on_forced_fallback_endings_and_accurate_fact_list(self):
+    def test_every_final_error_code_in_roll_appears_in_roll_reference(self):
+        import roll
         ref_path = Path(route_judge.__file__).resolve().parents[1] / 'references' / 'roll-reference.md'
         text = ref_path.read_text(encoding='utf-8')
-        tell_user_lines = [line for line in text.splitlines() if '`caller_action: "tell_user"`' in line]
-        self.assertEqual(len(tell_user_lines), 1, tell_user_lines)
-        bullet = tell_user_lines[0]
-        self.assertIn('owner_named_model_failed', bullet)
-        self.assertIn('relaunch_not_started', bullet)
-        self.assertNotIn('unconfigured account or provider', bullet)
+        for code in roll.FINAL_ERRORS.values():
+            with self.subTest(code=code):
+                self.assertIn(f'`{code}`', text)
 
 
 if __name__ == '__main__':

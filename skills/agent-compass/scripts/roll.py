@@ -1409,6 +1409,76 @@ def launched_next(result, worker, argv):
     return result.get('next') or 'Worker launched; do not launch another.'
 
 
+CAUSE_LIMIT = 300
+
+
+def _raw_cause(result):
+    worker = result.get('worker') or {}
+    if result.get('error') == 'scorer_unavailable' or result.get('dispatch_mode') == 'scorer_unavailable':
+        return result.get('cause') or result.get('reason') or 'scorer_unavailable'
+    return result.get('error') or result.get('cause') or worker.get('cause') or worker.get('error') or worker.get('read_error')
+
+
+def _cause_sentence_ends(raw):
+    """End offsets of whole sentences/clauses in `raw` (`; ` or `. ` / `! ` / `? ` outside parentheses/brackets)."""
+    ends = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch in '([':
+            depth += 1
+        elif ch in ')]' and depth > 0:
+            depth -= 1
+        elif depth == 0 and i + 1 < n and raw[i + 1] == ' ':
+            if ch == ';' and raw[start:i].strip():
+                ends.append(i)
+                i += 2
+                while i < n and raw[i] == ' ':
+                    i += 1
+                start = i
+                continue
+            if (ch in '.!?'
+                    and raw[start:i + 1].strip()
+                    and not raw[:i + 1].lower().endswith(('e.g.', 'i.e.', 'vs.', 'etc.'))):
+                ends.append(i + 1)
+                i += 2
+                while i < n and raw[i] == ' ':
+                    i += 1
+                start = i
+                continue
+        i += 1
+    if raw[start:].strip():
+        ends.append(n)
+    return ends
+
+
+def _compact_cause(cause, next_action, detail_path):
+    """Short `cause` for `compact`: never cut mid-word or mid-sentence; when it does not fit in `CAUSE_LIMIT`, end after
+    the last whole sentence that fits and name where the rest is (`next_action` and/or the details file)."""
+    raw = str(cause)
+    if len(raw) <= CAUSE_LIMIT:
+        return raw
+    in_next = bool(next_action and raw in next_action)
+    if not in_next and detail_path is None:
+        return raw      # nothing else holds the rest, so nothing is cut (as for route.warnings)
+    where = (f'next_action and the details file ({detail_path})' if in_next and detail_path
+             else f'the details file ({detail_path})' if detail_path else 'next_action')
+    ends = _cause_sentence_ends(raw)
+    fitting = [end for end in ends if end <= CAUSE_LIMIT]
+    if fitting:
+        kept = raw[:fitting[-1]]
+        more = len(ends) - len(fitting)
+        if kept.endswith(('.', '!', '?')):
+            return f'{kept} The rest ({more} more) is in {where}.'
+        return f'{kept}; the rest ({more} more) is in {where}'
+    cut = raw.rfind(' ', 0, CAUSE_LIMIT + 1)
+    prefix = raw[:cut].rstrip(' ,;:') if cut > 0 else raw[:CAUSE_LIMIT]
+    return f'{prefix}... (the rest is in {where})'
+
+
 def compact(result, status, detail_path):
     """The default --task answer: state, worker, reason and the single next action; everything else is on disk."""
     worker = result.get('worker') or {}
@@ -1436,11 +1506,9 @@ def compact(result, status, detail_path):
            'reason': reason_val, 'next_action': nxt}
     if is_scorer_unavail:
         out['error'] = 'scorer_unavailable'
-        cause = result.get('cause') or ((result.get('route') or {}).get('reason')) or result.get('reason') or 'scorer_unavailable'
-    else:
-        cause = result.get('error') or worker.get('cause') or worker.get('error') or worker.get('read_error')
+    cause = _raw_cause(result)
     if cause and status in ('error', 'blocked', 'pending'):
-        out['cause'] = str(cause)[:300]
+        out['cause'] = _compact_cause(cause, nxt, detail_path)
     route_warnings = (result.get('route') or {}).get('warnings') or []
     if route_warnings:
         # The first four, and how many more the details file holds: none is dropped without a word.
@@ -1554,7 +1622,9 @@ def run(args, judge):
     agent_id = (result.get('worker') or {}).get('agent_id')
     if agent_id:
         result['continuation'] = worker_sessions.continuation_verdict(agent_id)
-    # The file on disk and --verbose carry the same cause and next action as the compact answer.
+    # The file on disk and --verbose carry the full cause and the same next action as the compact answer.
+    if status in ('error', 'blocked', 'pending') and 'cause' not in result and (raw := _raw_cause(result)):
+        result['cause'] = str(raw)
     summary = compact(result, status, None)
     result.update({k: summary[k] for k in ('cause', 'next_action') if summary.get(k) and k not in result})
     if getattr(args, 'verbose', False):
