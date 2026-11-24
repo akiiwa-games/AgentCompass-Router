@@ -2127,9 +2127,10 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
                **({'chain_id': chain_id} if chain_id else {}),
                **({k: attempt[k] for k in ('attempt_of', 'attempt', 'previous_attempt') if attempt.get(k) is not None}
                   if attempt else {}),
-               # A route the user named launches past the full-capacity rule, and past a free allowance's local
-               # estimate, with its warning (candidate_eval).
-               **({'warnings': warned} if (warned := [candidate[k] for k in ('capacity_warning', 'estimate_warning')
+               # A route the user named launches past the full-capacity rule, past a free allowance's local
+               # estimate, and with --fast past the fast burn estimate, with its warning (candidate_eval).
+               **({'warnings': warned} if (warned := [candidate[k] for k in ('capacity_warning', 'estimate_warning',
+                                                                             'fast_estimate_warning')
                                                        if candidate.get(k)]) else {})}
         event(row, 'prepared', now)
         save(connection, row)

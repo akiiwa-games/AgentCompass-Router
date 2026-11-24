@@ -5,6 +5,7 @@ import argparse
 import copy
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ import axis_scores
 import decision_ledger
 import dispatch_registry
 import candidate_eval
+import candidate_ranking
 import fast_modes
 import launch_failures
 import live_models
@@ -109,6 +111,50 @@ class FastModeFactTests(NamedRouteCase):
         with self.assertRaises(ValueError) as stored:
             dispatch_registry.resolve_bundle(dict(bundle, fast=True), self.accounts, explicit_override=True)
         self.assertEqual(str(stored.exception), reason)
+
+    def test_a_named_fast_route_only_the_fast_burn_estimate_holds_launches_fast_with_one_warning(self):
+        """Owner, 2026-11-24: a route the user named with --fast that only the fast mode's consumption estimate holds
+        launches fast, with one warning in the estimate's numbers; record and prepare agree; a fact (a window at 0) still
+        refuses it; automatic routing offers no fast twin on that reading. No shipped row cites its fast multipliers, so
+        a synthetic cited row stands in (`cited_fast`), on a Codex plan whose capacity the shipped data cites."""
+        from router_test_support import CITED_FAST, cited_fast, usage_windows
+        fleet = copy.deepcopy(self.accounts)
+        fleet['accounts']['codex']['plan'] = 'pro'
+        named = dict(account='codex', provider='codex', model='gpt-6.1-sol', effort='high')
+
+        def run(remaining, **fields):
+            self.usage = usage_windows(NOW, {'codex': [('usage', remaining, 100)]})
+            task = self.task(parent_agent_id='parent-1', task_id='t-' + os.urandom(4).hex(), disable_fast=False,
+                             expected_hours=8)
+            args = argparse.Namespace(**{'basis': 'User asked', 'input': None, 'usage_cache': None, 'accounts': None,
+                                         'constraint': 'user_override', 'specialty': None, 'reason_category': None,
+                                         'fast': False, 'parent_id': None, **named, **fields})
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory, \
+                    patch.dict(os.environ, {'ROUTER_DISPATCH_DB': os.path.join(directory, 'db.sqlite3')}), \
+                    patch.object(route_judge.usage_reading, 'usage_snapshot', return_value=copy.deepcopy(self.usage)), \
+                    patch.object(account_fleet, 'load_accounts', return_value=copy.deepcopy(fleet)), \
+                    patch.object(route_judge, 'datetime', wraps=datetime) as clock, \
+                    patch.object(decision_ledger, 'datetime', wraps=datetime) as ledger_clock:
+                clock.now.return_value = ledger_clock.now.return_value = NOW
+                result = route_judge.record_constraint(args, task, {'task': task})     # planned: the plan row is read
+                row = dispatch_registry.prepare(result['decision_id'], task, {'title': 'x', 'initialPrompt': 'go'},
+                                                copy.deepcopy(self.usage), accounts=copy.deepcopy(fleet), now=NOW)
+            return task, row
+
+        with cited_fast('gpt-6.1-sol'):
+            task, plain = run(15)
+            _, fast = run(15, fast=True)
+            self.assertTrue(fast['bundle'].get('fast'))
+            self.assertEqual(fast['request']['settings']['features'], {'service_tier': 'priority'})
+            warned = [w for w in fast.get('warnings') or () if 'fast mode' in w]
+            self.assertEqual(len(warned), 1, fast.get('warnings'))
+            self.assertIn("this is the router's estimate, so the run may stop at the limit", warned[0])
+            self.assertIn('launched fast because the user named it with --fast', warned[0])
+            self.assertAlmostEqual(fast['expected_usd'], plain['expected_usd'] * CITED_FAST['price_multiplier'], places=1)
+            automatic = self.plan(task, fleet)
+            self.assertIsNone(candidate_ranking.candidate_for_bundle(automatic['ranking'], 'sol_high', True))
+            with self.assertRaises(dispatch_registry.RouteFactRefused):
+                run(0, fast=True)
 
     def test_roll_says_the_note_once_and_a_resume_reads_fast_as_absent_on_a_route_without_a_contract(self):
         import roll
