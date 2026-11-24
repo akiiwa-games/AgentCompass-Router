@@ -37,6 +37,18 @@ def test_dead_end_and_broken_promise_are_read_from_the_chain():
     assert not report.promise_broken(scenario, dict(chains[1], outcome="relaunched"))
 
 
+def test_a_deferral_the_run_did_not_wait_out_is_not_a_dead_end_when_its_next_action_says_what_to_do():
+    """A deferral longer than the run waits (experience_run.WAIT_LIMIT_HOURS) tells the session to wait, name a route or
+    do the task itself: the session can act on it, so it is counted apart, with the hours it was told."""
+    told = "Defer sol62_medium for 66.0h until codex's usage window resets; do not launch now. Roll again then."
+    scenario = {"answers": [answer("0", status="blocked", caller_action="wait_for_reset", start_after_hours=66.0, next_action=told),
+                            answer("1", status="blocked", caller_action="wait_for_reset", start_after_hours=40.0, next_action="")]}
+    chains = [{"id": "0", "answers": [0], "outcome": "deferred_not_waited"}, {"id": "1", "answers": [1], "outcome": "deferred_not_waited"}]
+    assert [c["id"] for c in chains if report.is_dead_end(scenario, c)] == ["1"]
+    assert report.deferred_past_wait(scenario, chains[0]) == {"chain": "0", "hours": 66.0, "brief": scenario["answers"][0]["brief"]}
+    assert report.deferred_past_wait(scenario, chains[1]) is None
+
+
 def test_the_fit_question_reads_the_recorded_fit_of_hard_work_only():
     ranking = [{"id": "a", "fit": 1.0}, {"id": "b", "fit": 2.0}]
     hard = answer("0", level=report.limit("hard_level"), bundle_id="a", ranking=ranking)

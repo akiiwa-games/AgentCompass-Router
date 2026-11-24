@@ -199,13 +199,32 @@ def chain_answers(scenario: dict, chain: dict) -> list[dict]:
 
 def is_dead_end(scenario: dict, chain: dict) -> bool:
     """A chain that reached no worker and ended on an answer the session cannot act on: the run had to stop following
-    (dead_end, a deferral it could not wait out), or the last answer is an error or a block whose next_action is empty."""
-    if chain.get("outcome") in ("dead_end", "deferred_not_waited"):
+    (dead_end), or the last answer (a deferral the run did not wait out included) is an error or a block whose
+    next_action is empty. A deferral whose next_action says what to do (wait, name a route, do it yourself) is one the
+    session can act on: `deferred_past_wait`."""
+    if chain.get("outcome") == "dead_end":
         return True
-    if chain.get("outcome") != "handed_to_session":
+    if chain.get("outcome") not in ("handed_to_session", "deferred_not_waited"):
         return False
     last = chain_answers(scenario, chain)[-1:] or [{}]
     return last[0].get("next_action") in NOT_A_WAY_OUT
+
+
+def deferred_past_wait(scenario: dict, chain: dict) -> dict | None:
+    """A deferral the run did not wait out (longer than experience_run.WAIT_LIMIT_HOURS, or a third deferral in a row) whose
+    next_action the session can follow: the chain and the hours it was told to wait."""
+    if chain.get("outcome") != "deferred_not_waited" or is_dead_end(scenario, chain):
+        return None
+    last = chain_answers(scenario, chain)[-1:] or [{}]
+    return {"chain": chain["id"], "hours": last[0].get("start_after_hours"), "brief": last[0].get("brief")}
+
+
+def wait_limit() -> float:
+    packaging = str(ROOT / "packaging")
+    if packaging not in sys.path:
+        sys.path.insert(0, packaging)
+    import experience_run
+    return experience_run.WAIT_LIMIT_HOURS
 
 
 def promise_broken(scenario: dict, chain: dict) -> bool:
@@ -340,6 +359,7 @@ def summarize(rows: dict) -> dict:
                                                  "fixture_error": any(t in json.dumps(a, ensure_ascii=False) for t in texts)}
                              for a in read if a.get("status") not in ("launched", "batch")],
             "dead_ends": [c["id"] for c in chains if is_dead_end(scenario, c)],
+            "deferred_past_wait": [d for c in chains if (d := deferred_past_wait(scenario, c))],
             "broken_promises": [c["id"] for c in chains if promise_broken(scenario, c)],
             "level_x_model": share_table(launched, level_label, model_label),
             "kind_x_model": share_table(launched, lambda a: a.get("work_kind"), model_label),
@@ -436,6 +456,14 @@ def look_first(rows: dict, summary: dict, most: int = 10) -> list[dict]:
     if dead:
         items.append({"weight": 90 + len(dead), "title": f"{len(dead)} chain(s) ended without a worker on an answer the session cannot act on",
                       "rows": [{"scenario": n, "chain": c} for n, c in dead]})
+    beyond = [(s["name"], d) for s in summary["scenarios"] for d in s.get("deferred_past_wait") or []]
+    if beyond:
+        hours = sorted(d["hours"] for _, d in beyond if isinstance(d["hours"], (int, float)))
+        told = f"; told to wait {hours[0]}..{hours[-1]} h (median {hours[len(hours) // 2]})" if hours else ""
+        items.append({"weight": 80 + len(beyond), "title": f"{len(beyond)} chain(s) ended on a deferral the run did not wait out (over "
+                      f"{wait_limit():g} h, or a third in a row){told}: next_action says to wait, name a route or do the task "
+                      "yourself; whether rolling again then launches is not played",
+                      "rows": [{"scenario": n, **d} for n, d in beyond]})
     errors = [s["name"] for s in summary["scenarios"] if s.get("error")]
     if errors:
         items.append({"weight": 95, "title": f"the run could not finish {len(errors)} scenario(s): " + ", ".join(errors), "rows": [{"scenario": n} for n in errors]})
@@ -581,8 +609,8 @@ def render(rows: dict, summary: dict, items: list[dict]) -> str:
         for row in item["rows"][:limit("rows_per_item")]:
             out.append(f"   - `{json.dumps(row, ensure_ascii=False, default=str)[:400]}`")
     out += ["", "## Across scenarios", ""]
-    head = ["scenario", "chains", "workers", "not launched", "dead ends", "promises not kept", "unused at resets in the day / overnight (pp, estimated)", "roll s median/p90/max", "error"]
-    out += md_table(head, [[s["name"], s["chains"], s["workers"], len(s["not_launched"]), len(s["dead_ends"]), len(s["broken_promises"]), f'{s["unused_at_reset"]} / {s["unused_overnight"]}',
+    head = ["scenario", "chains", "workers", "not launched", "dead ends", "deferred past the run's wait", "promises not kept", "unused at resets in the day / overnight (pp, estimated)", "roll s median/p90/max", "error"]
+    out += md_table(head, [[s["name"], s["chains"], s["workers"], len(s["not_launched"]), len(s["dead_ends"]), len(s.get("deferred_past_wait") or []), len(s["broken_promises"]), f'{s["unused_at_reset"]} / {s["unused_overnight"]}',
                             f"{s['roll_seconds']['median']}/{s['roll_seconds']['p90']}/{s['roll_seconds']['max']}", "yes" if s["error"] else ""]
                            for s in summary["scenarios"]])
     out += ["", "Answers a session read, by status / caller_action, all scenarios:", ""]
