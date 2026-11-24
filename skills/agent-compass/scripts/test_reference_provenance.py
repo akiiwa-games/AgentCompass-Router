@@ -280,7 +280,7 @@ class ProvenanceTests(unittest.TestCase):
                 free.update(extra)
                 reference_provenance.validate_plan_templates_provenance(doc)
                 del free['allowance_launch_prefix']
-                with self.assertRaisesRegex(ValueError, "plan-templates\['opencode'\]\['free'\]\.allowance_launch_prefix"):
+                with self.assertRaisesRegex(ValueError, r"plan-templates\['opencode'\]\['free'\]\.allowance_launch_prefix"):
                     reference_provenance.validate_plan_templates_provenance(doc)
 
     def test_public_user_scores_reject_a_local_kind(self):

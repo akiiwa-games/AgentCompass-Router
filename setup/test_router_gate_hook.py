@@ -1922,9 +1922,11 @@ process.stdout.write(JSON.stringify(out));
 
         @contextmanager
         def latched_exhaustion():
+            # A latch ends by itself at its re-probe time (quota_exhaustion.due_at, read on the real clock), so it
+            # is recorded now: one at T0 has long ended.
             exhaustion = gate.router_module("quota_exhaustion")
             with mock.patch.dict(os.environ, {"ROUTER_STATE_DIR": str(self.state)}):
-                self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+                self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=dt.datetime.now(UTC).isoformat()))
                 try:
                     yield
                 finally:
@@ -2145,7 +2147,7 @@ process.stdout.write(JSON.stringify(out));
             ("self-labelled", "sess-self", False),          # a record naming itself as parent: the caller is the target
         )
         with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "", "ROUTER_STATE_DIR": str(self.state)}):
-            self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=T0.isoformat()))
+            self.assertTrue(exhaustion.record("claude-lab", "Individual quota reached", at=dt.datetime.now(UTC).isoformat()))
             try:
                 for target, session, owned in cases:
                     payload = {"tool_name": "mcp__paseo__send_agent_prompt",
