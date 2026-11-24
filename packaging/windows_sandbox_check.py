@@ -93,7 +93,10 @@ def stage(base: Path, repo_root: Path, gui: bool = False, inno: bool = False) ->
     shutil.copy2(NODE, stage_in / "node" / "node.exe")
     shutil.copytree(HC, stage_in / "hc")
     if gui:
-        shutil.copytree(build_frozen(repo, base), stage_in / "frozen" / "AgentCompass")
+        frozen = build_frozen(repo, base)
+        shutil.copytree(frozen, stage_in / "frozen" / "AgentCompass")
+        # The installer's icon: the spec writes it beside the folder, where agentcompass.iss reads it (SetupIconFile).
+        shutil.copy2(frozen.parent / "agentcompass-v1.ico", stage_in / "frozen" / "agentcompass-v1.ico")
     if inno:
         installer = next(TOOLS.glob("innosetup-*.exe"), None)
         if not installer:

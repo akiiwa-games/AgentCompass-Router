@@ -801,6 +801,10 @@ def schtasks_xml(name):
     return done.stdout if done.returncode == 0 else None
 
 
+# The icon packaging/agentcompass-tray.spec writes beside the frozen folder; agentcompass.iss reads it there (SetupIconFile).
+SETUP_ICON = "agentcompass-v1.ico"
+
+
 def g_installer():
     if ONLY and "installer" not in ONLY:
         return
@@ -818,6 +822,7 @@ def g_installer():
     (BUILD / "packaging").mkdir(parents=True, exist_ok=True)
     shutil.copy2(IN / "inno" / "packaging" / "agentcompass.iss", BUILD / "packaging" / "agentcompass.iss")
     shutil.copytree(IN / "frozen" / "AgentCompass", BUILD / "dist" / "AgentCompass", dirs_exist_ok=True)
+    shutil.copy2(IN / "frozen" / SETUP_ICON, BUILD / "dist" / SETUP_ICON)
     built = run([iscc, f"/DMyAppVersion={version}", BUILD / "packaging" / "agentcompass.iss"], cwd=BUILD, label="iscc", timeout=900)
     setup_exe = BUILD / "dist" / "AgentCompass-tray-setup.exe"
     check("ISCC builds AgentCompass-tray-setup.exe from agentcompass.iss and the frozen folder", built.returncode == 0 and setup_exe.is_file(), (built.stdout + built.stderr)[-500:])
@@ -1093,6 +1098,7 @@ def g_installer():
         (build_040 / "packaging").mkdir(parents=True, exist_ok=True)
         shutil.copy2(IN / "inno" / "packaging" / "agentcompass.iss", build_040 / "packaging" / "agentcompass.iss")
         shutil.copytree(IN / "frozen" / "AgentCompass", build_040 / "dist" / "AgentCompass", dirs_exist_ok=True)
+        shutil.copy2(IN / "frozen" / SETUP_ICON, build_040 / "dist" / SETUP_ICON)
         shutil.rmtree(build_040 / "dist" / "AgentCompass" / "app" / "current", ignore_errors=True)
         shutil.copytree(pkg_c_tree, build_040 / "dist" / "AgentCompass" / "app" / "current")
         shutil.rmtree(build_040 / "dist" / "AgentCompass" / "app" / "packages", ignore_errors=True)
@@ -1370,6 +1376,7 @@ def g_product():
         (BUILD / "packaging").mkdir(parents=True, exist_ok=True)
         shutil.copy2(IN / "inno" / "packaging" / "agentcompass.iss", BUILD / "packaging" / "agentcompass.iss")
         shutil.copytree(IN / "frozen" / "AgentCompass", BUILD / "dist" / "AgentCompass", dirs_exist_ok=True)
+        shutil.copy2(IN / "frozen" / SETUP_ICON, BUILD / "dist" / SETUP_ICON)
         version = (IN / "inno" / "version.txt").read_text(encoding="utf-8").strip()
         run([INNO_DIR / "ISCC.exe", f"/DMyAppVersion={version}", BUILD / "packaging" / "agentcompass.iss"], cwd=BUILD, label="iscc", timeout=900)
     check("the installer built from this tree is available", setup_exe.is_file(), setup_exe)
