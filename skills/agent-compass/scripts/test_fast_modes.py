@@ -63,13 +63,16 @@ class FastModesTests(unittest.TestCase):
                     with patch.object(account_fleet, 'load_accounts', return_value=accounts), \
                             patch.object(usage_reading, 'usage_snapshot', return_value=usage):
                         if policy is not True or provider == 'claude':
-                            with self.assertRaisesRegex(ValueError, 'has no verified fast mode on .*; run it without --fast'):
-                                route_judge.record_constraint(args)
-                            with self.assertRaisesRegex(ValueError, 'has no verified fast mode on .*; run it without --fast'):
+                            # A named --fast without a contract launches plain (owner, 2026-11-24); a stored fast bundle
+                            # of such a model is refused with the reason before anything starts.
+                            recorded = route_judge.record_constraint(args)
+                            self.assertNotIn('fast', recorded['selected_bundle'])
+                            self.assertRegex(recorded['fast_not_applied'], f'^{model} has no verified fast mode on {provider}$')
+                            with self.assertRaisesRegex(ValueError, f'^{model} has no verified fast mode on {provider}$'):
                                 registry.resolve_bundle(bundle, accounts)
                             with patch.object(roll, 'provider_definition', return_value=(provider, {})), \
                                     patch.object(roll.subprocess, 'Popen') as spawn:
-                                with self.assertRaisesRegex(ValueError, 'has no verified fast mode on .*; run it without --fast'):
+                                with self.assertRaisesRegex(ValueError, f'^{model} has no verified fast mode on {provider}$'):
                                     roll.cli(SimpleNamespace(wait=0), {}, bundle, 'fixture')
                                 spawn.assert_not_called()
                         else:

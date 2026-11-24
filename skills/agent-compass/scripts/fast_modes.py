@@ -34,11 +34,18 @@ def supported(harness, model, model_info):
 
 
 def refusal(harness, model, model_info):
-    """Why `model` has no fast mode `harness` can launch (the one wording every stage uses), else None. A missing price
-    or speed datum is not a refusal: that is the economy's data error (candidate_eval)."""
+    """Why `model` has no fast mode `harness` can launch (the one wording every stage uses), else None. A route named with
+    --fast that has none launches in its plain mode with this reason (`not_applied`, owner 2026-11-24); a stored fast
+    route (an older decision or worker) is refused with it. A missing price or speed datum is not a refusal: that is
+    the economy's data error (candidate_eval)."""
     if supported(harness, model, model_info):
         return None
-    return f'{model} has no verified fast mode on {harness}; run it without --fast'
+    return f'{model} has no verified fast mode on {harness}'
+
+
+def not_applied(reason):
+    """The note of a route named with --fast that runs in its plain mode, as if --fast had not been given."""
+    return f'--fast was not applied: {reason}; the route runs in its plain mode.'
 
 
 def price_gap(model, model_info):

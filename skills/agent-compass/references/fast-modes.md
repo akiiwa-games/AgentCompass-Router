@@ -7,7 +7,9 @@ The verified models are data: a model row in `accounts.json` declares
 (`codex`; Claude has no fast contract, see below). An absent flag or `fast_capable: false` (also in the
 effective local policy) means no fast. Automatic selection, explicit records and
 launch revalidation read this same declaration (`fast_modes.refusal`: `<model> has no
-verified fast mode on <harness>; run it without --fast`).
+verified fast mode on <harness>`). A route named with `--fast` that has no such contract launches in its plain mode
+as if `--fast` had not been given, with `--fast was not applied: <reason>; the route runs in its plain mode.`; a stored
+fast route whose contract is gone is refused with the reason.
 
 | Harness | Verified models | Paseo creation | CLI creation |
 |---|---|---|---|

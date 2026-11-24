@@ -18,6 +18,7 @@ import uuid
 import dispatch_fallback
 import dispatch_flow
 import entry
+import fast_modes
 import dispatch_registry as registry
 import host_placement
 import host_policy
@@ -214,7 +215,8 @@ def named_route_conflict(args, bundle, accounts=None):
     the turn is the explicit resume), else the error text. --resume names the worker, and its route is the worker's
     own; a different named route contradicts it, so neither is chosen for the caller. Fast mode is part of the route:
     --fast on a worker that runs without it is such a contradiction (the entry cannot tell an absent --fast from a plain
-    mode asked for, so only a given --fast is compared)."""
+    mode asked for, so only a given --fast is compared), unless the worker's route has no fast mode at all: then --fast
+    is read as absent, as for a named route (owner, 2026-11-24)."""
     import account_fleet
     import model_resolution
     if accounts is None:
@@ -240,7 +242,9 @@ def named_route_conflict(args, bundle, accounts=None):
         ('--account', args.account and args.account != bundle.get('account')),
         ('--model', model and not account_fleet.pin_names_bundle(args.model, bundle, accounts, pool=pool)),
         ('--effort' if args.effort else '--model', effort and effort != bundle.get('effort')),
-        ('--fast', getattr(args, 'fast', False) and not bundle.get('fast'))) if differs]
+        # --fast on a worker whose route has no fast mode is read as absent (fast_route_lacks), as for a named route.
+        ('--fast', getattr(args, 'fast', False) and not bundle.get('fast') and not fast_route_lacks(bundle, accounts)))
+        if differs]
     if not conflicting:
         return None
     own = f"{bundle.get('account')}/{bundle.get('model')}:{bundle.get('effort')}{', fast' if bundle.get('fast') else ''}"
@@ -504,9 +508,22 @@ def ignored_flag_notes(args, decision, explicit_id):
         notes.append('--basis names no route by itself and was ignored: it only quotes the user for --provider, --account, '
                      '--model or --effort.')
     if getattr(args, 'fast', False) and bundle and not bundle.get('fast'):
-        notes.append('--fast was not applied (it is a preference): '
+        # A named route with no fast mode its harness can launch runs as if --fast had not been given (the record's
+        # `fast_not_applied`, as for a resume); for the router's choice --fast is a preference.
+        own = decision.get('fast_not_applied') or (fast_route_lacks(bundle) if explicit_id else None)
+        notes.append(fast_modes.not_applied(own) if own else '--fast was not applied (it is a preference): '
                      + ((decision.get('decision') or {}).get('fast_not_applied') or 'the chosen route runs in its plain mode') + '.')
     return notes
+
+
+def fast_route_lacks(bundle, accounts=None):
+    """Why `bundle`'s route has no fast mode its harness can launch (fast_modes.refusal), else None."""
+    import account_fleet
+    if accounts is None:
+        accounts = account_fleet.load_accounts()
+    model = account_fleet.canonical(bundle.get('model'), accounts)
+    return fast_modes.refusal(account_fleet.bundle_harness(bundle, bundle.get('account')), model,
+                              account_fleet.row_spec(accounts, model))
 
 
 def files_not_sent(out, args, provider):

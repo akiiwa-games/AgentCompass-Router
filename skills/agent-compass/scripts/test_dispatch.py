@@ -333,7 +333,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(allowed, {})
 
     @pytest.mark.slow
-    def test_cli_pi_fast_is_rejected_before_recording_an_unlaunchable_feature(self):
+    def test_cli_pi_fast_records_the_plain_route_with_the_note_and_no_unlaunchable_feature(self):
         pi_home = self.root / '.pi' / 'agent'
         pi_home.mkdir(parents=True)
         (pi_home / 'auth.json').write_text(json.dumps({'openai-codex': {
@@ -342,8 +342,11 @@ class DispatchTests(unittest.TestCase):
             'record', '--constraint', 'user_override', '--basis', 'Synthetic unsupported fast fixture',
             '--provider', 'pi', '--account', 'codex', '--model', 'gpt-6-astra', '--effort', 'high', '--fast']
         result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn('gpt-6-astra has no verified fast mode on pi; run it without --fast', json.loads(result.stdout)['detail'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        decision = json.loads(result.stdout)
+        self.assertNotIn('fast', decision['selected_bundle'])
+        self.assertIn('--fast was not applied: gpt-6-astra has no verified fast mode on pi; the route runs in its plain mode.',
+                      decision['warnings'])
         self.assertEqual(registry.reservations(), [])
 
     def override_decision(self, effort='low', **changes):
@@ -5667,9 +5670,10 @@ class ContinuationRollTests(unittest.TestCase):
             ('claude-lab', 'claude-lab', 'claude-sonnet-5-5', 'medium', False, '--effort'),
             (None, None, 'claude-sonnet-5-5:medium', None, False, '--model'),
             ('codex', 'codex', 'gpt-6.1-sol', 'high', False, '--provider and --account and --model'),
-            (None, None, None, None, True, '--fast'),
-            ('claude-lab', 'claude-lab', 'claude-sonnet-5-5', 'high', True, '--fast'),
-            ('claude-lab', 'claude-lab', 'claude-opus-5-5', 'high', True, '--model and --fast'),
+            # --fast on a worker whose route has no fast mode (Claude) is read as absent (owner, 2026-11-24)
+            (None, None, None, None, True, None),
+            ('claude-lab', 'claude-lab', 'claude-sonnet-5-5', 'high', True, None),
+            ('claude-lab', 'claude-lab', 'claude-opus-5-5', 'high', True, '--model'),
             ('claude-lab', 'claude-lab', 'claude-sonnet-5-5', 'high', False, None),
             (None, None, 'claude-sonnet-5-5:high', None, False, None),
             (None, None, 'claude-sonnet-5-5', None, False, None),

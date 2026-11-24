@@ -72,25 +72,59 @@ class FastModeFactTests(NamedRouteCase):
         self.skipTest('the reference fleet has no row with a verified fast contract')
 
     def uncontracted(self):
-        for bundle in account_fleet.bundles(self.accounts).values():
+        """A route without a fast contract, a Claude one first (Claude's fast contract was withdrawn, owner 2026-11-24)."""
+        for bundle in sorted(account_fleet.bundles(self.accounts).values(),
+                             key=lambda b: account_fleet.bundle_harness(b, b['account']) != 'claude'):
             harness = account_fleet.bundle_harness(bundle, bundle['account'])
             if bundle.get('effort') and not fast_modes.supported(
                     harness, bundle['model'], account_fleet.model_spec(self.accounts, bundle['model'])):
                 return bundle, harness
         self.skipTest('the reference fleet has no row without a fast contract')
 
-    def test_no_contract_is_refused_with_the_one_wording_at_record_and_at_launch(self):
+    def test_no_contract_launches_plain_as_if_fast_were_not_given_with_one_note(self):
+        """Owner, 2026-11-24: a route the user names with --fast whose harness cannot launch the model fast runs in its
+        plain mode as if --fast had not been given: no refusal, one note saying why, the plain mode's reservation and
+        expected spend. A stored fast route of such a model (an older decision) is still refused with the reason."""
         bundle, harness = self.uncontracted()
         model = account_fleet.canonical(bundle['model'], self.accounts)
-        fact = fast_modes.refusal(harness, model, account_fleet.model_spec(self.accounts, model))
-        self.assertEqual(fact, f'{model} has no verified fast mode on {harness}; run it without --fast')
-        with self.assertRaises(ValueError) as at_record:
-            self.record(account=bundle['account'], provider=bundle['provider'], model=bundle['model'],
-                        effort=bundle['effort'], fast=True)
-        self.assertEqual(str(at_record.exception), fact)
-        with self.assertRaises(ValueError) as at_launch:
+        reason = fast_modes.refusal(harness, model, account_fleet.model_spec(self.accounts, model))
+        self.assertEqual(reason, f'{model} has no verified fast mode on {harness}')
+        named = dict(account=bundle['account'], provider=bundle['provider'], model=bundle['model'],
+                     effort=bundle['effort'])
+        fast_result, fast_row = self.launched(fast=True, **named)
+        plain_result, plain_row = self.launched(**named)
+        self.assertNotIn('fast', fast_result['selected_bundle'])
+        self.assertNotIn('force_fast', fast_result.get('_route') or {})
+        self.assertEqual(fast_result['fast_not_applied'], reason)
+        note = fast_modes.not_applied(reason)
+        self.assertEqual([w for w in fast_result.get('warnings') or () if '--fast' in w], [note])
+        self.assertEqual([w for w in fast_result.get('warnings') or () if w != note],
+                         list(plain_result.get('warnings') or ()))
+        self.assertFalse(fast_row['bundle'].get('fast'))
+        self.assertEqual(fast_row['request']['settings'].get('features'),
+                         plain_row['request']['settings'].get('features'))
+        self.assertEqual(fast_row['expected_usd'], plain_row['expected_usd'])
+        self.assertEqual(fast_result['selected_bundle'].get('expected_usd'),
+                         plain_result['selected_bundle'].get('expected_usd'))
+        with self.assertRaises(ValueError) as stored:
             dispatch_registry.resolve_bundle(dict(bundle, fast=True), self.accounts, explicit_override=True)
-        self.assertEqual(str(at_launch.exception), fact)
+        self.assertEqual(str(stored.exception), reason)
+
+    def test_roll_says_the_note_once_and_a_resume_reads_fast_as_absent_on_a_route_without_a_contract(self):
+        import roll
+        bundle, harness = self.uncontracted()
+        model = account_fleet.canonical(bundle['model'], self.accounts)
+        reason = fast_modes.refusal(harness, model, account_fleet.model_spec(self.accounts, model))
+        from_roll = self.record(account=bundle['account'], provider=bundle['provider'], model=bundle['model'],
+                                effort=bundle['effort'], fast=True, _from_roll=True)
+        self.assertFalse([w for w in from_roll.get('warnings') or () if '--fast' in w])     # roll's own note says it
+        args = argparse.Namespace(fast=True, basis=None, provider=None, account=None, model=None, effort=None)
+        self.assertEqual(roll.ignored_flag_notes(args, from_roll, ''), [fast_modes.not_applied(reason)])
+        with patch.object(account_fleet, 'load_accounts', return_value=copy.deepcopy(self.accounts)):
+            resume = argparse.Namespace(provider=None, account=None, model=None, effort=None, fast=True)
+            self.assertIsNone(roll.named_route_conflict(resume, dict(bundle, bundle_id=bundle['id']), self.accounts))
+            self.assertEqual(roll.ignored_flag_notes(resume, {'selected_bundle': dict(bundle)}, 'agent-1'),
+                             [fast_modes.not_applied(reason)])
 
     def test_a_contract_without_a_price_launches_fast_carrying_the_data_error(self):
         fleet, bundle = self.contracted()
