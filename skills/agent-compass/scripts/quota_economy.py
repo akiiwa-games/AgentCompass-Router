@@ -414,7 +414,7 @@ class FiveAxisEconomy:
 
     def rec(self, entry, wid):
         st, cap = entry['states'][wid]
-        return self.member_records((entry['qsrc'], wid), st, cap)
+        return self.member_records((entry['qsrc'], wid), st, cap, entry['spend'])
 
     def record(self, wkey, st, cap, share=1.0):
         """The window's recovery record with its burst size `lump_usd` attached (None when the window is unreadable). A
@@ -424,20 +424,20 @@ class FiveAxisEconomy:
             rec['lump_usd'] = self.lump(wkey, rec['reset_hours']) * share
         return rec
 
-    def member_records(self, wkey, st, cap):
-        """[(state, record, share)] of the windows that serve window `wkey`'s work: the window itself (share 1), or for a
-        pool (`members`, quota_pools.pool_row) each counted member on its own window (owner 2026-11-24). The work is split
-        evenly over the serving members (quota_pools.serving_members: the balanced assumption). Each member's term is this module's own record on its C, U, e, reset and share, so members in step (same used
-        share, same reset) give the merged window's term: capacity, used and burst all scale by the share."""
+    def member_records(self, wkey, st, cap, spend):
+        """[(state, record, share)] of the windows that serve `spend` of window `wkey`: the window itself (share 1), or
+        for a pool (`members`, quota_pools.pool_row) each member on its own window with its share of that spend by the
+        pool's one split (quota_pools.shares: balanced, by room). Each member's term is this module's own record on its
+        C, U, e, reset and share, so members in step (same used share, same reset) give the merged window's term:
+        capacity, used and burst all scale by the share."""
         if not st.get('members'):
             rec = self.record(wkey, st, cap)
             return [] if rec is None else [(st, rec, 1.0)]
-        serving = quota_pools.serving_members(st)
         out = []
-        for m in serving:
-            rec = self.record(wkey, m, cap, 1.0 / len(serving))
+        for m, share in quota_pools.shares(st, 100.0 * spend / cap if cap else None):
+            rec = self.record(wkey, m, cap, share)
             if rec is not None:
-                out.append((m, rec, 1.0 / len(serving)))
+                out.append((m, rec, share))
         return out
 
     def lump(self, wkey, reset_hours=None):
@@ -471,9 +471,9 @@ class FiveAxisEconomy:
             slack = 1.0
             for wid in best['states']:
                 recs = self.rec(best, wid)
-                if recs:        # a pool: the mean of its serving members' slack, each at its share of the spend
-                    slack = min(slack, sum(five_axis_substitute_slack(rec, best['spend'] * share)
-                                           for _, rec, share in recs) / len(recs))
+                if recs:        # a pool: its members' slack at their shares of the spend, weighted by the shares
+                    slack = min(slack, sum(share * five_axis_substitute_slack(rec, best['spend'] * share)
+                                           for _, rec, share in recs))
             got = self._alts[(unit, gi)] = (best['fits'][gi], slack)
         return got
 
@@ -539,9 +539,9 @@ class FiveAxisEconomy:
                 'period_hours': None if period is None else round(period, 2),
                 'elapsed_hours': None if period is None else round(period - agg['reset_hours'], 2),
                 'reset_in_hours': None if agg['reset_hours'] == float('inf') else round(agg['reset_hours'], 2),
-                'need_probability': round(sum(t['need_probability'] for t in terms) / len(terms), 4),
+                'need_probability': round(sum(t['need_probability'] * r[2] for t, r in zip(terms, recs)), 4),
                 'lump_usd': round(sum(rec['lump_usd'] for _, rec, _ in recs), 2),
-                'quota_price': round(sum(t['quota_price'] for t in terms) / len(terms), 6),
+                'quota_price': round(sum(t['quota_price'] * r[2] for t, r in zip(terms, recs)), 6),
                 'ladder_steps': len(ladder['steps']), 'outside_fit': round(outside, 4), 'best_fit': round(best, 4),
                 'substitute_slack': round(slack, 4), 'candidates': len(self.points[wkey]),
                 **({'members': [member_view(m, rec, t) for (m, rec, _), t in zip(recs, terms)]}
@@ -615,7 +615,7 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                 rec = five_axis_window_recovery(st, cap_usd_w)
                 recs = []
             else:
-                recs = econ.member_records((own_qsrc, wid), st, cap_usd_w)
+                recs = econ.member_records((own_qsrc, wid), st, cap_usd_w, spend)
                 rec = pool_record(st, cap_usd_w, recs) if recs else None
             if rec is None:
                 continue
@@ -644,7 +644,7 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
             }
             if not row['short'] and spend > 0:
                 # Each serving window prices its share of the spend on its own record; the window's term is their sum
-                # and its price and need the members' mean (member_records; one window is the case of one member).
+                # and its price and need the members' share-weighted mean (member_records; one window is one member).
                 gots = [econ.window_cost((own_qsrc, wid), m_rec, spend * share, econ_h,
                                          start_offset_hours=max(float(m.get('start_offset_hours') or 0.0),
                                                                 float(st.get('start_offset_hours') or 0.0)),
@@ -652,9 +652,9 @@ def apply_five_axis_economy(candidates, eligible, task, accounts, policy, pool=N
                         for m, m_rec, share in recs]
                 unit_cost = float((1.0 + sum(float(g['cost']) for g in gots)) - 1.0)
                 row.update(priced=True, cost=unit_cost, opportunity_cost=unit_cost,
-                           quota_price=round(sum(g['lambda_start'] for g in gots) / len(gots), 6),
-                           need_start=round(sum(g['need_start'] for g in gots) / len(gots), 4),
-                           need_end=round(sum(g['need_end'] for g in gots) / len(gots), 4),
+                           quota_price=round(sum(g['lambda_start'] * r[2] for g, r in zip(gots, recs)), 6),
+                           need_start=round(sum(g['need_start'] * r[2] for g, r in zip(gots, recs)), 4),
+                           need_end=round(sum(g['need_end'] * r[2] for g, r in zip(gots, recs)), 4),
                            spend_before_reset=round(sum(g['spend_before'] for g in gots), 2),
                            spend_after_reset=round(sum(g['spend_after'] for g in gots), 2))
                 if st.get('members'):

@@ -95,12 +95,12 @@ def economy(spend_max=60.0, lump=30.0):
 
 def term(state, spend=40.0, hours=2.0, econ=None):
     """(cost, price, need) of `spend` on a window state, as apply_five_axis_economy's eval_windows composes them: each
-    serving window's own cost at its share, summed; price and need the mean (R3)."""
+    serving window's own cost at its share, summed; price and need weighted by the shares (R3)."""
     econ = econ or economy()
-    recs = econ.member_records(W, state, CAP)
+    recs = econ.member_records(W, state, CAP, spend)
     gots = [econ.window_cost(W, rec, spend * share, hours, share=share) for _, rec, share in recs]
-    return (sum(g['cost'] for g in gots), sum(g['lambda_start'] for g in gots) / len(gots),
-            sum(g['need_start'] for g in gots) / len(gots))
+    return (sum(g['cost'] for g in gots), sum(g['lambda_start'] * r[2] for g, r in zip(gots, recs)),
+            sum(g['need_start'] * r[2] for g, r in zip(gots, recs)))
 
 
 GATE_FIELDS = ('known', 'full', 'remaining', 'target_remaining', 'reset_hours', 'end_hours', 'stale')
@@ -176,7 +176,7 @@ class InStepTests(unittest.TestCase):
                 renewed_pool, renewed_merged = quota_pools.after_reset(pool, 168.0), quota_pools.after_reset(merged, 168.0)
                 self.assertEqual({f: renewed_pool[f] for f in ('remaining', 'deferred_hours', 'full')},
                                  {f: renewed_merged[f] for f in ('remaining', 'deferred_hours', 'full')})
-                drawn = quota_pools._even_draw(pool['members'], min(30.0, pool['remaining']), CAP)
+                drawn = quota_pools._draw(pool, min(30.0, pool['remaining']), CAP)
                 self.assertAlmostEqual(sum(m['remaining'] for m in drawn), merged['remaining'] - min(30.0, merged['remaining']))
 
 
@@ -205,15 +205,50 @@ class OrderTests(unittest.TestCase):
 
 
 class MonotoneTests(unittest.TestCase):
-    def test_cost_is_non_decreasing_in_each_members_used_share(self):
-        # Quota cost non-decreasing in used share (AGENTS.md), member by member: raising one member's use, the others
-        # fixed, never lowers the pool's term.
-        other = (40.0, 60.0)
-        for hours in (30.0, 146.0):
-            with self.subTest(hours=hours):
-                costs = [term(pool_state([(used, hours), other]))[0] for used in range(0, 100, 5)]
-                for low, high in zip(costs, costs[1:]):
-                    self.assertGreaterEqual(high, low - 1e-12)
+    SPEND = 40.0        # $40 of a $1000 window: an equal share is 2% of one account
+
+    def test_cost_is_non_decreasing_in_a_members_used_share_while_it_has_room_for_its_equal_share(self):
+        # Quota cost non-decreasing in used share (AGENTS.md), member by member, the others fixed, (a) for as long as
+        # the member has room for its equal share of the work (quota_pools.shares: by room). Past that point the pool
+        # draws less of that member (its last dollars) and more of the others, so the pool's cost may fall: the owner's
+        # open question (report Round 2), not asserted either way.
+        equal_share_pct = 100.0 * self.SPEND / CAP / 2
+        for other in ((40.0, 60.0), (0.0, 146.0)):
+            for hours in (30.0, 146.0):
+                with self.subTest(other=other, hours=hours):
+                    used = [*range(0, int(100 - equal_share_pct)), 100 - equal_share_pct - 0.5, 100 - equal_share_pct]
+                    costs = [term(pool_state([(u, hours), other]), self.SPEND)[0] for u in used]
+                    for low, high in zip(costs, costs[1:]):
+                        self.assertGreaterEqual(high, low - 1e-12)
+
+    def test_a_member_at_100_percent_is_the_limit_of_one_near_it_and_takes_no_share(self):
+        # (b) no jump at 100%: as a member's room shrinks to 0 it carries only that room, so the pool's term tends to
+        # its term at 100% (the gap shrinks with the room: at most the top price times the room); (c) a member at 100%
+        # takes no share and the pool is the others (shares: none above a member's room).
+        for other in ((40.0, 60.0), (0.0, 146.0)):
+            with self.subTest(other=other):
+                full = term(pool_state([(100.0, 30.0), other]), self.SPEND)[0]
+                gaps = [abs(term(pool_state([(100.0 - room, 30.0), other]), self.SPEND)[0] - full)
+                        for room in (1e-3, 1e-5, 1e-7)]
+                for wider, narrower in zip(gaps, gaps[1:]):
+                    self.assertLess(narrower, wider / 10)
+                self.assertLess(gaps[-1], 0.01 * full)
+                self.assertEqual([m['position'] for m, _ in quota_pools.shares(pool_state([(100.0, 30.0), other]), 4.0)],
+                                 [2])
+
+    def test_one_split_by_room_for_price_and_reservations(self):
+        # Review round 2 (owner): one split rule, by room, read by the price and the in-flight draw alike. A member gets
+        # an equal share, never above its room; what it cannot hold goes to the others.
+        pool = pool_state([(99.0, 30.0), (40.0, 60.0), (70.0, 90.0)])
+        split = dict((m['position'], share) for m, share in quota_pools.shares(pool, 12.0))
+        self.assertAlmostEqual(split[1] * 12.0, 1.0)                    # its room, 1%
+        self.assertAlmostEqual(split[2], split[3])                      # the rest in equal parts
+        self.assertAlmostEqual(sum(split.values()), 1.0)
+        drawn = {m['position']: m['observed_remaining'] - m['remaining']
+                 for m in quota_pools._draw(pool, 12.0, CAP) if 'observed_remaining' in m}
+        self.assertEqual({k: round(v, 9) for k, v in drawn.items()}, {k: round(s * 12.0, 9) for k, s in split.items()})
+        recs = economy().member_records(W, pool, CAP, 120.0)          # $120 = 12% of one account
+        self.assertEqual({m['position']: round(share, 9) for m, _, share in recs}, {k: round(s, 9) for k, s in split.items()})
 
     def test_unused_quota_nearer_its_reset_makes_the_term_no_larger(self):
         # Derived from quota_economy: at the same use, a later point of the period (larger elapsed fraction e) gives a
@@ -244,11 +279,11 @@ class UnknownAndEmptyMemberTests(unittest.TestCase):
     def test_a_member_at_zero_takes_no_share(self):
         # R2: a member with nothing left serves none of the work; the others carry all of it.
         pool = pool_state([(100.0, 30.0), (40.0, 90.0)])
-        self.assertEqual([m['position'] for m in quota_pools.serving_members(pool)], [2])
-        _, rec, share = economy().member_records(W, pool, CAP)[0]
+        self.assertEqual([m['position'] for m, _ in quota_pools.shares(pool, 4.0)], [2])
+        _, rec, share = economy().member_records(W, pool, CAP, 40.0)[0]
         self.assertEqual(share, 1.0)
         self.assertAlmostEqual(term(pool)[0], term(single_state(40.0, 90.0))[0], places=12)
-        drawn = quota_pools._even_draw(pool['members'], 20.0, CAP)
+        drawn = quota_pools._draw(pool, 20.0, CAP)
         self.assertEqual([m['remaining'] for m in drawn], [0.0, 40.0])
 
     def test_the_pool_is_exhausted_only_when_every_member_is(self):

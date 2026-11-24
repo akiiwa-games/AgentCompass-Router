@@ -295,9 +295,8 @@ def reserve_inflight(account, spec, wid, wspec, state, records, accounts, policy
     if reserved_usd > 0 and win_cap_usd:
         reserved_pct = min(state['remaining'], round(100.0 * reserved_usd / win_cap_usd, 2))
         if state.get('members'):
-            # Balanced (owner 2026-11-24): the in-flight work draws evenly on the members that have quota left; a
-            # member that runs out leaves the rest to the others.
-            members = _even_draw(state['members'], reserved_pct, win_cap_usd)
+            # The in-flight work draws on the members by the one split (shares): never above a member's room.
+            members = _draw(state, reserved_pct, win_cap_usd)
             state = {**pool_row({k: state[k] for k in ('id', 'hours', 'short', 'stale') if k in state}, members),
                      **{k: state[k] for k in ('deferred_hours', 'start_offset_hours') if k in state}}
             state.update(observed_remaining=state['remaining'] + reserved_pct, reserved_usd=round(reserved_usd, 2))
@@ -309,22 +308,13 @@ def reserve_inflight(account, spec, wid, wspec, state, records, accounts, policy
     return state, 0.0, 0.0
 
 
-def _even_draw(members, pct, cap_usd):
-    """Members after `pct` (percent of one account) is drawn evenly from those with quota left (the balanced split)."""
-    taken = {m['position']: 0.0 for m in members}
-    left = pct
-    while left > 1e-9:
-        open_ = [m for m in members if m.get('known') and m['remaining'] - taken[m['position']] > 1e-9]
-        if not open_:
-            break
-        share = left / len(open_)
-        for m in open_:
-            take = min(share, m['remaining'] - taken[m['position']])
-            taken[m['position']] += take
-            left -= take
-    return [{**m, 'remaining': m['remaining'] - taken[m['position']],
+def _draw(state, pct, cap_usd):
+    """The pool's members after `pct` (percent of one account, at most what the pool has left) is drawn by `shares`."""
+    taken = {m['position']: share * pct for m, share in shares(state, pct)}
+    members = state['members']
+    return [{**m, 'remaining': m['remaining'] - taken.get(m['position'], 0.0),
              **({'observed_remaining': m['remaining'], 'reserved_usd': round(taken[m['position']] * cap_usd / 100.0, 2)}
-                if taken[m['position']] > 0 else {})} for m in members]
+                if taken.get(m['position'], 0.0) > 0 else {})} for m in members]
 
 
 def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
@@ -457,22 +447,45 @@ def pool_row(base, members):
     return row
 
 
-def serving_members(state):
-    """The members of a pool state that take a share of its work (owner 2026-11-24: the gateway's choice among members
-    is taken as balanced, an assumption and not a measurement): the known members with quota left, or every known member
-    when none has (as one exhausted window still prices). A member whose state is not known takes no share."""
+def shares(state, amount=None):
+    """[(member, share of the work)]: the one split of a pool's work over its members, read by the price, the need, the
+    substitute slack, the gates and the in-flight reservations alike. The gateway's choice among members is taken as
+    balanced (owner 2026-11-24, an assumption and not a measurement), by room (review round 2): equal shares among the
+    known members, none given more than its room (what it has left, in percent of one account); what a member cannot
+    hold goes to the others in equal parts. Work beyond every member's room is split evenly over all known members, as
+    one window prices the work past its remaining. `amount` is the work in percent of one account; None (or 0) is the
+    limit of a small work: equal shares among the members with quota left, or among all known ones when none has. A
+    member whose state is not known takes no share. Members in step get equal shares."""
     known = [m for m in state['members'] if m.get('known')]
-    return [m for m in known if m['remaining'] > 1e-9] or known
+    if not known:
+        return []
+    if amount is None or amount <= 1e-12:
+        serving = [m for m in known if m['remaining'] > 1e-9] or known
+        return [(m, 1.0 / len(serving)) for m in serving]
+    taken = [0.0] * len(known)
+    left = float(amount)
+    while left > 1e-12:
+        open_ = [i for i, m in enumerate(known) if m['remaining'] - taken[i] > 1e-12]
+        if not open_:
+            break
+        part = left / len(open_)
+        for i in open_:
+            take = min(part, known[i]['remaining'] - taken[i])
+            taken[i] += take
+            left -= take
+    if left > 1e-12:
+        taken = [t + left / len(known) for t in taken]
+    return [(m, t / amount) for m, t in zip(known, taken) if t > 0]
 
 
-def hours_before(state, horizon):
-    """Hours of the work that fall before a window's reset, `horizon(st)` for one account's window. For a pool, the
-    work is split evenly over its serving members and each member's share runs to its own reset, so the pool's hours
-    before reset are the mean of its serving members' (equal to the merged window's when the members are in step)."""
+def hours_before(state, horizon, amount=None):
+    """Hours of the work that fall before a window's reset, `horizon(st)` for one account's window. For a pool each
+    member's share of the work (`shares`, of the work `amount`) runs to its own reset, so the pool's hours before reset
+    are the members' horizons weighted by their shares (the merged window's when the members are in step)."""
     if not state.get('members'):
         return horizon(state)
-    serving = serving_members(state)
-    return sum(horizon(m) for m in serving) / len(serving) if serving else horizon(state)
+    split = shares(state, amount)
+    return sum(share * horizon(m) for m, share in split) if split else horizon(state)
 
 
 def window_state(wid, spec, observed, account_spec, now, short_hours, account_stale=False, expected_reset_at=None):
