@@ -2757,6 +2757,10 @@ test('stale .lock.recovery directory is reclaimed by one watcher while a fresh o
     assert.equal(twoA.pid, twoB.pid);
     assert.notEqual(twoA.pid, deadPid);
     assert.equal(running(twoA.pid), true);
+    // The contender that lost answers before its own `finally` leaves the recovery slot: the slot is gone soon after.
+    for (let waited = 0; fs.existsSync(`${twoFile}.lock.recovery`) && waited < 5000; waited += 50) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
     assert.equal(fs.existsSync(`${twoFile}.lock.recovery`), false);
     const twoWatchers = fs.readFileSync(path.join(root, 'watchers.jsonl'), 'utf8').trim().split('\n')
       .filter(Boolean).map(line => JSON.parse(line)).filter(e => e.argv.includes('stale-two'));

@@ -419,7 +419,6 @@ EN = {
     '未启用': 'Disabled',
     '重置前优先': 'Pre-Reset Priority',
     '已停止': 'Stopped',
-    '正常': 'Healthy',
     '有服务停止': 'A service has stopped',
     '正在检查并更新插件组件…': 'Checking and updating plugin components…',
     '已启动隧道': 'Tunnel started',
