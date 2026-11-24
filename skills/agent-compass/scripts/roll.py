@@ -338,6 +338,8 @@ def _auto_resumable(worker, policy, usage_cache_path=None, accounts=None):
     bundle = _resolve_worker_bundle(worker, accounts)
     if bundle is None or not host_policy.account_allowed(policy, bundle.get('account')):
         return False
+    if fast_session_refusal(worker, accounts):
+        return False
     _, cwd_spec = worker_cwd_spec(worker, accounts)
     if cwd_spec.get('cwd_regex'):
         own = host_placement.worker_directory(None, worker)
@@ -365,6 +367,18 @@ def _not_reusable_text(explicit_id, parent, excluded):
                or registry.Refusal('it is not an idle worker of this parent', 'Roll without --resume to start a fresh worker.'))
     return (f'Nothing was launched: worker {explicit_id!r} cannot be resumed by parent {parent!r}: {refusal.reason}. '
             f'{refusal.remedy}')
+
+
+def fast_session_refusal(worker, accounts=None):
+    """Why `worker` cannot take a resumed turn as its plain route, else None: it was started fast on a route that has no
+    fast contract now (fast_route_lacks). A resumed turn keeps the session's own fast setting (the host relabels the
+    worker and sends the prompt; it changes no feature, fast-modes.md), so the turn would still run fast."""
+    bundle = _resolve_worker_bundle(worker, accounts) or {}
+    if bundle.get('fast') and (reason := fast_route_lacks(bundle, accounts)):
+        return (f'Nothing was launched: worker {worker.get("agent_id")!r} was started in fast mode and {reason}; a resumed '
+                'turn keeps its session\'s fast mode, so it cannot run as the plain route. Write a handoff brief and omit '
+                '--resume to start a fresh worker in the plain mode.')
+    return None
 
 
 def _resume_refusal(out, explicit_id, error, next_text, code=2):
@@ -1758,6 +1772,8 @@ def _run(args, judge):
                     f'Nothing was launched: worker {explicit_id!r} reached the context rotation limit and cannot be resumed. '
                     'Write a handoff brief and omit --resume to start a fresh worker.',
                 )
+            if fast_refused := fast_session_refusal(explicit_worker):
+                return _resume_refusal(base_out, explicit_id, 'resume_worker_fast_mode', fast_refused)
             if gate_reason := _worker_gate_refusal(explicit_worker, usage_cache_path=usage_cache_path):
                 return _resume_refusal(base_out, explicit_id, 'resume_worker_gated',
                                        gate_refusal_text(explicit_id, gate_reason))

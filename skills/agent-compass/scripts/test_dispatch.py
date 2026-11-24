@@ -5716,6 +5716,58 @@ class ContinuationRollTests(unittest.TestCase):
                 self.assertEqual((code, res['status'], operations[0]), (0, 'launched', ('resume', 'agent-idle')), res)
                 self.assertEqual(decision_ledger.read_ledger()[-1]['constraint'], 'explicit_resume')
 
+    def test_a_recorded_fast_route_without_a_fast_contract_launches_plain_or_names_the_way_on(self):
+        # Rule (router-internals.md, --fast): a route that cannot run fast runs in its plain mode with the one note. A
+        # stored decision recorded fast (before Claude's contract was withdrawn) launches a new worker plain, at the plain
+        # spend. A worker started fast cannot: a resumed turn keeps its session's fast mode, so the resume names the way
+        # on (caller_action roll_fresh_worker) instead of a flag the caller cannot change.
+        import argparse
+        import decision_ledger
+        import fast_modes
+        import roll
+        plain_bundle = dict(self.bundle, bundle_id='lab_sonnet55_high')
+        note = fast_modes.not_applied('claude-sonnet-5-5 has no verified fast mode on claude')
+        rows = {}
+        for fast in (False, True):
+            task = dict(self.task, task_id=f't-stored-{fast}')
+            with patch.object(fast_modes, 'supported', return_value=True):      # recorded while the contract held
+                decision = registry.issue({'stage': 'record', 'choice': 'constraint', 'constraint': 'user_override',
+                                           'basis': 'User asked', 'decision': {'action': 'start'},
+                                           'selected_bundle': dict(plain_bundle, **({'fast': True} if fast else {}))},
+                                          task, self.now)
+            rows[fast] = registry.prepare(decision['decision_id'], task, self.launch, self.usage, accounts=self.accounts,
+                                          now=self.now)
+        self.assertFalse(rows[True]['bundle'].get('fast'))
+        self.assertEqual(rows[True]['request']['settings']['features'], {'fast_mode': False})
+        self.assertEqual(rows[True]['warnings'][:1], [note])
+        self.assertEqual(rows[True]['expected_usd'], rows[False]['expected_usd'])
+
+        operations, host, judge, _ = self._setup_paseo_env()
+        worker = {'agent_id': 'agent-idle', 'dispatch_id': 'd-fast', 'bundle_id': 'lab_sonnet55_high',
+                  'bundle': dict(plain_bundle, fast=True), 'chain_id': 'chain-idle', 'task_ids': ['t-old'],
+                  'brief_paths': [], 'read_only_review': False, 'worn': False,
+                  'session_state': {'context_tokens': 1000, 'compacted_tokens': 0}}
+        brief = self.root / 't-resume-fast.md'
+        brief.write_text('# Continue\n', encoding='utf-8')
+        args = dict(task=None, file=[], apply_to=None, local_only='local', keep_whole=None, hours=0.5, title=None,
+                    workspace=None, task_id='t-resume-fast', wait=0, parent_id=None, parent_host=None,
+                    parent_address=None, provider=None, account=None, model=None, effort=None, basis=None,
+                    usage_cache=None, dry_run=False, verbose=False, fast=False, resume='agent-idle', new_worker=False)
+        rows_before = len(decision_ledger.read_ledger())
+        with fake_owners(self), patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent-a'}), \
+                patch.object(account_fleet, 'load_accounts', return_value=self.accounts), \
+                patch.object(roll, 'WORKER_PROMPTS_DIR', self.root / 'wp'), \
+                patch.object(roll, 'RESULTS_DIR', self.root / 'rr'), \
+                patch.object(registry, 'reusable_workers', return_value=[worker]), \
+                patch.object(roll, '_worker_gate_refusal', return_value=None), \
+                patch.object(flow, 'host_call', host):
+            res, code = roll.run(argparse.Namespace(brief=brief, **args), judge)
+        self.assertEqual((code, res['status'], res['cause']), (2, 'blocked', 'resume_worker_fast_mode'), res)
+        self.assertIn('claude-sonnet-5-5 has no verified fast mode on claude', res['next_action'])
+        self.assertEqual(json.loads(Path(res['details']).read_text(encoding='utf-8'))['caller_action'], 'roll_fresh_worker')
+        self.assertEqual(operations, [])
+        self.assertEqual(len(decision_ledger.read_ledger()), rows_before)
+
     def test_a_named_worker_that_fails_on_its_turn_is_not_relaunched_on_another_worker(self):
         # Rule (dispatch_fallback `worker_named`): a failure of the turn a named worker took is reported as it is; no
         # transient retry on a new worker and no switch to the next candidate.
