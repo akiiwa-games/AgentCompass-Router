@@ -789,6 +789,8 @@ def account_cards() -> list[dict]:
         usage = usage_reading.usage_snapshot(None, None, now, quota_sources=sources, inventory=inventory)
     else:
         usage = usage_reading.usage_snapshot(None, None, now)
+    # A free allowance's current period, read from local spend, is its window's reading as in a plan.
+    usage = axis_scores.with_local_readings(usage, accounts, now)
     capacity = _read_json(STATE_DIR / "capacity.json")
     observed = capacity.get("observed") or {}
     try:

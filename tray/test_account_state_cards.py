@@ -298,6 +298,11 @@ class AccountStateCardTests(unittest.TestCase):
         free = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec=spec)
         self.assertEqual((free['kind'], free['windows']), ('ok', []))
         self.assertNotIn('不参与自动路由', free['badge'])
+        # Its period read from local spend (axis_scores.with_local_readings) is the window's reading, as in a plan.
+        read = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={**spec, 'local_period': {
+            'window': 'allowance', 'used_usd': 1.0,
+            'resets_at': (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat()}})
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in read['windows']], [('allowance', 100 - 100 * 1.0 / 2.5)])
         self.assertIn('供应商未公布额度上限', free['usage_hover'])
         self.assertNotIn('capacity_unknown', free)
         reset = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
