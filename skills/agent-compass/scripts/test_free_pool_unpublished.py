@@ -669,6 +669,27 @@ class StatedResetParseTests(unittest.TestCase):
         self.assertEqual(quota_exhaustion.stated_reset(f'retrying in {int(longest * 3600) - 60}s', self.AT),
                          self.AT + timedelta(seconds=int(longest * 3600) - 60))
 
+    def test_a_plan_templates_document_of_the_wrong_shape_raises_the_reference_readers_own_error(self):
+        """Rule (quota_exhaustion.longest_reset_hours, review round 2 N6): the bound is read from plan-templates.json of
+        the held set through public_data.document; a document not in the shape it reads raises
+        public_data.ReferenceDataError, the reader's own data error, and the reader's own errors pass through: never an
+        AttributeError, never a silent bound."""
+        import public_data
+        window = {'hours': 5}
+        for doc in ([], {'claude': []}, {'claude': {'max': []}}, {'claude': {'max': {'windows': []}}},
+                    {'claude': {'max': {'windows': {'five_hour': []}}}}, {'claude': {'max': {'windows': {'w': window},
+                                                                                              'cadence': []}}}):
+            with self.subTest(doc=doc), patch.object(public_data, 'document', return_value=doc):
+                with self.assertRaises(public_data.ReferenceDataError):
+                    quota_exhaustion.longest_reset_hours()
+                with self.assertRaises(public_data.ReferenceDataError):
+                    quota_exhaustion.stated_reset(COUNTDOWN, self.AT)
+        with patch.object(public_data, 'document', side_effect=public_data.ReferenceDataError('unreadable')):
+            with self.assertRaises(public_data.ReferenceDataError):
+                quota_exhaustion.longest_reset_hours()
+        with patch.object(public_data, 'document', return_value={'claude': {'max': {'windows': {'w': window}}}}):
+            self.assertEqual(quota_exhaustion.longest_reset_hours(), 5)
+
     def test_the_limit_sentences_are_confirmed_quota_failures(self):
         for text in (LIMIT, CLOCK, COUNTDOWN, UNREADABLE):
             self.assertTrue(quota_exhaustion.confirmed(text), text)

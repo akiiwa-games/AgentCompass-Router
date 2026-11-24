@@ -118,19 +118,30 @@ def stated_period(error):
 
 
 def longest_reset_hours():
-    """The longest reset period any window of the shipped plan templates declares (hours), the furthest a quota can
-    reset from now; None when the templates cannot be read."""
+    """The longest reset period any window (or dispatch cadence) of the shipped plan templates declares (hours), the
+    furthest a quota can reset from now; None when no template declares one. Read from plan-templates.json of the held
+    reference set (public_data.document), whose errors pass through; a document not in the shape read here (objects of
+    families, of plans, of windows and of a cadence) raises public_data.ReferenceDataError: never a guess, never a
+    silent bound."""
     import provider_inventory
+    import public_data
+
+    def shaped(value, where, *, optional=False):
+        if optional and value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise public_data.ReferenceDataError(f'plan-templates.json: {where} is not an object')
+        return value
+
     periods = []
-    for plans in provider_inventory.shipped_plan_templates().values():
-        for template in (plans.values() if isinstance(plans, dict) else ()):
-            if not isinstance(template, dict):
-                continue
-            for window in (template.get('windows') or {}).values():
-                hours = window.get('hours') if isinstance(window, dict) else None
+    for family, plans in shaped(public_data.document(provider_inventory.PLAN_TEMPLATES), 'the document').items():
+        for plan, template in shaped(plans, f'[{family!r}]').items():
+            where = f'[{family!r}][{plan!r}]'
+            for wid, window in shaped(shaped(template, where).get('windows'), f'{where}.windows', optional=True).items():
+                hours = shaped(window, f'{where}.windows[{wid!r}]').get('hours')
                 if isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0:
                     periods.append(hours)
-            seconds = (template.get('cadence') or {}).get('window_seconds') if isinstance(template.get('cadence'), dict) else None
+            seconds = shaped(template.get('cadence'), f'{where}.cadence', optional=True).get('window_seconds')
             if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
                 periods.append(seconds / 3600)
     return max(periods) if periods else None
