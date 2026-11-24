@@ -587,6 +587,14 @@ def evaluate_bundle(bundle, task, ctx):
                 # time): a quota wait like any window used up with a known reset (the merged quota-wait rule).
                 result['_five_long_wait'] = True
                 latched_long = latched_long or not is_short
+                # A wait the router offers is a promise: at its end the work passes every gate that can be evaluated
+                # now. The full-capacity rule reads the window's full capacity, not its reading, so a latched window
+                # is held to it as a window used up with an observed reset is: work no renewal can hold is excluded
+                # now with the rule's numbers (a route the user named keeps its wait and launches past the estimate).
+                if exclude_if_renewal_short(wid, wspec, quota_pools.window_state(
+                        wid, wspec, observed, spec, now, policy['short_window_hours'], account_stale=acct_stale),
+                        quota_economy.unit_rate(spec, wid, model, info)):
+                    continue
                 if not pool:
                     wait = (latched_reset - now).total_seconds() / 3600
                     available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)

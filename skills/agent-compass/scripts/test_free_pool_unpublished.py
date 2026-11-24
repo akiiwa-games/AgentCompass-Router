@@ -659,6 +659,94 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertEqual(free, [])
 
 
+    # -- a wait is a promise --------------------------------------------------------------------------------------------
+
+    WORK_HOURS = (0.5, 2.0, 5.0, 9.0, 10.0, 30.0)     # from well inside one period's allowance to past it
+
+    def held_and_freed(self):
+        """The pool latched at 0 until a stated reset, and the same pool read again a minute past that reset."""
+        message, reset = self.expected_resets()[2]
+        acc = self.only(POOL)
+        self.fail_turn(acc, message, 'd-promise')
+        held = self.discovered(acc)
+        after = reset + timedelta(minutes=1)
+        with patch.object(quota_exhaustion, 'datetime', wraps=datetime) as clock:
+            clock.now.side_effect = lambda tz=None: after
+            freed = self.discovered(acc)
+        self.assertNotIn('exhausted_windows', freed['_discovery']['accounts'][POOL])
+        return held, freed, reset
+
+    def named_plan(self, acc, bid, **task):
+        """The plan of a route the user named in this request (`user_override`: prepare pins `pinned_bundle` for it)."""
+        acc = copy.deepcopy(acc)
+        with tf._synthetic_doc_ctx(self.doc):
+            usage = sim.snapshot(sim.synthetic_document(acc, self.now, sim.STATES['ample']), acc, self.now)
+            return allocator.plan({'objective': 't', 'profile': dict(tf.PROFILE), **task}, usage, self.now, accounts=acc,
+                                  overrides=[], records=[], host_policy_config={'allowed_accounts': list(acc['accounts'])},
+                                  route={'pinned_bundle': bid, 'user_named_bundle': bid})
+
+    def test_a_wait_offered_on_a_latched_window_is_kept_at_the_offered_time(self):
+        """Rule (brief D1; candidate_eval.evaluate_bundle, renewal_capacity_refusal): a wait the router offers is a
+        promise: at the time it names, the work passes every gate that can be evaluated now. The same task planned at
+        the offered time, the window refilled, is never refused by the full-capacity rule."""
+        held, freed, reset = self.held_and_freed()
+        offered = 0
+        for hours in self.WORK_HOURS:
+            for c in self.rows(self.plan(held, expected_hours=hours)):
+                if c['excluded'] or not c.get('available_in_hours'):
+                    continue
+                offered += 1
+                at = self.now + timedelta(hours=c['available_in_hours'])
+                self.assertGreaterEqual(at, reset)
+                later = next(r for r in self.rows(self.plan(freed, now=at + timedelta(minutes=1), expected_hours=hours))
+                             if r['id'] == c['id'])
+                with self.subTest(hours=hours, bundle=c['id']):
+                    self.assertNotIn('full_capacity_short', later)
+                    self.assertFalse([e for e in later['excluded'] if 'full capacity' in e], later['excluded'])
+        self.assertTrue(offered, 'expected at least one wait offered on the latched pool')
+
+    def test_work_no_renewal_can_hold_on_a_latched_window_is_excluded_now_with_the_rules_numbers(self):
+        """Rule (brief D1; renewal_capacity_refusal): a latched window is held to the full-capacity rule as a window used
+        up with an observed reset is: work over its full capacity plus the margin is excluded now, with the rule's own
+        estimate, full capacity and margin, and no wait is offered for it."""
+        import candidate_eval
+        held, _, _ = self.held_and_freed()
+        refused = 0
+        for hours in self.WORK_HOURS:
+            for c in self.rows(self.plan(held, expected_hours=hours)):
+                short = (c.get('full_capacity_short') or {}).get('allowance')
+                if short is None:
+                    continue
+                refused += 1
+                with self.subTest(hours=hours, bundle=c['id']):
+                    self.assertLess(short['full'] - short['need_pct'], short['margin_pct'])
+                    self.assertIn(short['text'], c['excluded'])
+                    self.assertIn(f"~{short['need_pct']:.1f}%", short['text'])
+                    self.assertIn(f"{short['margin_pct']}% margin", short['text'])
+                    self.assertFalse(c.get('available_in_hours'))
+                    self.assertNotIn(candidate_eval.quota_pools.latched_wait_text(held, POOL, 'allowance'), c['notes'])
+        self.assertTrue(refused, 'expected work past the full capacity among the sizes')
+
+    def test_a_route_the_user_named_on_a_latched_window_keeps_its_wait(self):
+        """Rule (candidate_eval.evaluate_bundle `override_named`; brief D1): the full-capacity rule does not refuse a
+        route the user named; on a latched window it keeps the wait to the latch's end and carries the rule's warning."""
+        held, _, reset = self.held_and_freed()
+        bid = next(iter(held['accounts'][POOL]['bundles']))
+        hours_to_reset = (reset - self.now).total_seconds() / 3600
+        warned = 0
+        for hours in self.WORK_HOURS:
+            row = next(c for c in self.rows(self.named_plan(held, bid, expected_hours=hours))
+                       if c['id'] == bid)
+            with self.subTest(hours=hours):
+                self.assertFalse(row['excluded'], row['excluded'])
+                self.assertAlmostEqual(row['available_in_hours'], hours_to_reset, places=3)
+                self.assertEqual(row['waiting_on'], 'allowance')
+                if 'allowance' in (row.get('full_capacity_short') or {}):
+                    warned += 1
+                    self.assertIn('launched because the user named it', row['capacity_warning'])
+        self.assertTrue(warned, 'expected a named route past the full capacity among the sizes')
+
+
 class PaidLatchReadingTests(unittest.TestCase):
     """Review round 2 N2. Rule (quota_exhaustion.exhausted_windows, candidate_eval.evaluate_bundle): where the account has
     a usage reader, the reading decides. A good reading newer than the latch releases it; the latch's end is a wait only
