@@ -69,6 +69,14 @@ def validate_plan_templates_provenance(doc):
                 if tpl.get('price_usd_per_month') != 0 or not valid_vendor_price_source(tpl.get('price_source')):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_unpublished is declared only on a plan '
                                      'whose cited vendor price is $0 (price_usd_per_month 0 with a price_source)')
+                # "Publishes no capacity" cannot stand beside a capacity figure or a declared window.
+                if 'capacity_usd' in tpl or tpl.get('windows'):
+                    raise ValueError(f'plan-templates[{family!r}][{plan!r}] declares capacity_unpublished beside a '
+                                     'capacity figure or a window (the allowance window is the free pool\'s own)')
+                prefix = tpl.get('allowance_launch_prefix', None)
+                if prefix is not None and not (isinstance(prefix, str) and prefix.strip()):
+                    raise ValueError(f'plan-templates[{family!r}][{plan!r}].allowance_launch_prefix must be the provider '
+                                     'prefix the allowance is launched under (non-empty text)')
 
 
 def validate_accounts_provenance(doc):

@@ -691,7 +691,8 @@ class QuotaPage:
         return widgets
 
     def build_unmetered_chip(self, index, card, refreshable):
-        """Compact 1-line status strip item for unmetered accounts (OpenCode, Dot, ChatGPT Web)."""
+        """Compact 1-line status strip item for an account with no window to show: an unmetered channel (Dot, ChatGPT
+        Web), or a free allowance whose vendor publishes no capacity while no limit of it is observed (OpenCode)."""
         tk = self.tk
         outer = tk.Frame(self.quota_unmetered, bg=theme.BORDER, padx=1, pady=1)
         outer.pack(side="left", padx=(0, theme.px(6)), pady=(0, theme.px(2)))

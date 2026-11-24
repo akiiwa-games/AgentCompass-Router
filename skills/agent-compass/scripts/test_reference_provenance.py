@@ -207,6 +207,29 @@ class ProvenanceTests(unittest.TestCase):
         write_json(self.folder / 'plan-templates.json', templates)
         self.assertRejected('plan-templates.json', 'price_source')
 
+    def test_an_unpublished_capacity_declaration_is_a_vendor_citation_on_a_free_plan_with_no_capacity_beside_it(self):
+        """Rule (reference_provenance.validate_plan_templates_provenance): `capacity_unpublished` says the vendor
+        publishes no capacity, so no capacity figure or declared window may stand beside it; it needs its dated vendor
+        citation with the statement read, a $0 cited price, and a launch prefix that names one."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        reference_provenance.validate_plan_templates_provenance(shipped)
+        free = shipped['opencode']['free']
+        for label, change in (
+                ('a capacity figure', {'capacity_usd': {'allowance': 3.0}}),
+                ('a declared window', {'windows': {'allowance': {'hours': 5}}}),
+                ('a window capacity', {'windows': {'allowance': {'capacity_usd': 3.0}}}),
+                ('no vendor citation', {'capacity_unpublished': {'statement': 'none published'}}),
+                ('a community citation', {'capacity_unpublished': {**free['capacity_unpublished'], 'kind': 'community'}}),
+                ('no statement', {'capacity_unpublished': {**free['capacity_unpublished'], 'statement': ''}}),
+                ('a price', {'price_usd_per_month': 5}),
+                ('an empty prefix', {'allowance_launch_prefix': ''}),
+                ('a prefix that is no text', {'allowance_launch_prefix': 3})):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(shipped))
+                doc['opencode']['free'].update(change)
+                with self.assertRaisesRegex(ValueError, "plan-templates\\['opencode'\\]\\['free'\\]"):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+
     def test_public_user_scores_reject_a_local_kind(self):
         write_json(self.folder / 'user-scores.json', {
             'schema_version': user_scores.SCHEMA_VERSION,

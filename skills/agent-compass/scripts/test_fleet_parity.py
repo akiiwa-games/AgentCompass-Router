@@ -134,6 +134,7 @@ class CleanInstallParityTests(unittest.TestCase):
         opencode = self.specs['opencode']
         self.assertEqual(opencode['plan'], 'free')
         self.assertFalse(opencode.get('unmetered'))
+        self.assertFalse(opencode.get('unlimited'))      # neither flag survives anywhere: the allowance is a quota
         self.assertTrue(opencode['verified'])
         web = self.specs['chatgpt-web']
         self.assertEqual(web['cadence'], {'window_seconds': 43200, 'limit': 5})
