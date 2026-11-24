@@ -81,6 +81,42 @@ class ResumedWorkerBusy(Refused):
         self.agent_id = agent_id
 
 
+class RouteFactRefused(Refused):
+    """A named or forced route cannot start now because of a fact of the account, model or host (quota window, launch
+    protection, cooldown, latch, missing credentials / sign-in, unconfigured account or provider, unreadable live model
+    list), rather than an invalid flag or input. Carries `start_after_hours` and `retry_at` when every refusing quota
+    window has an observed reset (`quota_pools.refusal_schedule`)."""
+
+    def __init__(self, cause, *, start_after_hours=None, retry_at=None, user_named=True):
+        super().__init__(cause)
+        self.cause = str(cause)
+        self.start_after_hours = start_after_hours
+        self.retry_at = retry_at
+        self.user_named = user_named
+
+    def next_action(self):
+        who = 'the route the user named' if self.user_named else 'the forced route'
+        if self.start_after_hours is not None and self.retry_at:
+            return (f'Nothing was recorded or launched: {who} cannot start now ({self.cause}); it can start in '
+                    f'{self.start_after_hours}h (at {self.retry_at}). Tell the user why and when it can start; the user '
+                    'may wait until then, name another route, or let the router choose (roll without --provider, '
+                    '--account, --model, --effort, or --basis).')
+        return (f'Nothing was recorded or launched: {who} cannot start now ({self.cause}). Tell the user why; the user '
+                'may name another route, or let the router choose (roll without --provider, --account, --model, '
+                '--effort, or --basis).')
+
+    def answer(self, base=None, *, for_roll=False):
+        out = dict(base or {}, status='blocked', caller_action='tell_user', cause=self.cause,
+                   next_action=self.next_action())
+        if for_roll:
+            out.update(launched=False, dispatch_mode='none', error=self.cause, next=out['next_action'])
+        if self.start_after_hours is not None:
+            out['start_after_hours'] = self.start_after_hours
+        if self.retry_at:
+            out['retry_at'] = self.retry_at
+        return out
+
+
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -218,7 +254,7 @@ def resolve_bundle(bundle, accounts, explicit_override=False):
                 **({'fast': True} if bundle.get('fast') else {}))
 
 
-def check_launch_quota(bundle, accounts, usage, now):
+def check_launch_quota(bundle, accounts, usage, now, *, user_named=True, records=None):
     """Same existing account protection for prepared MCP and direct SDK launches.
 
     Local disablement also applies after preparation. For quota, only fresh,
@@ -229,9 +265,9 @@ def check_launch_quota(bundle, accounts, usage, now):
     import quota_pools
     reason = provider_inventory.unavailable_reason(accounts.get('_discovery') or {}, bundle['account'], bundle['provider'])
     if reason:
-        raise Refused(reason)
+        raise RouteFactRefused(reason, user_named=user_named)
     if bundle['account'] not in accounts['accounts']:
-        raise Refused('Account is no longer configured; reroute using the current provider inventory')
+        raise RouteFactRefused('Account is no longer configured in the current provider inventory', user_named=user_named)
     if bundle.get('fast'):
         model = account_fleet.canonical(bundle['model'], accounts)
         fast_modes.validate(account_fleet.bundle_harness(bundle, bundle['account']), model,
@@ -242,7 +278,15 @@ def check_launch_quota(bundle, accounts, usage, now):
     for wid, window, observed in quota_pools.applicable_windows(spec, bundle.get('model'), row, bundle, accounts):
         if quota_pools.below_launch_floor(window, observed, row, now):
             floor = window.get('launch_min_remaining_pct', 0)
-            raise Refused(f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor); refresh quota or replan")
+            if records is None:
+                records = reservations(now=now, read_only=True)
+            start_after_hours, retry_at = quota_pools.refusal_schedule(bundle, accounts, usage, now, records=records)
+            raise RouteFactRefused(
+                f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor)",
+                start_after_hours=start_after_hours,
+                retry_at=retry_at,
+                user_named=user_named,
+            )
 
 
 EARLIER_VERSION = ('decision {decision_id} was recorded by an earlier version of AgentCompass ({detail}); roll or '
@@ -1839,7 +1883,7 @@ def prepare(decision_id, task, launch, usage, accounts=None, now=None, path=None
         if bundle.get('fast') and not candidate['bundle'].get('fast') and not exclusions:
             exclusions.append('fast mode quota is no longer sufficient')
         if exclusions or (resume_bundle is None and waits):
-            raise CapacityChanged('Capacity/availability changed; replan: ' + '; '.join(exclusions or ['reset not yet observed']))
+            raise CapacityChanged('Capacity/availability changed: ' + '; '.join(exclusions or ['reset not yet observed']))
         if resume_agent_id is None and candidate.get('action') == 'resume':
             chain_worker = ((alloc_task.get('chain') or {}).get('worker')
                             if isinstance(alloc_task.get('chain'), dict) else None) or {}

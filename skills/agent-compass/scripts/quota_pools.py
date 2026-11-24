@@ -240,9 +240,9 @@ def used_up_in_cycle(observed, now):
 def window_refusal(wid, window, observed, usage_row, now, latched=()):
     """Why a drawn window refuses any launch now, whatever the task's size; None when it does not."""
     if wid in latched:
-        return f'{wid}: quota confirmed exhausted; refresh quota or replan'
+        return f'{wid}: quota confirmed exhausted'
     if below_launch_floor(window, observed, usage_row, now):
-        return f'{wid}: confirmed exhausted or below launch floor; refresh quota or replan'
+        return f'{wid}: confirmed exhausted or below launch floor'
     return None
 
 
@@ -314,7 +314,7 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
             pass
         elif state['known'] and isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) and state['remaining'] <= float(wspec['launch_min_remaining_pct']):
             floor = float(wspec['launch_min_remaining_pct'])
-            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%); refresh quota or replan"
+            reason = f"{wid}: confirmed exhausted or below launch floor ({state['remaining']:.0f}% left, floor {floor:g}%)"
         elif not state['short']:
             # Priced work needs remaining - need >= safety margin; no task size passes at or under the margin. A window
             # of unknown capacity cannot price the need at all, so it is held at the margin too (as candidate_eval does).
@@ -342,6 +342,53 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
         if reason:
             found.append((wid, reason))
     return found
+
+
+def refusal_schedule(bundle, accounts, usage, now, latched=None, records=None):
+    """`(start_after_hours, retry_at)` when every quota window in `launch_blockers` has an observed reset (`after_reset`),
+    computed by the same owners the automatic deferral path uses (`window_state`, `after_reset`,
+    `candidate_eval.binding_wait`, `allocator.advised_hours`); `(None, None)` otherwise."""
+    import allocator
+    import candidate_eval
+    accounts = accounts if isinstance(accounts, dict) else {}
+    if '_five_axis' not in accounts:
+        accounts = axis_scores.five_axis_overlay(accounts)
+    usage = provider_inventory.merge_usage(usage, accounts, now)
+    latched_set = latched_windows(accounts, bundle['account']) if latched is None else set(latched)
+    blocked_wids = {wid for wid, _ in launch_blockers(bundle, accounts, usage, now, latched=latched_set, records=records)}
+    if not blocked_wids:
+        return None, None
+    spec = (accounts.get('accounts') or {}).get(bundle.get('account')) or {}
+    policy = accounts.get('scoring') or {}
+    row = ((usage or {}).get('accounts') or {}).get(bundle['account']) or {}
+    stale = row.get('status') == 'stale' or row.get('stale') is True
+    model = account_fleet.canonical(bundle.get('model') or '', accounts)
+    available_at, waiting_on, waits, reset_times = None, None, {}, {}
+    for wid, wspec, observed in applicable_windows(spec, model, row, bundle, accounts):
+        if wid not in blocked_wids:
+            continue
+        if wid in latched_set:
+            return None, None
+        observed = cycle_observation(wspec, observed, row, now)
+        state = window_state(wid, wspec, observed, spec, now, policy.get('short_window_hours', 24), account_stale=stale)
+        if not state['known'] or wspec.get('hours') is None:
+            return None, None
+        state, _, _ = reserve_inflight(bundle['account'], spec, wid, wspec, state, records, accounts, policy, now)
+        launch_floor = (float(wspec['launch_min_remaining_pct'])
+                        if isinstance(wspec.get('launch_min_remaining_pct'), (int, float)) else None)
+        if launch_floor is not None and state.get('full', 100.0) <= launch_floor:
+            return None, None
+        renewed = after_reset(state, wspec['hours'])
+        if renewed is None:
+            return None, None
+        available_at, waiting_on = candidate_eval.binding_wait(
+            available_at, waiting_on, renewed['deferred_hours'], wid, waits,
+        )
+        reset_dt = parse_time(state.get('reset_at')) or (now + timedelta(hours=renewed['deferred_hours']))
+        reset_times[wid] = reset_dt.isoformat()
+    if not available_at or not waiting_on:
+        return None, None
+    return allocator.advised_hours(available_at), reset_times[waiting_on]
 
 
 def pool_size(observed):

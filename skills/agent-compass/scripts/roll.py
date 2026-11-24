@@ -1459,10 +1459,10 @@ def compact(result, status, detail_path):
         out['native_tool'], out['launch_fields'] = result.get('native_tool'), result.get('launch_fields')
     if status == 'split':
         out['task_count'] = result.get('task_count')
+    if status == 'blocked' and result.get('caller_action') in ('wait_for_reset', 'tell_user'):
+        out['caller_action'] = result['caller_action']
     if result.get('start_after_hours') is not None:
         out['start_after_hours'] = result['start_after_hours']
-        if result.get('caller_action') == 'wait_for_reset':
-            out['caller_action'] = 'wait_for_reset'
     if result.get('retry_at'):
         out['retry_at'] = result['retry_at']
     if result.get('workspace'):
@@ -1709,7 +1709,14 @@ def _run(args, judge):
             # Only the model is pinned: the task is classified exactly as an automatic roll's, and the pinned bundle
             # is priced and reserved from that profile.
             classified = judge.classify_pinned(task, args)
-            decision = classified['result'] if 'result' in classified else judge.record_constraint(args, task, classified)
+            try:
+                decision = classified['result'] if 'result' in classified else judge.record_constraint(args, task, classified)
+            except registry.RouteFactRefused as refused:
+                base = {'stage': 'roll', 'parent_id': parent, 'parent_host': parent_host,
+                        'parent_address': parent_address, **({'workspace': canonical_ws} if canonical_ws else {})}
+                if (notes := ignored_flag_notes(args, {}, explicit_id)):
+                    base['warnings'] = notes
+                return refused.answer(base, for_roll=True), 2
         else:
             args.stage = 'roll'
             decision, _ = judge.plan_stage({'task': task}, args)

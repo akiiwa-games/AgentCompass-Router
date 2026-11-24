@@ -766,5 +766,280 @@ class DotFailures(HandBuilt):
         self.assertEqual((code, result['status']), (0, 'launched'))
 
 
+class NamedRouteFactRefusalTests(unittest.TestCase):
+    """Contract (roll-reference.md, router-internals.md): a named route refused by an account/model/host fact answers
+    `status: blocked`, `caller_action: tell_user` (exit 2), carrying `start_after_hours` and `retry_at` from the same
+    owner as the automatic deferral path when every refusing quota window has an observed reset, and naming no `plan`,
+    `replan`, or `substitute`; request-input refusals stay `status: error` (exit 1); standalone `record` answers
+    identically; forced-route relaunch (`dispatch_fallback`) keeps its endings without telling the parent to replan."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        import provider_inventory
+        from router_test_support import profile
+        self.home = isolated_router_state(self.addCleanup, discovery=False, policy=False)
+        self.state = Path(os.environ['ROUTER_STATE_DIR'])
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.cache_path = Path(os.environ['ROUTER_USAGE_CACHE'])
+        self.ledger_path = Path(os.environ['ROUTER_LEDGER'])
+        self.db_path = Path(os.environ['ROUTER_DISPATCH_DB'])
+        self.policy_path = self.state / 'host-policy.json'
+        self.policy_path.write_text(
+            json.dumps({'allowed_accounts': ['claude'], 'known_accounts': ['claude']}), encoding='utf-8',
+        )
+        (self.home / '.claude').mkdir(parents=True, exist_ok=True)
+        (self.home / '.claude' / '.credentials.json').write_text(
+            json.dumps({'claudeAiOauth': {'accessToken': 'fixture-claude-token', 'subscriptionType': 'pro'}}),
+            encoding='utf-8',
+        )
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.enterContext(patch.object(provider_inventory, 'current', side_effect=provider_inventory.discover))
+        self.enterContext(patch.object(
+            provider_inventory, '_which', side_effect=lambda product, *a, **k: 'fixture-claude' if product == 'claude' else None,
+        ))
+        self.enterContext(patch.dict(os.environ, {
+            'ROUTER_HOST_POLICY': str(self.policy_path),
+            'PASEO_AGENT_ID': 'parent-named',
+            'ROUTER_LAUNCH_COOLDOWN': 'on',
+        }))
+        import scorer_client
+        self.enterContext(patch.object(
+            scorer_client, 'score_task', return_value=(profile(), {'source': 'system_one', 'model': 'fixture'}),
+        ))
+
+    def write_usage_cache(self, windows, *, account='claude', plan='pro'):
+        import provider_inventory
+        cred_key = ((provider_inventory.discover().get('accounts') or {}).get(account) or {}).get('credential_key')
+        doc = {
+            'providers': {
+                account: {
+                    'available': True,
+                    'stale': False,
+                    'plan': plan,
+                    'plan_label': plan,
+                    'plan_source': 'profile_api',
+                    **({'credential_key': cred_key} if cred_key else {}),
+                    'fetched_at': self.now.isoformat(),
+                    'windows': windows,
+                },
+            },
+        }
+        self.cache_path.write_text(json.dumps(doc), encoding='utf-8')
+
+    def run_cli(self, *argv):
+        buf = io.StringIO()
+        with patch.object(sys, 'argv', ['agentcompass', *argv]), contextlib.redirect_stdout(buf):
+            code = route_judge.main()
+        return code, json.loads(buf.getvalue())
+
+    NAMED_FLAGS = ('--provider', 'claude', '--account', 'claude', '--model', 'claude-opus-5-5', '--effort', 'high',
+                   '--basis', 'the user said: have Opus look at this one')
+
+    def test_a_and_d_floor_refusal_with_observed_reset_matches_automatic_start_time_for_roll_and_record(self):
+        # Claude Pro declares `five_hour` `launch_min_remaining_pct: 25`; 85% used leaves 15% with an observed reset in 2h15m.
+        reset_dt = self.now + timedelta(hours=2, minutes=15)
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 85.0, 'resets_at': reset_dt.isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        auto_code, auto_ans = self.run_cli('roll', '--task', 'Review architecture')
+        self.assertEqual((auto_code, auto_ans['status'], auto_ans.get('caller_action')), (2, 'blocked', 'wait_for_reset'), auto_ans)
+        expected_hours = auto_ans['start_after_hours']
+        self.ledger_path.unlink(missing_ok=True)
+        self.db_path.unlink(missing_ok=True)
+
+        # (a) Named roll
+        roll_code, roll_ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+        self.assertEqual((roll_code, roll_ans['status'], roll_ans.get('caller_action')), (2, 'blocked', 'tell_user'), roll_ans)
+        self.assertAlmostEqual(roll_ans['start_after_hours'], expected_hours, places=1)
+        self.assertEqual(roll_ans['retry_at'], reset_dt.isoformat())
+        for text in (roll_ans['cause'], roll_ans['next_action']):
+            lowered = text.lower()
+            for forbidden in ('plan', 'replan', 'substitute', 'pick an account', 'change a flag', 'change what cause names'):
+                self.assertNotIn(forbidden, lowered, text)
+        self.assertFalse(self.ledger_path.exists())
+        self.assertFalse(self.db_path.exists())
+
+        # (d) Standalone record answers identically from the same owner
+        rec_code, rec_ans = self.run_cli('record', '--constraint', 'user_override', *self.NAMED_FLAGS)
+        self.assertEqual((rec_code, rec_ans['status'], rec_ans.get('caller_action')), (2, 'blocked', 'tell_user'), rec_ans)
+        self.assertEqual(rec_ans['cause'], roll_ans['cause'])
+        self.assertEqual(rec_ans['next_action'], roll_ans['next_action'])
+        self.assertAlmostEqual(rec_ans['start_after_hours'], roll_ans['start_after_hours'], places=1)
+        self.assertEqual(rec_ans['retry_at'], roll_ans['retry_at'])
+        self.assertFalse(self.ledger_path.exists())
+        self.assertFalse(self.db_path.exists())
+
+    def test_b_fact_refusals_without_observed_reset_carry_no_time(self):
+        import launch_failures
+        import model_latch
+        import quota_exhaustion
+        # 1. Window latched in quota-exhaustion.json without any observed reset timestamp for five_hour.
+        self.write_usage_cache([
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        self.assertTrue(quota_exhaustion.record(
+            'claude', 'Individual quota reached', windows=['five_hour'], at=(self.now + timedelta(seconds=1)).isoformat(),
+        ))
+        try:
+            code, ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+            self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
+            self.assertIn('five_hour', ans['cause'])
+            self.assertNotIn('start_after_hours', ans)
+            self.assertNotIn('retry_at', ans)
+            detail_doc = full(ans)
+            self.assertNotIn('start_after_hours', detail_doc)
+            self.assertNotIn('retry_at', detail_doc)
+        finally:
+            quota_exhaustion.clear('claude')
+
+        # 2. Cooldown, model latch, and missing credentials all answer `blocked` / `tell_user` with no time and no `replan`.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        bundle = {'account': 'claude', 'provider': 'claude', 'model': 'claude-opus-5-5'}
+        launch_failures.record(bundle, 'provider_unavailable', now=self.now)
+        try:
+            code, cool_ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+            self.assertEqual((code, cool_ans['status'], cool_ans.get('caller_action')), (2, 'blocked', 'tell_user'), cool_ans)
+            self.assertIn('cooling down', cool_ans['cause'])
+            self.assertNotIn('start_after_hours', cool_ans)
+            self.assertNotIn('replan', cool_ans['cause'].lower() + cool_ans['next_action'].lower())
+        finally:
+            launch_failures.clear('claude')
+
+        model_latch.record(bundle, 'INVALID_MODEL', at=self.now)
+        try:
+            code, latch_ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+            self.assertEqual((code, latch_ans['status'], latch_ans.get('caller_action')), (2, 'blocked', 'tell_user'), latch_ans)
+            self.assertIn('INVALID_MODEL', latch_ans['cause'])
+            self.assertNotIn('start_after_hours', latch_ans)
+        finally:
+            model_latch.clear('claude')
+
+        (self.home / '.claude' / '.credentials.json').unlink()
+        self.cache_path.unlink()
+        code, cred_ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+        self.assertEqual((code, cred_ans['status'], cred_ans.get('caller_action')), (2, 'blocked', 'tell_user'), cred_ans)
+        self.assertNotIn('start_after_hours', cred_ans)
+        self.assertNotIn('reroute', cred_ans['cause'].lower())
+
+        # 3. Unreadable live model list for a model with no row answers `blocked` / `tell_user` (host fact), while a
+        # readable list omitting that model answers `error` (request input, tested in test_c).
+        (self.home / '.claude' / '.credentials.json').write_text(
+            json.dumps({'claudeAiOauth': {'accessToken': 'fixture-claude-token', 'subscriptionType': 'pro'}}),
+            encoding='utf-8',
+        )
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        import live_models
+        live_models.invalidate()
+        with patch.object(live_models, 'fetch_from_paseo', return_value={'ok': False, 'error': 'host_connection_failed'}):
+            code, list_ans = self.run_cli(
+                'roll', '--task', 'Review architecture',
+                '--provider', 'claude', '--account', 'claude', '--model', 'claude-zeta-1', '--effort', 'high',
+                '--basis', 'the user said: try claude-zeta-1',
+            )
+        self.assertEqual((code, list_ans['status'], list_ans.get('caller_action')), (2, 'blocked', 'tell_user'), list_ans)
+        self.assertIn('model list of provider claude could not be read', list_ans['cause'])
+        self.assertNotIn('start_after_hours', list_ans)
+        live_models.invalidate()
+
+    def test_c_request_input_refusals_stay_error_with_present_next_action(self):
+        import live_models
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        live_models.invalidate()
+        with patch.object(live_models, 'fetch_from_paseo', return_value={
+            'ok': True, 'providers': {'claude': {'ok': True, 'models': [{'id': 'claude-opus-5-5'}]}},
+        }):
+            for label, extra in (
+                ('unaccepted effort', ('--provider', 'claude', '--account', 'claude', '--model', 'claude-opus-5-5',
+                                       '--effort', 'turbo', '--basis', 'quote')),
+                ('model not listed by provider', ('--provider', 'claude', '--account', 'claude',
+                                                  '--model', 'claude-zeta-2', '--effort', 'high', '--basis', 'quote')),
+                ('missing route flags', ('--provider', 'claude')),
+                ('basis over limit', ('--provider', 'claude', '--account', 'claude', '--model', 'claude-opus-5-5',
+                                      '--basis', 'x' * 401)),
+            ):
+                with self.subTest(label=label):
+                    code, ans = self.run_cli('roll', '--task', 'Review architecture', *extra)
+                    self.assertEqual((code, ans['status']), (1, 'error'), ans)
+                    self.assertNotIn('caller_action', ans)
+                    self.assertTrue(
+                        ans['next_action'].startswith('The request was refused as given. Change what cause names'),
+                        ans['next_action'],
+                    )
+        live_models.invalidate()
+
+    def test_forced_route_prepare_refusal_in_fallback_never_tells_parent_to_replan(self):
+        import account_fleet
+        import dispatch_fallback
+        import model_latch
+        import roll
+        import usage_reading
+        from router_test_support import profile
+        # Issue a valid named decision while healthy, then check both prepare-time refusal paths:
+        # (1) check_launch_quota floor protection, and (2) candidate_eval exclusion via model_latch at prepare time.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        args = route_judge.build_parser().parse_args([
+            'record', '--constraint', 'user_override', *self.NAMED_FLAGS,
+        ])
+        task = {'parent_agent_id': 'parent-named', 'task_id': 't-forced', 'objective': 'Review',
+                'expected_hours': 0.5, 'profile': profile()}
+        decision = route_judge.record_constraint(args, task=task, classified={'task': task, 'scorer': None})
+        task2 = {**task, 'task_id': 't-forced-latch'}
+        decision2 = route_judge.record_constraint(args, task=task2, classified={'task': task2, 'scorer': None})
+
+        # Path 1: check_launch_quota floor refusal inside prepare
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        launch = {'title': 'Review', 'initialPrompt': 'Review'}
+        with self.assertRaises(registry.CapacityChanged) as caught:
+            registry.prepare(
+                decision['decision_id'], task, launch,
+                usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                accounts=account_fleet.load_accounts(), now=self.now,
+            )
+        outcome = dispatch_fallback.after_refusal(decision['decision_id'], launch, caught.exception, judge=route_judge)
+        res, code = roll.fallback_result({'stage': 'roll'}, outcome, decision, 'parent-named', args)
+        self.assertEqual((code, res['caller_action'], res['error']), (2, 'tell_user', 'owner_named_model_failed'))
+        combined = (res['next'] + '\n' + '\n'.join(res.get('attempts') or ())).lower()
+        self.assertNotIn('replan', combined)
+        self.assertNotIn('reroute', combined)
+
+        # Path 2: candidate exclusion inside prepare (Capacity/availability changed)
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        model_latch.record({'account': 'claude', 'provider': 'claude', 'model': 'claude-opus-5-5'}, 'INVALID_MODEL', at=self.now)
+        try:
+            with self.assertRaises(registry.CapacityChanged) as caught2:
+                registry.prepare(
+                    decision2['decision_id'], task2, launch,
+                    usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                    accounts=account_fleet.load_accounts(), now=self.now,
+                )
+            outcome2 = dispatch_fallback.after_refusal(decision2['decision_id'], launch, caught2.exception, judge=route_judge)
+            res2, code2 = roll.fallback_result({'stage': 'roll'}, outcome2, decision2, 'parent-named', args)
+            self.assertEqual((code2, res2['caller_action'], res2['error']), (2, 'tell_user', 'owner_named_model_failed'))
+            combined2 = (res2['next'] + '\n' + '\n'.join(res2.get('attempts') or ())).lower()
+            self.assertNotIn('replan', combined2)
+            self.assertNotIn('reroute', combined2)
+        finally:
+            model_latch.clear('claude')
+
+
 if __name__ == '__main__':
     unittest.main()

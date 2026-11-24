@@ -338,7 +338,7 @@ class UnknownAccountTests(RecordCli):
     def test_an_account_that_does_not_exist_is_named_with_the_accounts_there_are(self):
         code, result = self.run_main(['record', '--constraint', 'user_override', '--provider', 'codex', '--account', 'nope',
                                       '--model', 'gpt-6.1-sol', '--basis', 'q'])
-        self.assertEqual((code, result['status']), (1, 'error'), result)
+        self.assertEqual((code, result['status'], result.get('caller_action')), (2, 'blocked', 'tell_user'), result)
         self.assertIn('account nope', result['cause'])
         self.assertTrue(all(a in result['cause'] for a in ('codex', 'claude')), result['cause'])
         self.assertNotIn('named_model_unavailable', result['cause'])
@@ -346,7 +346,7 @@ class UnknownAccountTests(RecordCli):
     def test_a_provider_the_account_does_not_launch_through_is_named_with_those_it_does(self):
         code, result = self.run_main(['record', '--constraint', 'user_override', '--provider', 'claude', '--account', 'codex',
                                       '--model', 'gpt-6.1-sol', '--basis', 'q'])
-        self.assertEqual(code, 1, result)
+        self.assertEqual((code, result['status'], result.get('caller_action')), (2, 'blocked', 'tell_user'), result)
         served = auto_bundles.launch_providers('codex', account_fleet.load_accounts()['accounts']['codex'])
         self.assertTrue(served and 'claude' not in served, served)
         self.assertTrue(result['cause'].startswith('account codex ') and 'provider claude' in result['cause'])
