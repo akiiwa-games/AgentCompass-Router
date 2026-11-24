@@ -12,7 +12,7 @@ The global rule block AgentCompass installs is a short pointer to this skill. Re
 
 1. Never pick a model or effort, and never raise the effort the router returned.
 2. Only when the user named a model or effort in this request: add `--provider <p> --account <a> --model <m> --effort <e> --basis "<the user's words>"` to `roll` ([router internals, record an override](router-internals.md#b-record-an-explicit-user-modeleffort-override)).
-3. When an automatic route's account or model becomes unavailable (subscription expired, account removed, quota exhausted), roll again; do not pick a substitute model yourself. When a route the user named cannot start now because of an account, model or host fact (`status: blocked`, `caller_action: tell_user`, carrying `start_after_hours` and `retry_at` when a refusing quota window has an observed reset), tell the user why (and when it can start, when known) so the user can wait, name another route, or let the router choose; never wait or substitute on your own.
+3. When an automatic route's account or model becomes unavailable (subscription expired, account removed, quota exhausted), roll again; do not pick a substitute model yourself. When a route the user named cannot start because of an account, model or host fact (`status: blocked`, `caller_action: tell_user`, carrying `start_after_hours` and `retry_at` when a refusing quota window has an observed reset), tell the user why (and when it can start, when known) so the user can wait, name another route, or let the router choose; never wait or substitute on your own.
 
 ## 3. Continue a worker, or replace it
 

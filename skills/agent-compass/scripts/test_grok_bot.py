@@ -693,12 +693,12 @@ with patch.object(runner, 'submit', side_effect=accept), patch.object(
                 else:
                     self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                     self.assertTrue(json.loads(proc.stdout)['worker']['mocked_send'])
-        # A named route is refused by a fact as `blocked` (exit 2: a provider the account does not launch through,
-        # route_judge.named_pair_refusal) and by request input as `error` (exit 1: a model not listed, or an unaccepted effort).
-        for flag, value, expected_code, fact in [
-            ('--model', 'grok-4.7', 1, 'named_model_unavailable: grok-4.7 has no row on grok-bot/grok-bot'),
-            ('--provider', 'unknown-bot', 2, 'account grok-bot does not launch through provider unknown-bot'),
-            ('--effort', 'high', 1, 'high is not an effort grok-bot/grok-bot accepts (it takes none)'),
+        # A named route does not silently fall through to another model, provider or effort when the request names one
+        # that does not exist (exit 1: status error).
+        for flag, value, fact in [
+            ('--model', 'grok-4.7', 'named_model_unavailable: grok-4.7 has no row on grok-bot/grok-bot'),
+            ('--provider', 'unknown-bot', 'account grok-bot does not launch through provider unknown-bot'),
+            ('--effort', 'high', 'high is not an effort grok-bot/grok-bot accepts (it takes none)'),
         ]:
             args = list(command)
             if flag in args:
@@ -707,7 +707,7 @@ with patch.object(runner, 'submit', side_effect=accept), patch.object(
                 args += [flag, value]
             with self.subTest(flag=flag):
                 proc = subprocess.run(args, capture_output=True, text=True, encoding='utf-8', env=env, timeout=30)
-                self.assertEqual(proc.returncode, expected_code, proc.stdout + proc.stderr)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn(fact, proc.stdout)
                 self.assertNotIn('mocked_send', proc.stdout)
         # Out of automatic routing is not a ban: the route the user named still launches, and says why it did

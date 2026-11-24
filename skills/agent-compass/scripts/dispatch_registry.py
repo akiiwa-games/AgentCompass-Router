@@ -81,27 +81,39 @@ class ResumedWorkerBusy(Refused):
         self.agent_id = agent_id
 
 
-class RouteFactRefused(Refused):
-    """A named or forced route cannot start now because of a fact of the account, model or host (quota window, launch
-    protection, cooldown, latch, missing credentials / sign-in, unconfigured account or provider, unreadable live model
-    list), rather than an invalid flag or input. Carries `start_after_hours` and `retry_at` when every refusing quota
-    window has an observed reset (`quota_pools.refusal_schedule`)."""
+class LaunchFloorRefused(Refused):
+    """One or more applicable quota windows are below their existing launch protection floor."""
 
-    def __init__(self, cause, *, start_after_hours=None, retry_at=None, user_named=True):
+    def __init__(self, floors):
+        super().__init__(floors[0][1])
+        self.floors = list(floors)
+
+
+class RouteFactRefused(Refused):
+    """A named or forced route cannot start because of a fact of the account, model or host (quota window, launch
+    protection, cooldown, latch, missing credentials / sign-in, `cwd_regex`, or unreadable live model list), rather than
+    an invalid flag or input. Carries `start_after_hours`, `retry_at` and `waiting_on` when every refusing quota window
+    has an observed reset (`allocator.refusal_schedule`)."""
+
+    def __init__(self, cause, *, user_named, start_after_hours=None, retry_at=None, waiting_on=None):
+        if not isinstance(user_named, bool):
+            raise TypeError('user_named must be a bool')
         super().__init__(cause)
         self.cause = str(cause)
+        self.user_named = user_named
         self.start_after_hours = start_after_hours
         self.retry_at = retry_at
-        self.user_named = user_named
+        self.waiting_on = waiting_on
 
     def next_action(self):
         who = 'the route the user named' if self.user_named else 'the forced route'
         if self.start_after_hours is not None and self.retry_at:
-            return (f'Nothing was recorded or launched: {who} cannot start now ({self.cause}); it can start in '
-                    f'{self.start_after_hours}h (at {self.retry_at}). Tell the user why and when it can start; the user '
-                    'may wait until then, name another route, or let the router choose (roll without --provider, '
-                    '--account, --model, --effort, or --basis).')
-        return (f'Nothing was recorded or launched: {who} cannot start now ({self.cause}). Tell the user why; the user '
+            when_reset = f', when {self.waiting_on} resets' if self.waiting_on else ''
+            return (f'Nothing was recorded or launched: {who} cannot start ({self.cause}); it can start in '
+                    f'{self.start_after_hours}h (at {self.retry_at}{when_reset}). Tell the user why and when it can '
+                    'start; the user may wait until then, name another route, or let the router choose (roll without '
+                    '--provider, --account, --model, --effort, or --basis).')
+        return (f'Nothing was recorded or launched: {who} cannot start ({self.cause}). Tell the user why; the user '
                 'may name another route, or let the router choose (roll without --provider, --account, --model, '
                 '--effort, or --basis).')
 
@@ -254,7 +266,7 @@ def resolve_bundle(bundle, accounts, explicit_override=False):
                 **({'fast': True} if bundle.get('fast') else {}))
 
 
-def check_launch_quota(bundle, accounts, usage, now, *, user_named=True, records=None):
+def check_launch_quota(bundle, accounts, usage, now):
     """Same existing account protection for prepared MCP and direct SDK launches.
 
     Local disablement also applies after preparation. For quota, only fresh,
@@ -265,9 +277,9 @@ def check_launch_quota(bundle, accounts, usage, now, *, user_named=True, records
     import quota_pools
     reason = provider_inventory.unavailable_reason(accounts.get('_discovery') or {}, bundle['account'], bundle['provider'])
     if reason:
-        raise RouteFactRefused(reason, user_named=user_named)
+        raise Refused(reason)
     if bundle['account'] not in accounts['accounts']:
-        raise RouteFactRefused('Account is no longer configured in the current provider inventory', user_named=user_named)
+        raise Refused('Account is no longer configured in the current provider inventory')
     if bundle.get('fast'):
         model = account_fleet.canonical(bundle['model'], accounts)
         fast_modes.validate(account_fleet.bundle_harness(bundle, bundle['account']), model,
@@ -275,18 +287,16 @@ def check_launch_quota(bundle, accounts, usage, now, *, user_named=True, records
     usage = provider_inventory.merge_usage(usage, accounts, now)
     spec = accounts['accounts'][bundle['account']]
     row = (usage.get('accounts') or {}).get(bundle['account']) or {}
+    floors = []
     for wid, window, observed in quota_pools.applicable_windows(spec, bundle.get('model'), row, bundle, accounts):
         if quota_pools.below_launch_floor(window, observed, row, now):
             floor = window.get('launch_min_remaining_pct', 0)
-            if records is None:
-                records = reservations(now=now, read_only=True)
-            start_after_hours, retry_at = quota_pools.refusal_schedule(bundle, accounts, usage, now, records=records)
-            raise RouteFactRefused(
+            floors.append((
+                wid,
                 f"Account {bundle['account']} {wid} is below its existing launch protection ({floor}% remaining floor)",
-                start_after_hours=start_after_hours,
-                retry_at=retry_at,
-                user_named=user_named,
-            )
+            ))
+    if floors:
+        raise LaunchFloorRefused(floors)
 
 
 EARLIER_VERSION = ('decision {decision_id} was recorded by an earlier version of AgentCompass ({detail}); roll or '

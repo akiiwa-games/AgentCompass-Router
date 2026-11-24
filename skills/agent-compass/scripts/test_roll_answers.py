@@ -887,13 +887,14 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             self.assertIn('five_hour', ans['cause'])
             self.assertNotIn('start_after_hours', ans)
             self.assertNotIn('retry_at', ans)
+            self.assertNotIn('cannot start now', ans['next_action'])
             detail_doc = full(ans)
             self.assertNotIn('start_after_hours', detail_doc)
             self.assertNotIn('retry_at', detail_doc)
         finally:
             quota_exhaustion.clear('claude')
 
-        # 2. Cooldown, model latch, and missing credentials all answer `blocked` / `tell_user` with no time and no `replan`.
+        # 2. Cooldown, model latch, and missing credentials all answer `blocked` / `tell_user` with no time, no `cannot start now`, and no `replan`.
         self.write_usage_cache([
             {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
@@ -905,6 +906,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             self.assertEqual((code, cool_ans['status'], cool_ans.get('caller_action')), (2, 'blocked', 'tell_user'), cool_ans)
             self.assertIn('cooling down', cool_ans['cause'])
             self.assertNotIn('start_after_hours', cool_ans)
+            self.assertNotIn('cannot start now', cool_ans['next_action'])
             self.assertNotIn('replan', cool_ans['cause'].lower() + cool_ans['next_action'].lower())
         finally:
             launch_failures.clear('claude')
@@ -915,6 +917,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             self.assertEqual((code, latch_ans['status'], latch_ans.get('caller_action')), (2, 'blocked', 'tell_user'), latch_ans)
             self.assertIn('INVALID_MODEL', latch_ans['cause'])
             self.assertNotIn('start_after_hours', latch_ans)
+            self.assertNotIn('cannot start now', latch_ans['next_action'])
         finally:
             model_latch.clear('claude')
 
@@ -923,6 +926,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         code, cred_ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
         self.assertEqual((code, cred_ans['status'], cred_ans.get('caller_action')), (2, 'blocked', 'tell_user'), cred_ans)
         self.assertNotIn('start_after_hours', cred_ans)
+        self.assertNotIn('cannot start now', cred_ans['next_action'])
         self.assertNotIn('reroute', cred_ans['cause'].lower())
 
         # 3. Unreadable live model list for a model with no row answers `blocked` / `tell_user` (host fact), while a
@@ -946,6 +950,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         self.assertEqual((code, list_ans['status'], list_ans.get('caller_action')), (2, 'blocked', 'tell_user'), list_ans)
         self.assertIn('model list of provider claude could not be read', list_ans['cause'])
         self.assertNotIn('start_after_hours', list_ans)
+        self.assertNotIn('cannot start now', list_ans['next_action'])
         live_models.invalidate()
 
     def test_c_request_input_refusals_stay_error_with_present_next_action(self):
@@ -1018,7 +1023,7 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         self.assertNotIn('replan', combined)
         self.assertNotIn('reroute', combined)
 
-        # Path 2: candidate exclusion inside prepare (Capacity/availability changed)
+        # Path 2: candidate exclusion inside prepare (Capacity/availability changed) — model_latch and latched quota window
         self.write_usage_cache([
             {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
             {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
@@ -1039,6 +1044,265 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
             self.assertNotIn('reroute', combined2)
         finally:
             model_latch.clear('claude')
+
+        # Path 3 (F2 + F9): latched quota window at prepare time for both `user_override` and `hard_constraint`
+        # calls `quota_pools.window_refusal` (one owner, no "refresh quota or replan") and compact carries `tell_user`.
+        import quota_exhaustion
+        task_uo = {**task, 'task_id': 't-forced-exhausted-uo'}
+        dec_uo = route_judge.record_constraint(args, task=task_uo, classified={'task': task_uo, 'scorer': None})
+        args_hc = route_judge.build_parser().parse_args([
+            'record', '--constraint', 'hard_constraint', '--provider', 'claude', '--account', 'claude',
+            '--model', 'claude-opus-5-5', '--effort', 'high', '--basis', 'project rule',
+        ])
+        task_hc = {**task, 'task_id': 't-forced-exhausted-hc'}
+        dec_hc = route_judge.record_constraint(args_hc, task=task_hc, classified={'task': task_hc, 'scorer': None})
+        self.assertTrue(quota_exhaustion.record(
+            'claude', 'Individual quota reached', windows=['five_hour'], at=(self.now + timedelta(seconds=1)).isoformat(),
+        ))
+        try:
+            for label, dec_item, task_item, args_item, expected_err in (
+                ('user_override', dec_uo, task_uo, args, 'owner_named_model_failed'),
+                ('hard_constraint', dec_hc, task_hc, args_hc, 'relaunch_not_started'),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaises(registry.CapacityChanged) as caught_ex:
+                        registry.prepare(
+                            dec_item['decision_id'], task_item, launch,
+                            usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                            accounts=account_fleet.load_accounts(), now=self.now,
+                        )
+                    self.assertNotIn('replan', str(caught_ex.exception).lower())
+                    self.assertNotIn('refresh quota', str(caught_ex.exception).lower())
+                    out_ex = dispatch_fallback.after_refusal(
+                        dec_item['decision_id'], launch, caught_ex.exception, judge=route_judge,
+                    )
+                    res_ex, code_ex = roll.fallback_result({'stage': 'roll'}, out_ex, dec_item, 'parent-named', args_item)
+                    self.assertEqual((code_ex, res_ex['caller_action'], res_ex['error']), (2, 'tell_user', expected_err))
+                    compact_ex = roll.compact(res_ex, 'blocked', None)
+                    self.assertEqual((compact_ex['status'], compact_ex.get('caller_action')), ('blocked', 'tell_user'))
+                    combined_ex = (res_ex['next'] + '\n' + '\n'.join(res_ex.get('attempts') or ())).lower()
+                    self.assertNotIn('replan', combined_ex)
+                    self.assertNotIn('refresh quota', combined_ex)
+                    self.assertNotIn('reroute', combined_ex)
+        finally:
+            quota_exhaustion.clear('claude')
+
+    def test_f1_prepare_and_claim_floor_refusal_with_unsettled_ended_worker_return_capacity_changed_at_once(self):
+        import account_fleet
+        import allocator
+        import time
+        import usage_reading
+        from router_test_support import profile
+        # Healthy initial state: prepare a first worker and write its finished watcher receipt on disk (unsettled),
+        # plus prepare one dispatch to test `claim` as well, and record both an automatic and a forced decision.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        accounts = account_fleet.load_accounts()
+        usage_ok = usage_reading.usage_snapshot(self.cache_path, now=self.now)
+        args_forced = route_judge.build_parser().parse_args([
+            'record', '--constraint', 'user_override', *self.NAMED_FLAGS,
+        ])
+        t_ended = {'parent_agent_id': 'parent-named', 'task_id': 't-ended', 'objective': 'First',
+                   'expected_hours': 0.05, 'hours': 0.05, 'profile': profile()}
+        dec_ended = route_judge.record_constraint(args_forced, task=t_ended, classified={'task': t_ended, 'scorer': None})
+        t_claim = {**t_ended, 'task_id': 't-claim'}
+        dec_claim = route_judge.record_constraint(args_forced, task=t_claim, classified={'task': t_claim, 'scorer': None})
+        t_auto = {**t_ended, 'task_id': 't-auto'}
+        planned = allocator.plan(t_auto, usage_ok, self.now, accounts=accounts)
+        self.assertNotIn(planned['choice'], (None, 'none'), planned)
+        dec_auto = dict(planned, **registry.issue(planned, t_auto, self.now))
+        t_forced = {**t_ended, 'task_id': 't-forced-f1'}
+        dec_forced = route_judge.record_constraint(args_forced, task=t_forced, classified={'task': t_forced, 'scorer': None})
+
+        row_ended = registry.prepare(dec_ended['decision_id'], t_ended, {'title': 'First', 'initialPrompt': 'First'},
+                                     usage_ok, accounts=accounts, now=self.now)
+        row_claim = registry.prepare(dec_claim['decision_id'], t_claim, {'title': 'Claim', 'initialPrompt': 'Claim'},
+                                     usage_ok, accounts=accounts, now=self.now)
+        notif_dir = self.state / 'paseo-notifications'
+        notif_dir.mkdir(parents=True, exist_ok=True)
+        (notif_dir / f"{row_ended['dispatch_id']}.json").write_text(
+            json.dumps({'terminal': {'reason': 'finished', 'at': (self.now + timedelta(seconds=5)).isoformat()}}),
+            encoding='utf-8',
+        )
+
+        # Now `five_hour` drops below the 25% launch protection floor while `row_ended`'s receipt is still unsettled on disk.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        usage_low = usage_reading.usage_snapshot(self.cache_path, now=self.now)
+        accounts_low = account_fleet.load_accounts()
+
+        for label, dec_item, task_item in (
+            ('automatic', dec_auto, t_auto),
+            ('forced', dec_forced, t_forced),
+        ):
+            with self.subTest(kind=label):
+                t0 = time.monotonic()
+                with self.assertRaises(registry.CapacityChanged):
+                    registry.prepare(
+                        dec_item['decision_id'], task_item, {'title': label, 'initialPrompt': label},
+                        usage_low, accounts=accounts_low, now=self.now,
+                    )
+                elapsed = time.monotonic() - t0
+                self.assertLess(elapsed, 1.0, f'{label} prepare took {elapsed:.2f}s')
+
+        t0 = time.monotonic()
+        with self.assertRaises(registry.CapacityChanged):
+            registry.claim(row_claim['request'], parent_id='parent-named', now=self.now)
+        elapsed_claim = time.monotonic() - t0
+        self.assertLess(elapsed_claim, 1.0, f'claim took {elapsed_claim:.2f}s')
+
+    def test_f3_f4_unconfigured_account_and_wrong_provider_are_input_errors_before_signin_check(self):
+        # `claude` is signed in with fresh usage; `codex` has no credentials on this fixture machine.
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        # F3: signed-in `claude` named with wrong provider `codex` must report the provider pairing error (exit 1),
+        # never `missing_credentials` / "sign in again".
+        code_f3, ans_f3 = self.run_cli(
+            'roll', '--task', 'Review architecture',
+            '--provider', 'codex', '--account', 'claude', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        )
+        self.assertEqual((code_f3, ans_f3['status']), (1, 'error'), ans_f3)
+        self.assertNotIn('caller_action', ans_f3)
+        self.assertIn('account claude does not launch through provider codex', ans_f3['cause'])
+        self.assertIn('Name the provider it launches through; do not substitute another account.', ans_f3['cause'])
+        self.assertNotIn('missing_credentials', ans_f3['cause'])
+        self.assertNotIn('sign in', ans_f3['cause'].lower())
+
+        # F4: typo account `claud` is a request-input error (exit 1) keeping "Ask the user which one they meant".
+        code_f4, ans_f4 = self.run_cli(
+            'roll', '--task', 'Review architecture',
+            '--provider', 'claude', '--account', 'claud', '--model', 'claude-opus-5-5', '--basis', 'quote',
+        )
+        self.assertEqual((code_f4, ans_f4['status']), (1, 'error'), ans_f4)
+        self.assertNotIn('caller_action', ans_f4)
+        self.assertIn('account claud is not configured on this machine', ans_f4['cause'])
+        self.assertIn('Ask the user which one they meant; do not substitute another account.', ans_f4['cause'])
+        self.assertNotIn('cannot start now', ans_f4['next_action'])
+
+    def test_f5_cwd_regex_is_blocked_tell_user_without_cannot_start_now(self):
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+        ])
+        override_path = Path(os.environ['AGENTCOMPASS_ACCOUNTS_OVERRIDE'])
+        override_path.parent.mkdir(parents=True, exist_ok=True)
+        override_path.write_text(
+            json.dumps({'schema_version': 2, 'accounts': {'claude': {'cwd_regex': '^D:/work/only(/|$)'}}}),
+            encoding='utf-8',
+        )
+        try:
+            code, ans = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+            self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
+            self.assertIn('cwd_regex', ans['cause'])
+            self.assertIn('a named route does not reach past it', ans['cause'])
+            self.assertNotIn('substitute', ans['cause'].lower())
+            self.assertNotIn('cannot start now', ans['next_action'])
+            self.assertNotIn('Change what cause names', ans['next_action'])
+            self.assertNotIn('start_after_hours', ans)
+
+            rec_code, rec_ans = self.run_cli('record', '--constraint', 'user_override', *self.NAMED_FLAGS)
+            self.assertEqual((rec_code, rec_ans['status'], rec_ans.get('caller_action')), (2, 'blocked', 'tell_user'), rec_ans)
+            self.assertIn("this process's working directory", rec_ans['cause'])
+            self.assertNotIn('cannot start now', rec_ans['next_action'])
+        finally:
+            override_path.unlink(missing_ok=True)
+
+    def test_f6_multiple_refusing_windows_names_time_deciding_window_first_and_others_after(self):
+        # Case 1: `five_hour` resets in 1h (90% used, below 25% floor) and `seven_day` resets in 30h (100% used).
+        # `seven_day` decides the 30.0h wait and must appear first in `cause`, with `five_hour` after it.
+        r_5h = self.now + timedelta(hours=1)
+        r_7d = self.now + timedelta(hours=30)
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': r_5h.isoformat()},
+            {'id': 'seven_day', 'used_pct': 100.0, 'resets_at': r_7d.isoformat()},
+        ])
+        code1, ans1 = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+        self.assertEqual((code1, ans1['status'], ans1.get('caller_action')), (2, 'blocked', 'tell_user'), ans1)
+        self.assertAlmostEqual(ans1['start_after_hours'], 30.0, places=1)
+        self.assertEqual(ans1['retry_at'], r_7d.isoformat())
+        self.assertIn('seven_day', ans1['cause'])
+        self.assertIn('five_hour', ans1['cause'])
+        self.assertLess(ans1['cause'].index('seven_day'), ans1['cause'].index('five_hour'), ans1['cause'])
+
+        # Case 2 (reverse): `five_hour` resets in 4h and `seven_day` resets in 2h -> `five_hour` decides 4.0h and leads.
+        r_5h_late = self.now + timedelta(hours=4)
+        r_7d_early = self.now + timedelta(hours=2)
+        self.write_usage_cache([
+            {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': r_5h_late.isoformat()},
+            {'id': 'seven_day', 'used_pct': 100.0, 'resets_at': r_7d_early.isoformat()},
+        ])
+        code2, ans2 = self.run_cli('roll', '--task', 'Review architecture', *self.NAMED_FLAGS)
+        self.assertEqual((code2, ans2['status'], ans2.get('caller_action')), (2, 'blocked', 'tell_user'), ans2)
+        self.assertAlmostEqual(ans2['start_after_hours'], 4.0, places=1)
+        self.assertEqual(ans2['retry_at'], r_5h_late.isoformat())
+        self.assertIn('five_hour', ans2['cause'])
+        self.assertIn('seven_day', ans2['cause'])
+        self.assertLess(ans2['cause'].index('five_hour'), ans2['cause'].index('seven_day'), ans2['cause'])
+
+    def test_f7_refusal_schedule_has_top_level_imports_and_no_cycle_dodge_in_quota_pools(self):
+        import allocator
+        import ast
+        import quota_pools
+        qp_tree = ast.parse(Path(quota_pools.__file__).read_text(encoding='utf-8'))
+        late_in_qp = [
+            node.name for node in ast.walk(qp_tree)
+            if isinstance(node, ast.FunctionDef)
+            and any(isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in ast.walk(node))
+        ]
+        self.assertEqual(late_in_qp, [])
+        self.assertFalse(hasattr(quota_pools, 'refusal_schedule'))
+        self.assertTrue(hasattr(allocator, 'refusal_schedule'))
+        alloc_tree = ast.parse(Path(allocator.__file__).read_text(encoding='utf-8'))
+        sched_fn = next(n for n in alloc_tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refusal_schedule')
+        late_in_sched = [sub for sub in ast.walk(sched_fn) if isinstance(sub, (ast.Import, ast.ImportFrom))]
+        self.assertEqual(late_in_sched, [])
+
+    def test_f8_route_fact_refused_has_no_user_named_default_and_prepare_never_claims_user_named(self):
+        import account_fleet
+        import usage_reading
+        from router_test_support import profile
+        with self.subTest(check='no_default'):
+            with self.assertRaises(TypeError):
+                registry.RouteFactRefused('quota window exhausted')
+        with self.subTest(check='prepare_cause'):
+            self.write_usage_cache([
+                {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=3)).isoformat()},
+                {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+            ])
+            args_hc = route_judge.build_parser().parse_args([
+                'record', '--constraint', 'hard_constraint', '--provider', 'claude', '--account', 'claude',
+                '--model', 'claude-opus-5-5', '--effort', 'high', '--basis', 'project rule',
+            ])
+            task_hc = {'parent_agent_id': 'parent-named', 'task_id': 't-f8-hc', 'objective': 'Review',
+                       'expected_hours': 0.05, 'hours': 0.05, 'profile': profile()}
+            dec_hc = route_judge.record_constraint(args_hc, task=task_hc, classified={'task': task_hc, 'scorer': None})
+            self.write_usage_cache([
+                {'id': 'five_hour', 'used_pct': 90.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
+                {'id': 'seven_day', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(days=4)).isoformat()},
+            ])
+            with self.assertRaises(registry.CapacityChanged) as caught:
+                registry.prepare(
+                    dec_hc['decision_id'], task_hc, {'title': 'Review', 'initialPrompt': 'Review'},
+                    usage_reading.usage_snapshot(self.cache_path, now=self.now),
+                    accounts=account_fleet.load_accounts(), now=self.now,
+                )
+            self.assertNotIsInstance(caught.exception.__cause__, registry.RouteFactRefused)
+
+    def test_f9_roll_reference_documents_tell_user_on_forced_fallback_endings_and_accurate_fact_list(self):
+        ref_path = Path(route_judge.__file__).resolve().parents[1] / 'references' / 'roll-reference.md'
+        text = ref_path.read_text(encoding='utf-8')
+        tell_user_lines = [line for line in text.splitlines() if '`caller_action: "tell_user"`' in line]
+        self.assertEqual(len(tell_user_lines), 1, tell_user_lines)
+        bullet = tell_user_lines[0]
+        self.assertIn('owner_named_model_failed', bullet)
+        self.assertIn('relaunch_not_started', bullet)
+        self.assertNotIn('unconfigured account or provider', bullet)
 
 
 if __name__ == '__main__':
