@@ -42,6 +42,10 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#MyAppName} tray
+; The compass icon packaging/agentcompass-tray.spec writes on every build. The Start menu and desktop shortcuts take
+; theirs from the executable, which the spec builds with the same file.
+SetupIconFile=..\dist\agentcompass-v1.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 CloseApplications=force
 RestartApplications=no
 ChangesEnvironment=yes

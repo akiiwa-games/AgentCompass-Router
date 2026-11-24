@@ -24,6 +24,18 @@ root = Path(SPECPATH).resolve().parent
 sys.path.insert(0, str(root / "packaging"))
 import app_bundle  # noqa: E402
 
+# Both executables and the installer carry the product's own icon, so the Start menu and desktop shortcuts, Explorer and
+# Setup show the compass the tray and its windows draw (tray/ui_theme.compass_image, the one drawing) instead of the
+# bootloader's default. Written anew on every build, beside the tray folder, where packaging/agentcompass.iss reads it.
+sys.path.insert(0, str(root / "tray"))
+import ui_theme  # noqa: E402
+
+ICON_FILE = Path(DISTPATH) / "agentcompass-v1.ico"
+ICON_FILE.unlink(missing_ok=True)
+ICON = str(ui_theme.window_icon_path(Path(DISTPATH)))
+if Path(ICON) != ICON_FILE:
+    raise SystemExit(f"the icon was written to {ICON}, not {ICON_FILE}: packaging/agentcompass.iss reads the latter")
+
 # The router skill, CLI, and tray modules are loaded from <app>/app/current on disk, not frozen into PYZ,
 # so the frozen interpreter carries the full Windows Python standard library (see app_bundle.collect_bundled_stdlib)
 # and records the bundled module set inside runtime_fingerprint.
@@ -60,6 +72,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=True,
     argv_emulation=False,
+    icon=ICON,
 )
 
 coll = COLLECT(
@@ -100,6 +113,7 @@ cli_exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    icon=ICON,
 )
 cli_coll = COLLECT(
     cli_exe,

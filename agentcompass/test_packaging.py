@@ -167,6 +167,22 @@ class PackagingTests(unittest.TestCase):
         self.assertIn(r'Filename: "{app}\cli\agentcompass.exe"; Parameters: "uninstall --yes"', iss)
         self.assertNotIn("/D /C agentcompass uninstall", iss)       # never whichever agentcompass PATH finds first
 
+    def test_the_executables_and_the_installer_carry_the_products_own_icon(self):
+        # The shortcuts show the icon of the executable they start, so an executable built without one shows the
+        # bootloader's default in the Start menu. One file, from the tray's own drawing, for both executables and Setup.
+        spec = (ROOT / "packaging" / "agentcompass-tray.spec").read_text(encoding="utf-8")
+        self.assertIn("ui_theme.window_icon_path(Path(DISTPATH))", spec)
+        executables = spec.split("EXE(")[1:]
+        self.assertEqual(len(executables), 2)
+        for body in executables:
+            self.assertIn("icon=ICON,", body.split("\n)", 1)[0])
+        name = spec.split('ICON_FILE = Path(DISTPATH) / "', 1)[1].split('"', 1)[0]
+        iss = (ROOT / "packaging" / "agentcompass.iss").read_text(encoding="utf-8")
+        self.assertIn(f"SetupIconFile=..\\dist\\{name}", iss)
+        self.assertIn("UninstallDisplayIcon={app}\\{#MyAppExeName}", iss)
+        icons = iss.split("[Icons]", 1)[1].split("\n[", 1)[0]
+        self.assertNotIn("IconFilename", icons)                     # the shortcuts follow the executable's icon
+
     def test_the_installer_applies_an_earlier_setup_again_and_never_leaves_the_tray_down(self):
         iss = (ROOT / "packaging" / "agentcompass.iss").read_text(encoding="utf-8")
         code = iss.split("[Code]", 1)[1].split("\n[", 1)[0]
