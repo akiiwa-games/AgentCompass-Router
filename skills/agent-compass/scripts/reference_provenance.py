@@ -103,10 +103,13 @@ def validate_plan_templates_provenance(doc):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_measured requires kind="maintainer", '
                                      'ISO as_of, a statement, capacity_usd > 0 at list price, period_hours > 0, bound '
                                      f'{" or ".join(MEASURED_BOUNDS)}, and the model and request count it rests on')
-                prefix = tpl.get('allowance_launch_prefix', None)
-                if prefix is not None and not (isinstance(prefix, str) and prefix.strip()):
+                # Without the prefix every bundle of the provider would draw the allowance, a paid one launched under
+                # another prefix included, and a measurement beside it would size that whole provider.
+                prefix = tpl.get('allowance_launch_prefix')
+                if not (isinstance(prefix, str) and prefix.strip()):
                     raise ValueError(f'plan-templates[{family!r}][{plan!r}].allowance_launch_prefix must be the provider '
-                                     'prefix the allowance is launched under (non-empty text)')
+                                     'prefix the allowance is launched under (non-empty text), required beside '
+                                     'capacity_unpublished')
 
 
 def validate_accounts_provenance(doc):

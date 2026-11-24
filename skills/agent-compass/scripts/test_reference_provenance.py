@@ -264,6 +264,25 @@ class ProvenanceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reference_provenance.validate_plan_templates_provenance(doc)
 
+    def test_an_allowance_declaration_names_the_launch_prefix_its_free_models_draw_it_under(self):
+        """Rule (reference_provenance.validate_plan_templates_provenance, review round 2 N5): without
+        `allowance_launch_prefix` the allowance would be drawn by every bundle of the provider, a paid one launched
+        under another prefix included (axis_scores.five_axis_overlay), and a measured capacity would size that whole
+        provider. So the declaration needs it, alone and beside a measurement."""
+        shipped = json.loads((self.folder / 'plan-templates.json').read_text(encoding='utf-8'))
+        measured = {'kind': 'maintainer', 'as_of': '2026-11-24', 'capacity_usd': 2.5, 'period_hours': 24,
+                    'bound': 'lower_bound', 'model': 'example-free-model', 'requests': 100, 'statement': 'fixture'}
+        for label, extra in (('the declaration alone', {}), ('beside a measurement', {'capacity_measured': measured})):
+            with self.subTest(label):
+                doc = json.loads(json.dumps(shipped))
+                free = doc['opencode']['free']
+                free.pop('capacity_measured', None)
+                free.update(extra)
+                reference_provenance.validate_plan_templates_provenance(doc)
+                del free['allowance_launch_prefix']
+                with self.assertRaisesRegex(ValueError, "plan-templates\['opencode'\]\['free'\]\.allowance_launch_prefix"):
+                    reference_provenance.validate_plan_templates_provenance(doc)
+
     def test_public_user_scores_reject_a_local_kind(self):
         write_json(self.folder / 'user-scores.json', {
             'schema_version': user_scores.SCHEMA_VERSION,
