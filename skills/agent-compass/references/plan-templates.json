@@ -365,6 +365,16 @@
         "as_of": "2026-11-24",
         "statement": "The page publishes no request, token, concurrency or dollar limit for the free models (\"free on OpenCode for a limited time\"). The limit shows only when it is reached: the hosted service's error states when the allowance resets (\"Free usage limit reached\", \"You've used today's free messages. They reset at ...\"; maintainer issue https://github.com/anomalyco/opencode/issues/59387, 2026-10-26)."
       },
+      "capacity_measured": {
+        "kind": "maintainer",
+        "as_of": "2026-11-24",
+        "capacity_usd": 0.135,
+        "period_hours": 24,
+        "bound": "measurement",
+        "model": "deepseek-v4.1-flash-free",
+        "requests": 121,
+        "statement": "Measured 2026-11-24 with OpenCode v2.2.6 on opencode/deepseek-v4.1-flash-free: 121 successful requests (132,027 input, 59,904 output and 3,124,480 cache-read tokens in the 120 logged ones), $0.135 at the public list price, up to the vendor's free-limit error (provider.free-limit, HTTP 429, retryAfterMs 72,230,000 = 20.06 h). The allowance recurs: an account limited on 2026-11-12 worked again, and the limit errors of both days gave resets at the same clock time, so its period is taken as about one day (24 h). Not known: whether the vendor counts requests, tokens or value (its sentence says \"free messages\"), so the dollar figure holds for small requests like these."
+      },
       "allowance_launch_prefix": "opencode",
       "windows": {},
       "basis": "OpenCode's free models need no sign-in and draw one allowance whose size the vendor does not publish (`capacity_unpublished`). Its capacity is this account's spend in the period its limit error ends (quota_exhaustion.observation), else a dated maintainer measurement shipped here as `capacity_measured`, else unknown and out of automatic routing (axis_scores.free_allowance_period); the limit error holds the allowance until the reset it states. No window is declared here: the allowance window is the free pool's own (axis_scores.five_axis_overlay). `allowance_launch_prefix`: the free models are OpenCode's own provider `opencode` (launch ids `opencode/<model>`, models.dev catalog `opencode`); OpenCode Go models connected on the same account launch as `opencode-go/<model>`, a paid subscription, and do not draw the free allowance."

@@ -69,10 +69,14 @@ def setUpModule():
 class UnpublishedFreePoolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.bare = sim.fresh_accounts(shipped_template(), snapshot())
-        cls.doc = tf.document(cls.bare['models'])
-        cls.declaration = copy.deepcopy(provider_inventory.shipped_plan_templates()['opencode']['free'])
-        cls.accounts = cls.with_measured(cls.bare)      # a pool with a capacity, for the latch tests
+        shipped = sim.fresh_accounts(shipped_template(), snapshot())
+        cls.doc = tf.document(shipped['models'])
+        cls.declaration = {k: v for k, v in provider_inventory.shipped_plan_templates()['opencode']['free'].items()
+                           if k != 'capacity_measured'}
+        # The plan as declared with no measurement shipped beside it (a pool with no C), and with the fixture one.
+        cls.bare = copy.deepcopy(shipped)
+        cls.bare['plan_templates'] = {'opencode': {'free': copy.deepcopy(cls.declaration)}}
+        cls.accounts = cls.with_measured(shipped)      # a pool with a capacity, for the latch tests
 
     @classmethod
     def with_measured(cls, acc, measured=MEASURED, family='opencode'):
@@ -128,6 +132,18 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         return {**copy.deepcopy(acc), '_discovery': {'accounts': rows}}
 
     # -- the declaration ------------------------------------------------------------------------------------------------
+
+    def test_the_shipped_measurement_has_its_provenance_and_is_read_as_the_pools_capacity(self):
+        """The shipped `capacity_measured` (owner-confirmed, 2026-11-24) passes its provenance check and, with no
+        observation of the account's own, is the pool's C over its period (source 2 of free_allowance_period)."""
+        import reference_provenance
+        shipped = provider_inventory.shipped_plan_templates()['opencode']['free']['capacity_measured']
+        self.assertTrue(reference_provenance.valid_measured_capacity(shipped))
+        spec = self.overlay(self.only(POOL, acc=sim.fresh_accounts(shipped_template(), snapshot())))['accounts'][POOL]
+        self.assertEqual(spec['capacity_usd'], {'allowance': shipped['capacity_usd']})
+        self.assertEqual(spec['windows'], {'allowance': {'hours': shipped['period_hours']}})
+        self.assertEqual((spec['capacity_source']['allowance']['status'], spec['capacity_source']['allowance']['as_of']),
+                         ('maintainer', shipped['as_of']))
 
     def test_the_shipped_declaration_is_a_dated_vendor_citation_on_a_zero_price_plan(self):
         declared = self.declaration['capacity_unpublished']

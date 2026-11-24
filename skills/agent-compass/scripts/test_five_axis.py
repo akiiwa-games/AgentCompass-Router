@@ -24,6 +24,7 @@ import account_fleet
 import axis_scores
 import candidate_ranking
 import ledger_snapshot
+import provider_inventory
 import quota_economy
 import task_intake
 import route_judge
@@ -444,12 +445,15 @@ class FiveAxisTests(unittest.TestCase):
         # Antigravity has no community source: every window unknown.
         self.assertEqual(out['accounts']['antigravity']['capacity_usd'], {})
         self.assertTrue(out['accounts']['antigravity']['capacity_unknown'])
-        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag, capacity_unknown.
-        # Its vendor's declaration that it publishes no capacity (plan-templates `capacity_unpublished`) ships no figure.
+        # OpenCode ("free" pool) is an ordinary quota pool on the five-axis path: no unmetered/unlimited flag. Its vendor
+        # publishes no capacity (plan-templates `capacity_unpublished`); its capacity is the maintainer's measurement
+        # shipped beside that declaration (`capacity_measured`).
         self.assertFalse(out['accounts']['opencode'].get('unmetered'))
         self.assertFalse(out['accounts']['opencode'].get('unlimited'))
-        self.assertTrue(out['accounts']['opencode']['capacity_unknown'])
         self.assertEqual(out['accounts']['opencode']['capacity_unpublished']['kind'], 'vendor')
+        measured = out['accounts']['opencode']['capacity_unpublished']['measured']
+        self.assertEqual(out['accounts']['opencode']['capacity_usd'], {'allowance': measured['capacity_usd']})
+        self.assertFalse(out['accounts']['opencode'].get('capacity_unknown'))
 
     def test_tie_break_order_net_score_then_wait_then_faster_then_fewer_usd_then_level(self):
         """Quota economy v3 + R2-F4: N = F - C is never rounded; C carries billed vs free, pool used share, and +fast burn.
@@ -727,6 +731,11 @@ class FiveAxisTests(unittest.TestCase):
         acc['accounts']['opencode']['bundles'] = {
             'glm53_free': {'provider': 'opencode', 'harness': 'opencode', 'account': 'opencode', 'model': 'glm-5.3-flash-free'}
         }
+        # The free plan as declared, with no capacity measurement shipped beside it: no C (the shipped one is read in
+        # test_free_pool_unpublished.py).
+        acc['plan_templates'] = {'opencode': {'free': {k: v for k, v in
+                                                       provider_inventory.shipped_plan_templates()['opencode']['free'].items()
+                                                       if k != 'capacity_measured'}}}
         acc.setdefault('_discovery', {}).setdefault('accounts', {})['opencode'] = {
             'usage': {'models': {'glm-5.3-flash-free': {'input': 1_000_000, 'output': 500_000, 'cache_read': 0, 'cost': 0.0}}}
         }

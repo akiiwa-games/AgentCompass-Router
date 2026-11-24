@@ -2612,6 +2612,10 @@ class RollTests(unittest.TestCase):
 
     def test_opencode_deepseek_explicit_override_prepares_paseo_request(self):
         (self.root / 'host.json').write_text(json.dumps({'allowed_accounts': ['claude-lab', 'codex', 'antigravity', 'opencode']}))
+        # The request's shape, not the allowance's size: the free plan as declared with no measured capacity beside it
+        # (with the shipped one this brief's estimate exceeds the window, and the full-capacity rule refuses it).
+        self.accounts['plan_templates'] = {'opencode': {'free': {
+            k: v for k, v in provider_inventory.shipped_plan_templates()['opencode']['free'].items() if k != 'capacity_measured'}}}
         for effort in ('high', 'default'):
             with self.subTest(effort=effort):
                 task = dict(self.task, task_id=f'opencode-{effort}')

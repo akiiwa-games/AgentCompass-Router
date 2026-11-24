@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import allocator
 import axis_scores
+import provider_inventory
 import candidate_eval
 import task_intake
 import candidate_ranking
@@ -1313,6 +1314,11 @@ class WeeklyWindowTests(unittest.TestCase):
                                                                          'model': 'glm-5.3-flash-free', 'draws': [], 'auto': True},
                                                'named': {'provider': 'opencode', 'harness': 'opencode', 'model': 'glm-5.3-flash-free',
                                                          'draws': ['elsewhere']}}}
+        # The free plan as declared, with no capacity measurement shipped beside it: no C (the shipped one is read in
+        # test_free_pool_unpublished.py).
+        acc['plan_templates'] = {'opencode': {'free': {k: v for k, v in
+                                                       provider_inventory.shipped_plan_templates()['opencode']['free'].items()
+                                                       if k != 'capacity_measured'}}}
         out = axis_scores.five_axis_overlay(acc)['accounts']['pool']
         self.assertEqual(list(out['windows']), ['allowance'])
         self.assertEqual(out['bundles']['auto:pool:opencode:x']['draws'], ['allowance'])
