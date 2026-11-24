@@ -526,6 +526,7 @@ def evaluate_bundle(bundle, task, ctx):
     # rule's numbers. Facts (a window at 0 or latched, below its launch floor) still hold it as they hold any route.
     override_named = not pool and task.get('pinned_bundle') == bundle['id']
     past_full = {}      # window -> the rule's estimate this named route launches past
+    full_short = {}     # window -> the rule's estimate, refused or launched past (structured, for readers and tests)
     if not spec.get('unmetered'):
         def exclude_if_renewal_short(wid_k, wspec_k, st_k, unit_k, work_hours=None):
             refusal = renewal_capacity_refusal(
@@ -534,6 +535,7 @@ def evaluate_bundle(bundle, task, ctx):
             )
             if refusal is None:
                 return False
+            full_short.setdefault(wid_k, {k: refusal[k] for k in ('need_pct', 'full', 'margin_pct')})
             if override_named:
                 past_full.setdefault(wid_k, refusal)
                 return False
@@ -825,6 +827,8 @@ def evaluate_bundle(bundle, task, ctx):
                     if exclude_if_renewal_short(wid, wspec, st, unit, work_hours=req_hours - h_bef):
                         continue
                     five_window_states[wid] = (wspec, {**st, 'start_offset_hours': available_at}, cap_usd_w, unit)
+    if full_short:
+        result['full_capacity_short'] = full_short
     if past_full:
         result['capacity_warning'] = full_capacity_warning(bundle['account'], model, past_full)
         result['notes'].append(result['capacity_warning'])

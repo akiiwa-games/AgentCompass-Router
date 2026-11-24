@@ -286,25 +286,30 @@ class AccountStateCardTests(unittest.TestCase):
         # out of automatic routing as on main; with one it is a state like any pool; a latch shows the allowance as a
         # window at 0 until its end. The explanation is only in the hover.
         from datetime import datetime, timedelta, timezone
+        # Interface text is asserted through its catalog key (review round 3 N-e): the key is in the language table and
+        # the card shows its translation.
+        out_key, hover_key = '额度上限未知（不参与自动路由）', '供应商未公布额度上限：上限取本机最近一次限额报错前的花费与出厂实测值中较大的一个（两者都是下界）；两者都没有时不参与自动路由，点名可用'
+        self.assertTrue({out_key, hover_key} <= set(i18n_catalog.EN))
+        out_text, hover_text = router_data._tr(out_key), router_data._tr(hover_key)
         declared = {'kind': 'vendor', 'url': 'https://example.invalid/free', 'as_of': '2026-11-24',
                     'statement': 'no limit published', 'plan': 'free'}
         unknown = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={
             'five_axis_free_pool': True, 'windows': {'allowance': {'hours': None}}, 'bundles': {}, 'capacity_usd': {},
             'capacity_unknown': True, 'capacity_unpublished': declared})
         self.assertEqual(unknown['kind'], 'warn')
-        self.assertIn('不参与自动路由', unknown['badge'])
-        self.assertIn('供应商未公布额度上限', unknown['usage_hover'])
+        self.assertEqual(unknown['badge'], out_text)
+        self.assertIn(hover_text, unknown['usage_hover'])
         spec = {'five_axis_free_pool': True, 'windows': {'allowance': {'hours': 24}}, 'bundles': {},
                 'capacity_usd': {'allowance': 2.5}, 'capacity_unpublished': declared}
         free = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec=spec)
         self.assertEqual((free['kind'], free['windows']), ('ok', []))
-        self.assertNotIn('不参与自动路由', free['badge'])
+        self.assertNotIn(out_text, free['badge'])
         # Its period read from local spend (axis_scores.with_local_readings) is the window's reading, as in a plan.
         read = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec={**spec, 'local_period': {
             'window': 'allowance', 'used_usd': 1.0,
             'resets_at': (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat()}})
         self.assertEqual([(w['id'], w['remaining_pct']) for w in read['windows']], [('allowance', 100 - 100 * 1.0 / 2.5)])
-        self.assertIn('供应商未公布额度上限', free['usage_hover'])
+        self.assertIn(hover_text, free['usage_hover'])
         self.assertNotIn('capacity_unknown', free)
         # Review round 3 S1: a failed read of opencode.db is carried to the hover; the card stays a priced, routable one.
         unread = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode',
@@ -324,7 +329,7 @@ class AccountStateCardTests(unittest.TestCase):
         stated = held['windows'][0]
         self.assertIs(stated['reset_stated'], True)
         self.assertEqual(panel_quota.window_countdown(stated), panel_quota.short_countdown(stated['reset_in']))
-        self.assertIn('供应商未公布额度上限', held['usage_hover'])
+        self.assertIn(hover_text, held['usage_hover'])
         # A limit sentence with no reset: the card shows the latch's re-probe time, as discovery publishes it.
         import tempfile
         from pathlib import Path

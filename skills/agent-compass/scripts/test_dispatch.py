@@ -141,8 +141,6 @@ class DispatchTests(unittest.TestCase):
         of the work's estimate plus its margin keeps the bundle out of automatic routing and out of a project rule
         (hard_constraint); a route the user named (user_override) launches past it with one warning that states the
         rule's own estimate. Same task, same window, same reading."""
-        import re
-        short = re.compile(r'(\w+) full capacity \(\d+%\) is short of the ~([\d.]+)%')
         task = found = None
         for hours in (1, 2, 4, 8, 16, 40, 120):     # the first length of work this window's full capacity cannot hold
             task = dict(self.task, task_id=f'long-work-{hours}', expected_hours=hours)
@@ -150,25 +148,28 @@ class DispatchTests(unittest.TestCase):
             plan = allocator.plan(copy.deepcopy(task), self.usage, self.now, accounts=copy.deepcopy(self.accounts),
                                   host_policy_config={'allowed_accounts': ['claude-lab']}, read_local_state=False)
             row = next(c for c in plan['ranking'] if c['id'] == 'lab_sonnet55_high')
-            found = next((m for e in row['excluded'] if (m := short.search(e))), None)
+            found = row.get('full_capacity_short')
             if found:
                 break
         self.assertIsNotNone(found, 'no length of work reaches the full-capacity rule on this window')
-        window, need = found.group(1), float(found.group(2))
+        self.assertTrue(row['excluded'])
         automatic = dict(task, task_id='automatic')
-        with self.assertRaisesRegex(registry.CapacityChanged, f'{window} full capacity'):
+        with self.assertRaises(registry.CapacityChanged):
             self.prepare(self.issue(task=automatic), task=automatic)
         project = dict(task, task_id='project-rule')
-        with self.assertRaisesRegex(registry.CapacityChanged, f'{window} full capacity'):
+        with self.assertRaises(registry.CapacityChanged):
             self.prepare(self.issue(stage='record', choice='constraint', constraint='hard_constraint',
                                     basis='Project rule', task=project), task=project)
         named = dict(task, task_id='user-named')
         row = self.prepare(self.issue(stage='record', choice='constraint', constraint='user_override',
                                       basis='User named it', task=named), task=named)
         self.assertEqual(row['bundle']['bundle_id'], 'lab_sonnet55_high')
+        # The one warning states the rule's own estimate of the same windows: each window of the structured shortfall the
+        # automatic plan was refused on, with its estimate (no sentence parsed: the window and the number are looked for).
         self.assertEqual(len(row['warnings']), 1, row.get('warnings'))
-        stated = re.findall(r"about (\d+)% of (\w+)'s full capacity", row['warnings'][0])
-        self.assertIn((f'{need:.0f}', window), stated)
+        for wid, short in found.items():
+            self.assertIn(wid, row['warnings'][0])
+            self.assertIn(f"{short['need_pct']:.0f}%", row['warnings'][0])
 
     def test_the_re_plan_counts_the_cadence_from_the_records_the_plan_read(self):
         # Rule (quota_pools.cadence_dispatches): a `record` row with no registry row is a launch outside roll and counts;
