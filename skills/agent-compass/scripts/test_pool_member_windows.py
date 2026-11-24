@@ -324,6 +324,29 @@ class IdleMemberTests(unittest.TestCase):
         self.assertEqual(waits(raw_pool([(100.0, 2.0), (0.0, None)], 'five_hour')), idle)
 
 
+class OutOfStepTests(unittest.TestCase):
+    """Review N1: the rules that members in step cannot tell apart (first = mean = soonest = latest)."""
+
+    def test_the_pools_reset_is_the_soonest_reset_of_a_member_that_spent_some(self):
+        # R4: the pool's reset is its next partial refill, not the latest reset nor the first listed member's.
+        for members, soonest in (([(0.0, 146.0), (31.0, 30.0), (10.0, 90.0)], 30.0),
+                                 ([(50.0, 146.0), (0.0, 30.0), (10.0, 90.0)], 90.0),
+                                 ([(0.0, 146.0), (0.0, 30.0)], 30.0)):
+            with self.subTest(members=members):
+                self.assertEqual(pool_state(members)['reset_hours'], soonest)
+
+    def test_the_hours_before_reset_come_from_every_member_by_its_share(self):
+        # R4/shares: each member's share of the work runs to its own reset, so the pool's hours before reset are the
+        # members' horizons weighted by their shares (equal shares while every member has room).
+        pool = pool_state([(0.0, 146.0), (31.0, 3.0), (10.0, 1.0)])
+        horizon = lambda s: min(5.0, s['reset_hours'])
+        split = quota_pools.shares(pool, 6.0)
+        self.assertEqual(len(split), 3)
+        self.assertAlmostEqual(quota_pools.hours_before(pool, horizon, 6.0),
+                               sum(share * horizon(m) for m, share in split))
+        self.assertAlmostEqual(quota_pools.hours_before(pool, horizon, 6.0), (5.0 + 3.0 + 1.0) / 3)
+
+
 class WaitTests(unittest.TestCase):
     def test_the_wait_is_the_earliest_member_reset_that_restores_capacity_for_the_work(self):
         # R4: an exhausted pool renews member by member; its wait is the soonest reset that gives quota back, and with
