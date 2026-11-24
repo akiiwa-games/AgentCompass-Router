@@ -1,23 +1,23 @@
 {
   "schema_version": 8,
-  "version": "3270d156b555",
-  "published_at": "2026-11-21T04:39:53Z",
+  "version": "70954f922b71",
+  "published_at": "2026-11-24T12:46:39Z",
   "files": {
     "accounts.json": {
-      "sha256": "fd1ff02373214c06d15b769520cd7873efce6674c5d3aea4f3c1bcf794c34d12",
-      "bytes": 159620
+      "sha256": "02c35ec03c71e3d31d645122d10f8c9d8dc90b39d2b5cdd64b92529e2992d333",
+      "bytes": 158204
     },
     "plan-templates.json": {
-      "sha256": "00562815ae9be176e6ede44d0897dc9905f22c7512b46db0d2eae3cb9efc1d8c",
-      "bytes": 13517
+      "sha256": "5241b092e9fa78fd7c0d2a807a357e3cab3d5967d04f96d8e8879913adc9cc0b",
+      "bytes": 16397
     },
     "classifier-cases.json": {
       "sha256": "b45164f413e8e06f689aeb2a844816ec2590b1e11f13b1e9acc7184255f49f18",
       "bytes": 22056
     },
     "five-axis-scores.json": {
-      "sha256": "8f60222bb1ba9d296416e3741256ad24abe4c47c13c7624c9e3b27dac9ed57a0",
-      "bytes": 3217063
+      "sha256": "bef2934bb84396a394d97345f25d56273477170fbb30bd75128cd38e8ade321c",
+      "bytes": 3215125
     },
     "user-scores.json": {
       "sha256": "85e8f32804ca196a09ee9fe1e63ea9bc40da6670aa36db6b9c3ea90c99bcf8c9",
