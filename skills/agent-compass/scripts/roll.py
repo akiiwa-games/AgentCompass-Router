@@ -1456,27 +1456,32 @@ def _cause_sentence_ends(raw):
 
 
 def _compact_cause(cause, next_action, detail_path):
-    """Short `cause` for `compact`: never cut mid-word or mid-sentence; when it does not fit in `CAUSE_LIMIT`, end after
-    the last whole sentence that fits and name where the rest is (`next_action` and/or the details file)."""
+    """Short `cause` for `compact`: at most `CAUSE_LIMIT` including its note, never cut mid-word or mid-sentence when
+    a boundary exists, and naming where the rest is (`next_action` and/or `the details file`, without repeating `details`)."""
     raw = str(cause)
     if len(raw) <= CAUSE_LIMIT:
         return raw
     in_next = bool(next_action and raw in next_action)
     if not in_next and detail_path is None:
         return raw      # nothing else holds the rest, so nothing is cut (as for route.warnings)
-    where = (f'next_action and the details file ({detail_path})' if in_next and detail_path
-             else f'the details file ({detail_path})' if detail_path else 'next_action')
+    where = ('next_action and the details file' if in_next and detail_path
+             else 'the details file' if detail_path else 'next_action')
     ends = _cause_sentence_ends(raw)
-    fitting = [end for end in ends if end <= CAUSE_LIMIT]
-    if fitting:
-        kept = raw[:fitting[-1]]
-        more = len(ends) - len(fitting)
-        if kept.endswith(('.', '!', '?')):
-            return f'{kept} The rest ({more} more) is in {where}.'
-        return f'{kept}; the rest ({more} more) is in {where}'
-    cut = raw.rfind(' ', 0, CAUSE_LIMIT + 1)
-    prefix = raw[:cut].rstrip(' ,;:') if cut > 0 else raw[:CAUSE_LIMIT]
-    return f'{prefix}... (the rest is in {where})'
+    for idx in range(len(ends) - 2, -1, -1):
+        kept = raw[:ends[idx]]
+        more = len(ends) - 1 - idx
+        note = (f'{kept} The rest ({more} more) is in {where}.'
+                if kept.endswith(('.', '!', '?'))
+                else f'{kept}; the rest ({more} more) is in {where}')
+        if len(note) <= CAUSE_LIMIT:
+            return note
+    tail = f'... (the rest is in {where})'
+    budget = CAUSE_LIMIT - len(tail)
+    cut = raw.rfind(' ', 0, budget + 1)
+    prefix = raw[:cut].rstrip(' ,;:') if cut > 0 else ''
+    if not prefix:
+        prefix = raw[:budget]
+    return f'{prefix}{tail}'
 
 
 def compact(result, status, detail_path):

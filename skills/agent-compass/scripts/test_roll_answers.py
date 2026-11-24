@@ -1224,61 +1224,118 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
         self.assertNotIn('sign in', ans_wrong['cause'].lower())
 
     def test_n2_compact_cause_ends_after_last_whole_sentence_and_points_to_rest(self):
-        import quota_exhaustion
         import roll
-        # Real 3-window refusal (> 300 chars): `five_hour`, `seven_day` and `weekly_fable` latched on `max5` + `claude-fable-5-2`.
+
+        def assert_compact_cause_rule(raw_cause, compacted, *, detail_path, in_next, has_boundary=True):
+            self.assertLessEqual(len(compacted), roll.CAUSE_LIMIT, (len(raw_cause), len(compacted), compacted))
+            if len(raw_cause) <= roll.CAUSE_LIMIT:
+                self.assertEqual(compacted, raw_cause)
+                return
+            if detail_path:
+                self.assertNotIn(detail_path, compacted)
+                self.assertIn('the details file', compacted)
+            else:
+                self.assertNotIn('the details file', compacted)
+            if in_next:
+                self.assertIn('next_action', compacted)
+            else:
+                self.assertNotIn('next_action', compacted)
+            if '; the rest (' in compacted:
+                kept = compacted.split('; the rest (', 1)[0]
+                self.assertTrue(raw_cause.startswith(kept + '; '), (kept, raw_cause))
+            elif ' The rest (' in compacted:
+                kept = compacted.split(' The rest (', 1)[0]
+                self.assertTrue(kept.endswith(('.', '!', '?')) and raw_cause.startswith(kept + ' '), (kept, raw_cause))
+            else:
+                self.assertIn('... (the rest is in ', compacted)
+                kept = compacted.split('... (the rest is in ', 1)[0]
+                self.assertTrue(bool(kept) and raw_cause.startswith(kept), (kept, raw_cause))
+                if has_boundary:
+                    self.assertTrue(not kept[-1].isspace() and raw_cause[len(kept)] in ' ,;:',
+                                    (kept, raw_cause[len(kept):len(kept) + 10]))
+
+        # Real 3-window refusal (346 chars): `five_hour` below 25% launch protection + `seven_day` & `weekly_fable` exhausted.
         self.write_usage_cache([
-            {'id': 'five_hour', 'used_pct': 10.0, 'resets_at': (self.now + timedelta(hours=2)).isoformat()},
-        ], plan='max5')
-        self.assertTrue(quota_exhaustion.record(
-            'claude', 'Individual quota reached', windows=['five_hour', 'seven_day', 'weekly_fable'],
-            at=(self.now + timedelta(seconds=1)).isoformat(),
-        ))
-        try:
-            code, ans = self.run_cli(
-                'roll', '--task', 'Review architecture',
-                '--provider', 'claude', '--account', 'claude', '--model', 'claude-fable-5-2', '--effort', 'high',
-                '--basis', 'the user said: use claude-fable-5-2',
-            )
-            self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
-            detail_doc = full(ans)
-            self.assertGreater(len(detail_doc['cause']), 300)
-            self.assertIn('weekly_fable: quota confirmed exhausted', detail_doc['cause'])
-            self.assertIn(detail_doc['cause'], ans['next_action'])
-            # Compact cause ends after the last whole window sentence that fits (`seven_day`), never mid-word (`weekly_fab`),
-            # and names `next_action` and the details file (`ans['details']`) with the count left out (`1 more`).
-            self.assertIn('seven_day: quota confirmed exhausted)', ans['cause'])
-            self.assertNotIn('weekly_fable', ans['cause'])
-            self.assertNotIn('weekly_fab', ans['cause'])
-            self.assertIn('1 more', ans['cause'])
-            self.assertIn('next_action', ans['cause'])
-            self.assertIn(ans['details'], ans['cause'])
-        finally:
-            quota_exhaustion.clear('claude')
+            {'id': 'five_hour', 'used_pct': 85.0, 'resets_at': (self.now + timedelta(days=3)).isoformat()},
+            {'id': 'seven_day', 'used_pct': 100.0, 'resets_at': (self.now + timedelta(days=1)).isoformat()},
+            {'id': 'weekly_fable', 'used_pct': 100.0, 'resets_at': (self.now + timedelta(days=2)).isoformat()},
+        ], plan='pro')
+        code, ans = self.run_cli(
+            'roll', '--task', 'Review architecture',
+            '--provider', 'claude', '--account', 'claude', '--model', 'claude-fable-5-2', '--effort', 'high',
+            '--basis', 'the user said: use claude-fable-5-2',
+        )
+        self.assertEqual((code, ans['status'], ans.get('caller_action')), (2, 'blocked', 'tell_user'), ans)
+        detail_doc = full(ans)
+        self.assertEqual(len(detail_doc['cause']), 346, detail_doc['cause'])
+        self.assertIn('weekly_fable: confirmed exhausted or below launch floor', detail_doc['cause'])
+        self.assertIn(detail_doc['cause'], ans['next_action'])
+        assert_compact_cause_rule(
+            detail_doc['cause'], ans['cause'], detail_path=ans['details'], in_next=True, has_boundary=True,
+        )
+        self.assertIn('1 more', ans['cause'])
 
-        # Other cause shapes go through the same single owner `roll.compact`:
-        # (1) `. `-separated sentences where `next_action` does not embed the full cause -> points to details file only.
-        s1 = 'First sentence explains the failure clearly.'
-        s2 = 'Second sentence adds context that still fits inside three hundred characters.'
-        s3 = 'Third sentence is ' + ('very ' * 45) + 'long so the full cause exceeds three hundred characters.'
-        multi_dot = f'{s1} {s2} {s3}'
-        self.assertGreater(len(multi_dot), 300)
-        comp_dot = roll.compact({'error': multi_dot, 'next': 'Fix the issue and retry.'}, 'error', 'D:/work/details.json')
-        self.assertTrue(comp_dot['cause'].startswith(f'{s1} {s2}'), comp_dot['cause'])
-        self.assertNotIn('Third sentence', comp_dot['cause'])
-        self.assertIn('1 more', comp_dot['cause'])
-        self.assertIn('D:/work/details.json', comp_dot['cause'])
-        self.assertNotIn('next_action', comp_dot['cause'])
+        def sentence_cause(target_len, sep='; '):
+            clauses = []
+            idx = 1
+            while True:
+                body = f'Clause {idx} states why window w{idx} refused the launch'
+                if sep == '. ':
+                    body += '.'
+                joined = (sep if sep == '; ' else ' ').join([*clauses, body])
+                rem = target_len - len(joined)
+                if rem <= 90:
+                    tail = ('detail ' * 20)[:rem - (len(sep) if sep == '; ' else 1)]
+                    if sep == '. ':
+                        tail = tail[:-1].rstrip() + '.'
+                        pad = target_len - len(' '.join([*clauses, body, tail]))
+                        tail = tail[:-1] + ('x' * pad) + '.'
+                        out = ' '.join([*clauses, body, tail])
+                    else:
+                        tail = tail.rstrip()
+                        pad = target_len - len('; '.join([*clauses, body, tail]))
+                        tail = tail + ('x' * pad)
+                        out = '; '.join([*clauses, body, tail])
+                    self.assertEqual(len(out), target_len)
+                    return out
+                clauses.append(body)
+                idx += 1
 
-        # (2) Single >300-char sentence with no `; ` or `. ` before 300 -> cut at a word boundary, never mid-word.
-        words = ' '.join(f'word{i:02d}' for i in range(60))
-        self.assertGreater(len(words), 300)
-        comp_word = roll.compact({'error': words, 'next': 'Fix it.'}, 'error', 'D:/work/details.json')
-        prefix = comp_word['cause'].split('...', 1)[0]
-        self.assertTrue(words.startswith(prefix + ' '), comp_word['cause'])
-        self.assertIn('D:/work/details.json', comp_word['cause'])
+        def word_cause(target_len):
+            stream = ' '.join(f'word{i:03d}' for i in range(200))
+            head = stream[:target_len - 6].rstrip()
+            pad = target_len - len(head) - 1
+            out = f"{head} {'w' * pad}"
+            self.assertEqual(len(out), target_len)
+            return out
 
-        # (3) With no details file and full cause not in `next_action`, nothing holds the rest, so nothing is cut.
+        long_detail_path = 'D:/work/isolated-state/.agent-compass/roll-results/1795493207-5492aad9-long-detail-record-path.json'
+        cases = [
+            ('299_sentences', sentence_cause(299), True),
+            ('299_words', word_cause(299), True),
+            ('300_sentences', sentence_cause(300), True),
+            ('300_words', word_cause(300), True),
+            ('301_semicolons', sentence_cause(301, '; '), True),
+            ('301_dots', sentence_cause(301, '. '), True),
+            ('301_long_first_sentence', word_cause(250) + '; ' + ('z' * 49), True),
+            ('301_words', word_cause(301), True),
+            ('346_three_windows', detail_doc['cause'], True),
+            ('900_semicolons', sentence_cause(900, '; '), True),
+            ('900_dots', sentence_cause(900, '. '), True),
+            ('900_words', word_cause(900), True),
+            ('900_no_boundary', 'x' * 900, False),
+        ]
+        for label, raw_cause, has_boundary in cases:
+            for in_next, detail_path in ((True, long_detail_path), (False, long_detail_path), (True, None)):
+                with self.subTest(case=label, in_next=in_next, has_file=bool(detail_path)):
+                    nxt = f'Tell the user ({raw_cause}).' if in_next else 'Fix the issue and retry.'
+                    comp = roll.compact({'error': raw_cause, 'next': nxt}, 'error', detail_path)
+                    assert_compact_cause_rule(
+                        raw_cause, comp['cause'], detail_path=detail_path, in_next=in_next, has_boundary=has_boundary,
+                    )
+
+        # With no details file and full cause not in `next_action`, nothing holds the rest, so nothing is cut.
+        multi_dot = sentence_cause(346, '. ')
         uncut = roll.compact({'error': multi_dot, 'next': 'Fix it.'}, 'error', None)
         self.assertEqual(uncut['cause'], multi_dot)
 
