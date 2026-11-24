@@ -295,6 +295,20 @@ def _resolve_rule_capacity(accounts, community, cap_family, raw_plan, plan, src_
     return scaled, meta, None
 
 
+def unpublished_capacity(accounts, family, plan, shipped=None):
+    """The dated vendor declaration that `family`'s `plan` publishes no capacity for its allowance (plan-templates
+    `capacity_unpublished`, with the plan it was read from), else None. Read from data, never from a name."""
+    resolved = provider_inventory.configured_plan(family, plan, accounts=accounts, shipped=shipped) if family else None
+    if not resolved or resolved not in provider_inventory.plan_table(accounts, family, shipped=shipped):
+        return None
+    template = provider_inventory.plan_defaults(accounts, family, resolved, shipped=shipped) or {}
+    declared = template.get('capacity_unpublished')
+    if not isinstance(declared, dict):
+        return None
+    prefix = template.get('allowance_launch_prefix')
+    return {**declared, 'plan': resolved, **({'allowance_launch_prefix': prefix} if isinstance(prefix, str) and prefix else {})}
+
+
 def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scores=None, local_scores=None):
     """A copy of `accounts` carrying the scoring data of references/five-axis-scores.json plus manual scores
     (`references/user-scores.json` maintainer layer, then local `user-scores.json` when `read_local_state=True`).
@@ -306,7 +320,9 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
     merged cited value (an unsourced usd is removed, not defaulted). Each windowed account's capacity is the
     data's community real-usage figure for its plan and window (round 4), replacing the packaged figure and any dated
     change; a window without one is marked unknown, with no template fallback. Free pools are ordinary quota pools with
-    C/U/t0/T (round 11): when capacity is unreadable, they enter mode B (`capacity_unknown`), out of automatic routing."""
+    C/U/t0/T (round 11): when capacity is unreadable, they enter mode B (`capacity_unknown`), out of automatic routing,
+    unless their plan carries the vendor's dated declaration that it publishes none (`capacity_unpublished`): then the
+    allowance is `unpublished`, not unknown, and the pool routes until its limit is observed (owner, 2026-11-24)."""
     explicit_data = data is not None
     cfg_path = five_axis_config(accounts.get('scoring')).get('path')
     data = data if explicit_data else load_five_axis(cfg_path)
@@ -361,6 +377,14 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
         # channels that usually cannot be used up, and stay in automatic routing (owner, 2026-11-10).
         is_free_pool = bool(spec.get('free_allowance') or str(spec.get('plan') or '') == 'free')
         family = families_by_account[name]
+        # A free pool whose plan the vendor sizes nowhere (plan-templates `capacity_unpublished`, a dated vendor
+        # declaration) has no capacity to read: it is used until the vendor's limit error, which latches it until the
+        # reset that error states (quota_exhaustion). Without the declaration it stays mode B (owner, 2026-11-24).
+        spec.pop('capacity_unpublished', None)
+        unpublished = (unpublished_capacity(out, family, spec.get('plan'), shipped=shipped_templates)
+                       if is_free_pool and spec.get('billing') != 'metered' else None)
+        if unpublished:
+            spec['capacity_unpublished'] = unpublished
         if is_free_pool and spec.get('billing') != 'metered':
             # Round 11 (user 2026-11-10): "free" models are an ordinary quota pool (same C/U/t0/T; a starter allowance
             # has T = inf so recovery line is 0 and X = S). Remove unmetered / unlimited / $0 spend on the five-axis path.
@@ -370,12 +394,22 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             if not spec.get('windows'):
                 spec['windows'] = {'allowance': {'hours': None}}
                 spec['capacity_usd'] = {}
-                spec['capacity_unknown'] = True
-                spec['capacity_source'] = {'allowance': {'status': 'missing', 'plan': spec.get('plan') or 'free'}}
+                if not unpublished:
+                    spec['capacity_unknown'] = True
+                    spec['capacity_source'] = {'allowance': {'status': 'missing', 'plan': spec.get('plan') or 'free'}}
                 # Auto bundles were derived while this account declared no window, so they carry an explicit empty `draws`
-                # (authoritative): every model of a free pool spends the one allowance, so they draw it (round 15).
+                # (authoritative): every model of a free pool spends the one allowance, so they draw it (round 15). A plan
+                # that names the provider prefix its free models launch under (`allowance_launch_prefix`) scopes it: a
+                # model the account launches under another prefix of its own (a paid product on the same provider) draws
+                # nothing of it.
+                prefix = (unpublished or {}).get('allowance_launch_prefix')
                 for b in (spec.get('bundles') or {}).values():
-                    if isinstance(b, dict) and b.get('draws') == []:
+                    if not isinstance(b, dict) or b.get('draws') not in (None, []):
+                        continue
+                    head, sep, _ = str(b.get('launch_model') or b.get('model') or '').partition('/')
+                    if prefix and sep and head != prefix:
+                        b['draws'] = []
+                    elif b.get('draws') == [] or prefix:
                         b['draws'] = ['allowance']
             acct_spend = 0.0
             seen_models = set()
@@ -451,7 +485,12 @@ def five_axis_overlay(accounts, data=None, *, read_local_state=True, public_scor
             for wid in caps:
                 cap_sources[wid] = {'status': 'explicit', 'as_of': None, 'plan': plan or None}
         spec['capacity_usd'] = caps
-        unknown = [wid for wid in spec['windows'] if wid not in caps]
+        if unpublished:
+            for wid in spec['windows']:
+                if wid not in caps:
+                    cap_sources[wid] = {'status': 'unpublished', 'as_of': unpublished.get('as_of'),
+                                        'plan': unpublished.get('plan'), 'source': unpublished.get('url')}
+        unknown = [wid for wid in spec['windows'] if wid not in caps and not unpublished]
         if (unknown and not plan_unknown_reason and not is_free_pool
                 and spec.get('billing') != 'metered' and not src_spec.get('plan_priced_as')):
             table = provider_inventory.plan_table(out, cap_family, shipped=shipped_templates)

@@ -7,9 +7,11 @@ successful reading newer than the latch that shows it under 100% used, by that
 reading's reset time passing, or by an explicit clear; an account-wide latch narrows
 to the windows such a reading shows exhausted. No latch waits for a person (owner,
 2026-11-24): every latch is also due at a time (`due_at`), after which the next roll
-may pick its candidates again and so re-probes the quota. That time is not a guess
-at recovery: it is the latches' shared re-probe period (account_state.LATCH_RETRY_HOURS)
-counted from the observation. No remote error text is stored.
+may pick its candidates again and so re-probes the quota: the reset the error itself
+states (`stated_reset`, the one parse of a vendor's sentence; an allowance with no
+reader is held exactly until then), else the latches' shared re-probe period
+(account_state.LATCH_RETRY_HOURS) counted from the observation, which is not a guess at
+recovery. No remote error text is stored.
 """
 import json
 import os
@@ -40,22 +42,80 @@ def _time(value):
         return None
 
 
+_CONFIRMED = re.compile(
+    r'individual quota reached|quota[_ ](?:exceeded|exhausted)|insufficient_quota|'
+    r'(?:usage|credit|spending|weekly|monthly) limit (?:reached|exceeded)|'
+    r'usage_limit_reached|insufficient credits|额度(?:已)?(?:耗尽|用尽)|'
+    # A free allowance used up (OpenCode's hosted free tier, anomalyco/opencode#59387, 2026-10-26: "Free usage exceeded,
+    # subscribe to Go", "You've used today's free messages. They reset at ...").
+    r"free usage exceeded|used today['’]s free messages", re.I)
+
+
+def confirmed(error):
+    """True when a provider's error text explicitly says a quota is used up (network errors and generic 429s are not)."""
+    return isinstance(error, str) and bool(_CONFIRMED.search(error))
+
+
+# The reset a limit error states, in the forms the vendor's own sentences use (anomalyco/opencode#59387 and the issues
+# it collects, read 2026-11-24): a wall-clock time ("They reset at 21:00", "They reset at 11:59 PM"), a date and time
+# ("They reset at Oct 28, 2026, 12:59AM"), both shown in the user's local time, and a countdown in seconds
+# ("reintentando en 74000s", the client's "retrying in" line).
+_RESET_DATE = re.compile(r'resets? at\s+([A-Za-z]{3,9}\.? \d{1,2},? \d{4},? \d{1,2}:\d{2}\s?[AaPp][Mm])')
+_RESET_CLOCK = re.compile(r'resets? at\s+(\d{1,2}):(\d{2})(?:\s?([AaPp][Mm]))?(?![\d:])')
+_RESET_COUNTDOWN = re.compile(r'(?:retrying in|reintentando en)\s+(\d+)\s*s\b', re.I)
+
+
+def stated_reset(error, at):
+    """The reset time a limit error states, as an aware datetime, else None. The boundary parse of the vendor's sentence,
+    in one place: a sentence in none of the forms above gives None (the latch's re-probe period applies), never a guess.
+    `at` is when the error was observed: a countdown counts from it, and a bare clock time is its next occurrence."""
+    if not isinstance(error, str):
+        return None
+    at = _time(at) if isinstance(at, str) else at
+    if at is None:
+        return None
+    if (m := _RESET_DATE.search(error)):
+        words = re.findall(r'[A-Za-z]+|\d+', m.group(1))     # month, day, year, hour, minute, AM/PM
+        text = f'{words[0][:3].title()} {words[1]} {words[2]} {words[3]}:{words[4]} {words[5].upper()}'
+        try:
+            return datetime.strptime(text, '%b %d %Y %I:%M %p').astimezone()
+        except ValueError:
+            return None
+    if (m := _RESET_CLOCK.search(error)):
+        hour, minute, half = int(m.group(1)), int(m.group(2)), (m.group(3) or '').upper()
+        if half:
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if half == 'PM' else 0)
+        if hour > 23 or minute > 59:
+            return None
+        local = at.astimezone()
+        moment = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if moment <= local:
+            moment = (local.replace(tzinfo=None) + timedelta(days=1)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0).astimezone()
+        return moment
+    if (m := _RESET_COUNTDOWN.search(error)):
+        return at + timedelta(seconds=int(m.group(1)))
+    return None
+
+
 def record(account, error, *, windows=None, at=None, source=None, path=None):
-    if not isinstance(error, str) or not re.search(
-        r'individual quota reached|quota[_ ](?:exceeded|exhausted)|insufficient_quota|'
-        r'(?:usage|credit|spending|weekly|monthly) limit (?:reached|exceeded)|'
-        r'usage_limit_reached|insufficient credits|额度(?:已)?(?:耗尽|用尽)', error, re.I
-    ):
+    """Latch the quota windows `windows` (the whole account when None) for an error that `confirmed` reads as a used-up
+    quota, with the reset the error states (`stated_reset`) when it states one. The error text is not stored."""
+    if not confirmed(error):
         return False
     path = path or store_path()
     at = at or datetime.now(timezone.utc).isoformat()
+    resets = stated_reset(error, _time(at))
     with override_store.locked(path):
         doc = _read(path)
         previous = doc.setdefault('accounts', {}).get(account) or {}
         # Replaying an old observation must not resurrect a manually cleared latch.
         if (_time(previous.get('observed_at')) or datetime.min.replace(tzinfo=timezone.utc)) >= _time(at):
             return False
-        entry = {'observed_at': at, 'source': source, 'blocked': True}
+        entry = {'observed_at': at, 'source': source, 'blocked': True,
+                 **({'resets_at': resets.isoformat()} if resets else {})}
         # Windows accumulate while latched; unknown windows latch the whole account.
         if windows and not (previous.get('blocked') and not previous.get('windows')):
             entry['windows'] = sorted(set(windows) | set(previous.get('windows') or [] if previous.get('blocked') else []))
@@ -68,9 +128,18 @@ ALL = '*'
 
 
 def due_at(row):
-    """When a latch ends by itself: its observation plus the latches' re-probe period. None for a row with no time."""
+    """When a latch ends by itself: the reset its error stated, else its observation plus the latches' re-probe period.
+    None for a row with no time."""
+    stated = _time((row or {}).get('resets_at'))
+    if stated is not None:
+        return stated
     observed = _time((row or {}).get('observed_at'))
     return observed + timedelta(hours=account_state.LATCH_RETRY_HOURS) if observed else None
+
+
+def stated_reset_of(row):
+    """The reset the latch's error stated, else None."""
+    return _time((row or {}).get('resets_at'))
 
 
 def exhausted_windows(account, usage=None, *, path=None, now=None, read_only=False):

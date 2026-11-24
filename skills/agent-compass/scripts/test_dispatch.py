@@ -4354,9 +4354,11 @@ class ProviderRetryTests(unittest.TestCase):
     decides what it blocks."""
     setUp_dispatch, snapshot = DispatchTests.setUp, DispatchTests.snapshot
     issue, prepare = DispatchTests.issue, DispatchTests.prepare
-    MESSAGE = 'Free usage exceeded, subscribe to Go'
+    # Provider failures that are not quotas: a confirmed used-up quota is a quota latch, not a hold (the last test here).
+    MESSAGE = 'Provider overloaded: this model is temporarily unavailable'
+    V2_MESSAGE = 'This account is not permitted to use these models right now.'
     # opencode 2.2.6 on LS, daemon log `handleStreamEvent: turn_failed`, 2026-11-09.
-    V2_MESSAGE = ('Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, '
+    FREE_LIMIT = ('Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, '
                   'or switch models.')
 
     def setUp(self):
@@ -4450,6 +4452,30 @@ class ProviderRetryTests(unittest.TestCase):
                          ('provider_turn_failed', self.V2_MESSAGE))
         _, excluded = self.excluded('lab_opus55_high')
         self.assertTrue(any('provider turn failed' in e and self.V2_MESSAGE in e for e in excluded), excluded)
+
+    def test_a_turn_that_failed_on_a_used_up_quota_latches_the_windows_it_draws_and_holds_nothing(self):
+        """A confirmed used-up quota (quota_exhaustion.confirmed) is the exhaustion of the windows the model draws, recorded
+        where exhausted windows are (quota_exhaustion), not a provider hold; with no reset in the sentence it is due at the
+        latches' re-probe period (account_state.LATCH_RETRY_HOURS) from the observation."""
+        import account_state
+        import provider_retry
+        import quota_exhaustion
+        self.scopes = ['account']
+        row = self.launched()
+        registry.observe(row['dispatch_id'], self.snapshot(row), now=self.now)
+        at = self.now + timedelta(seconds=15)
+        terminal = {'reason': 'error', 'status': 'error', 'attentionReason': 'error', 'at': at.isoformat(),
+                    'failure_code': 'provider_turn_failed', 'provider_message': self.FREE_LIMIT}
+        done = registry.observe(row['dispatch_id'], self.snapshot(row, status='error'),
+                                now=self.now + timedelta(seconds=20), terminal=terminal)
+        self.assertEqual((done['state'], done['failure_code']), ('failed', 'provider_turn_failed'))
+        self.assertEqual(provider_retry.active(now=at), {})
+        account = self.bundle['account']
+        windows = set(registry.bundle_windows(self.bundle, self.accounts)) or {quota_exhaustion.ALL}
+        self.assertEqual(quota_exhaustion.exhausted_windows(account, now=at, read_only=True), windows)
+        due = at + timedelta(hours=account_state.LATCH_RETRY_HOURS)
+        self.assertTrue(quota_exhaustion.exhausted_windows(account, now=due - timedelta(minutes=1), read_only=True))
+        self.assertEqual(quota_exhaustion.exhausted_windows(account, now=due + timedelta(minutes=1), read_only=True), set())
 
     def test_an_error_the_classifier_reads_as_not_the_provider_holds_nothing(self):
         import provider_retry

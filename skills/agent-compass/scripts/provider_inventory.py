@@ -1641,12 +1641,17 @@ def _latch_exhausted_quota(accounts, state_dir, cache_rows):
             continue
         latched = quota_exhaustion.exhausted_windows(name, cache_rows.get(name), path=exhaustion_path)
         due = quota_exhaustion.due_at(exhausted_accounts.get(name))
+        stated = quota_exhaustion.stated_reset_of(exhausted_accounts.get(name))
         if quota_exhaustion.ALL in latched:
             row.update(status='quota_exhausted',
-                       reason=f"confirmed quota exhausted; re-probed at {due.isoformat() if due else 'the next roll'}")
+                       reason=(f'confirmed quota exhausted; resets at {stated.isoformat()} (stated by the provider)' if stated
+                               else f"confirmed quota exhausted; re-probed at {due.isoformat() if due else 'the next roll'}"))
         elif latched:
             # Only these windows are out; the account's other windows stay routable.
             row['exhausted_windows'] = sorted(latched)
+            if stated:
+                # The reset the provider's own error stated: these windows have 0 left until then (an observed reset).
+                row['exhausted_resets_at'] = stated.isoformat()
 
 
 def _assign_quota_owners(accounts):

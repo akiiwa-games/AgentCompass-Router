@@ -19,12 +19,17 @@ import provider_inventory
 import public_data
 
 
-def bundle_windows(bundle):
-    """Quota windows a dispatched bundle draws; None (whole account) when they cannot be resolved."""
+def bundle_windows(bundle, accounts=None):
+    """Quota windows a dispatched bundle draws, as routing sees them (the five-axis overlay gives a free pool its
+    allowance window); None (whole account) when they cannot be resolved."""
     try:
         import account_fleet
+        import axis_scores
         import quota_pools
-        return quota_pools.bundle_pools(bundle, account_fleet.load_accounts()) or None
+        fleet = accounts if accounts is not None else account_fleet.load_accounts()
+        if '_five_axis' not in fleet:
+            fleet = axis_scores.five_axis_overlay(fleet)
+        return quota_pools.bundle_pools(bundle, fleet) or None
     except Exception:
         return None
 

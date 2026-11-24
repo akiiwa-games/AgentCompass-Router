@@ -722,6 +722,8 @@ class FiveAxisTests(unittest.TestCase):
             sys.path.insert(0, tray_dir)
         doc = document(self.accounts['models'], **{'glm-5.3-flash-free': row(0.75, usd=1.50, image_input='no')})
         acc = copy.deepcopy(self.accounts)
+        # The free plan without the vendor's declaration that it publishes no capacity (capacity_unpublished): mode B.
+        acc['plan_templates'] = {'opencode': {'free': {'provenance': 'vendor', 'price_usd_per_month': 0}}}
         acc['accounts']['opencode']['bundles'] = {
             'glm53_free': {'provider': 'opencode', 'harness': 'opencode', 'account': 'opencode', 'model': 'glm-5.3-flash-free'}
         }

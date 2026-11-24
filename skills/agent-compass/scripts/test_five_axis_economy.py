@@ -726,7 +726,7 @@ class ReadFailureAndHoldTests(unittest.TestCase):
         self.assertEqual(free['selected_bundle']['account'], 'claude')
         entry = provider_retry.record(
             self.bundle('claude', model),
-            {'failure_code': 'provider_turn_failed', 'at': NOW.isoformat(), 'provider_message': 'rate limited, quota exhausted'},
+            {'failure_code': 'provider_turn_failed', 'at': NOW.isoformat(), 'provider_message': 'model temporarily unavailable for this login'},
             dispatch_id='d-1', at=NOW, classify=lambda *a: ('model', {}), accounts=self.fleet.accounts)
         self.assertIsNotNone(entry)
         again = self.fleet.plan(0.3, 0.9, axes=FRONTIER, hours=6.0, allowed=('claude',), usage_hook=hook)
@@ -750,7 +750,7 @@ class ReadFailureAndHoldTests(unittest.TestCase):
         with patch.object(provider_retry, 'resolve_pool', return_value=pool):      # the pools come from structure (pool_of)
             entry = provider_retry.record(
                 self.bundle('claude', fable[0]['bundle']['model']),
-                {'failure_code': 'provider_turn_failed', 'at': NOW.isoformat(), 'provider_message': 'quota exhausted for this plan'},
+                {'failure_code': 'provider_turn_failed', 'at': NOW.isoformat(), 'provider_message': 'this plan may not use these models right now'},
                 dispatch_id='d-2', at=NOW, classify=lambda *a: ('account', {}), accounts=self.fleet.accounts)
         self.assertIsNotNone(entry)
         self.assertEqual(entry['pool']['id'], 'weekly_fable')
@@ -1313,6 +1313,8 @@ class WeeklyWindowTests(unittest.TestCase):
                                                                          'model': 'glm-5.3-flash-free', 'draws': [], 'auto': True},
                                                'named': {'provider': 'opencode', 'harness': 'opencode', 'model': 'glm-5.3-flash-free',
                                                          'draws': ['elsewhere']}}}
+        # A free plan that declares no unpublished capacity (the shipped OpenCode plan declares one: test_free_pool_unpublished.py).
+        acc['plan_templates'] = {'opencode': {'free': {'provenance': 'vendor', 'price_usd_per_month': 0}}}
         out = axis_scores.five_axis_overlay(acc)['accounts']['pool']
         self.assertEqual(list(out['windows']), ['allowance'])
         self.assertEqual(out['bundles']['auto:pool:opencode:x']['draws'], ['allowance'])

@@ -195,6 +195,12 @@ def latched_windows(accounts, account):
     return set((((accounts.get('_discovery') or {}).get('accounts') or {}).get(account) or {}).get('exhausted_windows') or ())
 
 
+def latched_reset(accounts, account):
+    """The reset the latching error stated for this account's latched windows (an observed reset), else None."""
+    row = (((accounts.get('_discovery') or {}).get('accounts') or {}).get(account) or {})
+    return parse_time(row.get('exhausted_resets_at'))
+
+
 def cycle_observation(window, observed, usage_row, now, read_failed_ok=False):
     """The window's reading, or None when a reading that is not current cannot describe the current cycle.
 
@@ -292,8 +298,15 @@ def launch_blockers(bundle, accounts, usage, now, latched=None, records=None):
         # An account the configuration does not describe still has its readings: every window binds.
         spec = {}
         accounts = {**accounts, 'accounts': {**(accounts.get('accounts') or {}), bundle['account']: spec}}
-    if spec.get('unmetered') or spec.get('five_axis_free_pool'):
-        return []       # a purpose-limited channel or a free starter allowance never blocks a launch
+    if spec.get('unmetered'):
+        return []       # a purpose-limited channel never blocks a launch
+    if spec.get('five_axis_free_pool'):
+        # A free allowance has no reading to refuse on: only its confirmed exhaustion stops a launch, until it is due.
+        latched = latched_windows(accounts, bundle['account']) if latched is None else set(latched)
+        reset = latched_reset(accounts, bundle['account'])
+        until = f'its reset at {reset.isoformat()}' if reset else 'it is re-probed'
+        return [(wid, f'{wid} has 0 left until {until}; start after its reset')
+                for wid in bundle_pools(bundle, accounts) if wid in latched]
     policy = accounts.get('scoring') or {}
     row = ((usage or {}).get('accounts') or {}).get(bundle['account']) or {}
     stale = row.get('status') == 'stale' or row.get('stale') is True

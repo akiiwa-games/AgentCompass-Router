@@ -74,7 +74,8 @@ def _snapshot_row(candidate, detail):
                           'binding_window': econ.get('binding_window'),
                           'decided_by': comps.get('decided_by'),
                           'windows': [{k: _round(v) for k, v in w.items()}
-                                      for w in econ.get('windows') or ()]}
+                                      for w in econ.get('windows') or ()],
+                          **({'cost_basis': econ['cost_basis']} if econ.get('cost_basis') else {})}
         if 'expected_usd' not in row and candidate.get('expected_usd') is not None:
             row['expected_usd'] = _round(candidate['expected_usd'])
         if 'expected_hours' not in row and candidate.get('expected_hours') is not None:

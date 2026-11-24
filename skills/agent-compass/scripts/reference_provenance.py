@@ -60,6 +60,15 @@ def validate_plan_templates_provenance(doc):
                 continue
             if 'price_source' in tpl and not valid_vendor_price_source(tpl.get('price_source')):
                 raise ValueError(f'plan-templates[{family!r}][{plan!r}].price_source requires kind="vendor", https url and ISO as_of')
+            if 'capacity_unpublished' in tpl:
+                # The route reads it as an allowance that costs nothing and has no capacity to read: both are vendor facts.
+                if not (valid_vendor_price_source(tpl['capacity_unpublished'])
+                        and str(tpl['capacity_unpublished'].get('statement') or '').strip()):
+                    raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_unpublished requires kind="vendor", '
+                                     'https url, ISO as_of and the statement read')
+                if tpl.get('price_usd_per_month') != 0 or not valid_vendor_price_source(tpl.get('price_source')):
+                    raise ValueError(f'plan-templates[{family!r}][{plan!r}].capacity_unpublished is declared only on a plan '
+                                     'whose cited vendor price is $0 (price_usd_per_month 0 with a price_source)')
 
 
 def validate_accounts_provenance(doc):

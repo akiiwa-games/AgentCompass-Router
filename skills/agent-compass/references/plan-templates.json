@@ -348,5 +348,25 @@
       "basis": "| Ultra | $200/mo | $2000/yr ($167/mo) | 50x |. Live window IDs come from the usage collector; capacity follows the runtime price-matching rule.",
       "windows": {}
     }
+  },
+  "opencode": {
+    "free": {
+      "provenance": "vendor",
+      "price_usd_per_month": 0,
+      "price_source": {
+        "kind": "vendor",
+        "url": "https://opencode.ai/docs/zen/",
+        "as_of": "2026-11-24",
+        "statement": "Free models section: \"Big Pickle is a stealth model that’s free on OpenCode for a limited time.\" \"DeepSeek V4.1 Flash Free is free on OpenCode for a limited time.\""
+      },
+      "capacity_unpublished": {
+        "kind": "vendor",
+        "url": "https://opencode.ai/docs/zen/",
+        "as_of": "2026-11-24",
+        "statement": "The page publishes no request, token, concurrency or dollar limit for the free models (\"free on OpenCode for a limited time\"). The limit shows only when it is reached: the hosted service's error states when the allowance resets (\"Free usage limit reached\", \"You've used today's free messages. They reset at ...\"; maintainer issue https://github.com/anomalyco/opencode/issues/59387, 2026-10-26)."
+      },
+      "allowance_launch_prefix": "opencode",
+      "basis": "OpenCode's free models need no sign-in and draw one allowance whose size the vendor does not publish (`capacity_unpublished`). The router uses it until the vendor's limit error is observed and then holds the allowance until the reset that error states (quota_exhaustion). No window is declared here: the allowance window is the free pool's own (axis_scores.five_axis_overlay). `allowance_launch_prefix`: the free models are OpenCode's own provider `opencode` (launch ids `opencode/<model>`, models.dev catalog `opencode`); OpenCode Go models connected on the same account launch as `opencode-go/<model>`, a paid subscription, and do not draw the free allowance."
+    }
   }
 }

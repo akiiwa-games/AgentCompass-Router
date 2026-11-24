@@ -892,6 +892,18 @@ def account_cards() -> list[dict]:
                     refill if refill is not None else window.get("seconds_until_reset"))),
                 **({"metered_usd": True, "spent_text": spent_text} if metered_usd else {}),
                 "stale": reset_passed or usage_row.get("status") != "fresh" or reading_failed})
+        if spec.get("capacity_unpublished"):
+            # A free allowance the vendor sizes nowhere: no reading, so its one state is whether its limit error latched
+            # it (0 left until the stated reset). The details are hover text, not card prose.
+            usage_hover = _tr("供应商未公布额度上限：用到供应商的限额报错为止，之后等到报错给出的重置时间")
+            reset_at = quota_pools.parse_time((row or {}).get("exhausted_resets_at"))
+            for wid in sorted(latched - {w["id"] for w in windows}):
+                windows.append({
+                    "id": wid, "hours": None, "remaining_pct": 0.0, "used_pct": 100.0, "accounts": 1,
+                    "remaining_usd": None, "reserved_pct": 0.0, "reserved_usd": 0.0, "reserved_workers": [],
+                    "rate_3h": None, "rate_24h": None,
+                    "reset_in": countdown((reset_at - now).total_seconds() if reset_at else None),
+                    "stale": False})
         bundle_pills = []
         for bid, bspec in (spec.get("bundles") or {}).items():
             b_prov = bspec.get("provider")

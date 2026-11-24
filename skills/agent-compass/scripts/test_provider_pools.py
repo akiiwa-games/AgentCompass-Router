@@ -12,7 +12,9 @@ import auto_bundles
 import provider_retry
 from router_test_support import fleet_with_derived_bundles
 
-MESSAGE = 'Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.'
+# A provider failure that is not a quota: a confirmed used-up quota (OpenCode's free-limit sentence among them) is a
+# quota latch of the windows the model draws (quota_exhaustion), not a provider hold (test_free_pool_unpublished.py).
+MESSAGE = 'This account is not permitted to use these models right now.'
 QUOTA = 'You have reached the quota for these models. It resets in 4 hours.'
 NOW = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
 ZEN = ('opencode/deepseek-v4.1-flash-free', 'opencode/glm-5.3-flash-free')
@@ -75,7 +77,7 @@ def test_an_opencode_zen_quota_hold_leaves_go_models_dispatchable(accounts, stor
 
 
 def test_a_go_hold_leaves_zen_dispatchable(accounts, store):
-    hold(accounts, GO[1], 'account', 'd1', message='Monthly limit reached for this model on OpenCode Go.')
+    hold(accounts, GO[1], 'account', 'd1', message='This account is not permitted to use OpenCode Go models right now.')
     assert set(provider_retry.active(now=NOW)) == {'opencode#opencode-go'}
     assert all(held_out(accounts, m) for m in GO)
     assert not any(held_out(accounts, m) for m in ZEN)

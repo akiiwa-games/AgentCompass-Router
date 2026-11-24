@@ -1,4 +1,4 @@
-"""Providers that failed a router worker, held out of dispatch until they are retried or cleared.
+"""Providers that failed a router worker, held out of dispatch until their retry time or an observed fact lifts them.
 
 Contract: the Paseo bridge's watcher records a terminal sighting carrying the provider's own message verbatim when
   - `provider_retry_stuck`: it stopped a worker whose provider kept retrying one request with nothing else happening
@@ -6,13 +6,14 @@ Contract: the Paseo bridge's watcher records a terminal sighting carrying the pr
     auto-retry status line), with the provider's next retry time when it gave one, or
   - `provider_turn_failed`: the worker's turn ended in error with the provider's error text (agent.lastError; opencode
     2.x fails a free model at once: "Free usage limit reached. Connect a provider or subscribe to OpenCode Go ...").
-None is special-cased here. This module records each such dispatch once in <state dir>/provider-retry.json:
+None is special-cased here, except that a message quota_exhaustion confirms as a used-up quota is its fact, not a hold
+(below). This module records each such dispatch once in <state dir>/provider-retry.json:
   - Scope: the configured System-One classifier reads the provider's message and answers `model` (this model only),
-    `account` (every model of the account, e.g. a free-usage quota all free models share), `transient`, `none` (not
+    `account` (every model of the account, e.g. rejected credentials or a limit shared by its models), `transient`, `none` (not
     the provider refusing or failing to serve, e.g. a tool or code error), `task_input` (this task's own input was
     refused, e.g. a prompt too long for the model), or `unknown`. `none` and `task_input` hold nothing, and a failed
     turn read that way is the worker's error, not the provider's (`outcome_code`).
-    No code reads the message. `unknown`, or no classifier answer, holds the model and widens to its pool once a
+    No code here reads the message (quota_exhaustion.confirmed does). `unknown`, or no classifier answer, holds the model and widens to its pool once a
     second model of the same pool is held the same way, i.e. a recent hold whose scope was also `unknown` (a
     `transient` or `model` hold never widens anything); `transient` and `model` hold only the model.
   - Pools: one account (one Paseo provider) can hold several independent quotas, so an `account` answer, or a widened
@@ -372,17 +373,26 @@ def record(bundle, failure, *, dispatch_id, at=None, classify=None, path=None, a
     # The classifier can take seconds: ask it before taking the lock.
     scope, meta = (classify or classify_scope)(account, provider, model, message, code)
     scope = scope if scope in SCOPES else 'unknown'
-    # Reading the accounts can take a moment too, and a scope that holds nothing needs no pool.
-    pool = resolve_pool(bundle, accounts) if scope not in NO_HOLD else None
     at = _time(at) or _time(failure.get('at')) or datetime.now(timezone.utc)
+    # A used-up quota is not a provider hold: it is the exhaustion of the windows the model draws, latched with the reset
+    # the message states (quota_exhaustion owns both). The dispatch keeps the classifier's scope for the fall-back.
+    import quota_exhaustion
+    quota = quota_exhaustion.confirmed(message)
+    if quota:
+        import dispatch_registry
+        quota_exhaustion.record(account, message, windows=dispatch_registry.bundle_windows(bundle, accounts),
+                                at=at.isoformat(), source=dispatch_id)
+    # Reading the accounts can take a moment too, and a scope that holds nothing needs no pool.
+    pool = resolve_pool(bundle, accounts) if scope not in NO_HOLD and not quota else None
     nxt = _time(failure.get('next'))
     with override_store.locked(path):
         doc = _read(path)
         if dispatch_id in doc['dispatches']:
             return None
-        doc['dispatches'][dispatch_id] = {'at': at.isoformat(), 'scope': scope}
-        if scope in NO_HOLD:
-            # Read, and not the provider's doing: nothing to hold, and never read again.
+        doc['dispatches'][dispatch_id] = {'at': at.isoformat(), 'scope': scope,
+                                          **({'quota_exhausted': True} if quota else {})}
+        if scope in NO_HOLD or quota:
+            # Read, and not the provider's doing (or a quota latch holds it): nothing to hold, and never read again.
             override_store.write(path, doc)
             return None
         entries = doc['entries']

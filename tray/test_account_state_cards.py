@@ -280,6 +280,25 @@ class AccountStateCardTests(unittest.TestCase):
         self.assertNotIn('capacity_unknown', card['usage_note'])   # an internal flag is not interface text
         self.assertIn('$1.85', card['usage_note'])
 
+    def test_a_free_pool_with_no_published_capacity_is_a_state_with_its_details_in_the_hover(self):
+        # Owner, 2026-11-24: used until the vendor's limit error, then 0 left until the reset that error states. The card
+        # shows the latched allowance as a window (a state), the explanation only in the hover.
+        from datetime import datetime, timedelta, timezone
+        spec = {'five_axis_free_pool': True, 'windows': {'allowance': {'hours': None}}, 'bundles': {},
+                'capacity_unpublished': {'kind': 'vendor', 'url': 'https://example.invalid/free', 'as_of': '2026-11-24',
+                                         'statement': 'no limit published', 'plan': 'free'}}
+        free = self.card({'family': 'opencode', 'status': 'ready'}, name='opencode', spec=spec)
+        self.assertEqual((free['kind'], free['windows']), ('ok', []))
+        self.assertNotIn('不参与自动路由', free['badge'])
+        self.assertIn('供应商未公布额度上限', free['usage_hover'])
+        self.assertNotIn('capacity_unknown', free)
+        reset = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        held = self.card({'family': 'opencode', 'status': 'ready', 'exhausted_windows': ['allowance'],
+                          'exhausted_resets_at': reset.isoformat()}, name='opencode', spec=spec)
+        self.assertEqual([(w['id'], w['remaining_pct']) for w in held['windows']], [('allowance', 0.0)])
+        self.assertIn('5', held['windows'][0]['reset_in'])
+        self.assertIn('供应商未公布额度上限', held['usage_hover'])
+
     def test_a_plan_without_capacity_says_whether_the_tier_was_read(self):
         # Owner, 2026-11-19: the card said "套餐未知（Mode B）", an internal name. No tier read is a failed reading;
         # a tier that was read but that no plan template sizes is a plan without capacity data.

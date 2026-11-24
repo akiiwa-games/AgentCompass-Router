@@ -455,7 +455,7 @@ def quota_unobserved(accounts, usage, bundle):
     account = bundle['account']
     spec = (accounts.get('accounts') or {}).get(account) or {}
     if spec.get('unmetered') or spec.get('five_axis_free_pool'):
-        return None     # a purpose-limited channel or a free starter allowance never blocks a launch (launch_blockers)
+        return None     # a purpose-limited channel or a free allowance has no reading to miss (launch_blockers)
     row = (usage.get('accounts') or {}).get(account) or {}
     fresh = bool(usage.get('read_ok')) and row.get('status') == 'fresh'
     windows = quota_pools.applicable_windows(spec, bundle.get('model'), row if fresh else {}, bundle=bundle,

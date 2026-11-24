@@ -526,12 +526,24 @@ def evaluate_bundle(bundle, task, ctx):
         acct_usage = ctx['usage'].get('accounts', {}).get(bundle['account']) or {}
         acct_stale = acct_usage.get('status') == 'stale' or acct_usage.get('stale') is True
         latched = quota_pools.latched_windows(accounts, bundle['account'])
+        latched_reset = quota_pools.latched_reset(accounts, bundle['account'])
+        unpaid = quota_economy.unpaid_allowance(spec)
         named = not pool and (pin_hit or task.get('pinned_bundle') == bundle['id'])
         for wid, wspec, observed in quota_pools.applicable_windows(spec, model, acct_usage, bundle, accounts):
             result.setdefault('_five_axis_windows', []).append(wid)
             is_short = quota_pools.window_is_short(wspec, policy)
             long_applicable = long_applicable or not is_short
             observed = quota_pools.cycle_observation(wspec, observed, acct_usage, now, read_failed_ok=True)
+            if wid in latched and latched_reset is not None and latched_reset > now:
+                # The provider's own error stated when this window resets: 0 left until then, a quota wait like any
+                # window used up with a known reset (the merged quota-wait rule), not an exclusion.
+                result['_five_long_wait'] = True
+                if not pool:
+                    wait = (latched_reset - now).total_seconds() / 3600
+                    available_at, waiting_on = binding_wait(available_at, waiting_on, wait, wid, waits)
+                    result['notes'].append(f'{wid} has 0 left until its reset at {latched_reset.isoformat()} '
+                                           f"(stated by the provider's limit error); start after its reset")
+                continue
             if wid in latched:
                 (short_exclude if is_short else exclude)(f'{wid}: quota confirmed exhausted; refresh quota or replan')
             below_floor = wid not in latched and quota_pools.below_launch_floor(wspec, observed, acct_usage, now)
@@ -544,6 +556,12 @@ def evaluate_bundle(bundle, task, ctx):
                                  account_stale=acct_stale, expected_reset_at=expected)
             unit = quota_economy.unit_rate(spec, wid, model, info)
             cap_usd_w = quota_economy.capacity_usd(spec, wid)
+            if cap_usd_w is None and unpaid:
+                # The vendor publishes no capacity for this allowance (plan-templates `capacity_unpublished`): nothing to
+                # read, price, reserve against or floor. It is used until its limit error latches it (quota_exhaustion).
+                result['notes'].append(f"{wid}: the vendor publishes no capacity ({unpaid.get('url')}, read "
+                                       f"{unpaid.get('as_of')}); used until its limit error, then held until the stated reset")
+                continue
             if cap_usd_w is None:
                 if floor_refusal:
                     (short_exclude if is_short else exclude)(floor_refusal)
@@ -680,6 +698,8 @@ def evaluate_bundle(bundle, task, ctx):
                 exclude(f'data error: {err}{plan_suffix} (out of automatic routing; name the model to dispatch it)')
         if quota_pools.metered_usd_uncapped(spec):
             pass  # no budget: not a window, not excluded for exhaustion, still a metered last resort
+        elif unpaid and long_applicable:
+            pass  # it draws an allowance with no published capacity: nothing about it is unread
         elif (not spec.get('unlimited') and not account_out and not result.get('data_errors')
                 and not any(not st.get('short') for _, st, _, _ in five_window_states.values())):
             # Priced on the weekly window or not at all (round 15): a candidate with no long reset-period window in its
@@ -701,7 +721,7 @@ def evaluate_bundle(bundle, task, ctx):
         result['_five_econ_hours'] = econ_hours
         result['_five_chain_hours'] = econ_chain_hours
         result['_five_context_burn'] = context_burn
-        if not five_window_states and not result['excluded'] and not result.get('data_errors'):
+        if not five_window_states and not result['excluded'] and not result.get('data_errors') and not (unpaid and long_applicable):
             result['notes'].append('no current capacity observation; unknown is not exhausted')
     # A declared dispatch cadence holds every account to it. It is priced only where it is the account's whole quota (an
     # unmetered account); beside quota windows it is a gate, and those windows price the task as they do without it.
