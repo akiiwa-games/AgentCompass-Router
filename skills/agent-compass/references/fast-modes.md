@@ -9,8 +9,8 @@ effective local policy) means no fast. Automatic selection, explicit records and
 launch revalidation read this same declaration (`fast_modes.refusal`: `<model> has no
 verified fast mode on <harness>`). A route named with `--fast` that has no such contract launches in its plain mode
 as if `--fast` had not been given, with `--fast was not applied: <reason>; the route runs in its plain mode.`; so does a
-stored decision recorded fast before its contract was withdrawn. A worker started fast is not resumed (its session keeps
-fast mode): roll answers `roll_fresh_worker`.
+stored decision recorded fast before its contract was withdrawn. A worker started fast on a route whose contract
+was withdrawn is not resumed (its session keeps fast mode): roll answers `roll_fresh_worker`.
 
 | Harness | Verified models | Paseo creation | CLI creation |
 |---|---|---|---|

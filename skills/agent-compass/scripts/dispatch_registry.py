@@ -279,6 +279,10 @@ def plan_row_holds(candidate, named):
                       and not e.startswith(('ability ', 'explicit model constraint', 'explicit effort constraint',
                                             provider_retry.EXCLUSION_PREFIX))]
         waits = [w for w in waits if w not in candidate_eval.AUTOMATIC_ROUTING_WAITS]
+        if waits:
+            # A named --fast on a row that must wait is held by the wait, which carries its time; that fast mode is
+            # offered only to a row that can start now is no second refusal beside it.
+            exclusions = [e for e in exclusions if e != candidate_eval.FAST_WAIT_REFUSAL]
     return exclusions, waits
 
 
@@ -534,7 +538,10 @@ def issue(result, task, now=None, path=None, allocation_task=None, listed_rows=N
     listed_rows = listed_rows if explicit else None
     named = explicit or (result.get('stage') == 'record' and result.get('constraint') == 'explicit_resume')
     route = {k: v for k, v in (route or {}).items() if v} if named else {}
-    accounts = provider_inventory.with_listed_rows(account_fleet.load_accounts(), listed_rows)
+    # The catalog row as a plan reads it: the windows a row draws are settled by the overlay (a free pool's allowance is
+    # declared there, after the auto bundles were derived), and the stored bundle is what the latch, the in-flight
+    # reservation and the launch facts read.
+    accounts = _overlaid(provider_inventory.with_listed_rows(account_fleet.load_accounts(), listed_rows))
     resolved = resolve_bundle(bundle, accounts, explicit)
     if resolved:
         bundle = {**bundle, **resolved}

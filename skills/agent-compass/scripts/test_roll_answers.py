@@ -1112,6 +1112,19 @@ class NamedRouteFactRefusalTests(unittest.TestCase):
                 self.assertEqual(datetime.fromisoformat(refused.retry_at), self.now + timedelta(hours=20.2))
                 self.assertTrue(refused.cause.startswith('seven_day holds it'), refused.cause)
 
+    def test_g_a_named_fast_row_that_must_wait_is_refused_by_the_wait_with_its_time(self):
+        """Rule (plan_row_holds, a named route is refused by a fact with its time): a named --fast on a row that must
+        wait is held by the wait; that fast mode is offered only to a row that can start now is no second, timeless
+        refusal beside it. Automatic routing keeps that exclusion."""
+        import candidate_eval
+        row = {'bundle': {'account': 'codex', 'bundle_id': 'sol', 'id': 'sol'}, 'waits': {'five_hour': 2.0},
+               'excluded': [candidate_eval.FAST_WAIT_REFUSAL], 'wait_reasons': {'five_hour': 'five_hour holds it for 2.0h'}}
+        exclusions, held = registry.plan_row_holds(row, True)
+        refused = registry.named_route_refusal(row, exclusions, held, {'accounts': {}}, self.now, user_named=True)
+        self.assertEqual(refused.waiting_on, 'five_hour')
+        self.assertEqual(datetime.fromisoformat(refused.retry_at), self.now + timedelta(hours=2.0))
+        self.assertIn(candidate_eval.FAST_WAIT_REFUSAL, registry.plan_row_holds(row, False)[0])
+
     def test_c_request_input_refusals_stay_error_with_present_next_action(self):
         import live_models
         self.write_usage_cache([

@@ -33,10 +33,13 @@ def store_path():
 
 
 def _read(path):
+    """The store, or an empty one when the file is absent or is not the document this module writes (derived state: a
+    latch that cannot be read is observed again by the next turn that meets the limit)."""
     try:
-        return json.loads(override_store.retry_denied(lambda: path.read_text(encoding='utf-8')))
-    except FileNotFoundError:
+        doc = json.loads(override_store.retry_denied(lambda: path.read_text(encoding='utf-8')))
+    except (FileNotFoundError, ValueError):
         return {'accounts': {}}
+    return doc if isinstance(doc, dict) and isinstance(doc.get('accounts'), dict) else {'accounts': {}}
 
 
 def _time(value):

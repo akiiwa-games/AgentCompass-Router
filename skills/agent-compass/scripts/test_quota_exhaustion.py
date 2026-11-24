@@ -114,3 +114,50 @@ def test_a_latch_with_no_reading_ends_by_itself_at_the_latches_period(tmp_path):
     assert q.stopping('acme', path=path, windows=['allowance'], now=after, read_only=True) == set()
     assert q.stopping('acme', path=path, windows=['allowance'], now=before) == {'allowance'}   # read_only or not
     assert q.stopping('acme', path=path, windows=['allowance'], now=after) == set()
+
+
+def test_a_store_that_is_not_this_modules_document_reads_as_empty(tmp_path):
+    """Rule (quota_exhaustion._read): the store is derived state, so a file cut short or of another shape reads as no
+    latch (the next turn that meets the limit observes it again) and stops no plan."""
+    path = tmp_path / 'quota.json'
+    for text in ('{', '[]', 'null', '{"accounts": []}'):
+        path.write_text(text, encoding='utf-8')
+        assert q.stopping('account', path=path) == set(), text
+    assert q.record('account', 'Individual quota reached', at=RECENT, path=path)
+    assert q.stopping('account', path=path) == {q.ALL}
+
+
+def test_a_stored_decision_draws_the_windows_its_plan_row_draws(tmp_path, monkeypatch):
+    """Rule (dispatch_registry.issue): the bundle a decision stores is the catalog row as a plan reads it. A free pool's
+    allowance is declared by the overlay after its auto bundles were derived, and the stored bundle is what the latch,
+    the in-flight reservation and the launch facts read: a latched allowance stops the stored bundle's launch."""
+    import account_fleet
+    import axis_scores
+    import dispatch_registry
+    import host_policy
+    import provider_inventory
+    import quota_pools
+    now = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+    reset_at = (now + timedelta(hours=6)).isoformat()
+    store = tmp_path / 'quota-exhaustion.json'
+    monkeypatch.setattr(q, 'store_path', lambda: store)
+    q.record('opencode', "You've used today's free messages. They reset at 18:00 UTC.", windows=['allowance'],
+             at=now.isoformat(), source='test', path=store, resets_at=reset_at)
+    discovery = {'schema_version': 2, 'launchers': {'opencode': {'status': 'ready', 'family': 'opencode'}},
+                 'accounts': {'opencode': {'provider': 'opencode', 'family': 'opencode', 'status': 'ready', 'plan': 'free',
+                                           'models': ['opencode/mimo-v2.6-flash-free'], 'exhausted_windows': ['allowance'],
+                                           'exhausted_resets_at': reset_at, 'exhausted_reset_stated': True}}}
+    monkeypatch.setattr(provider_inventory, 'current', lambda *a, **kw: discovery)
+    monkeypatch.setattr(host_policy, 'load_policy', lambda *a, **kw: {'allowed_accounts': ['opencode']})
+    overlaid = axis_scores.five_axis_overlay(account_fleet.load_accounts(read_only=True), read_local_state=False, now=now)
+    bid, row = next((k, b) for k, b in overlaid['accounts']['opencode']['bundles'].items() if k.startswith('auto:'))
+    assert row['draws'], row
+    task = {'parent_agent_id': 'parent', 'task_id': 'task', 'objective': 'x', 'hours': 0.5}
+    issued = dispatch_registry.issue(
+        {'stage': 'plan', 'choice': bid, 'decision': {'action': 'start'},
+         'selected_bundle': {**row, 'id': bid, 'bundle_id': bid, 'expected_usd': 0.25}},
+        task, now=now, path=tmp_path / 'dispatch.sqlite3')
+    stored = dispatch_registry.decision_record(issued['decision_id'], path=tmp_path / 'dispatch.sqlite3')['bundle']
+    assert stored['draws'] == row['draws']
+    assert quota_pools.launch_blockers(stored, overlaid, {'accounts': {}}, now)
+
