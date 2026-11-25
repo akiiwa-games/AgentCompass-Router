@@ -1323,11 +1323,16 @@ def boost_targets() -> list[tuple[str, str]]:
 def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, str] | None = None) -> str:
     """Add or remove one (account, model) of the user's quick-priority menu (`priority_targets` of
     accounts-override.json; the tray menu and the panel's one-click buttons show it). The first change starts from the
-    entries shown now, so the menu the user edits is the one they see."""
+    entries shown now, so the menu the user edits is the one they see. After that the user's list is edited entry by
+    entry: one that shows nothing now (its account or model is switched off) and an entry's own label stay."""
     modules()
     import account_fleet
     accounts = account_fleet.load_accounts()
     entries = [(t["account"], t["model"]) for t in router_priority.targets(accounts)]
+
+    def shows(entry) -> tuple[str, str] | None:
+        found = router_priority.targets(accounts, [entry]) if isinstance(entry, dict) else []
+        return (found[0]["account"], found[0]["model"]) if found else None
     if add is not None:
         account, model = add
         found = router_priority.targets(accounts, [{"account": account, "model": model}]) if model else []
@@ -1336,15 +1341,23 @@ def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, 
         pair = (found[0]["account"], found[0]["model"])
         if pair in entries:
             return _tr("快捷菜单里已有 {0}").format(found[0]["label"])
-        entries.append(pair)
         message = _tr("已加入快捷菜单：{0}").format(found[0]["label"])
+
+        def change(kept: list) -> list:
+            return [*kept, {"account": pair[0], "model": pair[1]}]
     elif remove is not None and tuple(remove) in entries:
-        entries.remove(tuple(remove))
         message = _tr("已从快捷菜单移除")
+
+        def change(kept: list) -> list:
+            return [entry for entry in kept if shows(entry) != tuple(remove)]
     else:
         return _tr("快捷菜单没有变化")
-    _edit_preferences(lambda document: document.__setitem__(
-        "priority_targets", [{"account": account, "model": model} for account, model in entries]))
+
+    def write(document: dict) -> None:
+        stored = document.get("priority_targets")
+        document["priority_targets"] = change(
+            list(stored) if isinstance(stored, list) else [{"account": a, "model": m} for a, m in entries])
+    _edit_preferences(write)
     return message
 
 

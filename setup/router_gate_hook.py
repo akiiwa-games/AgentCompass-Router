@@ -1059,7 +1059,9 @@ def detect_subagent_launch(tool_name: str, tool_input: dict, cwd: object = None)
     if tool_name in DIRECT_SUBAGENT_TOOLS:
         return None if host_tool_agent(tool_name, tool_input, cwd) else f"tool:{tool_name}"
     if tool_name in SCHEDULE_RETARGET_TOOLS:
-        return f"tool:{tool_name}" if any(tool_input.get(k) for k in SCHEDULE_TARGET_FIELDS) else None
+        # A model set to null clears the stored one (Paseo then starts the provider's default): a new target too.
+        retargets = any(tool_input.get(k) for k in SCHEDULE_TARGET_FIELDS) or tool_input.get("model", "") is None
+        return f"tool:{tool_name}" if retargets else None
     if tool_name in CODEMODE_TOOLS:
         if any(name in DIRECT_SUBAGENT_TOOLS for name, _ in wrapped_agent_calls(tool_name, tool_input)):
             return f"{tool_name}:create_agent"
@@ -1885,14 +1887,18 @@ def judge_schedule(
     if UNKNOWN_CLI_VALUE in named.values():
         note_unevaluated(SCHEDULE_ROUTE, "its provider or model is not a literal in the call")
         return unchecked, {}
-    route = {**{k: v for k, v in stored.items() if k in SCHEDULE_ROUTE_FIELDS}, **named}
+    kept = {k: v for k, v in stored.items() if k in SCHEDULE_ROUTE_FIELDS}
+    if args.get("model", "") is None or named.get("provider") not in (None, kept.get("provider")):
+        kept.pop("model", None)    # the stored model is the stored provider's, and a cleared model is no model
+    route = {**kept, **named}
     if len(route) == len(SCHEDULE_ROUTE_FIELDS) and identities:
-        own = [row for row in rows if carries_route(row) and written_by(row, identities)]
+        own = [row for row in rows if carries_route(row) and written_by(row, identities, paseo_agents_dir)]
         by_user = [row for row in own if row.get("stage") == "record" and row.get("constraint") == "user_override"
                    and row.get("trigger") != "workflow"]
         plans = [] if unchecked else [row for row in own if row.get("stage") == "plan"]
         for candidates in (by_user, plans):
-            if candidates and match_route(candidates, route, context, trigger, accounts=accounts, identities=identities)[0]:
+            if candidates and match_route(candidates, route, context, trigger, accounts=accounts, identities=identities,
+                                          paseo_agents_dir=paseo_agents_dir)[0]:
                 return None, {}
     if unchecked:
         return unchecked, {}
@@ -1941,21 +1947,22 @@ def caller_identities(payload: dict, caller_id: str | None) -> set[str]:
     }
 
 
-def written_by(row: dict, identities: set[str]) -> bool:
+def written_by(row: dict, identities: set[str], paseo_agents_dir: Path | None = None) -> bool:
     """The row was written by the calling session: its `session_ids` (the writer's own IDs, never the parent link
-    in parent_id/host_session_id, which a worker's rows carry for its parent) name one of the caller's IDs."""
+    in parent_id/host_session_id, which a worker's rows carry for its parent) name the caller (`is_caller`: one of
+    its IDs, or the Paseo agent whose provider session the hook carries)."""
     ids = row.get("session_ids")
-    return isinstance(ids, list) and bool(identities & {str(v) for v in ids if v})
+    return isinstance(ids, list) and any(is_caller(str(v), identities, paseo_agents_dir) for v in ids if v)
 
 
-def check_workflow_record(rows: list[dict], identities: set[str]) -> str | None:
+def check_workflow_record(rows: list[dict], identities: set[str], paseo_agents_dir: Path | None = None) -> str | None:
     """A Workflow passes only on this session's `record --trigger workflow` of the user's own naming (`user_override`).
     The record names no route: a Workflow's agents run on the calling session's own account and model."""
     if not identities:
         return workflow_deny_reason("hook 输入里没有会话 ID，无法确认授权记录属于本会话")
     for row in rows:
         if (row.get("stage") == "record" and row.get("constraint") == "user_override"
-                and row.get("trigger") == "workflow" and written_by(row, identities)):
+                and row.get("trigger") == "workflow" and written_by(row, identities, paseo_agents_dir)):
             return None
     return workflow_deny_reason("最近 15 分钟内本会话没有 `--trigger workflow` 的 user_override 记录")
 
@@ -2132,7 +2139,9 @@ def _decide_checked(
                     own_target = dict(target, account=own)
                     if found := check_target_disabled(own, resolve_target(own_target, accounts)[1]):
                         unchecked, native_unchecked = found, (own, target["model"])
-                reason = check_account_quota_exhausted(
+                # A schedule starts its runs at its own times: a window used up now says nothing about them, and
+                # the route the gate itself hands out for it must pass when the caller repeats it.
+                reason = None if trigger in SCHEDULE_TRIGGERS else check_account_quota_exhausted(
                     account or target.get("provider"), usage_cache_path=usage_cache_path, now=now, accounts=accounts,
                     windows=target_windows(candidates, accounts), bundles=candidates, model=target.get("model"),
                     exclude_dispatch_id=dispatch_id or target.get("dispatch_id"), exclude_agent_id=target.get("agent_id"),
@@ -2165,7 +2174,7 @@ def _decide_checked(
             if rows is None:
                 rows = recent_routes(ledger, now=now, window_seconds=win)
             if trigger == WORKFLOW_TRIGGER:
-                reason, fill = check_workflow_record(rows, identities), {}
+                reason, fill = check_workflow_record(rows, identities, paseo_agents_dir), {}
             else:
                 reason, fill = judge_schedule(
                     rows, args, correlation_fields(payload, tool_input, args), trigger, accounts, identities,

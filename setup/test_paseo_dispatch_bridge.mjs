@@ -1757,6 +1757,33 @@ test('a resume send whose outcome is not known keeps the worker bound and is not
   }
 });
 
+test('a resume that was not sent leaves no label of its dispatch, on an untitled worker too', async () => {
+  // Paseo merges a label patch and never removes a key, and its client refuses a null name (the SDK's request schema).
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-rollback-'));
+  const previous = process.env.ROUTER_STATE_DIR;
+  process.env.ROUTER_STATE_DIR = stateDir;
+  try {
+    let worker = {...resumable, title: null, labels: {'paseo.parent-agent-id': 'parent'}};
+    const client = {
+      fetchAgent: async id => ({agent: id === 'parent' ? {cwd: '/fixture'} : worker}),
+      updateAgent: async (id, patch) => {
+        if ('name' in patch && typeof patch.name !== 'string') throw new TypeError('name must be a string');
+        worker = {...worker, labels: {...worker.labels, ...patch.labels}};
+      },
+      sendMessage: async () => { throw Object.assign(new Error('refused'), {name: 'DaemonRpcError'}); },
+    };
+    const result = await execute(client, resumeInput, notifier);
+    assert.deepEqual([result.sent, result.error], [false, 'host_resume_failed']);
+    assert.deepEqual(worker.labels, {'paseo.parent-agent-id': 'parent', 'router.dispatch_id': ''});
+    // The blanked label is no owner and no dispatch: the next resume of this worker is admitted.
+    const next = await execute({...client, sendMessage: async () => {}}, resumeInput, notifier);
+    assert.equal(next.ok, true);
+  } finally {
+    if (previous === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = previous;
+    fs.rmSync(stateDir, {recursive: true, force: true});
+  }
+});
+
 test('a relabel whose outcome is not known is put back before the resume is reported as not sent', async () => {
   // The label may be on the worker although the request timed out. A worker created in its place must be the only
   // one carrying this dispatch; when the old labels cannot be put back either, the worker stays bound and nothing is

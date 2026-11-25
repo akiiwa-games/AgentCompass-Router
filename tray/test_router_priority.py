@@ -190,7 +190,14 @@ class PriorityTests(unittest.TestCase):
             written.assert_not_called()
             router_data.change_priority_menu(remove=shipped[0])
             written.call_args.args[0](document)
-            self.assertEqual(document['priority_targets'], [{'account': a, 'model': m} for a, m in shipped[1:]])
+            self.assertEqual(document['priority_targets'], [{'account': a, 'model': m} for a, m in [*shipped[1:], added]])
+            # The user's list is edited entry by entry: an entry that shows nothing now and an entry's label stay.
+            off = {'account': 'no-such-account', 'model': 'gpt-6-astra'}
+            labelled = {'account': shipped[0][0], 'model': shipped[0][1], 'label': 'Mine'}
+            document = {'priority_targets': [off, labelled]}
+            router_data.change_priority_menu(add=added)
+            written.call_args.args[0](document)
+            self.assertEqual(document['priority_targets'], [off, labelled, {'account': added[0], 'model': added[1]}])
         # The list as load_accounts hands it on: the user's, whole.
         mine = {'schema_version': 2, 'priority_targets': [{'account': added[0], 'model': added[1]}]}
         with patch.object(account_fleet.accounts_override, 'load_override', return_value=mine):

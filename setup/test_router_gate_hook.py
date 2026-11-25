@@ -3204,16 +3204,61 @@ process.stdout.write(JSON.stringify(out));
         ledger = self.write_ledger(str(self.state), [])
         runs = self.planner(ledger)
         self.stored_schedule()
+        self.stored_schedule("s2", provider="claude", model="claude-sonnet-5-5")
         for args, blocked in (({"id": "s1", "model": "gpt-6-astra"}, False),
                               ({"id": "s1", "provider": "codex", "model": "gpt-6-astra"}, False),
                               ({"id": "s1", "model": "gpt-6.1-sol"}, True),
+                              # A model set to null clears it (the provider's default would start): the plan's is asked for.
+                              ({"id": "s1", "model": None}, True),
+                              # Another provider: the stored model was the stored provider's and is not part of the route.
+                              ({"id": "s2", "provider": "codex"}, True),
                               ({"id": "s1", "cron": "9 * * * *"}, False)):
             with self.subTest(update=args):
                 result = gate.evaluate_payload({"tool_name": "mcp__paseo__update_schedule", "tool_input": args,
                                                 "session_id": "claude-session"}, ledger_path=ledger, now=T0,
                                                paseo_agents_dir=self.state / "agents")
                 self.assertEqual("reason" in result, blocked)
+                self.assertNotIn("claude-sonnet-5-5", result.get("reason", ""))
         self.assertEqual(runs, ["work"])
+
+    def test_the_route_the_gate_names_for_a_schedule_passes_whatever_the_window_reads_now(self):
+        """A schedule starts its runs at its own times: the quota check of a launch now (check_account_quota_exhausted)
+        does not refuse the route the gate itself handed out."""
+        ledger = self.write_ledger(str(self.state), [])
+        self.planner(ledger)
+        call = {"prompt": "x", "cron": "7 * * * *"}
+        now = dt.datetime.now(UTC)
+        with mock.patch.dict(os.environ, {"ROUTER_STATE_DIR": str(self.state)}), \
+                mock.patch.object(gate, "recent_routes", wraps=lambda *a, **k: [
+                    json.loads(line) for line in Path(ledger).read_text(encoding="utf-8").splitlines() if line.strip()]):
+            gate.router_module("quota_exhaustion").record("codex", "429 usage limit reached", windows=["usage"],
+                                                          at=now.isoformat(), source="w-1")
+            launch = gate.evaluate_payload({"tool_name": "mcp__paseo__create_agent", "session_id": "claude-session",
+                                            "tool_input": {"provider": "codex/gpt-6-astra", "initialPrompt": "x"}},
+                                           ledger_path=ledger, now=now)
+            self.assertIn("quota", launch["reason"])        # the failure is on record: a launch now is refused
+            first = gate.evaluate_payload({"tool_name": "create_schedule", "tool_input": call,
+                                           "session_id": "claude-session"}, ledger_path=ledger, now=now)
+            self.assertIn('provider="codex/gpt-6-astra"', first["reason"])
+            again = gate.evaluate_payload({"tool_name": "create_schedule", "session_id": "claude-session",
+                                           "tool_input": dict(call, provider="codex/gpt-6-astra")},
+                                          ledger_path=ledger, now=now)
+            self.assertEqual(again, {})
+
+    def test_a_record_written_under_the_paseo_agent_is_this_sessions_when_the_hook_carries_its_host_session(self):
+        """written_by reads the writer as is_caller does: a row written under the Paseo agent ID is the caller's when
+        the hook carries only that agent's provider session."""
+        directory = self.state / "agents" / "project"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "paseo-agent.json").write_text(json.dumps(
+            {"provider": "claude", "persistence": {"sessionId": "host-session"}}), encoding="utf-8")
+        ledger = self.write_ledger(str(self.state), [self.workflow_record(session_ids=["paseo-agent"])])
+        call = {"tool_name": "Workflow", "tool_input": {"script": "export const meta = {name: 'x', description: 'y'}"}}
+        for session, passes in (("host-session", True), ("another-session", False)):
+            with self.subTest(session=session), mock.patch.dict(os.environ, {"PASEO_AGENT_ID": ""}):
+                result = gate.evaluate_payload(dict(call, session_id=session), ledger_path=ledger, now=T0,
+                                               paseo_agents_dir=self.state / "agents")
+                self.assertEqual(result == {}, passes)
 
     def test_schedule_plan_is_this_sessions_by_any_id_that_names_the_caller(self):
         """Antigravity names its session `conversationId`: the plan it wrote is its own (caller_identities), as a

@@ -118,6 +118,8 @@ EN = {
     '尚未发现可用模型': 'No models discovered yet',
     '已选模型 · 推理档位自动选择': 'Selected models · reasoning effort selected automatically',
     '临时优先加权': 'Temporary boost',
+    '已更新 {0}{1} 预期重置，{2} 小时后重置前动态优先': 'Updated the expected reset of {0}{1}: priority until it resets in {2} h',
+    '已更新 {0}/{1} 预期重置时间；重置确认后撤销，最迟 {2} 失效': 'Updated the expected reset time of {0}/{1}; withdrawn once the reset is confirmed, ends {2} at the latest',
     '编辑菜单…': 'Edit menu…',
     '预计 {0} 小时后重置': 'Expected reset in {0} hours',
     '取消优先': 'Cancel Priority',

@@ -1568,7 +1568,7 @@ export async function execute(client, input, notify = ensureNotification) {
     if (!existing || existing.archivedAt)
       return {ok: false, sent: false, error: 'worker_not_found', condition: existing ? 'archived' : 'absent'};
     const labels = existing.labels ?? {};
-    const owner = labels['router.parent_id'] ?? labels['paseo.parent-agent-id'];
+    const owner = labels['router.parent_id'] || labels['paseo.parent-agent-id'];
     // A refusal names what differs (directories, provider/model ids, effort ids: no prompt or credential text),
     // so a caller that named this worker learns exactly why it did not take the turn.
     if (!owner || owner !== input.parent_id)
@@ -1611,6 +1611,14 @@ export async function execute(client, input, notify = ensureNotification) {
     const sendStartedAt = Date.now();
     let sent = false, relabeled = false;
     const mergedLabels = {...labels, ...(r.labels ?? {}), 'paseo.parent-agent-id': input.parent_id};
+    // Puts the worker's labels back after a resume that was not sent. Paseo merges a label patch and never removes a
+    // key, and its client refuses a null name: the router's own keys this dispatch added are blanked (the parent's
+    // stays, it is the worker's owner either way), and an untitled worker keeps the title it was given.
+    const added = Object.keys(mergedLabels).filter(key => key.startsWith('router.') && key !== 'router.parent_id'
+      && !(key in labels));
+    const rollback = () => client.updateAgent(input.agent_id, {
+      ...(typeof existing.title === 'string' && existing.title.trim() ? {name: existing.title} : {}),
+      labels: {...Object.fromEntries(added.map(key => [key, ''])), ...labels}});
     try {
       // Bind first, then send. A send cut off by the caller's timeout leaves an agent already carrying this
       // dispatch's labels, so reconcile can observe it; sending first left it bound to the previous dispatch.
@@ -1646,13 +1654,13 @@ export async function execute(client, input, notify = ensureNotification) {
           // worker stays bound to this dispatch and its watcher settles it, so nothing is created beside it.
           if (outcomeUnknown(error) || SEND_OUTCOME_UNKNOWN.has(hostFailureClass(error, true)))
             return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification};
-          try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
+          try { await rollback(); }
           catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
         } else if (outcomeUnknown(error) || SEND_OUTCOME_UNKNOWN.has(hostFailureClass(error, true))) {
           // The relabel itself has no known outcome: no turn was sent, and the label may be on the worker. The old
           // labels go back so that a worker created in its place is the only one carrying this dispatch; when that
           // fails too, the worker stays bound and its watcher settles it.
-          try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
+          try { await rollback(); }
           catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
         }
         stopWatcher(input, 'host_resume_failed');
