@@ -1741,8 +1741,13 @@ def _run(args, judge):
         task['host_session_id'] = host_session
     if parent and not args.dry_run:
         now = registry.utcnow()
+        same_task = not getattr(args, 'new_worker', False)
         stopped_roots = [r for r in registry.read_dispatches()
-                         if r.get('parent_id') == parent and registry.claim_stopped(r.get('fallback') or {}, now)]
+                         if same_task and (r.get('parent_id'), r.get('task_id')) == (parent, task['task_id'])
+                         and (registry.claim_stopped(r.get('fallback') or {}, now)
+                              or ((r.get('fallback') or {}).get('state') == 'retrying'
+                                  and (r.get('fallback') or {}).get('retry_of')
+                                  and not registry.later((r.get('fallback') or {}).get('retry_at'), now)))]
         pending_rows = [r for r in registry.pending() if r.get('parent_id') == parent]
         if pending_rows or stopped_roots:
             launchers = (provider_inventory.current().get('launchers') or {})
@@ -1755,7 +1760,10 @@ def _run(args, judge):
                 for r in stopped_roots:
                     dispatch_fallback.resume_due(r['dispatch_id'], judge=judge)
                 for r in pending_rows:
-                    dispatch_flow.reconcile(r['dispatch_id'])
+                    dispatch_flow.reconcile(
+                        r['dispatch_id'],
+                        carry_fallback=(same_task and r.get('task_id') == task['task_id']),
+                    )
                 pending_rows = [r for r in registry.pending() if r.get('parent_id') == parent]
         # The same task already dispatched by this parent: hand back that worker, without classifying or launching again.
         for row in pending_rows:

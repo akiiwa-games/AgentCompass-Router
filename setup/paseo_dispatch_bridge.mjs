@@ -269,9 +269,17 @@ function isResumedRecord(record) {
   return Boolean(record?.agent_id && record.agent_id !== record.dispatch_id && !record.created_agent);
 }
 
+function deliveredUnlabeledResume(agent, record) {
+  if (!agent || agent.archivedAt || agent.status !== 'running') return false;
+  const created = record.created_at ?? (record.resume_deadline ?? record.creation_deadline ?? 0) - CREATE_LIMIT_MS;
+  return typeof agent.lastUserMessageAt === 'string' && Date.parse(agent.lastUserMessageAt) >= created;
+}
+
 function continuingDispatch(agent, record) {
   const label = agent?.labels?.['router.dispatch_id'];
   if (typeof label !== 'string' || !label || label === record.dispatch_id) return null;
+  if (Object.prototype.hasOwnProperty.call(record, 'bound_unlabeled_from') && label === record.bound_unlabeled_from)
+    return null;
   return record.seen || !isResumedRecord(record) ? label : null;
 }
 
@@ -452,13 +460,21 @@ export function notificationEvents(agent, record, now, creation) {
       ? [{key: 'terminal', reason: CREATE_FAILED}] : [];
   }
   const label = agent.labels?.['router.dispatch_id'];
+  const matchesUnlabeled = Object.prototype.hasOwnProperty.call(record, 'bound_unlabeled_from')
+    && (label ?? '') === record.bound_unlabeled_from;
   // Seen under its own labels, so these are not a relabel that has yet to land: a later dispatch took this worker.
-  if (record.seen && label && label !== record.dispatch_id) return [{key: 'terminal', reason: SUPERSEDED}];
-  if (isResumedRecord(record) && label !== record.dispatch_id) {
-    // Not bound to this dispatch yet, so its state is the previous turn's. Past resume_deadline no relabel can arrive.
+  if (record.seen && label && label !== record.dispatch_id && !matchesUnlabeled)
+    return [{key: 'terminal', reason: SUPERSEDED}];
+  if (isResumedRecord(record) && label !== record.dispatch_id && !matchesUnlabeled) {
+    // Not bound to this dispatch yet, so its state is the previous turn's unless Paseo shows a running turn that
+    // started at or after this dispatch's send. Past resume_deadline no relabel can arrive.
     if (agent.archivedAt) return [{key: 'terminal', reason: 'worker unavailable'}];
-    return Number.isFinite(record.resume_deadline) && now >= record.resume_deadline
-      ? [{key: 'terminal', reason: CREATE_FAILED}] : [];
+    if (deliveredUnlabeledResume(agent, record)) {
+      record.bound_unlabeled_from = label ?? '';
+    } else {
+      return Number.isFinite(record.resume_deadline) && now >= record.resume_deadline
+        ? [{key: 'terminal', reason: CREATE_FAILED}] : [];
+    }
   }
   const nowIso = new Date(now).toISOString();
   if (!record.bound_agent && agent.id) record.bound_agent = {id: agent.id, at: nowIso};
@@ -1176,11 +1192,14 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
   try {
     const parsedDeadline = Date.parse(createDeadline);
     const isResume = Boolean(agentId && agentId !== dispatchId);
+    const nowMs = Date.now();
+    const createdMs = isResume && Number.isFinite(parsedDeadline)
+      ? Math.min(nowMs, parsedDeadline - 240_000) : nowMs;
     record = readRecord(file) ?? {dispatch_id: dispatchId, parent_id: parentId,
       ...(isResume ? {agent_id: agentId} : {}),
       ...(isResume && Number.isFinite(parsedDeadline) ? {resume_deadline: parsedDeadline} : {}),
-      deadline: Date.now() + WATCH_LIMIT_MS, created_at: Date.now(),
-      creation_deadline: parsedDeadline || Date.now() + CREATE_LIMIT_MS,
+      deadline: nowMs + WATCH_LIMIT_MS, created_at: createdMs,
+      creation_deadline: parsedDeadline || nowMs + CREATE_LIMIT_MS,
       status: 'watching', delivered: [], pending: null};
     if (isResume && !record.agent_id) record.agent_id = agentId;
     if (isResume && Number.isFinite(parsedDeadline) && !Number.isFinite(record.resume_deadline))
@@ -1587,6 +1606,7 @@ export async function execute(client, input, notify = ensureNotification) {
       return {ok: false, sent: false, error: 'create_send_window_elapsed',
         completion_notification: {...completion_notification, status: 'creation_failed'}};
     }
+    const sendStartedAt = Date.now();
     let sent = false, relabeled = false;
     const mergedLabels = {...labels, ...(r.labels ?? {}), 'paseo.parent-agent-id': input.parent_id};
     try {
@@ -1607,9 +1627,18 @@ export async function execute(client, input, notify = ensureNotification) {
       return {ok: true, sent: true, agent: project(fresh), completion_notification};
     } catch (error) {
       if (!sent) {
-        // A definite send failure falls back to a fresh create with the same dispatch labels: give the old
-        // worker its previous labels back so only one agent carries this dispatch.
+        // Before rolling back labels or reporting sent: false, inspect the worker: if sendMessage already started the
+        // turn before timing out, bind and observe it instead of triggering fallback_to_create or unlabeling it.
         if (relabeled) {
+          let after;
+          try { after = (await client.fetchAgent(input.agent_id))?.agent; }
+          catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
+          if (after && !after.archivedAt && after.status === 'running'
+              && typeof after.lastUserMessageAt === 'string' && Date.parse(after.lastUserMessageAt) >= sendStartedAt) {
+            return {ok: true, sent: true,
+              agent: project({...after, labels: {...(after.labels ?? {}), ...mergedLabels}}),
+              completion_notification};
+          }
           try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
           catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
         }
@@ -1717,6 +1746,23 @@ export async function execute(client, input, notify = ensureNotification) {
       const id = entry.agent?.id ?? entry.id;
       if (id) agent = (await client.fetchAgent(id))?.agent;
     }
+  }
+  if (agent && input.agent_id && agent.id === input.agent_id && !agent.archivedAt && agent.status === 'running'
+      && agent.labels?.['router.dispatch_id'] !== input.dispatch_id
+      && typeof input.resume_created_at === 'string' && Number.isFinite(Date.parse(input.resume_created_at))
+      && typeof agent.lastUserMessageAt === 'string'
+      && Date.parse(agent.lastUserMessageAt) >= Date.parse(input.resume_created_at)
+      && input.expected_labels && typeof input.expected_labels === 'object'
+      && typeof client.updateAgent === 'function') {
+    const repaired = {...(agent.labels ?? {}), ...input.expected_labels,
+      ...(typeof input.parent_id === 'string' && input.parent_id ? {'paseo.parent-agent-id': input.parent_id} : {})};
+    try {
+      await client.updateAgent(agent.id, {
+        ...(typeof input.expected_title === 'string' && input.expected_title ? {name: input.expected_title} : {}),
+        labels: repaired,
+      });
+      agent = {...agent, labels: repaired};
+    } catch {}
   }
   // Read the record, then the agent it names: a create that completes between the two lookups is not "removed".
   const creation = !agent && !input.agent_id ? await creationRecord(client, input.dispatch_id) : undefined;

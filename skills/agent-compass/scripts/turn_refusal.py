@@ -91,7 +91,8 @@ def window_refusal(account, accounts, now, usage_cache_path, records, bundles=No
 def worker_row(agent_id, stored):
     """The dispatch row of this worker among `stored` rows, else None. The newest row carrying the agent id wins; the
     Paseo record's `router.dispatch_id` label names it when no row carries the agent id yet."""
-    mine = [r for r in stored if isinstance(r, dict) and r.get('agent_id') == agent_id]
+    mine = [r for r in stored if isinstance(r, dict) and r.get('agent_id') == agent_id
+            and not registry.unbound_ended_resume(r)]
     if mine:
         return max(mine, key=lambda r: r.get('created_at') or '')
     doc = registry.paseo_agent_record(agent_id)

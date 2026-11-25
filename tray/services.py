@@ -995,6 +995,16 @@ def _readable_receipt(dispatch_id: object, state_dir: Path, *, parent_id: object
     return record
 
 
+def _watcher_live(dispatch_id: object, state_dir: Path) -> bool:
+    """True when `--watch <id>` has a readable active receipt and its watcher process is running."""
+    record = _readable_receipt(dispatch_id, state_dir)
+    if record is None or record.get("status") in _WATCHER_DONE_STATUSES:
+        return False
+    if (state_dir / "paseo-notifications" / f"{dispatch_id}.json.creation-failed").exists():
+        return False
+    return _watcher_process_alive(record.get("pid"), str(dispatch_id))
+
+
 def _watcher_restartable(dispatch_id: object, state_dir: Path) -> bool:
     """True only where `observe` -> `ensureNotification` in `paseo_dispatch_bridge.mjs` would restart `--watch <id>`."""
     record = _readable_receipt(dispatch_id, state_dir)
@@ -1005,6 +1015,18 @@ def _watcher_restartable(dispatch_id: object, state_dir: Path) -> bool:
     if (state_dir / "paseo-notifications" / f"{dispatch_id}.json.creation-failed").exists():
         return False
     return not _watcher_process_alive(record.get("pid"), str(dispatch_id))
+
+
+def _missing_unconfirmed_receipt(row: dict, dispatch_id: object, state_dir: Path) -> bool:
+    """True for a launched create or resume not yet observed bound whose receipt file was never written on disk."""
+    if not _safe_dispatch_id(dispatch_id) or row.get("observed_at"):
+        return False
+    parent_id = row.get("parent_id")
+    if not isinstance(parent_id, str) or not parent_id.strip() or parent_id == "top-level":
+        return False
+    if row.get("agent_id") and row.get("operation") != "resume":
+        return False
+    return not (state_dir / "paseo-notifications" / f"{dispatch_id}.json").exists()
 
 
 def _receipt_proves_ending(row: dict, dispatch_id: object, state_dir: Path) -> bool:
@@ -1044,6 +1066,18 @@ def _local_dispatch_notice_reasons(now: datetime | None = None) -> frozenset[tup
             continue
         state = row.get("state")
         dispatch_id = row.get("dispatch_id")
+        fb = row.get("fallback") if isinstance(row.get("fallback"), dict) else {}
+        if _safe_dispatch_id(dispatch_id):
+            if dispatch_registry.claim_stopped(fb, current):
+                reasons.add((str(dispatch_id), "stopped_fallback"))
+            elif (
+                fb.get("state") == "retrying"
+                and _safe_dispatch_id(fb.get("retry_of"))
+                and not dispatch_registry.later(fb.get("retry_at"), current)
+                and not _watcher_live(fb["retry_of"], state_dir)
+                and (not _watcher_restartable(fb["retry_of"], state_dir) or not dispatch_registry.fallback_guard(row, current))
+            ):
+                reasons.add((str(dispatch_id), "due_retry"))
         if state in _DISPATCH_NOTICE_ACTIVE:
             if not row.get("launched_at") or _in_create_send_window(row, current):
                 continue
@@ -1051,11 +1085,27 @@ def _local_dispatch_notice_reasons(now: datetime | None = None) -> frozenset[tup
                 reasons.add((str(dispatch_id), f"watcher:{state}"))
             elif _receipt_proves_ending(row, dispatch_id, state_dir):
                 reasons.add((str(dispatch_id), "settle_receipt"))
+            elif _missing_unconfirmed_receipt(row, dispatch_id, state_dir):
+                reasons.add((str(dispatch_id), "missing_receipt"))
         elif state == "expired" and row.get("launched_at") and dispatch_registry.later(row.get("hard_until"), current):
             if _watcher_restartable(dispatch_id, state_dir):
                 reasons.add((str(dispatch_id), "watcher:expired"))
             elif _receipt_proves_ending(row, dispatch_id, state_dir):
                 reasons.add((str(dispatch_id), "settle_receipt"))
+            elif _missing_unconfirmed_receipt(row, dispatch_id, state_dir):
+                reasons.add((str(dispatch_id), "missing_receipt"))
+        elif (
+            state == "create_failed"
+            and _safe_dispatch_id(dispatch_id)
+            and row.get("end_notice") is None
+            and not fb
+            and any(
+                isinstance(ev, dict) and ev.get("reason") in ("host_never_admitted_create", "host_never_bound_resume")
+                for ev in (row.get("events") or ())
+            )
+            and not (state_dir / "paseo-notifications" / f"{dispatch_id}.json").exists()
+        ):
+            reasons.add((str(dispatch_id), "unnotified_deadline_failure"))
         elif dispatch_registry.fallback_guard(row, current):
             if not _safe_dispatch_id(dispatch_id):
                 continue
@@ -1210,6 +1260,7 @@ def dispatch_notice_tick(force: bool = False) -> bool:
         return False
     state_dir = _dispatch_state_dir()
     env = os.environ.copy()
+    env["AGENTCOMPASS_CARRY_FALLBACK"] = "1"
     default_state = Path.home() / ".agent-compass"
     if state_dir != default_state:
         env.setdefault("ROUTER_STATE_DIR", str(state_dir))

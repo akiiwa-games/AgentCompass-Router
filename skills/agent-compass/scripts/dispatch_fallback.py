@@ -500,6 +500,20 @@ class Chain:
                 resumed_id = self.resumed_attempt(row)
                 if resumed_id:
                     return self.settle_resumed(resumed_id, attempt, failed_id)
+            live = self.live_attempt(failed_id)
+            if live:
+                live_row = registry.inspect(live)
+                self.save('relaunched', current=live)
+                if live_row['state'] not in registry.TERMINAL:
+                    try:
+                        import dispatch_flow
+                        dispatch_flow.ensure_watcher(live_row, host=self.host)
+                    except Exception:   # noqa: BLE001 - best-effort watcher start
+                        pass
+                return self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': live,
+                                                'root_dispatch_id': self.root_id, 'agent_id': live_row.get('agent_id'),
+                                                'attempts': self.attempts, 'lines': lines(self.attempts),
+                                                'detail': 'another attempt of this brief is live'})
             step = self.next_attempt(attempt, row, failed_id, kept, retry_due=due)
             if step[0] == 'again':
                 _, row, bundle, failure = step
@@ -552,6 +566,7 @@ class Chain:
             if live:
                 # Another attempt of this brief already runs (its own watcher reports): this failure is settled by
                 # it, and the chain's record must keep pointing at it.
+                self.save('relaunched', current=live)
                 return 'done', self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': live,
                                                         'root_dispatch_id': self.root_id, 'attempts': self.attempts,
                                                         'lines': lines(self.attempts),
@@ -965,11 +980,92 @@ def abandon(dispatch_id, *, judge=None, host=None):
 _ACTIVE_RESUME_DUE = set()
 
 
+def _queue_final_fallback_notice(target_id, outcome, now):
+    """Ensure a background fallback ending in `NOTHING_RUNS` (`blocked`, `not_relaunched`, `retry_expired`, ...) leaves a
+    due end notice and readable receipt when no live `--watch` owns `target_id` (for instance on a `create_failed`
+    attempt whose `stopWatcher` wrote `status: 'creation_failed'` before `roll` scheduled or started fallback)."""
+    if not isinstance(outcome, dict) or outcome.get('action') != 'final' or outcome.get('result') not in NOTHING_RUNS:
+        return
+    try:
+        import dispatch_flow
+        row = registry.inspect(target_id)
+        parent_id = row.get('parent_id')
+        if not isinstance(parent_id, str) or not parent_id.strip() or parent_id == 'top-level':
+            return
+        file = dispatch_flow.notification_file(target_id)
+        marker = Path(f'{file}.creation-failed')
+        receipt = registry.watcher_receipt(target_id)
+        if (isinstance(receipt, dict) and receipt.get('status') == 'watching' and not marker.exists()
+                and isinstance(receipt.get('pid'), int) and registry.process_started(receipt['pid']) is not None):
+            return
+        notice = row.get('end_notice') if isinstance(row.get('end_notice'), dict) else {}
+        if notice.get('state') == 'sent' and notice.get('source') != 'creation_failed':
+            return
+        now_iso = registry.stamp(now)
+        now_ms = int(now.timestamp() * 1000)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        marker.unlink(missing_ok=True)
+        base = receipt if isinstance(receipt, dict) and receipt.get('dispatch_id') == target_id else {
+            'dispatch_id': target_id,
+            'parent_id': parent_id,
+            **({'agent_id': row['agent_id']} if row.get('agent_id') else {}),
+            'created_at': now_ms,
+            'deadline': now_ms + 3600_000,
+            'creation_deadline': now_ms,
+            'delivered': [],
+            'pending': None,
+        }
+        updated_receipt = {
+            **base,
+            'status': 'delivery_failed',
+            'terminal': base.get('terminal') or {
+                'reason': 'creation failed' if row.get('state') == 'create_failed' else 'error',
+                'status': None,
+                'attentionReason': None,
+                'at': now_iso,
+            },
+            'fallback': {
+                'status': 'done',
+                'action': 'final',
+                'result': outcome['result'],
+                'root_dispatch_id': outcome.get('root_dispatch_id') or registry.chain_root(row),
+                'text': str(outcome.get('text') or '')[:6000],
+                'lines': [str(item) for item in (outcome.get('lines') or ())[:64]],
+            },
+        }
+        tmp = file.with_name(f'{file.name}.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(updated_receipt), encoding='utf-8')
+        tmp.replace(file)
+        with registry.transaction(upkeep=True) as connection:
+            latest = registry.get(connection, 'dispatches', target_id)
+            cur_notice = latest.get('end_notice') if isinstance(latest.get('end_notice'), dict) else {}
+            if cur_notice.get('state') != 'sent' or cur_notice.get('source') == 'creation_failed':
+                latest['end_notice'] = {'state': 'due', 'message_id': registry.end_notice_message_id(target_id)}
+                registry.save(connection, latest)
+    except Exception:   # noqa: BLE001 - best-effort notice handoff
+        pass
+
+
+def _live_retry_watcher(retry_id):
+    """True when `--watch <retry_id>` has a live process and active receipt owning a scheduled retry."""
+    if not isinstance(retry_id, str) or not retry_id:
+        return False
+    try:
+        import dispatch_flow
+        file = dispatch_flow.notification_file(retry_id)
+        if Path(f'{file}.creation-failed').exists():
+            return False
+        receipt = registry.watcher_receipt(retry_id)
+        pid = receipt.get('pid') if isinstance(receipt, dict) and receipt.get('status') == 'watching' else None
+        return isinstance(pid, int) and pid > 0 and registry.process_started(pid) is not None
+    except Exception:   # noqa: BLE001
+        return False
+
+
 def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
-    """Any observation of a brief (dispatch launch/observe/reconcile) carries what its fallback still owes, so that does
-    not depend on the failed attempt's watcher alone: a scheduled same-bundle retry once it is due, and a failed attempt
-    whose step stopped before it finished (inside its lease, a claim whose holder ended or released it:
-    registry.claim_held), which this step takes over. None when nothing is owed."""
+    """Carry what a brief's fallback still owes from an authorized launching owner (`launch`, `roll` of the same task, or
+    the tray's `reconcile` pass): a scheduled same-bundle retry once due, and a failed attempt whose step stopped before
+    it finished (`registry.claim_stopped`). None when nothing is owed."""
     if not enabled():
         return None
     now = now or registry.utcnow()
@@ -985,8 +1081,13 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
             seen.add(root_id)
             root = by_id.get(root_id, row)
             fb = root.get('fallback') or {}
-            if registry.claim_stopped(fb, now) or (
-                    fb.get('state') == 'retrying' and fb.get('retry_of') and not registry.later(fb.get('retry_at'), now)):
+            due_without_watcher = (
+                fb.get('state') == 'retrying'
+                and fb.get('retry_of')
+                and not registry.later(fb.get('retry_at'), now)
+                and (not registry.later(fb.get('until'), now) or not _live_retry_watcher(fb['retry_of']))
+            )
+            if registry.claim_stopped(fb, now) or due_without_watcher:
                 done = resume_due(root_id, judge=judge, host=host, now=now)
                 if done is not None:
                     last = done
@@ -1000,10 +1101,8 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
         return None
     fallback = root.get('fallback') or {}
     stopped = [failed_id for failed_id, item in (fallback.get('handled') or {}).items()
-               if isinstance(item, dict) and item.get('action') == 'pending' and registry.later(item.get('until'), now)
-               and not registry.claim_held(item, now)]
-    if not stopped and fallback.get('state') == 'relaunching' and registry.later(fallback.get('until'), now) \
-            and not registry.step_binds(fallback, now):
+               if isinstance(item, dict) and item.get('action') == 'pending' and not registry.claim_held(item, now)]
+    if not stopped and fallback.get('state') == 'relaunching' and not registry.step_binds(fallback, now):
         last_failed = next((a.get('dispatch_id') for a in reversed(fallback.get('attempts') or [])
                             if a.get('dispatch_id') and a.get('failure')), None) or root['dispatch_id']
         stopped = [last_failed]
@@ -1014,7 +1113,9 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
         return None
     _ACTIVE_RESUME_DUE.add(root['dispatch_id'])
     try:
-        return handle(target_id, judge=judge, host=host)
+        outcome = handle(target_id, judge=judge, host=host)
+        _queue_final_fallback_notice(target_id, outcome, now)
+        return outcome
     finally:
         _ACTIVE_RESUME_DUE.discard(root['dispatch_id'])
 

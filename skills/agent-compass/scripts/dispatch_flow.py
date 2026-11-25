@@ -547,9 +547,14 @@ def failed_attempts(row, path=None):
     return out
 
 
-def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, not_observed=None, *, carry_fallback=True):
+CARRY_FALLBACK_ENV = 'AGENTCOMPASS_CARRY_FALLBACK'
+
+
+def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, not_observed=None, *, carry_fallback=False):
     """Observe `dispatch_id`, or every open Paseo dispatch, and return the observations. The returned list holds only
-    what the host was asked and answered (launch reads `bool(observations)` as "the host was queried").
+    what the host was asked and answered (launch reads `bool(observations)` as "the host was queried"). By default this
+    reads and settles only (`carry_fallback=False`); only launching owners (the tray pass or a `roll` of the same task)
+    opt in to `carry_fallback=True` so non-launching callers (`release`, `prepare`, `plan`, `record`) never start a worker.
 
     `not_observed`, a list the `reconcile`/`start` actions pass, receives each dispatch this call was asked about and
     did not observe, with why (`NOT_OBSERVED`): the branch below that skipped it is the fact. An observation the
@@ -605,8 +610,12 @@ def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, no
             continue
         watch_extra = ({'parent_id': row.get('parent_id'), 'ensure_watch': True,
                         'create_deadline': registry.stamp(registry.resume_deadline(row) if row.get('operation') == 'resume'
-                                                          else registry.create_deadline(row))}
-                       if host is _DEFAULT_HOST_CALL else {})
+                                                          else registry.create_deadline(row)),
+                        **({'resume_created_at': row.get('created_at'),
+                            'expected_labels': (row.get('request') or {}).get('labels'),
+                            'expected_title': (row.get('request') or {}).get('title')}
+                           if row.get('operation') == 'resume' and not row.get('observed_at') else {})}
+                       if carry_fallback and host is _DEFAULT_HOST_CALL else {})
         response = host({'operation': 'observe', 'dispatch_id': row['dispatch_id'], 'agent_id': row.get('agent_id'),
                          **watch_extra,
                          **({'timeout_seconds': timeout} if timeout else {})})
@@ -633,6 +642,16 @@ def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, no
             results.append({'dispatch_id': row['dispatch_id'], 'error': response.get('error') or 'agent_not_observed'})
     registry.reservations(now, path)  # Expire unacknowledged prepared/launch leases as well.
     if carry_fallback and (path is None or Path(path) == Path(registry.db_path())):
+        if dispatch_id is None:
+            for settled_row in registry.read_dispatches(path):
+                if (settled_row.get('dispatch_mode', 'paseo') == 'paseo'
+                        and settled_row.get('state') == 'create_failed'
+                        and settled_row.get('end_notice') is None
+                        and not settled_row.get('fallback')
+                        and any(isinstance(ev, dict) and ev.get('reason') in ('host_never_admitted_create', 'host_never_bound_resume')
+                                for ev in (settled_row.get('events') or ()))
+                        and not notification_file(settled_row['dispatch_id']).exists()):
+                    ensure_watcher(settled_row, host=host)
         dispatch_fallback.resume_due(dispatch_id, host=host, now=now)
     return results
 
@@ -945,18 +964,20 @@ def settle(dispatch_id, path=None, now=None):
     receipt = document or {}
     terminal = receipt.get('terminal') if isinstance(receipt.get('terminal'), dict) else None
     reason = terminal.get('reason') if terminal else None
-    creating_failed = reason == 'creation failed' or receipt.get('status') == 'creation_failed'
+    resumed_receipt = bool(receipt.get('agent_id') and receipt.get('agent_id') != dispatch_id
+                           and not receipt.get('created_agent'))
+    creating_failed = not resumed_receipt and (reason == 'creation failed' or receipt.get('status') == 'creation_failed')
     if creating_failed and not row.get('agent_id') and row['state'] in ('launching', 'expired'):
         failure = terminal.get('failure_class') if terminal and isinstance(terminal.get('failure_class'), str) else 'unknown'
         code = terminal.get('failure_code') if terminal and isinstance(terminal.get('failure_code'), str) else None
         creation = {'phase': 'failed', 'failure_class': failure, **({'failure_code': code} if code else {})}
         settled = settle_create(row, creation, now, path)
         return end_notices(public(settled, now), now, path)
-    if creating_failed and row.get('operation') == 'resume' and not row.get('observed_at') and row['state'] in ('launching', 'expired'):
+    if reason == 'creation failed' and row.get('operation') == 'resume' and not row.get('observed_at') and row['state'] in ('launching', 'expired'):
         settled, _ended = registry.resolve_unconfirmed_resume(dispatch_id, now=now, path=path, from_receipt=True)
         return end_notices(public(settled, now), now, path)
     # registry.state_from_receipt owns whether the receipt proves an ending for this row; without one nothing changes.
-    no_ending = None if creating_failed or registry.state_from_receipt(row, receipt)[0] else (
+    no_ending = None if (creating_failed and not row.get('agent_id')) or registry.state_from_receipt(row, receipt)[0] else (
         absent or ('ending_not_counted' if reason else 'no_ending'))
     if row['state'] in registry.TERMINAL and row['state'] != 'expired' and not row.get('side_effects_due'):
         # Still let a stored receipt finish effects the state writer skipped. finalize keeps the terminal.
@@ -1057,8 +1078,9 @@ def cli(args):
     if action == 'start' and not args.dispatch_id:
         raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
     if action in ('reconcile', 'start'):
+        carry = action == 'reconcile' and os.environ.pop(CARRY_FALLBACK_ENV, '') == '1'
         not_observed = []
-        observations = reconcile(args.dispatch_id, not_observed=not_observed)
+        observations = reconcile(args.dispatch_id, not_observed=not_observed, carry_fallback=carry)
         answer = {'observations': observations, 'not_observed': not_observed, 'active_reservations': registry.reservations()}
         if not args.dispatch_id and not observations and not not_observed:
             elsewhere = ', '.join(f"{r['dispatch_id']} ({r['dispatch_mode']})" for r in registry.open_host_claims())

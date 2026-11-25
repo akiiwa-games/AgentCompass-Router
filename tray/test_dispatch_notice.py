@@ -1432,6 +1432,90 @@ class DispatchNoticeUnitTests(unittest.TestCase):
         watch_child.terminate.assert_not_called()
         watch_sub.terminate.assert_not_called()
 
+    def test_stopped_fallback_due_retry_without_watcher_and_missing_unconfirmed_receipt_wake_pass_with_opt_in(self):
+        now = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc)
+        ended_holder = {"pid": 999999, "started": 1}
+
+        # 1. Stopped fallback step (`claim_stopped`) on a `create_failed` root wakes the pass both inside and past `RUN_LEASE`.
+        db_stop = self.root / "rule2-stopped.sqlite3"
+        stop_row = base_paseo_row(
+            "d-stop",
+            state="create_failed",
+            agent_id=None,
+            now=now,
+            end_notice={"state": "sent", "source": "creation_failed", "message_id": registry.end_notice_message_id("d-stop")},
+        )
+        until_iso = (now + timedelta(seconds=registry.RUN_LEASE)).isoformat()
+        stop_row["fallback"] = {
+            "state": "relaunching",
+            "until": until_iso,
+            "holder": ended_holder,
+            "handled": {"d-stop": {"action": "pending", "at": now.isoformat(), "until": until_iso, "holder": ended_holder}},
+        }
+        seed_dispatch_row(db_stop, stop_row)
+        self.write_receipt("d-stop", status="creation_failed", pid=999999)
+        (self.state_dir / "paseo-notifications" / "d-stop.json.creation-failed").write_text("host_creation_failed", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"ROUTER_DISPATCH_DB": str(db_stop)}), \
+                mock.patch.object(registry, "process_started", return_value=None):
+            self.assertTrue(services.dispatch_notice_needed(now=now))
+            self.assertTrue(services.dispatch_notice_needed(now=now + timedelta(seconds=registry.RUN_LEASE + 30)))
+
+        # 2. Scheduled retry past `retry_at` with no restartable watcher (`creation_failed` receipt) wakes once due, not before.
+        db_due_retry = self.root / "rule2-due-retry.sqlite3"
+        retry_at = (now + timedelta(seconds=120)).isoformat()
+        guard_until = (now + timedelta(seconds=1800)).isoformat()
+        sched_row = base_paseo_row(
+            "d-sched-nowatch",
+            state="create_failed",
+            agent_id=None,
+            now=now,
+            end_notice={"state": "sent", "source": "creation_failed", "message_id": registry.end_notice_message_id("d-sched-nowatch")},
+        )
+        sched_row["fallback"] = {
+            "state": "retrying",
+            "current": "d-sched-nowatch",
+            "retry_of": "d-sched-nowatch",
+            "retry_at": retry_at,
+            "until": guard_until,
+            "handled": {"d-sched-nowatch": {"action": "scheduled", "retry_at": retry_at}},
+        }
+        seed_dispatch_row(db_due_retry, sched_row)
+        self.write_receipt("d-sched-nowatch", status="creation_failed", pid=999999)
+        with mock.patch.dict(os.environ, {"ROUTER_DISPATCH_DB": str(db_due_retry)}):
+            self.assertFalse(services.dispatch_notice_needed(now=now))
+            self.assertTrue(services.dispatch_notice_needed(now=registry.parse(retry_at)))
+            # When a live `--watch` owns `retry_of`, the tray starts zero passes even past `retry_at`.
+            bridge = str(services.ROOT / "setup" / "paseo_dispatch_bridge.mjs")
+            live_proc = mock.Mock()
+            live_proc.is_running.return_value = True
+            live_proc.cmdline.return_value = ["node", bridge, "--watch", "d-sched-nowatch", "parent-1", "", ""]
+            self.write_receipt("d-sched-nowatch", status="watching", pid=7373)
+            with mock.patch.object(services.psutil, "Process", return_value=live_proc):
+                self.assertFalse(services.dispatch_notice_needed(now=registry.parse(retry_at)))
+
+        # 3. Unconfirmed create or resume with no receipt on disk wakes past `CREATE_SEND_WINDOW` and after lease expiry (`expired`),
+        #    and `dispatch_notice_tick` passes `AGENTCOMPASS_CARRY_FALLBACK=1` to opt `reconcile` in.
+        for op, aid in (("create", None), ("resume", "w-unrelabeled")):
+            for state in ("launching", "expired"):
+                with self.subTest(operation=op, state=state):
+                    db_nr = self.root / f"rule2-noreceipt-{op}-{state}.sqlite3"
+                    did = f"d-nr-{op}-{state}"
+                    row = base_paseo_row(did, state=state, agent_id=aid, now=now)
+                    row["operation"] = op
+                    row["launched_at"] = (now - timedelta(seconds=registry.CREATE_SEND_WINDOW + 10)).isoformat()
+                    if state == "expired":
+                        row["lease_until"] = (now - timedelta(seconds=5)).isoformat()
+                        row["hard_until"] = (now + timedelta(hours=12)).isoformat()
+                    seed_dispatch_row(db_nr, row)
+                    self.reset_notice_state()
+                    with mock.patch.dict(os.environ, {"ROUTER_DISPATCH_DB": str(db_nr)}), \
+                            mock.patch.object(registry, "utcnow", return_value=now), \
+                            mock.patch.object(services, "hidden_popen", return_value=self.child(True)) as popen:
+                        self.assertTrue(services.dispatch_notice_needed(now=now))
+                        self.assertTrue(services.dispatch_notice_tick(force=True))
+                        _cmd, child_env, *_rest = popen.call_args.args
+                        self.assertEqual(child_env.get("AGENTCOMPASS_CARRY_FALLBACK"), "1")
+
 
 class DispatchNoticeIntegrationTests(unittest.TestCase):
     def setUp(self):

@@ -856,7 +856,16 @@ def host_generation(row, doc, later_ids=()):
     if not isinstance(doc, dict) or _updated_before_launch(row, doc):
         return None
     bound = _bound_dispatch(doc)
-    if bound is None or bound == row.get('dispatch_id'):
+    if bound == row.get('dispatch_id'):
+        return 'current'
+    if bound is None:
+        if row.get('operation') == 'resume' and not _at_or_after(
+                doc.get('lastUserMessageAt'), row.get('created_at') or row.get('launched_at')):
+            return None
+        return 'current'
+    if ('bound_unlabeled_from' in row and (bound or '') == row.get('bound_unlabeled_from')
+            and bound not in set(later_ids or ())
+            and _at_or_after(doc.get('lastUserMessageAt'), row.get('created_at') or row.get('launched_at'))):
         return 'current'
     if row.get('operation') == 'resume' and not row.get('started_at'):
         return None
@@ -1020,7 +1029,9 @@ def apply_ending(connection, row, now, receipt_only=False):
     changed = False
     bound = receipt.get('bound_agent') if isinstance(receipt, dict) and isinstance(receipt.get('bound_agent'), dict) else None
     if not row.get('agent_id') and isinstance(receipt, dict):
-        found_id = (bound or {}).get('id') or receipt.get('agent_id')
+        found_id = (bound or {}).get('id') or (
+            receipt.get('agent_id') if receipt.get('created_agent') or receipt.get('agent_id') == row['dispatch_id'] else None
+        )
         if isinstance(found_id, str) and found_id:
             row['agent_id'] = found_id
             changed = True
@@ -1691,6 +1702,12 @@ def _record_pending_ground_truth(path, now):
             continue
 
 
+def unbound_ended_resume(row):
+    """A resume dispatch that ended without Paseo ever showing the worker on this turn: the worker's own state is unchanged."""
+    return (isinstance(row, dict) and row.get('operation') == 'resume' and not row.get('observed_at')
+            and row.get('state') in TERMINAL and row.get('state') != 'expired')
+
+
 def _parent_histories(parent_id, now, path):
     """Every worker a dispatch of `parent_id` names, with its dispatches oldest first."""
     with transaction(path, upkeep=True) as connection:
@@ -1698,7 +1715,7 @@ def _parent_histories(parent_id, now, path):
         all_rows = rows(connection, 'dispatches')
     by_agent = {}
     for row in all_rows:
-        if row.get('parent_id') != parent_id:
+        if row.get('parent_id') != parent_id or unbound_ended_resume(row):
             continue
         agent_id = row.get('agent_id')
         if isinstance(agent_id, str) and agent_id.strip():
@@ -2578,12 +2595,12 @@ def relaunch_held(fallback, now):
 
 
 def claim_stopped(fallback, now):
-    """A step took this brief's failed attempt and stopped before it finished: inside its lease, a claim (or a relaunch
-    in progress) that no longer binds (`step_binds`: its step ended or released it). Nothing runs the brief until the
-    next step takes the claim over."""
-    if fallback.get('state') == 'relaunching' and later(fallback.get('until'), now) and not step_binds(fallback, now):
+    """A step took this brief's failed attempt and stopped before it finished: a claim (or a relaunch in progress) that
+    no longer binds (`step_binds`: its step ended or released it, or a legacy holderless claim outlived `until`) and has
+    not been replaced or closed. Nothing runs the brief until the next step takes the claim over."""
+    if fallback.get('state') == 'relaunching' and not step_binds(fallback, now):
         return True
-    return any(isinstance(item, dict) and item.get('action') == 'pending' and later(item.get('until'), now)
+    return any(isinstance(item, dict) and item.get('action') == 'pending'
                and not step_binds(item, now) for item in (fallback.get('handled') or {}).values())
 
 
@@ -2650,8 +2667,34 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
                     row = root
             return row
         labels = snapshot.get('labels') or {}
+        later_ids = _later_dispatch_ids(connection, row)
         if any(labels.get(k) != row['request']['labels'][k] for k in LABELS):
-            raise NotBound('Host snapshot belongs to another dispatch/parent/task')
+            prev_label = labels.get('router.dispatch_id') or ''
+            owner = labels.get('router.parent_id') or labels.get('paseo.parent-agent-id')
+            ref_stamp = row.get('created_at') or row.get('launched_at')
+            last_msg = snapshot.get('lastUserMessageAt')
+            try:
+                msg_after_send = isinstance(last_msg, str) and isinstance(ref_stamp, str) and parse(last_msg) >= parse(ref_stamp)
+            except ValueError:
+                msg_after_send = False
+            delivered_unlabeled = (
+                row.get('operation') == 'resume'
+                and isinstance(agent_id, str) and agent_id == row.get('agent_id')
+                and (not owner or owner == row.get('parent_id'))
+                and prev_label not in set(later_ids)
+                and (
+                    ('bound_unlabeled_from' in row and prev_label == row.get('bound_unlabeled_from'))
+                    or (
+                        not row.get('observed_at')
+                        and not snapshot.get('archivedAt')
+                        and snapshot.get('status') == 'running'
+                        and msg_after_send
+                    )
+                )
+            )
+            if not delivered_unlabeled:
+                raise NotBound('Host snapshot belongs to another dispatch/parent/task')
+            row.setdefault('bound_unlabeled_from', prev_label)
         if not isinstance(agent_id, str) or not agent_id or row.get('agent_id') not in (None, agent_id):
             raise Refused('Host agent ID mismatch')
         provider, _, model = row['request']['provider'].partition('/')
@@ -2684,7 +2727,6 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
                                                       code=snapshot.get('lastErrorClass'), at=updated_error, source=agent_id)
                 except OSError:
                     pass
-        later_ids = _later_dispatch_ids(connection, row)
         try:
             within_life = now < parse(row['hard_until'])
         except (TypeError, ValueError):
@@ -2697,7 +2739,13 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             raise Refused('Agent observed without a launch claim')
         updated = snapshot.get('updatedAt')
         if not isinstance(updated, str) or parse(updated) < parse(row['launched_at']):
-            raise Refused('Host snapshot predates this launch')
+            if 'bound_unlabeled_from' in row and isinstance(snapshot.get('lastUserMessageAt'), str):
+                ref = row.get('created_at') or row['launched_at']
+                cand = updated if isinstance(updated, str) else snapshot['lastUserMessageAt']
+                if parse(cand) < parse(ref):
+                    raise Refused('Host snapshot predates this launch')
+            else:
+                raise Refused('Host snapshot predates this launch')
         row['agent_id'] = agent_id
         row['observed_at'] = stamp(now)
         if isinstance(snapshot.get('cwd'), str):

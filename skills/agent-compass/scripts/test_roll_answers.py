@@ -607,6 +607,105 @@ class PendingNamesWhatIsKnown(Plain):
         self.assertEqual(registry.inspect(r_id)['state'], 'launching')
         flow.reconcile(r_id, host=resume_host, now=registry.resume_deadline(r_row))
         self.assertEqual(registry.inspect(r_id)['state'], 'create_failed')
+        # Rule 4a: settling an unbound resume leaves the untouched worker reusable for `--resume` and automatic reuse.
+        self.assertIsNone(registry.reuse_refusal('parent-a', 'agent-unrelabeled'))
+        self.assertIn('agent-unrelabeled', [w['agent_id'] for w in registry.reusable_workers('parent-a')])
+
+        # Rule 4b: an unlabeled resume whose worker Paseo reports `running` a turn started >= created_at binds instead of failing.
+        res_deliv, _ = self.run_roll(self.brief_file('r2.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r2')
+        d_deliv = json.loads(Path(res_deliv['details']).read_text(encoding='utf-8'))['worker']['dispatch_id']
+        row_deliv = registry.inspect(d_deliv)
+        prov, _, mod = row_deliv['request']['provider'].partition('/')
+        settings = row_deliv['request'].get('settings') or {}
+
+        def delivered_unlabeled_host(_req):
+            return {'ok': True, 'agent': {
+                'id': 'agent-unrelabeled', 'status': 'running', 'provider': prov, 'model': mod,
+                'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+                'lastUserMessageAt': row_deliv['created_at'], 'updatedAt': row_deliv['launched_at'],
+                'labels': {'router.dispatch_id': 'prev-dispatch', 'router.parent_id': 'parent-a'},
+            }}
+
+        flow.reconcile(d_deliv, host=delivered_unlabeled_host, now=registry.resume_deadline(row_deliv))
+        bound_row = registry.inspect(d_deliv)
+        self.assertEqual(bound_row['state'], 'started')
+        self.assertTrue(bound_row.get('observed_at'))
+
+    def test_refused_resume_receipt_never_settles_create_failed_in_either_order_and_ensure_watcher_invokes_bridge(self):
+        """Rule 3 & ensure_watcher: `stopWatcher`'s `status: 'creation_failed'` receipt on a refused resume never settles
+        either the resume row (before `fallback_to_create`) or the switched create row (after `fallback_to_create`),
+        whereas a deadline receipt (`terminal.reason == 'creation failed'`) settles an unbound resume; and `ensure_watcher`
+        invokes `paseo_dispatch_bridge.mjs --ensure-watch`."""
+        # Order A: `settle` runs before `fallback_to_create`.
+        prep_a = registry.prepare(self.issue()['decision_id'], self.task, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-a',
+                                  fallback_prompt='Fresh prompt')
+        claim_a = registry.claim(prep_a['request'], 'parent-a', now=self.now)
+        note_a = flow.notification_file(claim_a['dispatch_id'])
+        note_a.parent.mkdir(parents=True, exist_ok=True)
+        note_a.write_text(json.dumps({
+            'dispatch_id': claim_a['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-a',
+            'status': 'creation_failed', 'delivered': [], 'pending': None,
+        }), encoding='utf-8')
+        flow.settle(claim_a['dispatch_id'], now=self.now)
+        self.assertEqual(registry.inspect(claim_a['dispatch_id'])['state'], 'launching')
+        switched_a = registry.fallback_to_create(claim_a['dispatch_id'], claim_a['claim_id'], now=self.now)
+        self.assertIsNotNone(switched_a)
+        self.assertEqual((switched_a['operation'], switched_a['agent_id']), ('create', None))
+
+        # Order B: `fallback_to_create` runs first, then `settleBeforeExit` runs before `retireRefusedResume` unlinks the receipt.
+        task_b = dict(self.task, task_id='t-order-b')
+        prep_b = registry.prepare(self.issue(task_b)['decision_id'], task_b, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-b',
+                                  fallback_prompt='Fresh prompt B')
+        claim_b = registry.claim(prep_b['request'], 'parent-a', now=self.now)
+        note_b = flow.notification_file(claim_b['dispatch_id'])
+        note_b.write_text(json.dumps({
+            'dispatch_id': claim_b['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-b',
+            'status': 'creation_failed', 'delivered': [], 'pending': None,
+        }), encoding='utf-8')
+        switched_b = registry.fallback_to_create(claim_b['dispatch_id'], claim_b['claim_id'], now=self.now)
+        self.assertIsNotNone(switched_b)
+        flow.settle(claim_b['dispatch_id'], now=self.now)
+        self.assertEqual(registry.inspect(claim_b['dispatch_id'])['state'], 'launching')
+        prov, _, mod = switched_b['request']['provider'].partition('/')
+        settings = switched_b['request'].get('settings') or {}
+        observed_b = registry.observe(claim_b['dispatch_id'], {
+            'id': claim_b['dispatch_id'], 'status': 'running', 'provider': prov, 'model': mod,
+            'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+            'labels': switched_b['request']['labels'], 'updatedAt': switched_b['launched_at'],
+        }, now=self.now)
+        self.assertEqual(observed_b['state'], 'started')
+
+        # Deadline receipt (`terminal.reason == 'creation failed'`) settles an unconfirmed resume as `create_failed`.
+        task_c = dict(self.task, task_id='t-deadline-rec')
+        prep_c = registry.prepare(self.issue(task_c)['decision_id'], task_c, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-c')
+        claim_c = registry.claim(prep_c['request'], 'parent-a', now=self.now)
+        flow.notification_file(claim_c['dispatch_id']).write_text(json.dumps({
+            'dispatch_id': claim_c['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-c',
+            'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'creation failed', 'status': 'idle', 'attentionReason': None, 'at': claim_c['launched_at']},
+        }), encoding='utf-8')
+        settled_c = flow.settle(claim_c['dispatch_id'], now=self.now)
+        self.assertEqual(settled_c['state'], 'create_failed')
+
+        # `ensure_watcher` invokes `node paseo_dispatch_bridge.mjs --ensure-watch` when using the real host_call.
+        seen_popen = []
+
+        def fake_popen(args, **kwargs):
+            seen_popen.append(args)
+            kwargs['stdout'].write(json.dumps({'status': 'watching', 'pid': 4242}).encode('utf-8'))
+            proc = type('FakeProc', (), {'wait': lambda self, *_a: 0, 'kill': lambda self: None})()
+            return proc
+
+        with patch.object(flow, 'host_call', flow._DEFAULT_HOST_CALL), \
+                patch.dict(os.environ, {'ROUTER_PASEO_BRIDGE': str(flow._DEFAULT_BRIDGE)}), \
+                patch.object(flow.subprocess, 'Popen', side_effect=fake_popen):
+            ensured = flow.ensure_watcher(claim_a, retry_at='2026-11-25T12:00:00Z')
+        self.assertEqual(ensured, {'status': 'watching', 'pid': 4242})
+        self.assertEqual(seen_popen[0][2:5], ['--ensure-watch', claim_a['dispatch_id'], 'parent-a'])
+        self.assertEqual(seen_popen[0][-2:], ['retrying', '2026-11-25T12:00:00Z'])
 
 
 class FallbackKeepsClass(Plain):

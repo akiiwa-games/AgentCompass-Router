@@ -1231,18 +1231,18 @@ class FallbackTests(unittest.TestCase):
             self.assertIn('nothing is required', text)
             self.assertNotIn('run next_argv', text.lower())
 
-        # 1. Stopped fallback step is taken over by `reconcile(None)` without caller `launch`.
+        # 1. Stopped fallback step is taken over by `reconcile(None, carry_fallback=True)` without caller `launch`.
         root = self.failed_root()
         self.killed_step(root)
         real_handle = fallback.handle
         with self.at(minutes=1), patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(
                 did, **dict(kw, judge=self.judge))):
-            flow.reconcile(None, host=self.host, now=registry.utcnow())
+            flow.reconcile(None, host=self.host, now=registry.utcnow(), carry_fallback=True)
         self.assertEqual(len(self.host.creates), 2)
         self.assertNotEqual(registry.current_attempt(root['dispatch_id']), root['dispatch_id'])
         self.assert_one_worker()
 
-        # 2. Scheduled transient retry starts on `reconcile(None)` once due, and not before.
+        # 2. Scheduled transient retry starts on `reconcile(None, carry_fallback=True)` once due, and not before.
         retry_store = self.root / provider_retry.FILE
         with patch.dict(os.environ, {'ROUTER_PROVIDER_RETRY': str(retry_store)}):
             sched_root = self.first(task=dict(self.task, task_id='sched-self', can_wait_hours=1))
@@ -1259,12 +1259,104 @@ class FallbackTests(unittest.TestCase):
             creates_before = len(self.host.creates)
             with patch.object(registry, 'utcnow', return_value=due_at - timedelta(seconds=1)), \
                     patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
-                flow.reconcile(None, host=self.host, now=due_at - timedelta(seconds=1))
+                flow.reconcile(None, host=self.host, now=due_at - timedelta(seconds=1), carry_fallback=True)
             self.assertEqual(len(self.host.creates), creates_before)
             with patch.object(registry, 'utcnow', return_value=due_at), \
                     patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
-                flow.reconcile(None, host=self.host, now=due_at)
+                flow.reconcile(None, host=self.host, now=due_at, carry_fallback=True)
             self.assertEqual(len(self.host.creates), creates_before + 1)
+
+    def test_non_launching_callers_never_start_a_fallback_step_and_release_cancels_due_retry(self):
+        """Rule 1: default `reconcile`, `reservation_records` (`plan`/`record`), `dispatch prepare`, `dispatch release`,
+        and a `roll` of another task never run `resume_due`; `release` cancels a due retry instead of launching it first."""
+        import argparse
+        import contextlib
+        import public_data
+        import roll as roll_mod
+        stopped = self.failed_root(task=dict(self.task, task_id='stopped-task'))
+        self.killed_step(stopped)
+        sched_root, _ = self.scheduled_root(minutes=16)
+        retry_at = registry.inspect(sched_root['dispatch_id'])['fallback']['retry_at']
+        due_now = registry.parse(retry_at) + timedelta(seconds=5)
+        creates_before = len(self.host.creates)
+        effects_before = public_data._EFFECTS[0]
+        real_handle = fallback.handle
+        with patch.dict(os.environ, {'AGENTCOMPASS_LIVE_MODELS': 'off', 'AGENTCOMPASS_ANTIGRAVITY_PLAN': 'off'}), \
+                patch('account_fleet.load_accounts', return_value=self.accounts), \
+                patch.object(registry, 'utcnow', return_value=due_now), \
+                patch.object(flow, 'host_call', self.host), \
+                patch.object(roll_mod, 'match_reusable_worker', return_value=None), \
+                patch.object(roll_mod.provider_inventory, 'current', return_value={'launchers': {}}), \
+                patch.object(roll_mod.provider_inventory, 'snapshot', contextlib.nullcontext), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile()
+            flow.reservation_records(read_only=False)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertEqual(public_data._EFFECTS[0], effects_before)
+            # `dispatch --dispatch-action release` on a due retry cancels the retry without launching a worker.
+            rel = flow.cli(argparse.Namespace(
+                stage='dispatch', dispatch_action='release',
+                dispatch_id=sched_root['dispatch_id'], parent_id='parent-a', basis='user cancelled brief',
+            ))
+            self.assertTrue(rel['released'])
+            self.assertEqual(rel['canceled_retry'], sched_root['dispatch_id'])
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertEqual(registry.inspect(sched_root['dispatch_id'])['fallback']['state'], 'final')
+            # Rolling a DIFFERENT task leaves `stopped` untouched, whereas rolling the SAME task takes it over.
+            other_args = argparse.Namespace(
+                stage='roll', task='unrelated task', brief=None, task_id='different-task', title=None,
+                hours=0.5, can_wait_hours=None, local_only=None, keep_whole=None, file=[], apply_to=None,
+                fast=False, verbose=False, workspace=None, resume=None, new_worker=False, access=None,
+                score=False, no_score=True, score_timeout=10, dry_run=False, usage_cache=None,
+                provider=None, account=None, model=None, effort=None, basis=None, constraint=None,
+                reason_category=None, specialty=None, trigger=None, accounts=None,
+                parent_id='parent-a', parent_host='paseo', parent_address='parent-a', parent_model=None,
+            )
+            with patch.object(roll_mod, 'build_task', return_value=dict(self.task, task_id='different-task')), \
+                    patch.object(self.judge, 'plan_stage', create=True, side_effect=lambda doc, a: self.judge.plan_task(doc['task'], a)), \
+                    patch.object(roll_mod, 'paseo', return_value=({'launched': True, 'dispatch_mode': 'paseo'}, 0)):
+                roll_mod._run(other_args, self.judge)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertTrue(registry.claim_stopped(registry.inspect(stopped['dispatch_id'])['fallback'], due_now))
+            same_args = argparse.Namespace(**{**vars(other_args), 'task_id': 'stopped-task'})
+            with patch.object(roll_mod, 'build_task', return_value=dict(self.task, task_id='stopped-task')):
+                same_out, same_code = roll_mod._run(same_args, self.judge)
+            self.assertEqual(same_code, 0)
+            self.assertEqual(same_out['caller_action'], 'wait_for_notification')
+            self.assertEqual(len(self.host.creates), creates_before + 1)
+
+    def test_taking_over_a_step_stopped_after_claiming_attempt_2_saves_relaunched_state(self):
+        """Rule 5: when a step dies after claiming attempt 2 (`state != 'prepared'`) before saving `relaunched`, taking it
+        over updates `fallback.state == 'relaunched'` without spawning a third worker or leaving `FALLBACK_STOPPED_NEXT`."""
+        root = self.failed_root()
+        real_launch = flow.launch
+
+        class KilledAfterClaim(BaseException):
+            pass
+
+        def launch_then_die(dispatch_id, parent_id, **kw):
+            real_launch(dispatch_id, parent_id, **kw)
+            raise KilledAfterClaim()
+
+        with patch.object(registry, 'process_identity', return_value=self.ended_process()), \
+                patch.object(fallback.Chain, 'release', lambda *_: None), \
+                patch.object(flow, 'launch', side_effect=launch_then_die), \
+                self.assertRaises(KilledAfterClaim):
+            self.handle(root['dispatch_id'])
+        fb_before = registry.inspect(root['dispatch_id'])['fallback']
+        attempt2_id = fb_before['current']
+        self.assertEqual(fb_before['state'], 'relaunching')
+        self.assertIn(registry.inspect(attempt2_id)['state'], ('launching', 'launched', 'started'))
+        self.assertTrue(registry.claim_stopped(fb_before, registry.utcnow()))
+        real_handle = fallback.handle
+        with patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=self.host, now=registry.utcnow(), carry_fallback=True)
+        root_after = registry.inspect(root['dispatch_id'])
+        self.assertEqual(root_after['fallback']['state'], 'relaunched')
+        self.assertFalse(registry.claim_stopped(root_after['fallback'], registry.utcnow()))
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(root_after)))
+        self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(registry.inspect(attempt2_id))))
 
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim
