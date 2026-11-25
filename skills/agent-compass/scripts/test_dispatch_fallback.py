@@ -1076,7 +1076,7 @@ class FallbackTests(unittest.TestCase):
         prepared = fb['current']
         self.assertEqual((fb['state'], registry.inspect(prepared)['state']), ('relaunching', 'prepared'))
         self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
-        self.assertTrue(registry.claim_stopped(fb, registry.utcnow()))
+        self.assertTrue(registry.claim_stopped(registry.inspect(root['dispatch_id']), registry.utcnow()))
         out = self.handle(root['dispatch_id'])
         self.assertEqual(out['action'], 'relaunched')
         self.assertNotEqual(out['dispatch_id'], prepared)
@@ -1192,7 +1192,7 @@ class FallbackTests(unittest.TestCase):
         if pid is None:
             self.skipTest('no process refuses this user here')
         self.assertIsNone(registry.process_started(pid))
-        for delta in ({'hours': 1}, {'hours': 24}, {'days': 30}):
+        for delta in ({'hours': 1}, {'hours': 23}, {'days': 30}):
             with self.subTest(**delta):
                 creates = len(self.host.creates)
                 root = self.failed_root(task=dict(self.task, task_id=f"r3-1-{'-'.join(map(str, delta.values()))}"))
@@ -1201,8 +1201,13 @@ class FallbackTests(unittest.TestCase):
                     item = registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]
                     self.assertFalse(registry.claim_held(item, registry.utcnow()))
                     self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
-                    self.assertEqual(self.handle(root['dispatch_id'])['action'], 'relaunched')
-                self.assertEqual(len(self.host.creates), creates + 2)
+                    out = self.handle(root['dispatch_id'])
+                    if 'days' in delta:
+                        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+                        self.assertEqual(len(self.host.creates), creates + 1)
+                    else:
+                        self.assertEqual(out['action'], 'relaunched')
+                        self.assertEqual(len(self.host.creates), creates + 2)
 
     def test_a_live_holder_of_this_user_still_holds_and_another_users_pid_does_not(self):
         """E's rule stays: this process, as a holder, reads alive with its own start time. Without /proc, a pid whose
@@ -1219,6 +1224,202 @@ class FallbackTests(unittest.TestCase):
         no_proc = type('Os', (), {'name': 'posix', 'kill': staticmethod(refused), 'getpid': staticmethod(os.getpid)})
         with patch.object(registry, 'os', no_proc):
             self.assertIsNone(registry.process_started(987654))
+
+    def test_reconcile_and_fallback_texts_settle_stopped_steps_and_due_retries_without_caller_next_argv(self):
+        """reconcile carries a stopped fallback step and a due scheduled retry without caller next_argv, and no fallback
+        pending text asks the caller to run next_argv."""
+        import provider_retry
+        for text in (flow.FALLBACK_RUNNING_NEXT.format(where='attempt 1'),
+                     flow.FALLBACK_STOPPED_NEXT,
+                     flow.FALLBACK_SCHEDULED_NEXT.format(retry_at='2026-11-25T00:00:00Z'),
+                     flow.FALLBACK_RELAUNCHED_NEXT.format(current='d-2')):
+            self.assertIn('nothing is required', text)
+            self.assertNotIn('run next_argv', text.lower())
+
+        # 1. Stopped fallback step is taken over by `reconcile(None, carry_fallback=True)` without caller `launch`.
+        root = self.failed_root()
+        self.killed_step(root)
+        real_handle = fallback.handle
+        with self.at(minutes=1), patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(
+                did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=self.host, now=registry.utcnow(), carry_fallback=True)
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotEqual(registry.current_attempt(root['dispatch_id']), root['dispatch_id'])
+        self.assert_one_worker()
+
+        # 2. Scheduled transient retry starts on `reconcile(None, carry_fallback=True)` once due, and not before.
+        retry_store = self.root / provider_retry.FILE
+        with patch.dict(os.environ, {'ROUTER_PROVIDER_RETRY': str(retry_store)}):
+            sched_root = self.first(task=dict(self.task, task_id='sched-self', can_wait_hours=1))
+            failed_at = registry.utcnow()
+            terminal = {'reason': 'error', 'at': failed_at.isoformat(),
+                        'failure_code': 'provider_turn_failed', 'provider_message': '503 upstream overloaded'}
+            provider_retry.record(sched_root['bundle'], terminal, dispatch_id=sched_root['dispatch_id'],
+                                  at=failed_at.isoformat(),
+                                  classify=lambda *_: ('transient', {'source': 'system_one', 'scorer_type': 'fixture'}))
+            self.host.end(sched_root['dispatch_id'], 'error', terminal=terminal)
+            out = self.handle(sched_root['dispatch_id'])
+            self.assertEqual(out['action'], 'scheduled')
+            due_at = registry.parse(out['retry_at'])
+            creates_before = len(self.host.creates)
+            with patch.object(registry, 'utcnow', return_value=due_at - timedelta(seconds=1)), \
+                    patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+                flow.reconcile(None, host=self.host, now=due_at - timedelta(seconds=1), carry_fallback=True)
+            self.assertEqual(len(self.host.creates), creates_before)
+            with patch.object(registry, 'utcnow', return_value=due_at), \
+                    patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+                flow.reconcile(None, host=self.host, now=due_at, carry_fallback=True)
+            self.assertEqual(len(self.host.creates), creates_before + 1)
+
+    def test_non_launching_callers_never_start_a_fallback_step_and_release_cancels_due_retry(self):
+        """Rule 1: default `reconcile`, `reservation_records` (`plan`/`record`), `dispatch prepare`, `dispatch release`,
+        and a `roll` of another task never run `resume_due`; `release` cancels a due retry instead of launching it first."""
+        import argparse
+        import contextlib
+        import public_data
+        import roll as roll_mod
+        stopped = self.failed_root(task=dict(self.task, task_id='stopped-task'))
+        self.killed_step(stopped)
+        sched_root, _ = self.scheduled_root(minutes=16)
+        retry_at = registry.inspect(sched_root['dispatch_id'])['fallback']['retry_at']
+        due_now = registry.parse(retry_at) + timedelta(seconds=5)
+        creates_before = len(self.host.creates)
+        effects_before = public_data._EFFECTS[0]
+        real_handle = fallback.handle
+        with patch.dict(os.environ, {'AGENTCOMPASS_LIVE_MODELS': 'off', 'AGENTCOMPASS_ANTIGRAVITY_PLAN': 'off'}), \
+                patch('account_fleet.load_accounts', return_value=self.accounts), \
+                patch.object(registry, 'utcnow', return_value=due_now), \
+                patch.object(flow, 'host_call', self.host), \
+                patch.object(flow, 'paseo_reachable', return_value=True), \
+                patch.object(roll_mod, 'can_launch_via_paseo', return_value=True), \
+                patch.object(roll_mod, 'cli', side_effect=AssertionError('unexpected cli launch')), \
+                patch.object(roll_mod, 'match_reusable_worker', return_value=None), \
+                patch.object(roll_mod.provider_inventory, 'current', return_value={'launchers': {}}), \
+                patch.object(roll_mod.provider_inventory, 'snapshot', contextlib.nullcontext), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile()
+            flow.reservation_records(read_only=False)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertEqual(public_data._EFFECTS[0], effects_before)
+            # `dispatch --dispatch-action release` on a due retry cancels the retry without launching a worker.
+            rel = flow.cli(argparse.Namespace(
+                stage='dispatch', dispatch_action='release',
+                dispatch_id=sched_root['dispatch_id'], parent_id='parent-a', basis='user cancelled brief',
+            ))
+            self.assertTrue(rel['released'])
+            self.assertEqual(rel['canceled_retry'], sched_root['dispatch_id'])
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertEqual(registry.inspect(sched_root['dispatch_id'])['fallback']['state'], 'final')
+            # Rolling a DIFFERENT task leaves `stopped` untouched, whereas rolling the SAME task takes it over.
+            other_args = argparse.Namespace(
+                stage='roll', task='unrelated task', brief=None, task_id='different-task', title=None,
+                hours=0.5, can_wait_hours=None, local_only=None, keep_whole=None, file=[], apply_to=None,
+                fast=False, verbose=False, workspace=None, resume=None, new_worker=False, access=None,
+                score=False, no_score=True, score_timeout=10, dry_run=False, usage_cache=None,
+                provider=None, account=None, model=None, effort=None, basis=None, constraint=None,
+                reason_category=None, specialty=None, trigger=None, accounts=None,
+                parent_id='parent-a', parent_host='paseo', parent_address='parent-a', parent_model=None,
+            )
+            with patch.object(roll_mod, 'build_task', return_value=dict(self.task, task_id='different-task')), \
+                    patch.object(self.judge, 'plan_stage', create=True, side_effect=lambda doc, a: self.judge.plan_task(doc['task'], a)), \
+                    patch.object(roll_mod, 'paseo', return_value=({'launched': True, 'dispatch_mode': 'paseo'}, 0)):
+                roll_mod._run(other_args, self.judge)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertTrue(registry.claim_stopped(registry.inspect(stopped['dispatch_id']), due_now))
+            same_args = argparse.Namespace(**{**vars(other_args), 'task_id': 'stopped-task'})
+            with patch.object(roll_mod, 'build_task', return_value=dict(self.task, task_id='stopped-task')):
+                same_out, same_code = roll_mod._run(same_args, self.judge)
+            self.assertEqual(same_code, 0)
+            self.assertEqual(len(self.host.creates), creates_before + 1)
+
+    def test_taking_over_a_step_stopped_after_claiming_attempt_2_saves_relaunched_state(self):
+        """Rule 5: when a step dies after claiming attempt 2 (`state != 'prepared'`) before saving `relaunched`, taking it
+        over updates `fallback.state == 'relaunched'` without spawning a third worker or leaving `FALLBACK_STOPPED_NEXT`."""
+        root = self.failed_root()
+        real_launch = flow.launch
+
+        class KilledAfterClaim(BaseException):
+            pass
+
+        def launch_then_die(dispatch_id, parent_id, **kw):
+            real_launch(dispatch_id, parent_id, **kw)
+            raise KilledAfterClaim()
+
+        with patch.object(registry, 'process_identity', return_value=self.ended_process()), \
+                patch.object(fallback.Chain, 'release', lambda *_: None), \
+                patch.object(flow, 'launch', side_effect=launch_then_die), \
+                self.assertRaises(KilledAfterClaim):
+            self.handle(root['dispatch_id'])
+        root_before = registry.inspect(root['dispatch_id'])
+        fb_before = root_before['fallback']
+        attempt2_id = fb_before['current']
+        self.assertEqual(fb_before['state'], 'relaunching')
+        self.assertIn(registry.inspect(attempt2_id)['state'], ('launching', 'launched', 'started'))
+        self.assertTrue(registry.claim_stopped(root_before, registry.utcnow()))
+        real_handle = fallback.handle
+        with patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=self.host, now=registry.utcnow(), carry_fallback=True)
+        root_after = registry.inspect(root['dispatch_id'])
+        self.assertEqual(root_after['fallback']['state'], 'relaunched')
+        self.assertFalse(registry.claim_stopped(root_after, registry.utcnow()))
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(root_after)))
+        self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(registry.inspect(attempt2_id))))
+
+    def test_stopped_step_and_due_retry_past_max_lifetime_close_once_without_launching(self):
+        """Rule A: past `hard_until` (`registry.MAX_LIFETIME`), neither a stopped fallback step nor a due retry launches
+        anything: `reconcile(carry_fallback=True)` / `resume_due` closes the chain once as `final` (`not_relaunched` in
+        `NOTHING_RUNS` saying the step stopped and was not taken over in time), queues one parent end notice, and neither
+        `claim_stopped` nor `resume_due` names the dispatch again; an `AlreadyHandled` or failing takeover also closes
+        cleanly instead of spinning."""
+        stopped = self.failed_root(task=dict(self.task, task_id='expired-stopped'))
+        self.killed_step(stopped, relaunching=True)
+        sched_root, _ = self.scheduled_root(minutes=16)
+        past = registry.parse(stopped['hard_until']) + timedelta(days=2)
+        creates_before = len(self.host.creates)
+        notices_sent = []
+
+        def host_with_notify(req):
+            if req.get('operation') == 'notify_end':
+                notices_sent.append(req['dispatch_id'])
+                return {'ok': True, 'sent': True, 'message_id': registry.end_notice_message_id(req['dispatch_id'])}
+            return self.host(req)
+
+        real_handle = fallback.handle
+        with patch.object(registry, 'utcnow', return_value=past), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=host_with_notify, now=past, carry_fallback=True)
+            flow.deliver_end_notices(now=past, host=host_with_notify)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertFalse(registry.takeover_allowed(registry.inspect(stopped['dispatch_id']), past))
+            for did in (stopped['dispatch_id'], sched_root['dispatch_id']):
+                closed = registry.inspect(did)
+                self.assertEqual(closed['fallback']['state'], 'final')
+                self.assertEqual(closed['fallback']['outcome']['result'], 'not_relaunched')
+                self.assertIn(fallback.STEP_EXPIRED_DETAIL, closed['fallback']['outcome']['next_action'])
+                self.assertFalse(registry.claim_stopped(closed, past))
+                self.assertFalse(registry.fallback_expired(closed, past))
+                self.assertIsNone(fallback.resume_due(did, host=host_with_notify, now=past))
+            self.assertEqual(sorted(notices_sent), sorted([stopped['dispatch_id'], sched_root['dispatch_id']]))
+            # Second pass touches and sends nothing.
+            self.assertIsNone(fallback.resume_due(None, host=host_with_notify, now=past))
+            flow.deliver_end_notices(now=past, host=host_with_notify)
+            self.assertEqual(len(notices_sent), 2)
+
+        # An `AlreadyHandled` or failing takeover inside `hard_until` also clears `relaunching` instead of leaving `claim_stopped`.
+        already = self.failed_root(task=dict(self.task, task_id='already-handled-relaunching'))
+        ended = self.ended_process()
+        registry.update_fallback(
+            already['dispatch_id'],
+            lambda fb: fb.update(
+                state='relaunching', holder=ended,
+                handled={already['dispatch_id']: {'action': 'final', 'result': 'blocked', 'text': 'none left'}},
+            ),
+        )
+        self.assertTrue(registry.claim_stopped(registry.inspect(already['dispatch_id']), registry.utcnow()))
+        fallback.resume_due(already['dispatch_id'], judge=self.judge, host=self.host)
+        self.assertEqual(registry.inspect(already['dispatch_id'])['fallback']['state'], 'final')
+        self.assertFalse(registry.claim_stopped(registry.inspect(already['dispatch_id']), registry.utcnow()))
 
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim

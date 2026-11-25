@@ -1172,10 +1172,21 @@ class Play:
         if status == "launched" or record["launched"] is True:
             self.launched(op, chain, record, act)
             return
-        if status == "pending" and isinstance(doc.get("next_argv"), list):
+        if status == "pending" and action != "wait_for_notification" and isinstance(doc.get("next_argv"), list):
             if chain["commands"] >= FOLLOW_LIMIT:
                 chain["outcome"], chain["note"] = "dead_end", f"still pending after {chain['commands']} commands"
                 return
+            retry_at = doc.get("retry_at")
+            if isinstance(retry_at, str) and retry_at:
+                import datetime as dt
+                try:
+                    retry_dt = dt.datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
+                    target_hour = (retry_dt.timestamp() - s.clock.t0) / 3600.0 + 0.001
+                except ValueError:
+                    target_hour = None
+                if target_hour is not None and target_hour > s.clock.now and (target_hour - s.clock.now) <= WAIT_LIMIT_HOURS:
+                    chain["waits"].append(round(target_hour - s.clock.now, 4))
+                    self.note_resets(s.advance_to(target_hour))
             result = s.command(op, [str(a) for a in doc["next_argv"]])
             chain["commands"] += 1
             got = parse(result.stdout) or {}
@@ -1183,10 +1194,13 @@ class Play:
             follow.update({k: record[k] for k in ("account", "model", "effort", "bundle_id", "expected_usd", "decision_id") if follow.get(k) is None})
             if got.get("state") in ("completed", "launched", "started") or got.get("status") == "launched":
                 self.launched(op, chain, follow, act)
-            elif got.get("status") == "pending" and isinstance(got.get("next_argv"), list):
+            elif got.get("status") == "pending" and got.get("caller_action") != "wait_for_notification" and isinstance(got.get("next_argv"), list):
                 self.settle(op, chain, got, act, key, argv, depth)
             else:
                 chain["outcome"] = "handed_to_session"
+            return
+        if status == "pending" and record.get("dispatch_id"):
+            self.observe_pending(op, chain, record, act)
             return
         if mode == "split" or action == "roll_each_line":
             parts = self.corpus[key].get("split_into")
@@ -1248,23 +1262,67 @@ class Play:
                 continue
         return messages
 
+    def _poll_chain(self, op, chain, root_id: str, deadline: float) -> dict:
+        s = self.s
+        got = {}
+        while time.time() < deadline:
+            s.call(op, "dispatch", "--dispatch-action", "reconcile", "--carry-fallback")
+            root = parse(s.call(op, "dispatch", "--dispatch-action", "status", "--dispatch-id", root_id).stdout) or {}
+            current_id = root.get("current_attempt") or root_id
+            if current_id != root_id:
+                cur = parse(s.call(op, "dispatch", "--dispatch-action", "status", "--dispatch-id", current_id).stdout) or {}
+                got = dict(cur, attempts=root.get("attempts") or cur.get("attempts"), current_attempt=current_id,
+                           **({"retry_at": root["retry_at"]} if root.get("retry_at") else {}))
+            else:
+                got = root
+            retry_at = root.get("retry_at")
+            if isinstance(retry_at, str) and retry_at:
+                import datetime as dt
+                try:
+                    retry_dt = dt.datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
+                    target_hour = (retry_dt.timestamp() - s.clock.t0) / 3600.0 + 0.001
+                except ValueError:
+                    target_hour = None
+                if target_hour is not None and target_hour > s.clock.now and (target_hour - s.clock.now) <= WAIT_LIMIT_HOURS:
+                    chain["waits"].append(round(target_hour - s.clock.now, 4))
+                    self.note_resets(s.advance_to(target_hour))
+                    continue
+            if got.get("state") in ("launched", "started", "completed"):
+                break
+            if got.get("state") in TERMINAL and not retry_at and "relaunching this brief" not in str(root.get("next_action") or ""):
+                break
+            time.sleep(2)
+        return got
+
+    def observe_pending(self, op, chain, record, act):
+        """A Paseo pending answer says nothing is required and AgentCompass settles the dispatch itself: the session runs
+        no next_argv, and the run observes the dispatch the way the product does (reconcile)."""
+        before = len(self.inbox())
+        got = self._poll_chain(op, chain, record["dispatch_id"], time.time() + 40)
+        mail = self.inbox()[before:]
+        follow = self.answer(chain, got, ["dispatch", "--dispatch-action", "status"], None, None, record["brief"], kind="observe")
+        follow.update({k: record[k] for k in ("account", "model", "effort", "bundle_id", "expected_usd", "decision_id") if follow.get(k) is None})
+        follow["dispatch_id"] = got.get("dispatch_id") or record["dispatch_id"]
+        follow["worker_state"] = got.get("state")
+        follow["observed"] = {k: got.get(k) for k in ("state", "cause", "attempt_of", "attempts", "retry_at", "current_attempt") if got.get(k) is not None}
+        follow["mail"] = [m.get("text", "")[:600] for m in mail]
+        if got.get("state") in ("launched", "started", "completed"):
+            self.launched(op, chain, follow, act)
+            if got.get("dispatch_id") and got.get("dispatch_id") != record["dispatch_id"]:
+                chain["outcome"] = "relaunched"
+        else:
+            chain["outcome"] = "handed_to_session"
+            chain["note"] = f"after the pending answer the dispatch is {got.get('state')}; {len(mail)} message(s) reached the parent"
+
     def observe_after_error(self, op, chain, record, act):
         """An error answer that names a dispatch and says the router goes on by itself (a relaunch, a retry): the session runs
         nothing and waits for the notification, so the run observes the dispatch the way the product does (reconcile) and
         keeps its final state and whatever reached the parent's mailbox."""
-        s = self.s
         before = len(self.inbox())
-        deadline = time.time() + 40
-        got = {}
-        while time.time() < deadline:
-            s.call(op, "dispatch", "--dispatch-action", "reconcile")
-            result = s.call(op, "dispatch", "--dispatch-action", "status", "--dispatch-id", record["dispatch_id"])
-            got = parse(result.stdout) or {}
-            if got.get("state") in TERMINAL or got.get("state") in ("launched", "started"):
-                break
-            time.sleep(2)
+        got = self._poll_chain(op, chain, record["dispatch_id"], time.time() + 40)
         mail = self.inbox()[before:]
         follow = self.answer(chain, got, ["dispatch", "--dispatch-action", "status"], None, None, record["brief"], kind="observe")
+        follow["dispatch_id"] = got.get("dispatch_id") or record["dispatch_id"]
         follow["worker_state"] = got.get("state")
         follow["observed"] = {k: got.get(k) for k in ("state", "cause", "attempt_of", "attempts", "retry_at", "current_attempt") if got.get(k) is not None}
         follow["mail"] = [m.get("text", "")[:600] for m in mail]

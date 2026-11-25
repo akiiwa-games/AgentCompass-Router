@@ -11,7 +11,7 @@ import {setTimeout as pause} from 'node:timers/promises';
 import {execute, project, normalizeProviderModels, notificationStep, notificationEvents, ensureNotification, notificationReceipt,
   creationFailureClass, creationFailureCode, creationRecord, resolvePaseoPlacement, subscriptionLapsed, providerRetry, retryStreak, retryIsStuck,
   workedBeforeRetrying, endedOnReply, turnFailure, RETRY_STUCK_CODE, TURN_FAILED_CODE, fallbackArgv, abandonArgv, runFallback,
-  attemptsNote, notificationFile, agentResumed, settleArgv, settleBeforeExit, enterRecovery, leaveRecovery,
+  attemptsNote, notificationFile, agentResumed, settleArgv, settleBeforeExit, enterRecovery, leaveRecovery, reviveRetryWatch,
   finalReplyText, reportSection, composeNotice, notifyEnd, hostFailure, hostFailureClass, CONDITIONS, RECORDED_ENDS,
   BridgeError, createClient, continuationVerdict, REPORT_INLINE_LIMIT, REPORT_SUMMARY_LIMIT} from './paseo_dispatch_bridge.mjs';
 
@@ -2913,6 +2913,261 @@ test('leaveRecovery leaves a newly claimed .recovery directory to the late conte
       if (oldEnv[name] === undefined) delete process.env[name]; else process.env[name] = oldEnv[name];
     }
     await until(() => [...pids].filter(pid => pid !== process.pid).every(pid => !running(pid)));
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('notificationStep finds an unconfirmed created worker by label, saves bound_agent, and keeps structured create failure codes', async () => {
+  const sent = [];
+  const labelAgent = {
+    id: 'worker-under-other-id',
+    status: 'idle',
+    attentionReason: 'finished',
+    labels: {'router.dispatch_id': 'd-by-label', 'router.parent_id': 'parent-1'},
+  };
+  const client = {
+    async fetchAgent(id) {
+      if (id === 'parent-1') return {agent: {id: 'parent-1', status: 'idle'}};
+      if (id === 'worker-under-other-id') return {agent: labelAgent};
+      return null;
+    },
+    async fetchAgents(opts) {
+      assert.deepEqual(opts?.filter?.labels, {'router.dispatch_id': 'd-by-label'});
+      return {entries: [{id: 'worker-under-other-id'}]};
+    },
+    async fetchAgentTimeline(id) {
+      if (id === 'worker-under-other-id')
+        return {entries: [{timestamp: '2026-11-25T00:00:02Z', item: {type: 'assistant_message', text: 'label worker done'}}]};
+      return {entries: []};
+    },
+    async sendMessage(to, text, opts) { sent.push({to, text, opts}); },
+  };
+  const record = {
+    dispatch_id: 'd-by-label', parent_id: 'parent-1',
+    created_at: Date.parse('2026-11-25T00:00:00Z'),
+    creation_deadline: Date.parse('2026-11-25T00:04:00Z'),
+    deadline: Date.parse('2026-11-26T00:00:00Z'),
+    status: 'watching', delivered: [], pending: null,
+  };
+  const done = await notificationStep(client, record, () => {}, Date.parse('2026-11-25T00:00:05Z'), null);
+  assert.equal(done, true);
+  assert.equal(record.agent_id, 'worker-under-other-id');
+  assert.equal(record.bound_agent?.id, 'worker-under-other-id');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /label worker done/);
+
+  // Structured creation failure keeps failure_class and failure_code on record.terminal.
+  const failClient = {
+    async fetchAgent(id) { return id === 'parent-1' ? {agent: {id: 'parent-1', status: 'idle'}} : null; },
+    async fetchAgents() { return {entries: []}; },
+    async sendCorrelatedSessionRequest() {
+      return {snapshot: {phase: 'failed', outcomeUnknown: false, errorCode: 'INVALID_MODEL', error: 'unknown model'}};
+    },
+    async sendMessage() {},
+  };
+  const failRecord = {
+    dispatch_id: 'd-fail-code', parent_id: 'parent-1',
+    created_at: Date.parse('2026-11-25T00:00:00Z'),
+    creation_deadline: Date.parse('2026-11-25T00:04:00Z'),
+    deadline: Date.parse('2026-11-26T00:00:00Z'),
+    status: 'watching', delivered: [], pending: null,
+  };
+  await notificationStep(failClient, failRecord, () => {}, Date.parse('2026-11-25T00:00:05Z'), async () => ({action: 'declined'}));
+  assert.equal(failRecord.terminal?.reason, 'creation failed');
+  assert.equal(failRecord.terminal?.failure_class, 'model_unavailable');
+  assert.equal(failRecord.terminal?.failure_code, 'INVALID_MODEL');
+});
+
+test('an unconfirmed resume refuses late send_by and settles at resume_deadline when its relabel never landed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'router-resume-deadline-'));
+  const prevState = process.env.ROUTER_STATE_DIR;
+  process.env.ROUTER_STATE_DIR = root;
+  try {
+    let updated = false, sentTurn = false;
+    const existing = {
+      id: 'w-1', status: 'idle', provider: 'claude', model: 'claude-sonnet-5-5',
+      labels: {'router.parent_id': 'parent-1', 'router.dispatch_id': 'd-old'},
+    };
+    const client = {
+      async fetchAgent(id) {
+        if (id === 'parent-1') return {agent: {id: 'parent-1', status: 'idle'}};
+        if (id === 'w-1') return {agent: existing};
+        return null;
+      },
+      async updateAgent() { updated = true; },
+      async sendMessage() { sentTurn = true; },
+    };
+    const late = await execute(client, {
+      operation: 'resume', dispatch_id: 'd-res-late', parent_id: 'parent-1', agent_id: 'w-1',
+      send_by: new Date(Date.now() - 5000).toISOString(),
+      request: {provider: 'claude/claude-sonnet-5-5', title: 'follow up', initialPrompt: 'go', labels: {'router.dispatch_id': 'd-res-late'}},
+    }, async () => ({status: 'watching', pid: 999999, state_file: path.join(root, 'paseo-notifications', 'd-res-late.json')}));
+    assert.equal(late.ok, false);
+    assert.equal(late.sent, false);
+    assert.equal(late.error, 'create_send_window_elapsed');
+    assert.equal(updated, false);
+    assert.equal(sentTurn, false);
+
+    const record = {dispatch_id: 'd-res-2', parent_id: 'parent-1', agent_id: 'w-1', created_at: 100_000, resume_deadline: 240_000};
+    assert.deepEqual(notificationEvents(existing, record, 239_999), []);
+    assert.deepEqual(notificationEvents(existing, record, 240_000), [{key: 'terminal', reason: 'creation failed'}]);
+    const text = await composeNotice(client, record, {key: 'terminal', reason: 'creation failed'});
+    assert.match(text, /never bound this resumed turn/);
+
+    // Rule 4b & rollback: if sendMessage delivered the turn before throwing, execute(resume) keeps the bound turn
+    // instead of rolling back; and an unlabeled worker running a turn started >= created_at binds instead of failing.
+    let workerAfterSend = {...existing};
+    let rollbackCalls = 0;
+    const timeoutClient = {
+      async fetchAgent(id) {
+        if (id === 'parent-1') return {agent: {id: 'parent-1', status: 'idle'}};
+        if (id === 'w-1') return {agent: workerAfterSend};
+        return null;
+      },
+      async updateAgent(_id, patch) {
+        if (patch.labels?.['router.dispatch_id'] === 'd-old') rollbackCalls++;
+        workerAfterSend = {...workerAfterSend, labels: patch.labels};
+      },
+      async sendMessage() {
+        workerAfterSend = {...workerAfterSend, status: 'running', lastUserMessageAt: new Date(Date.now() + 10).toISOString()};
+        const err = new Error('Request timed out');
+        err.name = 'DaemonConnectionError';
+        err.code = 'DAEMON_REQUEST_TIMEOUT';
+        throw err;
+      },
+    };
+    const deliveredRes = await execute(timeoutClient, {
+      operation: 'resume', dispatch_id: 'd-res-delivered', parent_id: 'parent-1', agent_id: 'w-1',
+      request: {provider: 'claude/claude-sonnet-5-5', title: 'follow up', initialPrompt: 'go',
+        labels: {'router.dispatch_id': 'd-res-delivered'}},
+    }, async () => ({status: 'watching', pid: 999999, state_file: path.join(root, 'paseo-notifications', 'd-res-delivered.json')}));
+    assert.equal(deliveredRes.ok, true);
+    assert.equal(deliveredRes.sent, true);
+    assert.equal(rollbackCalls, 0);
+    assert.equal(deliveredRes.agent?.labels?.['router.dispatch_id'], 'd-res-delivered');
+
+    const unlabeledRec = {dispatch_id: 'd-res-unlabeled', parent_id: 'parent-1', agent_id: 'w-1',
+      created_at: Date.parse('2026-11-25T00:00:00Z'), resume_deadline: Date.parse('2026-11-25T00:04:00Z')};
+    const runningUnlabeled = {...existing, status: 'running', lastUserMessageAt: '2026-11-25T00:00:02Z'};
+    assert.deepEqual(notificationEvents(runningUnlabeled, unlabeledRec, Date.parse('2026-11-25T00:04:01Z')), []);
+    assert.equal(unlabeledRec.started, true);
+    assert.equal(unlabeledRec.bound_agent?.id, 'w-1');
+    // Subsequent poll while still carrying d-old must not emit SUPERSEDED, and finishes normally once idle.
+    assert.deepEqual(notificationEvents(runningUnlabeled, unlabeledRec, Date.parse('2026-11-25T00:04:06Z')), []);
+    const finishedUnlabeled = {...runningUnlabeled, status: 'idle', attentionReason: 'finished'};
+    assert.deepEqual(notificationEvents(finishedUnlabeled, unlabeledRec, Date.parse('2026-11-25T00:04:10Z')),
+      [{key: 'terminal', reason: 'finished'}]);
+  } finally {
+    if (prevState === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = prevState;
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('--ensure-watch CLI and main() sent-failure fallback both start a real bounded watcher process', async () => {
+  const {spawnSync} = await import('node:child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'router-ensure-watch-cli-'));
+  const fakeSdk = path.join(root, 'fake_sdk', 'node_modules');
+  fs.mkdirSync(path.join(fakeSdk, '@getpaseo', 'client'), {recursive: true});
+  fs.mkdirSync(path.join(fakeSdk, 'ws'), {recursive: true});
+  fs.writeFileSync(path.join(fakeSdk, '@getpaseo', 'client', 'package.json'),
+    JSON.stringify({name: '@getpaseo/client', exports: {'./internal/daemon-client': './client.cjs'}}));
+  fs.writeFileSync(path.join(fakeSdk, '@getpaseo', 'client', 'client.cjs'), `
+    exports.DaemonClient = class {
+      isConnected = false;
+      async connect() { this.isConnected = true; }
+      async close() { this.isConnected = false; }
+      async fetchAgent(id) {
+        if (process.env.THROW_ON_FETCH === '1' && !process.argv.includes('--watch')) {
+          const err = new Error('Request timed out');
+          err.name = 'DaemonConnectionError';
+          err.code = 'DAEMON_REQUEST_TIMEOUT';
+          throw err;
+        }
+        if (id === 'parent-1') return {agent: {id: 'parent-1', status: 'running'}};
+        return {agent: {id, status: 'running', labels: {'router.dispatch_id': id, 'router.parent_id': 'parent-1'}}};
+      }
+      async fetchAgents() { return {entries: []}; }
+      async sendCorrelatedSessionRequest() { return {snapshot: null}; }
+    };
+  `);
+  fs.writeFileSync(path.join(fakeSdk, 'ws', 'index.js'), 'exports.WebSocket = class {};\n');
+  const bridgePath = fileURLToPath(new URL('./paseo_dispatch_bridge.mjs', import.meta.url));
+  const env = {...process.env, ROUTER_STATE_DIR: root, ROUTER_PASEO_SDK_ROOT: fakeSdk, PASEO_HOME: path.join(root, '.paseo')};
+  const pids = [];
+  try {
+    const retryAt = new Date(Date.now() + 60_000).toISOString();
+    const ensured = spawnSync(process.execPath,
+      [bridgePath, '--ensure-watch', 'd-cli-watch', 'parent-1', '', '2026-11-25T01:00:00Z', 'retrying', retryAt],
+      {env, encoding: 'utf8', timeout: 15_000});
+    assert.equal(ensured.status, 0, ensured.stderr);
+    const receipt1 = JSON.parse(ensured.stdout);
+    assert.equal(receipt1.status, 'watching');
+    assert.ok(Number.isInteger(receipt1.pid) && receipt1.pid > 0);
+    pids.push({id: 'd-cli-watch', pid: receipt1.pid});
+
+    const failedMain = spawnSync(process.execPath, [bridgePath], {
+      env: {...env, THROW_ON_FETCH: '1'},
+      input: JSON.stringify({
+        operation: 'create', dispatch_id: 'd-main-sent', parent_id: 'parent-1',
+        request: {provider: 'codex/gpt-6.1-sol', title: 't', initialPrompt: 'p', labels: {'router.dispatch_id': 'd-main-sent'}},
+      }),
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(failedMain.status, 0, failedMain.stderr);
+    const outMain = JSON.parse(failedMain.stdout);
+    assert.equal(outMain.sent, true);
+    assert.equal(outMain.error, 'host_request_failed');
+    assert.equal(outMain.completion_notification?.status, 'watching');
+    pids.push({id: 'd-main-sent', pid: outMain.completion_notification.pid});
+  } finally {
+    for (const {id, pid} of pids) {
+      const f = path.join(root, 'paseo-notifications', `${id}.json.creation-failed`);
+      try { fs.writeFileSync(f, 'test_cleanup'); } catch {}
+      try { process.kill(pid); } catch {}
+    }
+    for (let i = 0; i < 30; i++) {
+      if (pids.every(({pid}) => { try { process.kill(pid, 0); return false; } catch { return true; } })) break;
+      await pause(100);
+    }
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('observe with ensure_watch starts a missing watcher and reviveRetryWatch clears creation_failed for a scheduled retry', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'router-revive-watch-'));
+  const prevState = process.env.ROUTER_STATE_DIR;
+  process.env.ROUTER_STATE_DIR = root;
+  try {
+    const notified = [];
+    const client = {
+      async fetchAgent() { return null; },
+      async fetchAgents() { return {entries: [{id: 'w-obs'}]}; },
+      async sendCorrelatedSessionRequest() { return {snapshot: null}; },
+    };
+    const observed = await execute(client, {
+      operation: 'observe', dispatch_id: 'd-missing-rec', parent_id: 'parent-1',
+      create_deadline: '2026-11-25T01:00:00Z', ensure_watch: true,
+    }, async (input) => { notified.push(input); return {status: 'watching', pid: 1234, state_file: 'x'}; });
+    assert.equal(observed.ok, true);
+    assert.equal(notified.length, 1);
+    assert.equal(notified[0].dispatch_id, 'd-missing-rec');
+    assert.equal(notified[0].parent_id, 'parent-1');
+
+    const file = notificationFile('d-sched-revive');
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(`${file}.creation-failed`, 'host_creation_failed');
+    fs.writeFileSync(file, JSON.stringify({dispatch_id: 'd-sched-revive', parent_id: 'parent-1', pid: 999999,
+      status: 'creation_failed', delivered: [], pending: null}));
+    const retryAt = new Date(Date.now() + 120_000).toISOString();
+    await reviveRetryWatch('d-sched-revive', 'parent-1', retryAt);
+    assert.equal(fs.existsSync(`${file}.creation-failed`), false);
+    const revived = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(revived.status, 'watching');
+    assert.equal(revived.fallback?.status, 'scheduled');
+    assert.equal(revived.fallback?.retry_at, retryAt);
+  } finally {
+    if (prevState === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = prevState;
     fs.rmSync(root, {recursive: true, force: true});
   }
 });

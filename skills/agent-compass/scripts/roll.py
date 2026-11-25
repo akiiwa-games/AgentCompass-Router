@@ -1086,10 +1086,17 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
         receipt = dict(receipt)
         receipt.setdefault('continuation_argv', entry.argv(
             'launch', '--dispatch-id', row['dispatch_id'], '--parent-id', parent, '--watch-seconds', '120'))
-        return dict(out, launched=None, dispatch_mode='paseo', caller_action='check_delivery_do_not_resend',
-                    next=receipt.get('next_action') or
-                         'Paseo delivery is unconfirmed. Run worker.continuation_argv to observe this same dispatch; '
-                         'do not roll again or issue another create request.',
+        watched = bool(receipt.get('watcher_confirmed'))
+        default_next = (
+            'Paseo delivery is unconfirmed; AgentCompass watches this dispatch and settles it itself, notifying the '
+            'parent of the outcome, so nothing is required. Do not roll again or issue another create request.'
+            if watched else
+            'Paseo delivery is unconfirmed and no background watcher is confirmed. Run next_argv to observe and settle '
+            'this same dispatch in the foreground; do not roll again or issue another create request.'
+        )
+        return dict(out, launched=None, dispatch_mode='paseo',
+                    caller_action='wait_for_notification' if watched else 'run_next_argv',
+                    next=receipt.get('next_action') or default_next,
                     worker=dict(receipt, provider=decision['selected_bundle']['provider'])), 0
     if ended_before_send:
         return dict(out, launched=False, dispatch_mode='paseo', caller_action='check_error',
@@ -1137,10 +1144,11 @@ def fallback_result(out, outcome, decision, parent, args):
     attempts = outcome.get('lines') or []
     if outcome.get('action') == 'relaunched':
         dispatch_id = outcome['dispatch_id']
-        receipt = dispatch_flow.public_chain(registry.inspect(dispatch_id))
+        relaunch_row = registry.inspect(dispatch_id)
+        receipt = dispatch_flow.public_chain(relaunch_row)
         receipt.update({k: v for k, v in (outcome.get('receipt') or {}).items()
-                        if k in ('completion_notification', 'error', 'cause', 'observe_error')})
-        bundle = registry.inspect(dispatch_id)['bundle']
+                        if k in ('completion_notification', 'watcher_confirmed', 'error', 'cause', 'observe_error')})
+        bundle = relaunch_row['bundle']
         route = dict(out.get('route') or {}, bundle={k: bundle[k] for k in (
             'provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast') if bundle.get(k)})
         out = dict(out, route=route, attempts=attempts)
@@ -1148,9 +1156,28 @@ def fallback_result(out, outcome, decision, parent, args):
         if receipt.get('state') in ('launching', 'expired') and not receipt.get('agent_id'):
             worker.setdefault('continuation_argv', entry.argv(
                 'launch', '--dispatch-id', dispatch_id, '--parent-id', parent, '--watch-seconds', '120'))
-            return dict(out, launched=None, dispatch_mode='paseo', caller_action='check_delivery_do_not_resend',
-                        next=receipt.get('next_action') or 'Paseo delivery of the relaunch is unconfirmed. Run '
-                             'worker.continuation_argv to observe it; do not roll again.', worker=worker), 0
+            ensured = worker.get('completion_notification')
+            if not dispatch_flow.watcher_confirmed(ensured, dispatch_id):
+                ensured = dispatch_flow.ensure_watcher(relaunch_row)
+                if ensured:
+                    worker['completion_notification'] = ensured
+            watched = dispatch_flow.watcher_confirmed(ensured, dispatch_id)
+            worker['watcher_confirmed'] = watched
+            if not watched:
+                worker['next_action'] = dispatch_flow.unwatched_pending_next(worker, row=relaunch_row) or (
+                    'Paseo delivery of the relaunch is unconfirmed and no background watcher is confirmed. Run '
+                    'next_argv to observe and settle it in the foreground; do not roll again.'
+                )
+            default_relaunch_next = (
+                'Paseo delivery of the relaunch is unconfirmed; AgentCompass watches it and settles it itself, '
+                'notifying the parent of the outcome, so nothing is required. Do not roll again.'
+                if watched else
+                'Paseo delivery of the relaunch is unconfirmed and no background watcher is confirmed. Run next_argv '
+                'to observe and settle it in the foreground; do not roll again.'
+            )
+            return dict(out, launched=None, dispatch_mode='paseo',
+                        caller_action='wait_for_notification' if watched else 'run_next_argv',
+                        next=worker.get('next_action') or default_relaunch_next, worker=worker), 0
         notification = receipt.get('completion_notification') or {}
         notif_status = notification.get('status')
         if notif_status == 'watching':
@@ -1176,17 +1203,44 @@ def fallback_result(out, outcome, decision, parent, args):
                             'next_action': outcome.get('text')}), 2
     if outcome.get('action') in ('pending', 'scheduled'):
         # pending: the bridge's watcher claimed this failure first and is relaunching the brief. scheduled: a transient
-        # failure whose same-model retry starts at retry_at, from the watcher or the next observation.
+        # failure whose same-model retry starts at retry_at, from the watcher or foreground next_argv.
         root = outcome.get('root_dispatch_id')
         scheduled = outcome['action'] == 'scheduled'
-        text = (dispatch_flow.FALLBACK_SCHEDULED_NEXT.format(retry_at=outcome.get('retry_at')) if scheduled
-                else dispatch_flow.FALLBACK_RUNNING_NEXT.format(where='its watcher is starting the next attempt'))
-        return dict(out, launched=None, dispatch_mode='paseo', caller_action='check_delivery_do_not_resend',
-                    attempts=attempts, **({'retry_at': outcome.get('retry_at')} if scheduled else {}), next=text,
+        retry_at = outcome.get('retry_at')
+        try:
+            root_row = registry.inspect(root) if root else {}
+        except (KeyError, ValueError, registry.Refused):
+            root_row = {}
+        fb = root_row.get('fallback') or {}
+        watch_id = (fb.get('retry_of') or root) if scheduled else (
+            next((fid for fid, item in (fb.get('handled') or {}).items()
+                  if isinstance(item, dict) and item.get('action') == 'pending'), None)
+            or (registry.current_attempt(root) if root_row else root)
+        )
+        ensured = outcome.get('completion_notification')
+        if not dispatch_flow.watcher_confirmed(ensured, watch_id) and watch_id:
+            try:
+                watch_row = registry.inspect(watch_id)
+            except (KeyError, ValueError, registry.Refused):
+                watch_row = None
+            if watch_row is not None:
+                ensured = dispatch_flow.ensure_watcher(watch_row, retry_at=retry_at if scheduled else None)
+        watched = dispatch_flow.watcher_confirmed(ensured, watch_id)
+        watch_sec = dispatch_flow.continuation_watch_seconds(retry_at if scheduled else None)
+        text = ((dispatch_flow.FALLBACK_SCHEDULED_NEXT.format(retry_at=retry_at) if scheduled
+                 else dispatch_flow.FALLBACK_RUNNING_NEXT.format(where='its watcher is starting the next attempt'))
+                if watched else
+                (dispatch_flow.UNWATCHED_FALLBACK_SCHEDULED_NEXT.format(retry_at=retry_at) if scheduled
+                 else dispatch_flow.UNWATCHED_FALLBACK_RUNNING_NEXT.format(where='another step claimed this attempt')))
+        return dict(out, launched=None, dispatch_mode='paseo',
+                    caller_action='wait_for_notification' if watched else 'run_next_argv',
+                    attempts=attempts, **({'retry_at': retry_at} if scheduled else {}), next=text,
                     worker={'dispatch_id': root, 'attempts': attempts, 'next_action': text,
-                            **({'retry_at': outcome.get('retry_at')} if scheduled else {}),
+                            'watcher_confirmed': watched,
+                            **({'completion_notification': ensured} if ensured else {}),
+                            **({'retry_at': retry_at} if scheduled else {}),
                             'continuation_argv': entry.argv(
-                                'launch', '--dispatch-id', root, '--parent-id', parent, '--watch-seconds', '120')}), 0
+                                'launch', '--dispatch-id', root, '--parent-id', parent, '--watch-seconds', str(watch_sec))}), 0
     # Declined (not a failure AgentCompass relaunches) or unsettled: the last attempt's own receipt says what to do.
     last = next((a.get('dispatch_id') for a in reversed(outcome.get('attempts') or []) if a.get('dispatch_id')), None)
     last_row = registry.inspect(last) if last else None
@@ -1411,7 +1465,7 @@ def status_of(result, code):
     mode, action = result.get('dispatch_mode'), result.get('caller_action')
     if result.get('launched') is True:
         return 'launched'
-    if result.get('launched') is None or action in ('check_delivery_do_not_resend', 'run_next_argv'):
+    if result.get('launched') is None or action in ('check_delivery_do_not_resend', 'run_next_argv', 'wait_for_notification'):
         return 'pending'
     if mode == 'scorer_unavailable' or result.get('error') == 'scorer_unavailable':
         return 'blocked'
@@ -1531,7 +1585,12 @@ def compact(result, status, detail_path):
     if status == 'launched':
         nxt = launched_next(result, worker, argv)
     elif status == 'pending' and argv:
-        nxt = worker.get('next_action') or 'Run next_argv to observe the same operation; do not roll again.'
+        if result.get('dispatch_mode') == 'paseo' and result.get('caller_action') == 'wait_for_notification':
+            nxt = worker.get('next_action') or result.get('next') or (
+                'AgentCompass watches this dispatch and settles it itself, notifying the parent of the outcome, so '
+                'nothing is required. Do not roll again.')
+        else:
+            nxt = worker.get('next_action') or result.get('next') or 'Run next_argv to observe the same operation; do not roll again.'
     elif status == 'native':
         nxt = (result.get('next')
                if (result.get('native_tool') or 'worker-start' in (result.get('next') or '')
@@ -1570,7 +1629,8 @@ def compact(result, status, detail_path):
         out['native_tool'], out['launch_fields'] = result.get('native_tool'), result.get('launch_fields')
     if status == 'split':
         out['task_count'] = result.get('task_count')
-    if status == 'blocked' and result.get('caller_action') in ('wait_for_reset', 'tell_user'):
+    if (status == 'blocked' and result.get('caller_action') in ('wait_for_reset', 'tell_user')) or (
+            status == 'pending' and result.get('caller_action') in ('wait_for_notification', 'run_next_argv', 'check_delivery_do_not_resend')):
         out['caller_action'] = result['caller_action']
     if result.get('start_after_hours') is not None:
         out['start_after_hours'] = result['start_after_hours']
@@ -1733,26 +1793,69 @@ def _run(args, judge):
     if host_session:
         task['host_session_id'] = host_session
     if parent and not args.dry_run:
+        now = registry.utcnow()
+        same_task = not getattr(args, 'new_worker', False)
+        stopped_roots = [r for r in registry.read_dispatches()
+                         if same_task and (r.get('parent_id'), r.get('task_id')) == (parent, task['task_id'])
+                         and (registry.claim_stopped(r, now)
+                              or (registry.takeover_allowed(r, now)
+                                  and (r.get('fallback') or {}).get('state') == 'retrying'
+                                  and (r.get('fallback') or {}).get('retry_of')
+                                  and not registry.later((r.get('fallback') or {}).get('retry_at'), now))
+                              or registry.fallback_expired(r, now))]
         pending_rows = [r for r in registry.pending() if r.get('parent_id') == parent]
-        if pending_rows:
+        if pending_rows or stopped_roots:
             launchers = (provider_inventory.current().get('launchers') or {})
             can_reconcile = any(
                 (r.get('task_id') == task['task_id'])
                 or (launchers.get((r.get('bundle') or {}).get('provider')) or {}).get('status') != 'disabled'
-                for r in pending_rows
+                for r in [*pending_rows, *stopped_roots]
             )
             if can_reconcile:
+                for r in stopped_roots:
+                    dispatch_fallback.resume_due(r['dispatch_id'], judge=judge)
                 for r in pending_rows:
-                    dispatch_flow.reconcile(r['dispatch_id'])
+                    dispatch_flow.reconcile(
+                        r['dispatch_id'],
+                        carry_fallback=(same_task and r.get('task_id') == task['task_id']),
+                    )
                 pending_rows = [r for r in registry.pending() if r.get('parent_id') == parent]
         # The same task already dispatched by this parent: hand back that worker, without classifying or launching again.
         for row in pending_rows:
             if not getattr(args, 'new_worker', False) and (row['parent_id'], row['task_id']) == (parent, task['task_id']):
-                argv = entry.argv('launch', '--dispatch-id', row['dispatch_id'], '--parent-id', parent, '--watch-seconds', '120')
+                current_id = registry.current_attempt(row['dispatch_id'])
+                current_row = row if current_id == row['dispatch_id'] else registry.inspect(current_id)
+                fb = row.get('fallback') or {}
+                retry_at = fb.get('retry_at') if fb.get('state') == 'retrying' else None
+                watch_row = registry.inspect(fb['retry_of']) if retry_at and fb.get('retry_of') else current_row
+                notification = dispatch_flow.ensure_watcher(watch_row, retry_at=retry_at)
+                watched = dispatch_flow.watcher_confirmed(notification, watch_row['dispatch_id'])
+                pub = dispatch_flow.public_chain(row)
+                pub['watcher_confirmed'] = watched
+                if notification:
+                    pub['completion_notification'] = notification
+                if watched:
+                    default_next = (f"This task already has an active Paseo dispatch (state {current_row['state']}). "
+                                    'AgentCompass watches it and notifies the parent when it finishes, so nothing is '
+                                    'required. Do not roll again: it will not create a second worker.')
+                    pub.setdefault('next_action', default_next)
+                else:
+                    if pub.get('next_action'):
+                        pub['next_action'] = dispatch_flow.unwatched_pending_next(pub, row=current_row, fallback=fb)
+                    pub.setdefault(
+                        'next_action',
+                        f"This task already has an active Paseo dispatch (state {current_row['state']}) and no "
+                        'background watcher is confirmed: run next_argv to observe and finish it in the foreground; '
+                        'do not roll again (it will not create a second worker).',
+                    )
+                watch_sec = dispatch_flow.continuation_watch_seconds(retry_at)
+                argv = entry.argv('launch', '--dispatch-id', row['dispatch_id'], '--parent-id', parent,
+                                  '--watch-seconds', str(watch_sec))
                 return dict(stage='roll', parent_id=parent, launched=None, dispatch_mode='paseo',
-                            caller_action='run_next_argv', worker=dict(dispatch_flow.public_chain(row), continuation_argv=argv),
-                            next='This task already has a dispatch (state ' + row['state'] + '): run next_argv to observe it; '
-                                 'it will not create a second worker.'), 0
+                            caller_action='wait_for_notification' if watched else 'run_next_argv',
+                            **({'retry_at': retry_at} if retry_at else {}),
+                            worker=dict(pub, continuation_argv=argv),
+                            next=pub['next_action']), 0
         excluded = set(getattr(args, '_exclude_agents', None) or ())
         usage_cache_path = getattr(args, 'usage_cache', None)
         all_reusable = [w for w in registry.reusable_workers(parent, named=explicit_id or None)

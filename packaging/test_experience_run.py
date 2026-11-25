@@ -276,3 +276,99 @@ def test_a_free_spend_is_written_where_the_router_reads_a_free_pools_use(tmp_pat
     spend, unpriced, unreadable = axis_scores.opencode_local_spend(table)
     assert spend == {"free-model": 0.04} and not unpriced and unreadable is None
     assert fake.vendor["opencode"]["spent"] == [(0.0, 0.04)]
+
+
+def test_settle_keeps_non_paseo_delivery_continuations_and_observe_pending_follows_fallback_attempts(tmp_path):
+    """Rule 6: Herdr and Grok Bot `pending` answers (`check_delivery_do_not_resend`) run `next_argv`; Paseo fallback
+    `pending` chains advance to `retry_at`, pass `--carry-fallback`, and follow `current_attempt`."""
+    import datetime as dt
+    import types
+
+    sim = xp.ScenarioClock(tmp_path / "sim-clock.txt")
+    cmd_calls, reconciles, statuses = [], [], {}
+
+    class FakeScenario:
+        def __init__(self):
+            self.clock = sim
+            self.state = tmp_path / "state"
+            self.vendor = {}
+            self.vendor_limited_at_roll = {}
+
+        def command(self, _op, argv, **_kw):
+            cmd_calls.append(list(argv))
+            out = {"status": "launched", "launched": True, "state": "completed"}
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+
+        def call(self, _op, *args, **env):
+            if args[:3] == ("dispatch", "--dispatch-action", "reconcile"):
+                reconciles.append((tuple(args), dict(env)))
+                return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            did = args[-1]
+            doc = statuses[did]()
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(doc), stderr="")
+
+        def advance_to(self, hour: float):
+            self.clock.now = hour
+            self.clock.set_hour(hour)
+            return []
+
+        def usage_of(self, _account):
+            return None
+
+    play = object.__new__(xp.Play)
+    play.s = FakeScenario()
+    play.answers = []
+    play.charges = []
+    play.free_limit_answers = []
+    play.labels = {}
+    play.sheet = {"bundles": {}, "capacity": {}, "prices": {}}
+    play.corpus = {"b1": {"text": "task"}}
+    play.note_resets = lambda _ev: None
+
+    def add_answer(chain, doc, argv, _res, _err, brief, kind="roll"):
+        idx = len(play.answers)
+        rec = {
+            "index": idx, "kind": kind, "brief": brief, "argv": argv,
+            "status": doc.get("status"), "caller_action": doc.get("caller_action"),
+            "dispatch_mode": doc.get("dispatch_mode"), "launched": doc.get("launched"),
+            "dispatch_id": doc.get("dispatch_id"), "agent_id": doc.get("agent_id"),
+            "account": doc.get("account"), "model": doc.get("model"), "effort": doc.get("effort"),
+            "bundle_id": doc.get("bundle_id"), "expected_usd": doc.get("expected_usd"),
+            "decision_id": doc.get("decision_id"), "next_action": doc.get("next_action"),
+        }
+        play.answers.append(rec)
+        chain["answers"].append(idx)
+        return rec
+
+    play.answer = add_answer
+
+    # 1. Herdr / Grok Bot `check_delivery_do_not_resend` runs `next_argv` continuation and reaches `launched`.
+    herdr_doc = {
+        "status": "pending", "launched": None, "dispatch_mode": "herdr",
+        "caller_action": "check_delivery_do_not_resend", "next_argv": ["herdr", "status", "job-1"],
+    }
+    chain1 = {"id": "c1", "day": 1, "index": 0, "commands": 1, "answers": [], "waits": [], "outcome": None}
+    add_answer(chain1, herdr_doc, ["roll"], None, None, "b1")
+    play.settle(None, chain1, herdr_doc, {}, "b1", ["roll"], 0)
+    assert cmd_calls == [["herdr", "status", "job-1"]]
+    assert chain1["outcome"] == "launched"
+
+    # 2. Paseo fallback `pending` on terminal `root` advances to `retry_at` and follows `current_attempt` to `d-attempt-2`.
+    retry_iso = dt.datetime.fromtimestamp(sim.t0 + 600, tz=dt.timezone.utc).isoformat()
+    statuses["d-root"] = lambda: (
+        {"dispatch_id": "d-root", "state": "failed", "retry_at": retry_iso, "current_attempt": "d-root"}
+        if sim.now < 0.16
+        else {"dispatch_id": "d-root", "state": "failed", "current_attempt": "d-attempt-2", "attempts": ["1", "2"]}
+    )
+    statuses["d-attempt-2"] = lambda: {"dispatch_id": "d-attempt-2", "state": "started", "agent_id": "w-2"}
+    paseo_doc = {
+        "status": "pending", "launched": None, "dispatch_mode": "paseo",
+        "caller_action": "wait_for_notification", "dispatch_id": "d-root",
+        "next_action": "The last attempt hit a transient provider failure; AgentCompass retries the same model by itself; do not roll it again.",
+    }
+    chain2 = {"id": "c2", "day": 1, "index": 1, "commands": 1, "answers": [], "waits": [], "outcome": None}
+    add_answer(chain2, paseo_doc, ["roll"], None, None, "b1")
+    play.settle(None, chain2, paseo_doc, {}, "b1", ["roll"], 0)
+    assert chain2["outcome"] == "relaunched"
+    assert chain2["waits"] and chain2["waits"][0] > 0.16
+    assert reconciles and all("--carry-fallback" in argv and "AGENTCOMPASS_CARRY_FALLBACK" not in env for argv, env in reconciles)

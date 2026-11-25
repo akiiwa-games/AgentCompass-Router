@@ -1187,6 +1187,8 @@ def build_parser():
                         'record: a task document ({"task": ...}), to compare the forced route with the router\'s own choice.')
     parser.add_argument('--dispatch-action', choices=('prepare', 'start', 'status', 'reconcile', 'release', 'fallback', 'abandon', 'settle'), default='prepare')
     parser.add_argument('--dispatch-id')
+    parser.add_argument('--carry-fallback', action='store_true',
+                        help='dispatch reconcile: also carry due retries, stopped fallback steps, and missing watcher receipts.')
     parser.add_argument('--parent-id', help='roll/record/launch/dispatch release: the parent session id (default for roll and '
                         'record: detected from the host session).')
     parser.add_argument('--parent-host', choices=('auto', 'paseo', 'native', 'orca', 't3', 'herdr'), help='roll: host owning the parent session (default: auto-detected from environment)')

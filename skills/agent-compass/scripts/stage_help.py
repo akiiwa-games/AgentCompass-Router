@@ -51,6 +51,7 @@ UNLISTED = {
     'roll': ('access', 'title', 'task_id', 'verbose', 'dry_run', 'no_score', 'score', 'score_timeout', 'usage_cache',
              'reason_category', 'specialty', 'trigger', 'accounts', 'parent_id', 'parent_host', 'parent_address',
              'parent_model'),
+    'dispatch': ('carry_fallback',),
 }
 
 

@@ -489,7 +489,8 @@ class PendingNamesWhatIsKnown(Plain):
                 self.assertEqual((res['status'], res['cause'], code_), ('pending', code, 0))
                 self.assertNotIn('still creating', res['next_action'])
                 self.assertIn('Do not roll again', res['next_action'])
-                self.assertIn('next_argv', res['next_action'])
+                self.assertIn('Run next_argv', res['next_action'])
+                self.assertEqual(res.get('caller_action'), 'run_next_argv')
                 self.assertIn('next_argv', res)
                 self.setUp()
 
@@ -534,7 +535,380 @@ class PendingNamesWhatIsKnown(Plain):
         res, _ = self.run_roll(host=self.host_answering({'ok': True, 'sent': True}), task_id='t-creating')
         self.assertEqual(res['status'], 'pending')
         self.assertIn('still creating', res['next_action'])
+        self.assertEqual(res.get('caller_action'), 'run_next_argv')
+        self.assertIn('run next_argv', res['next_action'].lower())
         self.assertNotIn('cause', res)
+
+    def test_pending_answers_wait_for_notification_only_when_ensure_watcher_confirms_running_pid_else_next_argv_finishes(self):
+        """Rule C: `roll` answers `wait_for_notification` only when `ensure_watcher` returns a receipt naming a running
+        `--watch` process; when `ensure_watcher` returns `None` or a dead PID, `roll` answers `run_next_argv` and running
+        `next_argv` (`launch`) finishes unconfirmed creates, stopped fallback steps, and scheduled retries in foreground."""
+        import allocator
+        import dispatch_fallback as fallback
+        import roll
+        live_receipt = {'status': 'watching', 'pid': os.getpid()}
+        dead_receipt = {'status': 'watching', 'pid': 999999}
+
+        # 1. Unconfirmed create: live PID -> wait_for_notification; None / dead PID -> run_next_argv.
+        with patch.object(flow, 'ensure_watcher', return_value=live_receipt):
+            res_live, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id='t-c-live')
+        self.assertEqual(res_live.get('caller_action'), 'wait_for_notification')
+        self.assertIn('nothing is required', res_live['next_action'])
+        self.assertNotIn('run next_argv', res_live['next_action'].lower())
+
+        self.setUp()
+        with patch.object(flow, 'ensure_watcher', return_value=dead_receipt), \
+                patch.object(registry, 'process_started', return_value=None):
+            res_dead, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id='t-c-dead')
+        self.assertEqual(res_dead.get('caller_action'), 'run_next_argv')
+        self.assertIn('Run next_argv', res_dead['next_action'])
+
+        # 2. Foreground `next_argv` on an unwatched unconfirmed create carries it through candidate failure -> relaunch -> completed.
+        self.setUp()
+        self.usage['accounts']['codex'] = {
+            'status': 'fresh', 'fetched_at': self.now.isoformat(),
+            'windows': [{'id': 'usage', 'used_pct': 0, 'remaining_pct_before_reset': 100,
+                         'resets_at': (self.now + timedelta(hours=100)).isoformat(), 'seconds_until_reset': 100 * 3600}],
+        }
+        res_unw, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id='t-c-fg')
+        self.assertEqual(res_unw.get('caller_action'), 'run_next_argv')
+        d_fg = json.loads(Path(res_unw['details']).read_text(encoding='utf-8'))['worker']['dispatch_id']
+        created_second = []
+
+        def fg_host(req):
+            op = req['operation']
+            if op == 'observe' and req['dispatch_id'] == d_fg:
+                return {'ok': True, 'agent': None,
+                        'creation': {'phase': 'failed', 'outcome_unknown': False, 'failure_class': 'model_unavailable'}}
+            if op == 'create':
+                created_second.append(req['dispatch_id'])
+                prov, _, mod = req['request']['provider'].partition('/')
+                return {'ok': True, 'sent': True, 'agent': {
+                    'id': req['dispatch_id'], 'provider': prov, 'model': mod, 'status': 'running',
+                    'currentModeId': (req['request'].get('settings') or {}).get('modeId'),
+                    'effectiveThinkingOptionId': (req['request'].get('settings') or {}).get('thinkingOptionId'),
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=1)),
+                    'labels': req['request']['labels'],
+                }}
+            if op == 'observe' and created_second and req['dispatch_id'] == created_second[0]:
+                row2 = registry.inspect(created_second[0])
+                prov, _, mod = row2['request']['provider'].partition('/')
+                return {'ok': True, 'agent': {
+                    'id': created_second[0], 'provider': prov, 'model': mod,
+                    'status': 'idle', 'attentionReason': 'finished',
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=2)),
+                    'labels': row2['request']['labels'],
+                }}
+            return {'ok': True, 'placeable': True, 'agents': []}
+
+        real_handle = fallback.handle
+        test_self = self
+
+        class FakeJudge:
+            @staticmethod
+            def plan_task(task, _args, unavailable=None):
+                planned = allocator.plan(dict(task), test_self.usage, registry.utcnow(),
+                                         unavailable=unavailable or (), accounts=test_self.accounts)
+                return dict(planned, **registry.issue(planned, task)), 0
+
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(self.root / 'lf-fg.json')}), \
+                patch('account_fleet.load_accounts', return_value=self.accounts), \
+                patch('usage_reading.usage_snapshot', side_effect=lambda *_, **__: self.usage), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=FakeJudge))):
+            fg_done = flow.launch(d_fg, 'parent-a', host=fg_host, watch_seconds=30, poll_seconds=1)
+        self.assertEqual(len(created_second), 1)
+        self.assertEqual((fg_done['dispatch_id'], fg_done['state']), (created_second[0], 'completed'))
+
+        # 3. Scheduled transient retry without confirmed watcher returns `run_next_argv`, and `launch` waits out `retry_at` and runs it.
+        self.setUp()
+        self.usage['accounts']['codex'] = {
+            'status': 'fresh', 'fetched_at': self.now.isoformat(),
+            'windows': [{'id': 'usage', 'used_pct': 0, 'remaining_pct_before_reset': 100,
+                         'resets_at': (self.now + timedelta(hours=100)).isoformat(), 'seconds_until_reset': 100 * 3600}],
+        }
+        retry_at = registry.stamp(registry.utcnow() + timedelta(seconds=1))
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(self.root / 'lf-sched.json')}):
+            sched_prep = self.prepare()
+            sched_claim = registry.claim(sched_prep['request'], 'parent-a', now=self.now)
+            sched_id = sched_claim['dispatch_id']
+            flow.settle_create(sched_claim, {'phase': 'failed', 'failure_class': 'provider_unavailable'}, self.now, None)
+        until_iso = registry.stamp(registry.utcnow() + timedelta(minutes=20))
+        registry.update_fallback(
+            sched_id,
+            lambda fb: fb.update(
+                state='retrying', current=sched_id, retry_of=sched_id, retry_at=retry_at, until=until_iso,
+                attempts=[{'attempt': 1, 'dispatch_id': sched_id, 'decision_id': sched_claim['decision_id'],
+                           **fallback.bundle_view(sched_claim['bundle']), 'failure': 'provider_turn_failed',
+                           'kind': 'transient', 'covered': True}],
+                handled={sched_id: {'action': 'scheduled', 'retry_at': retry_at}},
+            ),
+        )
+        decision_doc = {'selected_bundle': sched_claim['bundle']}
+        outcome_sched = {'action': 'scheduled', 'root_dispatch_id': sched_id, 'retry_at': retry_at, 'lines': ['attempt 1']}
+        with patch.object(flow, 'ensure_watcher', return_value=None):
+            sched_unw, _ = roll.fallback_result({}, outcome_sched, decision_doc, 'parent-a', None)
+        self.assertEqual(sched_unw['caller_action'], 'run_next_argv')
+        self.assertIn('run next_argv', sched_unw['next'].lower())
+        with patch.object(flow, 'ensure_watcher', return_value=live_receipt):
+            sched_wat, _ = roll.fallback_result({}, outcome_sched, decision_doc, 'parent-a', None)
+        self.assertEqual(sched_wat['caller_action'], 'wait_for_notification')
+        self.assertIn('nothing is required', sched_wat['next'])
+
+        retried_ids = []
+
+        def retry_host(req):
+            if req['operation'] == 'create':
+                retried_ids.append(req['dispatch_id'])
+                prov, _, mod = req['request']['provider'].partition('/')
+                return {'ok': True, 'sent': True, 'agent': {
+                    'id': req['dispatch_id'], 'provider': prov, 'model': mod, 'status': 'idle',
+                    'attentionReason': 'finished',
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=2)),
+                    'labels': req['request']['labels'],
+                }}
+            if req['operation'] == 'observe' and retried_ids and req['dispatch_id'] == retried_ids[0]:
+                r_ret = registry.inspect(retried_ids[0])
+                prov, _, mod = r_ret['request']['provider'].partition('/')
+                return {'ok': True, 'agent': {
+                    'id': retried_ids[0], 'provider': prov, 'model': mod, 'status': 'idle',
+                    'attentionReason': 'finished',
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=3)),
+                    'labels': r_ret['request']['labels'],
+                }}
+            return {'ok': True, 'agent': None}
+
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(self.root / 'lf-sched.json')}), \
+                patch('account_fleet.load_accounts', return_value=self.accounts), \
+                patch('usage_reading.usage_snapshot', side_effect=lambda *_, **__: self.usage), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=FakeJudge))):
+            retry_done = flow.launch(sched_id, 'parent-a', host=retry_host, watch_seconds=20, poll_seconds=0.2)
+        self.assertEqual(len(retried_ids), 1)
+        self.assertEqual((retry_done['dispatch_id'], retry_done['state']), (retried_ids[0], 'completed'))
+
+        # 4. Stopped fallback step without confirmed watcher: `next_argv` (`launch`) takes over the stopped step and completes.
+        self.setUp()
+        self.usage['accounts']['codex'] = {
+            'status': 'fresh', 'fetched_at': self.now.isoformat(),
+            'windows': [{'id': 'usage', 'used_pct': 0, 'remaining_pct_before_reset': 100,
+                         'resets_at': (self.now + timedelta(hours=100)).isoformat(), 'seconds_until_reset': 100 * 3600}],
+        }
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(self.root / 'lf-stop.json')}):
+            stop_prep = self.prepare()
+            stop_claim = registry.claim(stop_prep['request'], 'parent-a', now=self.now)
+            stop_id = stop_claim['dispatch_id']
+            flow.settle_create(stop_claim, {'phase': 'failed', 'failure_class': 'model_unavailable'}, self.now, None)
+        dead_holder = {'pid': 999999, 'started': 1}
+        registry.update_fallback(
+            stop_id,
+            lambda fb: fb.update(
+                state='relaunching', holder=dead_holder,
+                attempts=[{'attempt': 1, 'dispatch_id': stop_id, 'decision_id': stop_claim['decision_id'],
+                           **fallback.bundle_view(stop_claim['bundle']), 'failure': 'create_failed:model_unavailable',
+                           'kind': 'switch', 'covered': True}],
+                handled={stop_id: {'action': 'pending', 'at': self.now.isoformat(), 'holder': dead_holder}},
+            ),
+        )
+        took_over_ids = []
+
+        def stop_host(req):
+            if req['operation'] == 'create':
+                took_over_ids.append(req['dispatch_id'])
+                prov, _, mod = req['request']['provider'].partition('/')
+                return {'ok': True, 'sent': True, 'agent': {
+                    'id': req['dispatch_id'], 'provider': prov, 'model': mod, 'status': 'idle',
+                    'attentionReason': 'finished',
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=2)),
+                    'labels': req['request']['labels'],
+                }}
+            if req['operation'] == 'observe' and took_over_ids and req['dispatch_id'] == took_over_ids[0]:
+                r_to = registry.inspect(took_over_ids[0])
+                prov, _, mod = r_to['request']['provider'].partition('/')
+                return {'ok': True, 'agent': {
+                    'id': took_over_ids[0], 'provider': prov, 'model': mod, 'status': 'idle',
+                    'attentionReason': 'finished',
+                    'updatedAt': registry.stamp(registry.utcnow() + timedelta(seconds=3)),
+                    'labels': r_to['request']['labels'],
+                }}
+            return {'ok': True, 'agent': None}
+
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(self.root / 'lf-stop.json')}), \
+                patch.object(registry, 'process_started', return_value=None), \
+                patch('account_fleet.load_accounts', return_value=self.accounts), \
+                patch('usage_reading.usage_snapshot', side_effect=lambda *_, **__: self.usage), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=FakeJudge))):
+            stop_done = flow.launch(stop_id, 'parent-a', host=stop_host, watch_seconds=20, poll_seconds=0.2)
+        self.assertEqual(len(took_over_ids), 1)
+        self.assertEqual((stop_done['dispatch_id'], stop_done['state']), (took_over_ids[0], 'completed'))
+
+    def test_pending_paseo_dispatches_settle_unbound_resumes_and_watcher_bindings_without_caller_step(self):
+        import launch_failures
+        failure_store = self.root / 'launch-failures.json'
+        # 1. Structured creation failure written by watcher settles with candidate cooldown (before fake_owners mocks stores).
+        prepared = self.prepare()
+        claimed = registry.claim(prepared['request'], 'parent-a', now=self.now)
+        fail_id = claimed['dispatch_id']
+        note_fail = flow.notification_file(fail_id)
+        note_fail.parent.mkdir(parents=True, exist_ok=True)
+        note_fail.write_text(json.dumps({
+            'dispatch_id': fail_id, 'parent_id': 'parent-a', 'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'creation failed', 'status': None, 'attentionReason': None,
+                         'at': claimed['launched_at'], 'failure_class': 'model_unavailable', 'failure_code': 'INVALID_MODEL'},
+        }), encoding='utf-8')
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(failure_store),
+                                     'ROUTER_MODEL_LATCH': str(self.root / 'latch.json')}):
+            settled_fail = flow.settle(fail_id, now=self.now)
+            self.assertEqual(settled_fail['state'], 'create_failed')
+            self.assertTrue(launch_failures.active(now=self.now))
+        self.setUp()
+
+        # 2. Watcher finds an unconfirmed created worker, writes bound_agent + finished receipt, and settle binds and completes it.
+        with patch.object(flow, 'ensure_watcher', return_value={'status': 'watching', 'pid': os.getpid()}):
+            res, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id='t-bind')
+        full = json.loads(Path(res['details']).read_text(encoding='utf-8'))
+        self.assertEqual(full['caller_action'], 'wait_for_notification')
+        dispatch_id = full['worker']['dispatch_id']
+        launched_at = registry.inspect(dispatch_id)['launched_at']
+        note = flow.notification_file(dispatch_id)
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(json.dumps({
+            'dispatch_id': dispatch_id, 'parent_id': 'parent-a', 'agent_id': 'w-found-by-label',
+            'seen': True, 'started': True,
+            'bound_agent': {'id': 'w-found-by-label', 'at': launched_at, 'started_at': launched_at},
+            'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'finished', 'status': 'idle', 'attentionReason': 'finished',
+                         'at': launched_at, 'replied': True},
+        }), encoding='utf-8')
+        settled = flow.settle(dispatch_id)
+        self.assertEqual((settled['state'], settled['agent_id'], bool(settled.get('observed_at'))),
+                         ('completed', 'w-found-by-label', True))
+
+        # 3. Unconfirmed resume whose relabel never landed stays open before resume_deadline and settles at resume_deadline.
+        self.setUp()
+        self.make_worker('agent-unrelabeled')
+
+        def resume_host(request):
+            if request['operation'] == 'workspace_agents':
+                return {'ok': True, 'placeable': True, 'agents': []}
+            if request['operation'] == 'resume':
+                return bridge_answer('host_timeout')
+            if request['operation'] == 'observe':
+                return {'ok': True, 'agent': {'id': 'agent-unrelabeled', 'status': 'idle',
+                                              'labels': {'router.dispatch_id': 'prev-dispatch',
+                                                         'router.parent_id': 'parent-a'}}}
+            raise AssertionError(request['operation'])
+
+        with patch.object(flow, 'ensure_watcher', return_value={'status': 'watching', 'pid': os.getpid()}):
+            res_r, _ = self.run_roll(self.brief_file('r.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r')
+        r_full = json.loads(Path(res_r['details']).read_text(encoding='utf-8'))
+        self.assertEqual(r_full['caller_action'], 'wait_for_notification')
+        self.assertIn('nothing is required', res_r['next_action'])
+        self.assertNotIn('Run next_argv', res_r['next_action'])
+        r_id = r_full['worker']['dispatch_id']
+        r_row = registry.inspect(r_id)
+        early = registry.resume_deadline(r_row) - timedelta(seconds=1)
+        flow.reconcile(r_id, host=resume_host, now=early)
+        self.assertEqual(registry.inspect(r_id)['state'], 'launching')
+        flow.reconcile(r_id, host=resume_host, now=registry.resume_deadline(r_row))
+        self.assertEqual(registry.inspect(r_id)['state'], 'create_failed')
+        # Rule 4a: settling an unbound resume leaves the untouched worker reusable for `--resume` and automatic reuse.
+        self.assertIsNone(registry.reuse_refusal('parent-a', 'agent-unrelabeled'))
+        self.assertIn('agent-unrelabeled', [w['agent_id'] for w in registry.reusable_workers('parent-a')])
+
+        # Rule 4b: an unlabeled resume whose worker Paseo reports `running` a turn started >= created_at binds instead of failing.
+        res_deliv, _ = self.run_roll(self.brief_file('r2.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r2')
+        d_deliv = json.loads(Path(res_deliv['details']).read_text(encoding='utf-8'))['worker']['dispatch_id']
+        row_deliv = registry.inspect(d_deliv)
+        prov, _, mod = row_deliv['request']['provider'].partition('/')
+        settings = row_deliv['request'].get('settings') or {}
+
+        def delivered_unlabeled_host(_req):
+            return {'ok': True, 'agent': {
+                'id': 'agent-unrelabeled', 'status': 'running', 'provider': prov, 'model': mod,
+                'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+                'lastUserMessageAt': row_deliv['created_at'], 'updatedAt': row_deliv['launched_at'],
+                'labels': {'router.dispatch_id': 'prev-dispatch', 'router.parent_id': 'parent-a'},
+            }}
+
+        flow.reconcile(d_deliv, host=delivered_unlabeled_host, now=registry.resume_deadline(row_deliv))
+        bound_row = registry.inspect(d_deliv)
+        self.assertEqual(bound_row['state'], 'started')
+        self.assertTrue(bound_row.get('observed_at'))
+
+    def test_refused_resume_receipt_never_settles_create_failed_in_either_order_and_ensure_watcher_invokes_bridge(self):
+        """Rule 3 & ensure_watcher: `stopWatcher`'s `status: 'creation_failed'` receipt on a refused resume never settles
+        either the resume row (before `fallback_to_create`) or the switched create row (after `fallback_to_create`),
+        whereas a deadline receipt (`terminal.reason == 'creation failed'`) settles an unbound resume; and `ensure_watcher`
+        invokes `paseo_dispatch_bridge.mjs --ensure-watch`."""
+        # Order A: `settle` runs before `fallback_to_create`.
+        prep_a = registry.prepare(self.issue()['decision_id'], self.task, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-a',
+                                  fallback_prompt='Fresh prompt')
+        claim_a = registry.claim(prep_a['request'], 'parent-a', now=self.now)
+        note_a = flow.notification_file(claim_a['dispatch_id'])
+        note_a.parent.mkdir(parents=True, exist_ok=True)
+        note_a.write_text(json.dumps({
+            'dispatch_id': claim_a['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-a',
+            'status': 'creation_failed', 'delivered': [], 'pending': None,
+        }), encoding='utf-8')
+        flow.settle(claim_a['dispatch_id'], now=self.now)
+        self.assertEqual(registry.inspect(claim_a['dispatch_id'])['state'], 'launching')
+        switched_a = registry.fallback_to_create(claim_a['dispatch_id'], claim_a['claim_id'], now=self.now)
+        self.assertIsNotNone(switched_a)
+        self.assertEqual((switched_a['operation'], switched_a['agent_id']), ('create', None))
+
+        # Order B: `fallback_to_create` runs first, then `settleBeforeExit` runs before `retireRefusedResume` unlinks the receipt.
+        task_b = dict(self.task, task_id='t-order-b')
+        prep_b = registry.prepare(self.issue(task_b)['decision_id'], task_b, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-b',
+                                  fallback_prompt='Fresh prompt B')
+        claim_b = registry.claim(prep_b['request'], 'parent-a', now=self.now)
+        note_b = flow.notification_file(claim_b['dispatch_id'])
+        note_b.write_text(json.dumps({
+            'dispatch_id': claim_b['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-b',
+            'status': 'creation_failed', 'delivered': [], 'pending': None,
+        }), encoding='utf-8')
+        switched_b = registry.fallback_to_create(claim_b['dispatch_id'], claim_b['claim_id'], now=self.now)
+        self.assertIsNotNone(switched_b)
+        flow.settle(claim_b['dispatch_id'], now=self.now)
+        self.assertEqual(registry.inspect(claim_b['dispatch_id'])['state'], 'launching')
+        prov, _, mod = switched_b['request']['provider'].partition('/')
+        settings = switched_b['request'].get('settings') or {}
+        observed_b = registry.observe(claim_b['dispatch_id'], {
+            'id': claim_b['dispatch_id'], 'status': 'running', 'provider': prov, 'model': mod,
+            'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+            'labels': switched_b['request']['labels'], 'updatedAt': switched_b['launched_at'],
+        }, now=self.now)
+        self.assertEqual(observed_b['state'], 'started')
+
+        # Deadline receipt (`terminal.reason == 'creation failed'`) settles an unconfirmed resume as `create_failed`.
+        task_c = dict(self.task, task_id='t-deadline-rec')
+        prep_c = registry.prepare(self.issue(task_c)['decision_id'], task_c, self.launch, self.usage,
+                                  accounts=self.accounts, now=self.now, resume_agent_id='w-prev-c')
+        claim_c = registry.claim(prep_c['request'], 'parent-a', now=self.now)
+        flow.notification_file(claim_c['dispatch_id']).write_text(json.dumps({
+            'dispatch_id': claim_c['dispatch_id'], 'parent_id': 'parent-a', 'agent_id': 'w-prev-c',
+            'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'creation failed', 'status': 'idle', 'attentionReason': None, 'at': claim_c['launched_at']},
+        }), encoding='utf-8')
+        settled_c = flow.settle(claim_c['dispatch_id'], now=self.now)
+        self.assertEqual(settled_c['state'], 'create_failed')
+
+        # `ensure_watcher` invokes `node paseo_dispatch_bridge.mjs --ensure-watch` when using the real host_call.
+        seen_popen = []
+
+        def fake_popen(args, **kwargs):
+            seen_popen.append(args)
+            kwargs['stdout'].write(json.dumps({'status': 'watching', 'pid': 4242}).encode('utf-8'))
+            proc = type('FakeProc', (), {'wait': lambda self, *_a: 0, 'kill': lambda self: None})()
+            return proc
+
+        with patch.object(flow, 'host_call', flow._DEFAULT_HOST_CALL), \
+                patch.dict(os.environ, {'ROUTER_PASEO_BRIDGE': str(flow._DEFAULT_BRIDGE)}), \
+                patch.object(flow.subprocess, 'Popen', side_effect=fake_popen):
+            ensured = flow.ensure_watcher(claim_a, retry_at='2026-11-25T12:00:00Z')
+        self.assertEqual(ensured, {'status': 'watching', 'pid': 4242})
+        self.assertEqual(seen_popen[0][2:5], ['--ensure-watch', claim_a['dispatch_id'], 'parent-a'])
+        self.assertEqual(seen_popen[0][-2:], ['retrying', '2026-11-25T12:00:00Z'])
 
 
 class FallbackKeepsClass(Plain):
