@@ -1501,7 +1501,7 @@ class DispatchNoticeUnitTests(unittest.TestCase):
                 self.assertFalse(services.dispatch_notice_needed(now=registry.parse(retry_at)))
 
         # 3. Unconfirmed create or resume with no receipt on disk wakes past `CREATE_SEND_WINDOW` and after lease expiry (`expired`),
-        #    and `dispatch_notice_tick` passes `AGENTCOMPASS_CARRY_FALLBACK=1` to opt `reconcile` in.
+        #    and `dispatch_notice_tick` passes `--carry-fallback` on `reconcile` without setting an env var.
         for op, aid in (("create", None), ("resume", "w-unrelabeled")):
             for state in ("launching", "expired"):
                 with self.subTest(operation=op, state=state):

@@ -51,9 +51,15 @@ OBSERVE_FLOOR = 5
 CREATING_NEXT = ('Paseo is still creating this worker. Until it exists get_agent_status answers "not found"; '
                  'that is not a failure. AgentCompass watches for the worker and notifies the parent once the '
                  'dispatch finishes or fails, so nothing is required. Do not roll again.')
+UNWATCHED_CREATING_NEXT = ('Paseo is still creating this worker (no background watcher is confirmed). Until it exists '
+                           'get_agent_status answers "not found"; that is not a failure. Run next_argv to observe and '
+                           'settle this same dispatch in the foreground. Do not roll again.')
 STALLED_NEXT = ('Paseo still reports this create as running past its deadline and has no cancel, so the worker can still '
                 'appear. AgentCompass keeps watching it and notifies the parent if it finishes or fails (restarting the '
                 'Paseo daemon settles a stuck create), so nothing is required. Do not roll again.')
+UNWATCHED_STALLED_NEXT = ('Paseo still reports this create as running past its deadline and has no cancel, so the worker '
+                          'can still appear (no background watcher is confirmed). Run next_argv to keep observing it in '
+                          'the foreground (restarting the Paseo daemon settles a stuck create). Do not roll again.')
 # The covered failures (dispatch_fallback): AgentCompass retries or relaunches the brief itself, so these say so.
 CREATE_FAILED_NEXT = ('Paseo confirms it created no worker for this attempt and none can appear later. AgentCompass '
                       'relaunches this brief on the next candidate by itself and notifies the parent once the dispatch '
@@ -110,17 +116,31 @@ MANUAL_NEXT = {
 }
 FALLBACK_RUNNING_NEXT = ('AgentCompass is relaunching this brief itself ({where}) and notifies the parent once the '
                          'dispatch reaches a final state, so nothing is required. Do not roll it again.')
+UNWATCHED_FALLBACK_RUNNING_NEXT = ('AgentCompass is relaunching this brief ({where}) and no background watcher is '
+                                   'confirmed; run next_argv to observe and finish the current attempt in the foreground. '
+                                   'Do not roll it again.')
 # A step took the failed attempt and stopped before it finished (registry.claim_stopped): the attempt's watcher or
 # reconcile (dispatch_fallback.resume_due) takes the step over without a caller step.
 FALLBACK_STOPPED_NEXT = ('The AgentCompass step that was relaunching this brief stopped before it finished; AgentCompass '
                          'takes the step over to relaunch the brief (or report why it cannot) and notifies the parent of '
                          'the final outcome, so nothing is required. Do not roll it again.')
+UNWATCHED_FALLBACK_STOPPED_NEXT = ('The AgentCompass step that was relaunching this brief stopped before it finished and '
+                                   'no background watcher is confirmed. Run next_argv: it takes the step over in the '
+                                   'foreground and relaunches the brief, or answers why it cannot. Do not roll it again '
+                                   'before that.')
 FALLBACK_SCHEDULED_NEXT = ('The last attempt hit a transient provider failure; AgentCompass retries the same model by itself '
                            'at {retry_at} (its backoff) and notifies the parent once the dispatch reaches a final state, so '
                            'nothing is required. Do not roll it again.')
+UNWATCHED_FALLBACK_SCHEDULED_NEXT = ('The last attempt hit a transient provider failure; AgentCompass retries the same '
+                                     'model by itself at {retry_at} (its backoff), and because no background watcher is '
+                                     'confirmed you must run next_argv to wait out the backoff and finish the retry in '
+                                     'the foreground. Do not roll it again.')
 FALLBACK_RELAUNCHED_NEXT = ('This attempt failed and AgentCompass relaunched the brief as dispatch {current}; AgentCompass '
                             'watches the current attempt and notifies the parent once it finishes, so nothing is required. '
                             'Do not roll it again.')
+UNWATCHED_FALLBACK_RELAUNCHED_NEXT = ('This attempt failed and AgentCompass relaunched the brief as dispatch {current} '
+                                      '(no background watcher is confirmed); run next_argv to observe the current attempt '
+                                      'in the foreground. Do not roll it again.')
 RETRY_STUCK_RUNNING = ('Stopping the worker failed, so it may still be running and resume once the provider recovers: stop '
                        'it with cancel_agent on agent_id and check what it did before rolling this brief again.')
 REMOVED_NEXT = ('Paseo created this worker and it was removed before this dispatch observed it. The dispatch is over and '
@@ -155,9 +175,17 @@ OBSERVED_OVER = 'Observing it settled the dispatch as {state}; nothing was left 
 UNCONFIRMED_NEXT = ('Paseo did not confirm this create ({what}), so it is not known yet whether the worker exists or will '
                     'appear. AgentCompass watches for the worker by its labels and settles the dispatch itself, notifying '
                     'the parent of the outcome, so nothing is required. Do not roll again: a second roll can start a duplicate.')
+UNWATCHED_UNCONFIRMED_NEXT = ('Paseo did not confirm this create ({what}) and no background watcher is confirmed, so it '
+                              'is not known whether the worker exists or will appear. Run next_argv: it finds the worker '
+                              'by its labels if it was created, and settles the dispatch in the foreground if it was not. '
+                              'Do not roll again before that: a second roll can start a duplicate.')
 RESUME_UNCONFIRMED_NEXT = ('Paseo did not confirm this resume ({what}), so it is not known yet whether the worker took the turn. '
                            'AgentCompass watches the worker and settles the dispatch itself, notifying the parent of the outcome, '
                            'so nothing is required. Do not roll again: a second roll can send the turn twice.')
+UNWATCHED_RESUME_UNCONFIRMED_NEXT = ('Paseo did not confirm this resume ({what}) and no background watcher is confirmed, '
+                                     'so it is not known whether the worker took the turn. Run next_argv: it observes '
+                                     'the worker and settles the dispatch in the foreground. Do not roll again before '
+                                     'that: a second roll can send the turn twice.')
 UNCONFIRMED_WHAT = {
     'host_timeout': 'the host did not answer in time',
     'invalid_host_response': 'the bridge printed an answer that could not be read',
@@ -396,6 +424,59 @@ def ensure_watcher(row, *, host=None, retry_at=None):
             return receipt if isinstance(receipt, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def watcher_confirmed(receipt, dispatch_id=None):
+    """True when `receipt` (as returned by `ensure_watcher`) names a running `--watch` process of this user
+    (`registry.process_started`) for an active watch."""
+    if not isinstance(receipt, dict) or receipt.get('status') != 'watching':
+        return False
+    pid = receipt.get('pid')
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if dispatch_id:
+        try:
+            if Path(f'{notification_file(dispatch_id)}.creation-failed').exists():
+                return False
+        except Exception:   # noqa: BLE001
+            return False
+    return registry.process_started(pid) is not None
+
+
+def continuation_watch_seconds(retry_at=None, now=None):
+    """Watch window for `continuation_argv`: 120 s by default, or `wait + 121` s (capped at 86400 s) when a scheduled
+    retry must first wait out `retry_at`."""
+    if isinstance(retry_at, str) and retry_at:
+        try:
+            current = now or registry.utcnow()
+            wait = (registry.parse(retry_at) - current).total_seconds()
+            if wait > 0:
+                return min(86400, max(120, int(wait) + 121))
+        except ValueError:
+            pass
+    return 120
+
+
+def unwatched_pending_next(pub, *, row=None, fallback=None):
+    """Foreground `next_action` for a pending Paseo dispatch when no live `--watch` process was confirmed."""
+    fb = fallback if isinstance(fallback, dict) else ((row or {}).get('fallback') or {})
+    text = (pub or {}).get('next_action')
+    if text == CREATING_NEXT:
+        return UNWATCHED_CREATING_NEXT
+    if text == STALLED_NEXT:
+        return UNWATCHED_STALLED_NEXT
+    if text == FALLBACK_STOPPED_NEXT:
+        return UNWATCHED_FALLBACK_STOPPED_NEXT
+    retry_at = (pub or {}).get('retry_at') or fb.get('retry_at')
+    if retry_at and text == FALLBACK_SCHEDULED_NEXT.format(retry_at=retry_at):
+        return UNWATCHED_FALLBACK_SCHEDULED_NEXT.format(retry_at=retry_at)
+    where = (fb.get('lines') or ['attempt 1'])[-1]
+    if text == FALLBACK_RUNNING_NEXT.format(where=where):
+        return UNWATCHED_FALLBACK_RUNNING_NEXT.format(where=where)
+    current = (pub or {}).get('current_attempt') or fb.get('current')
+    if current and text == FALLBACK_RELAUNCHED_NEXT.format(current=current):
+        return UNWATCHED_FALLBACK_RELAUNCHED_NEXT.format(current=current)
+    return text
 
 
 def public(row, now=None):
@@ -774,25 +855,61 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
 
     if row['parent_id'] != parent_id:
         raise registry.Refused('Dispatch belongs to another parent')
-    if row['state'] in registry.TERMINAL and row['state'] != 'expired':
-        now = registry.utcnow()
+    started_prepared = row['state'] == 'prepared'
+    default_db = path is None or Path(path) == Path(registry.db_path())
+
+    def advance_terminal_chain():
+        nonlocal dispatch_id, row, queried_host, observed, notification
+        now_step = registry.utcnow()
         root_row = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path)
-        if registry.fallback_guard(root_row, now) or row['state'] == 'failed':
+        if registry.fallback_guard(root_row, now_step) or row['state'] == 'failed':
             observations = reconcile(
-                root_row['dispatch_id'] if registry.fallback_guard(root_row, now)
+                root_row['dispatch_id'] if registry.fallback_guard(root_row, now_step)
                 else dispatch_id, host=host, path=path, timeout=budget(), carry_fallback=False)
-            queried_host = bool(observations)
+            queried_host = bool(observations) or queried_host
             notification = next((item['completion_notification'] for item in observations
                                  if item.get('completion_notification')), notification)
             row = registry.inspect(dispatch_id, path)
-        if path is None or Path(path) == Path(registry.db_path()):
-            # A transient failure's same-bundle retry that fell due starts here too, not only from its watcher.
+            root_row = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path)
+        if default_db and dispatch_fallback.enabled():
             if dispatch_fallback.resume_due(dispatch_id, host=host) is not None:
-                row = registry.inspect(dispatch_id, path)   # the retry ran, or was retired: read what it left
+                row = registry.inspect(dispatch_id, path)
+                root_row = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path)
+            fb = root_row.get('fallback') or {}
+            while (watch_seconds > 0 and fb.get('state') == 'retrying' and fb.get('retry_at')
+                   and registry.fallback_guard(root_row, registry.utcnow()) and left() >= OBSERVE_FLOOR):
+                wait_due = (registry.parse(fb['retry_at']) - registry.utcnow()).total_seconds()
+                if wait_due <= 0:
+                    break
+                time.sleep(min(poll_seconds, wait_due, left() - OBSERVE_FLOOR))
+                reconcile(root_row['dispatch_id'], host=host, path=path, timeout=budget(), carry_fallback=False)
+                root_row = registry.inspect(root_row['dispatch_id'], path)
+                fb = root_row.get('fallback') or {}
+            if (watch_seconds > 0 and fb.get('state') == 'retrying' and fb.get('retry_at')
+                    and not registry.later(fb['retry_at'], registry.utcnow())):
+                if dispatch_fallback.resume_due(dispatch_id, host=host) is not None:
+                    row = registry.inspect(dispatch_id, path)
+                    root_row = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path)
+                    fb = root_row.get('fallback') or {}
+            if (watch_seconds > 0 and row['state'] in ('failed', 'create_failed')
+                    and dispatch_fallback.failure_of(row)['covered']
+                    and (fb.get('handled') or {}).get(dispatch_id) is None
+                    and not watcher_confirmed(notification, dispatch_id)):
+                dispatch_fallback.handle(dispatch_id, host=host)
+                row = registry.inspect(dispatch_id, path)
         current = registry.current_attempt(dispatch_id, path)
         if current != dispatch_id:
             dispatch_id, row = current, registry.inspect(current, path)
             queried_host = False
+            observed = False
+            return True
+        return False
+
+    if (row['state'] in registry.TERMINAL and row['state'] != 'expired') or (
+            not started_prepared and registry.claim_stopped(
+                row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row), path),
+                registry.utcnow())):
+        advance_terminal_chain()
     if row['state'] == 'prepared':
         row = registry.claim(row['request'], parent_id, now=registry.utcnow(), path=path)
 
@@ -864,18 +981,24 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
                              if item.get('completion_notification')), notification)
         row = registry.inspect(dispatch_id, path)
     observe_error = None
-    while row['state'] not in registry.TERMINAL and (not observed or left() >= OBSERVE_FLOOR):
-        observations = reconcile(dispatch_id, host=host, path=path, timeout=budget())
-        queried_host = observed = True
-        notification = next((item['completion_notification'] for item in observations
-                             if item.get('completion_notification')), notification)
-        observe_error = next((item['error'] for item in observations if item.get('error')), None)
-        row = registry.inspect(dispatch_id, path)
-        remaining = left()
-        if row['state'] in registry.TERMINAL or remaining < OBSERVE_FLOOR:
-            break
-        # Wake with at least the floor left, so the next observation is cut at what remains rather than given more.
-        time.sleep(min(poll_seconds, remaining - OBSERVE_FLOOR))
+    while True:
+        while row['state'] not in registry.TERMINAL and (not observed or left() >= OBSERVE_FLOOR):
+            observations = reconcile(dispatch_id, host=host, path=path, timeout=budget())
+            queried_host = observed = True
+            notification = next((item['completion_notification'] for item in observations
+                                 if item.get('completion_notification')), notification)
+            observe_error = next((item['error'] for item in observations if item.get('error')), None)
+            row = registry.inspect(dispatch_id, path)
+            remaining = left()
+            if row['state'] in registry.TERMINAL or remaining < OBSERVE_FLOOR:
+                break
+            # Wake with at least the floor left, so the next observation is cut at what remains rather than given more.
+            time.sleep(min(poll_seconds, remaining - OBSERVE_FLOOR))
+        if (not started_prepared and watch_seconds > 0 and default_db and dispatch_fallback.enabled()
+                and row['state'] in ('failed', 'create_failed') and advance_terminal_chain()):
+            observe_error = None
+            continue
+        break
     result = public_chain(row, path)
     if launch_error:
         result['error'] = launch_error
@@ -900,11 +1023,17 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
         notification = observed.get('completion_notification')
     if notification:
         result['completion_notification'] = notification
+    root_end = row if registry.chain_root(row) == row['dispatch_id'] else registry.inspect(registry.chain_root(row), path)
+    fb_end = root_end.get('fallback') or {}
+    now_end = registry.utcnow()
     if row['state'] not in registry.TERMINAL:
-        if (notification or {}).get('status') not in ('watching', 'delivered'):
+        ensured = None
+        if (notification or {}).get('status') != 'delivered':
             ensured = ensure_watcher(row, host=host)
             if ensured:
                 notification = result['completion_notification'] = ensured
+        watched = watcher_confirmed(ensured, row['dispatch_id'])
+        result['watcher_confirmed'] = watched
         if observe_error:
             # The host could not be read; says nothing about the worker. A create the host has not finished is `creating`.
             result['observe_error'] = observe_error
@@ -912,17 +1041,38 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
         if unconfirmed and row.get('operation') == 'resume' and not result.get('next_action'):
             # A resume the host may have received: the worker exists, and what is unknown is whether it took the turn.
             result['cause'] = failure_label(unconfirmed, unconfirmed_condition)
-            result['next_action'] = RESUME_UNCONFIRMED_NEXT.format(what=unconfirmed_what(unconfirmed, unconfirmed_condition))
+            template = RESUME_UNCONFIRMED_NEXT if watched else UNWATCHED_RESUME_UNCONFIRMED_NEXT
+            result['next_action'] = template.format(what=unconfirmed_what(unconfirmed, unconfirmed_condition))
         elif (unconfirmed and result.get('creation_phase') == 'unknown'
                 and result.get('next_action') in (CREATING_NEXT, STALLED_NEXT)):
             # The host has not said it carries out this create (a phase it reports, `accepted` for one, makes it the creating
             # state and keeps the text above): what is known is the error, so say that.
             result['cause'] = failure_label(unconfirmed, unconfirmed_condition)
-            result['next_action'] = UNCONFIRMED_NEXT.format(what=unconfirmed_what(unconfirmed, unconfirmed_condition))
-        result['continuation'] = ('AgentCompass watches and settles this dispatch itself; dispatch --dispatch-action '
-                                  'reconcile or launch with this dispatch_id is optional to inspect it and will not '
-                                  'create again.')
+            template = UNCONFIRMED_NEXT if watched else UNWATCHED_UNCONFIRMED_NEXT
+            result['next_action'] = template.format(what=unconfirmed_what(unconfirmed, unconfirmed_condition))
+        elif not watched and result.get('next_action'):
+            result['next_action'] = unwatched_pending_next(result, row=row, fallback=fb_end)
+        result['continuation'] = (
+            'AgentCompass watches and settles this dispatch itself; dispatch --dispatch-action reconcile or launch '
+            'with this dispatch_id is optional to inspect it and will not create again.'
+            if watched else
+            'Run dispatch --dispatch-action reconcile or launch with this dispatch_id; it will observe, not create again.'
+        )
         result['continuation_argv'] = entry.argv('launch', '--dispatch-id', dispatch_id, '--parent-id', parent_id, '--watch-seconds', '120')
+    elif registry.fallback_guard(root_end, now_end) or registry.claim_stopped(root_end, now_end):
+        retry_at = fb_end.get('retry_at') if fb_end.get('state') == 'retrying' else None
+        watch_id = fb_end.get('retry_of') if retry_at and fb_end.get('retry_of') else dispatch_id
+        ensured = ensure_watcher(registry.inspect(watch_id, path), host=host, retry_at=retry_at)
+        watched = watcher_confirmed(ensured, watch_id)
+        result['watcher_confirmed'] = watched
+        if ensured:
+            result['completion_notification'] = ensured
+        if not watched and result.get('next_action'):
+            result['next_action'] = unwatched_pending_next(result, row=root_end, fallback=fb_end)
+        watch_sec = continuation_watch_seconds(retry_at, now_end)
+        result['continuation_argv'] = entry.argv(
+            'launch', '--dispatch-id', root_end['dispatch_id'], '--parent-id', parent_id, '--watch-seconds', str(watch_sec),
+        )
     return result
 
 

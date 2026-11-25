@@ -690,7 +690,9 @@ class Chain:
         if failed_id:
             try:
                 import dispatch_flow
-                dispatch_flow.ensure_watcher(registry.inspect(failed_id), host=self.host, retry_at=retry_at)
+                ensured = dispatch_flow.ensure_watcher(registry.inspect(failed_id), host=self.host, retry_at=retry_at)
+                if ensured:
+                    out = dict(out, completion_notification=ensured)
             except Exception:   # noqa: BLE001 - best-effort watcher start
                 pass
         return out

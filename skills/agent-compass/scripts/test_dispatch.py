@@ -2139,11 +2139,14 @@ class RollTests(unittest.TestCase):
         with patch.object(flow, 'host_call', host):
             (first, _), _ = self.roll(decision)
             (again, code), seen = self.roll(decision)
+            with patch.object(flow, 'ensure_watcher', return_value={'status': 'watching', 'pid': os.getpid()}):
+                (watched_again, _), _ = self.roll(decision)
         self.assertEqual((len(creates), seen, code), (1, {}, 0))  # one create, no second classification
         self.assertEqual((first['launched'], again['launched'], again['caller_action']),
-                         (True, None, 'wait_for_notification'))
-        self.assertIn('nothing is required', again['next_action'])
-        self.assertNotIn('run next_argv', again['next_action'].lower())
+                         (True, None, 'run_next_argv'))
+        self.assertIn('run next_argv', again['next_action'].lower())
+        self.assertEqual(watched_again['caller_action'], 'wait_for_notification')
+        self.assertIn('nothing is required', watched_again['next_action'])
         self.assertEqual(again['worker']['continuation_argv'][4:9], ['launch', '--dispatch-id', again['worker']['dispatch_id'], '--parent-id', 'parent-a'])
         self.assertFalse(any(part.endswith('.py') for part in again['worker']['continuation_argv']))
         self.assertEqual(again['status'], 'pending')

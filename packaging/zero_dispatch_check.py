@@ -611,7 +611,7 @@ def step_paseo_host(z: Zero):
         got = parse(followed.stdout) or {}
         op.check("running next_argv exactly as handed back observes the dispatch through to completed", followed.returncode == 0 and got.get("state") == "completed", followed.stdout[:300] + followed.stderr[-300:])
 
-    op = run.operation("Paseo host: unknown delivery", "the host created the agent but the answer was lost: roll says pending (requiring no caller step), and next_argv remains safe to inspect the dispatch by label without creating twice")
+    op = run.operation("Paseo host: unknown delivery", "the host created the agent but the answer was lost: roll says pending, and next_argv observes the dispatch by label without creating twice")
     z.set_fault(create="uncertain", observe="unavailable")
     task = z.task("slow", "uncertain")
     result = z.call(op, "roll", "--task", task, **env)

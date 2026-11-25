@@ -1290,6 +1290,9 @@ class FallbackTests(unittest.TestCase):
                 patch('account_fleet.load_accounts', return_value=self.accounts), \
                 patch.object(registry, 'utcnow', return_value=due_now), \
                 patch.object(flow, 'host_call', self.host), \
+                patch.object(flow, 'paseo_reachable', return_value=True), \
+                patch.object(roll_mod, 'can_launch_via_paseo', return_value=True), \
+                patch.object(roll_mod, 'cli', side_effect=AssertionError('unexpected cli launch')), \
                 patch.object(roll_mod, 'match_reusable_worker', return_value=None), \
                 patch.object(roll_mod.provider_inventory, 'current', return_value={'launchers': {}}), \
                 patch.object(roll_mod.provider_inventory, 'snapshot', contextlib.nullcontext), \
