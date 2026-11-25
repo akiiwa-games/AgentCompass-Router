@@ -562,8 +562,9 @@ class PendingNamesWhatIsKnown(Plain):
 
     @unittest.skipUnless(os.name == 'nt', 'Windows job objects')
     def test_the_job_fact_is_read_from_the_job_the_command_runs_in_past_a_launchers_own_job(self):
-        """`host_job.ends_children`: true in a kill-on-close job, false in a job without that limit; a launcher's job
-        (kill on close, children leave silently) is harmless alone and does not hide a killing job around it."""
+        """`host_job.ends_children`: true in any job that keeps its children (one that does not kill on close may sit
+        in one that does, and Windows shows only the innermost); a launcher's job, which its children leave, is
+        harmless alone and does not hide a job around it."""
         import ctypes
         from ctypes import wintypes
         kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -592,7 +593,7 @@ class PendingNamesWhatIsKnown(Plain):
             for flags in nested:   # outermost first
                 self.assertTrue(kernel.AssignProcessToJobObject(job(flags), wintypes.HANDLE(int(child._handle))))
             read[name] = child.communicate('go\n', timeout=60)[0].strip()
-        self.assertEqual(read, {'kill': 'True', 'plain': 'False', 'launcher': 'False', 'launcher inside kill': 'True'})
+        self.assertEqual(read, {'kill': 'True', 'plain': 'True', 'launcher': 'False', 'launcher inside kill': 'True'})
 
     def test_pending_answers_wait_for_notification_only_when_ensure_watcher_confirms_running_pid_else_next_argv_finishes(self):
         """Rule C: `roll` answers `wait_for_notification` only when `ensure_watcher` returns a receipt naming a running

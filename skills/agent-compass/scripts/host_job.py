@@ -1,17 +1,16 @@
 """Whether the host ends a command's processes with the command (Windows job objects).
 
 A host may run each command in a job that kills its processes when the job closes and lets none leave (Antigravity,
-measured 2026-11-21): a detached child the command starts dies when the command returns. The fact is read from the job
-the process is in. A launcher's own job (`py.exe`, a venv or console-script launcher: kill on close, children leave it
-silently, flags 0x3000) hides the host's, so a child outside it reads the next job out.
-
-A job with neither limit keeps its children and is read as harmless: a killing job further out is not seen.
+flags 0x2000, measured 2026-11-21 and 2026-11-25): a detached child the command starts dies when the command returns.
+Windows shows a process only the innermost job it is in, so a job that does not kill on close may sit inside one that
+does. The one thing that can be read for certain is that a child is in no job at all: only then is it known to outlive
+the command. A launcher's own job (`py.exe`, a venv or console-script launcher: children leave it silently, flags
+0x3000) is left by the children, so a child outside it answers for the next job out.
 """
 import os
 import subprocess
 import sys
 
-KILL_ON_CLOSE = 0x2000
 SILENT_BREAKAWAY = 0x1000
 HOPS = 3
 _NO_JOB, _UNREADABLE = object(), object()
@@ -44,17 +43,16 @@ def _own_limits():
 
 
 def ends_children(hops=HOPS):
-    """True when a process this command starts dies with the command. What cannot be read counts as true: the answer
-    that follows from it (do the step in the foreground) holds either way."""
+    """True unless a process this command starts is in no job, so that nothing of the host's can end it with the
+    command. A job that keeps its children counts as true whatever its own limits say, and so does one that cannot be
+    read: the answer that follows (do the step in the foreground) holds either way."""
     if os.name != 'nt':
         return False
     flags = _own_limits()
     if flags is _NO_JOB:
         return False
-    if flags is _UNREADABLE:
+    if flags is _UNREADABLE or not flags & SILENT_BREAKAWAY:
         return True
-    if not flags & SILENT_BREAKAWAY:
-        return bool(flags & KILL_ON_CLOSE)
     if hops <= 0:
         return True
     # Started without a launcher of its own, or it would sit in a new launcher job and read that one.
