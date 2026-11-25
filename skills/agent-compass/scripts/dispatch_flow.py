@@ -937,7 +937,7 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
             if (watch_seconds > 0 and row['state'] in ('failed', 'create_failed')
                     and dispatch_fallback.failure_of(row)['covered']
                     and (fb.get('handled') or {}).get(dispatch_id) is None
-                    and not watcher_confirmed(notification, dispatch_id)):
+                    and not watcher_carries(notification, dispatch_id)):
                 dispatch_fallback.handle(dispatch_id, host=host)
                 row = registry.inspect(dispatch_id, path)
         current = registry.current_attempt(dispatch_id, path)

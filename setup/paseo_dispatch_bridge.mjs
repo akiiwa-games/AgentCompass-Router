@@ -272,7 +272,10 @@ function isResumedRecord(record) {
 function deliveredUnlabeledResume(agent, record) {
   if (!agent || agent.archivedAt || agent.status !== 'running') return false;
   const created = record.created_at ?? (record.resume_deadline ?? record.creation_deadline ?? 0) - CREATE_LIMIT_MS;
-  return typeof agent.lastUserMessageAt === 'string' && Date.parse(agent.lastUserMessageAt) >= created;
+  const sent = typeof agent.lastUserMessageAt === 'string' ? Date.parse(agent.lastUserMessageAt) : NaN;
+  // A turn that started at or past resume_deadline is not this resume's send (nothing of it can arrive by then): it is
+  // the worker's later turn, which a watcher started after the deadline must not take for this dispatch's.
+  return sent >= created && !(Number.isFinite(record.resume_deadline) && sent >= record.resume_deadline);
 }
 
 function continuingDispatch(agent, record) {

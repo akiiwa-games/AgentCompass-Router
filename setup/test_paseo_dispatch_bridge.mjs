@@ -3133,6 +3133,14 @@ test('an unconfirmed resume refuses late send_by and settles at resume_deadline 
     const finishedUnlabeled = {...runningUnlabeled, status: 'idle', attentionReason: 'finished'};
     assert.deepEqual(notificationEvents(finishedUnlabeled, unlabeledRec, Date.parse('2026-11-25T00:04:10Z')),
       [{key: 'terminal', reason: 'finished'}]);
+    // A turn that started at or past resume_deadline is not this resume's send: the worker's later turn is not bound,
+    // and the resume ends as never bound.
+    const lateRec = {dispatch_id: 'd-res-late', parent_id: 'parent-1', agent_id: 'w-1',
+      created_at: Date.parse('2026-11-25T00:00:00Z'), resume_deadline: Date.parse('2026-11-25T00:04:00Z')};
+    const laterTurn = {...existing, status: 'running', lastUserMessageAt: '2026-11-25T00:04:25Z'};
+    assert.deepEqual(notificationEvents(laterTurn, lateRec, Date.parse('2026-11-25T00:04:30Z')),
+      [{key: 'terminal', reason: 'creation failed'}]);
+    assert.equal(lateRec.seen, undefined);
   } finally {
     if (prevState === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = prevState;
     fs.rmSync(root, {recursive: true, force: true});

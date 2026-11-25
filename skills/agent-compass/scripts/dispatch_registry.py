@@ -2704,7 +2704,11 @@ def observe(dispatch_id, snapshot, now=None, path=None, terminal=None):
             ref_stamp = row.get('created_at') or row.get('launched_at')
             last_msg = snapshot.get('lastUserMessageAt')
             try:
-                msg_after_send = isinstance(last_msg, str) and isinstance(ref_stamp, str) and parse(last_msg) >= parse(ref_stamp)
+                # The resume's own send: at or after it was written, and before resume_deadline (a turn that started
+                # later is the worker's next one).
+                msg_after_send = (isinstance(last_msg, str) and isinstance(ref_stamp, str)
+                                  and parse(last_msg) >= parse(ref_stamp)
+                                  and not (row.get('launched_at') and parse(last_msg) >= resume_deadline(row)))
             except ValueError:
                 msg_after_send = False
             delivered_unlabeled = (

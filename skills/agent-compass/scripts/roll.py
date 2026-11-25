@@ -1153,9 +1153,9 @@ def fallback_result(out, outcome, decision, parent, args):
             'provider', 'harness', 'account', 'model', 'effort', 'modeId', 'launch_model', 'fast') if bundle.get(k)})
         out = dict(out, route=route, attempts=attempts)
         worker = dict(receipt, provider=bundle['provider'], attempts=attempts)
+        worker['continuation_argv'] = (outcome.get('receipt') or {}).get('continuation_argv') or entry.argv(
+            'launch', '--dispatch-id', dispatch_id, '--parent-id', parent, '--watch-seconds', '120')
         if receipt.get('state') in ('launching', 'expired') and not receipt.get('agent_id'):
-            worker.setdefault('continuation_argv', entry.argv(
-                'launch', '--dispatch-id', dispatch_id, '--parent-id', parent, '--watch-seconds', '120'))
             ensured = worker.get('completion_notification')
             if not dispatch_flow.watcher_confirmed(ensured, dispatch_id):
                 ensured = dispatch_flow.ensure_watcher(relaunch_row)

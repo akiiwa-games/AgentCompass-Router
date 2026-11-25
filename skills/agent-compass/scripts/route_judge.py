@@ -189,7 +189,9 @@ def record_workflow(args):
                                 'accepts it for none: run it from the session that calls the Workflow.']),
     ]
     return {**row, 'observed_at': now.isoformat(), **({'warnings': warnings} if warnings else {}),
-            'next_action': 'Call the Workflow from this session within 15 minutes; this record authorizes nothing else.'}
+            'next_action': ('Nothing was written (--dry-run): run it without --dry-run before calling the Workflow.'
+                            if getattr(args, 'dry_run', False) else
+                            'Call the Workflow from this session within 15 minutes; this record authorizes nothing else.')}
 
 
 def record_constraint(args, task=None, classified=None):

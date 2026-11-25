@@ -560,6 +560,60 @@ class PendingNamesWhatIsKnown(Plain):
         tray_source = (Path(__file__).resolve().parents[3] / 'tray' / 'app.pyw').read_text(encoding='utf-8')
         self.assertIn(json.dumps(flow.TRAY_MUTEX), tray_source)
 
+    def test_the_foreground_takes_a_failed_attempts_next_step_unless_a_watcher_that_outlives_the_command_does(self):
+        """`launch` leaves a covered failure's next step to the watcher only when that watcher acts after the command
+        (`watcher_carries`); one that ends with the command leaves the step to the command."""
+        import dispatch_fallback as fallback
+        live = {'status': 'watching', 'pid': os.getpid()}
+
+        def host(_request):
+            return {'ok': True, 'agent': None, 'completion_notification': dict(live),
+                    'creation': {'phase': 'failed', 'failure_class': 'model_unavailable', 'failure_code': 'INVALID_MODEL'}}
+        taken = {}
+        for tray in (False, True):
+            self.setUp()
+            claim = registry.claim(self.prepare()['request'], 'parent-a', now=self.now)
+            with patch.object(flow.host_job, 'ends_children', return_value=True), \
+                    patch.object(flow, 'tray_running', return_value=tray), patch.object(flow, 'host_call', host), \
+                    patch.object(fallback, 'handle', return_value=None) as handle:
+                flow.launch(claim['dispatch_id'], 'parent-a', watch_seconds=1, poll_seconds=1)
+            taken[tray] = handle.called
+        self.assertEqual(taken, {False: True, True: False})
+
+    def test_a_relaunch_that_bound_a_worker_carries_the_command_its_answer_names(self):
+        """`fallback_result`: an answer that tells the caller to run the continuation command carries it."""
+        live = {'status': 'watching', 'pid': os.getpid()}
+        self.usage['accounts']['codex'] = {
+            'status': 'fresh', 'fetched_at': self.now.isoformat(),
+            'windows': [{'id': 'usage', 'used_pct': 0, 'remaining_pct_before_reset': 100, 'seconds_until_reset': 360000,
+                         'resets_at': (self.now + timedelta(hours=100)).isoformat()}]}
+        creates = []
+
+        def host(request):
+            if request['operation'] == 'workspace_agents':
+                return {'ok': True, 'placeable': True, 'agents': []}
+            if request['operation'] == 'create':
+                creates.append(request['dispatch_id'])
+                if len(creates) == 1:
+                    return {'ok': False, 'sent': False, 'error': 'host_creation_failed', 'failure_class': 'model_unavailable'}
+                provider, _, model = request['request']['provider'].partition('/')
+                settings = request['request'].get('settings') or {}
+                return {'ok': True, 'sent': True, 'completion_notification': dict(live), 'agent': {
+                    'id': 'w-2', 'provider': provider, 'model': model, 'status': 'running',
+                    'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+                    'updatedAt': registry.stamp(registry.utcnow()), 'labels': request['request']['labels']}}
+            return {'ok': True, 'completion_notification': dict(live), 'agent': {
+                'id': 'w-2', 'status': 'running', 'updatedAt': registry.stamp(registry.utcnow()),
+                'labels': registry.inspect(request['dispatch_id'])['request']['labels']}}
+        with patch.object(flow.host_job, 'ends_children', return_value=True), \
+                patch.object(flow, 'tray_running', return_value=False), \
+                patch('account_fleet.load_accounts', return_value=self.accounts):
+            res, _ = self.run_roll(host=host, task_id='t-relaunch-argv')
+        self.assertEqual((res['status'], len(creates)), ('launched', 2), res)
+        self.assertIn('next_argv', res['next_action'])
+        self.assertEqual(res['next_argv'], full(res)['worker']['continuation_argv'])
+        self.assertIn(creates[1], res['next_argv'])
+
     @unittest.skipUnless(os.name == 'nt', 'Windows job objects')
     def test_the_job_fact_is_read_from_the_job_the_command_runs_in_past_a_launchers_own_job(self):
         """`host_job.ends_children`: true in any job that keeps its children (one that does not kill on close may sit
@@ -872,22 +926,31 @@ class PendingNamesWhatIsKnown(Plain):
         self.assertIsNone(registry.reuse_refusal('parent-a', 'agent-unrelabeled'))
         self.assertIn('agent-unrelabeled', [w['agent_id'] for w in registry.reusable_workers('parent-a')])
 
+        def running_unlabeled(row, last_message):
+            prov, _, mod = row['request']['provider'].partition('/')
+            settings = row['request'].get('settings') or {}
+            return lambda _req: {'ok': True, 'agent': {
+                'id': 'agent-unrelabeled', 'status': 'running', 'provider': prov, 'model': mod,
+                'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
+                'lastUserMessageAt': last_message, 'updatedAt': row['launched_at'],
+                'labels': {'router.dispatch_id': 'prev-dispatch', 'router.parent_id': 'parent-a'},
+            }}
+
+        # Rule 4c: a turn that started at or past resume_deadline is not this resume's send (nothing of it can arrive
+        # by then): the worker's later turn does not bind it.
+        res_late, _ = self.run_roll(self.brief_file('r3.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r3')
+        row_late = registry.inspect(
+            json.loads(Path(res_late['details']).read_text(encoding='utf-8'))['worker']['dispatch_id'])
+        ends = registry.resume_deadline(row_late)
+        flow.reconcile(row_late['dispatch_id'], now=ends, host=running_unlabeled(row_late, registry.stamp(ends)))
+        self.assertEqual(registry.inspect(row_late['dispatch_id'])['state'], 'create_failed')
+
         # Rule 4b: an unlabeled resume whose worker Paseo reports `running` a turn started >= created_at binds instead of failing.
         res_deliv, _ = self.run_roll(self.brief_file('r2.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r2')
         d_deliv = json.loads(Path(res_deliv['details']).read_text(encoding='utf-8'))['worker']['dispatch_id']
         row_deliv = registry.inspect(d_deliv)
-        prov, _, mod = row_deliv['request']['provider'].partition('/')
-        settings = row_deliv['request'].get('settings') or {}
-
-        def delivered_unlabeled_host(_req):
-            return {'ok': True, 'agent': {
-                'id': 'agent-unrelabeled', 'status': 'running', 'provider': prov, 'model': mod,
-                'currentModeId': settings.get('modeId'), 'effectiveThinkingOptionId': settings.get('thinkingOptionId'),
-                'lastUserMessageAt': row_deliv['created_at'], 'updatedAt': row_deliv['launched_at'],
-                'labels': {'router.dispatch_id': 'prev-dispatch', 'router.parent_id': 'parent-a'},
-            }}
-
-        flow.reconcile(d_deliv, host=delivered_unlabeled_host, now=registry.resume_deadline(row_deliv))
+        flow.reconcile(d_deliv, host=running_unlabeled(row_deliv, row_deliv['created_at']),
+                       now=registry.resume_deadline(row_deliv))
         bound_row = registry.inspect(d_deliv)
         self.assertEqual(bound_row['state'], 'started')
         self.assertTrue(bound_row.get('observed_at'))

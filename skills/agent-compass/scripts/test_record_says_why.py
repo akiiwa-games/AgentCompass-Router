@@ -433,6 +433,11 @@ class SmallerSilencesTests(RecordCli):
         code, result = self.run_main(['record', '--trigger', 'workflow'])
         self.assertEqual(code, 1, result)
         self.assertIn('--basis', result['cause'])
+        # A dry run writes no row, so its answer does not send the caller to the Workflow.
+        written = len(decision_ledger.read_ledger())
+        code, result = self.run_main(['record', '--trigger', 'workflow', '--basis', 'run this as a workflow', '--dry-run'])
+        self.assertEqual((code, len(decision_ledger.read_ledger())), (0, written), result)
+        self.assertIn('--dry-run', result['next_action'])
 
     def test_a_name_read_as_another_row_names_both(self):
         code, result = self.run_main(['record', '--constraint', 'user_override', '--provider', 'claude', '--account', 'claude',
