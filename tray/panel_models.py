@@ -401,16 +401,14 @@ class ModelsTab:
         entries.pack(side="left")
         self.fill_priority_buttons(entries, "Small.TButton", (0, 6), removable=True)
         form = ttk.Frame(box, style="Card.TFrame")
-        form.pack(fill="x", pady=(12, 10))
-        ttk.Label(form, text=_tr("设定预期重置时间"), style="CardH3.TLabel").pack(side="left", padx=(0, 10))
-        self.boost_target = ttk.Combobox(form, state="readonly", width=24)
+        form.pack(fill="x", pady=(12, 4))
+        # Every model that can be added and is not in the menu yet; the expected reset time is chosen on its entry.
+        self.boost_target = ttk.Combobox(form, state="readonly", width=44, height=20)
         self.boost_target.pack(side="left")
-        self.boost_hours = ttk.Combobox(form, state="readonly", width=4, values=["1h", "3h", "6h", "12h", "24h"])
-        self.boost_hours.set("6h")
-        self.boost_hours.pack(side="left")
-        ttk.Button(form, text=_tr("添加"), style="SmallAccent.TButton", command=self.add_boost).pack(side="left", padx=10)
-        ttk.Button(form, text=_tr("加入快捷菜单"), style="Small.TButton", command=self.add_menu_target).pack(side="left")
-        ttk.Label(box, text=_tr("后重置 · 越近越优先，额度回升后自动撤销"), style="CardTiny.TLabel").pack(fill="x")
+        ttk.Button(form, text=_tr("加入快捷菜单"), style="SmallAccent.TButton", command=self.add_menu_target
+                   ).pack(side="left", padx=10)
+        # What the last action answered, in this window: the panel's status line is behind it.
+        ttk.Label(box, textvariable=self.status, style="CardTiny.TLabel").pack(fill="x", pady=(0, 6))
         bottom = ttk.Frame(box, style="Card.TFrame")
         bottom.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Button(bottom, text=_tr("取消所选规则"), style="Small.TButton", command=self.cancel_rule).pack(side="right")
@@ -419,15 +417,15 @@ class ModelsTab:
                                                  ("intent", _tr("来源"), 160, "w")), 6)
         table.pack(fill="both", expand=True)
         data = self.data_module()
-        self.prefill(lambda: (data.overrides(), data.boost_targets()), self.boost_loaded)
+        self.prefill(lambda: (data.overrides(), data.menu_additions()), self.boost_loaded)
 
     def load_boost(self):
         self._boost_refreshed = time.monotonic()
         data = self.data_module()
-        self.run(lambda: (data.overrides(), data.boost_targets()), self.boost_loaded)
+        self.run(lambda: (data.overrides(), data.menu_additions()), self.boost_loaded)
 
     def boost_loaded(self, value):
-        rules, targets = value
+        rules, additions = value
         data = self.data_module()
         self.rule_rows = rules
         if hasattr(self, "boost_chips") and self.boost_chips.winfo_exists():
@@ -452,11 +450,11 @@ class ModelsTab:
                 _tr("是") if rule["stop_on_reset"] else _tr("否"), rule["intent"]))
         if not rules:
             self.rule_table.insert("", "end", values=(_tr("当前没有生效规则"), "", "", "", ""), tags=("muted",))
-        self.boost_pairs = [(a, None) for a in dict.fromkeys(a for a, _ in targets)] + targets
-        self.boost_target.configure(values=[
-            f"{data.account_label(a)} / {data.model_label(m) if m else _tr('全部模型')}" for a, m in self.boost_pairs])
-        if not self.boost_target.get() and self.boost_pairs:
-            self.boost_target.current(0)
+        self.boost_pairs = [(item["account"], item["model"]) for item in additions]
+        texts = [item["text"] for item in additions]
+        self.boost_target.configure(values=texts)
+        if self.boost_target.get() not in texts:    # the one just added is no longer offered
+            self.boost_target.set(texts[0] if texts else "")
 
     def fill_priority_buttons(self, frame, style, padx, prefix="", removable=False):
         """One-click reset-priority buttons for the targets of the user's menu; `removable` adds the button that takes
@@ -491,6 +489,7 @@ class ModelsTab:
         def refill():
             for frame, style, padx, prefix, removable in list(getattr(self, "priority_frames", ())):
                 self.fill_priority_buttons(frame, style, padx, prefix, removable)
+            self.load_boost()       # what the editor offers follows the menu
         self.run(lambda: self.data_module().change_priority_menu(add=add, remove=remove), self.say(refill))
 
     def add_menu_target(self):
@@ -523,15 +522,6 @@ class ModelsTab:
             return router_priority.perform({"kind": "enable", "hours": hours,
                                             **{k: target[k] for k in ("account", "model", "window")}})
         self.run(work, self.say(self.load_boost))
-
-    def add_boost(self):
-        index = self.boost_target.current()
-        if index < 0:
-            self.status.set(_tr("先选择账号 / 模型"))
-            return
-        account, model = self.boost_pairs[index]
-        hours = int(self.boost_hours.get().rstrip("h"))
-        self.run(lambda: self.data_module().add_boost(account, model, hours=hours), self.say(self.load_boost))
 
     def cancel_rule(self):
         selected = self.rule_table.selection()

@@ -71,8 +71,10 @@ class PriorityTests(unittest.TestCase):
     def test_countdown_follows_time_and_a_rule_without_boost_shows_no_bonus(self):
         import router_data
         with patch.object(router_data, 'modules', return_value=(self.a, self.r)):
-            router_data.add_boost('codex', 'gpt-6-astra', hours=12, now=self.now)
-            self.assertNotIn('boost', self.rows()[0])
+            self.enable(12)
+            stored = json.loads(self.path.read_text(encoding='utf-8'))
+            del stored['overrides'][0]['boost']     # a rule an earlier version's panel wrote carries no boost
+            self.path.write_text(json.dumps(stored), encoding='utf-8')
             first = router_data.overrides(self.now)[0]
             later = router_data.overrides(self.now + timedelta(hours=11))[0]
         self.assertEqual((first['remaining_hours'], later['remaining_hours']), (12, 1))
@@ -177,6 +179,11 @@ class PriorityTests(unittest.TestCase):
         choices = [(t['account'], t['model']) for t in priority.menu_choices(accounts)]
         self.assertTrue(shipped and set(shipped) <= set(choices), (shipped, choices))
         added = next(pair for pair in choices if pair not in shipped)
+        # The editor offers exactly what the menu can still take: each one a model, none shown already.
+        offered = router_data.menu_additions()
+        self.assertEqual([(item['account'], item['model']) for item in offered],
+                         [pair for pair in choices if pair not in shipped])
+        self.assertTrue(all(item['model'] and item['text'] for item in offered), offered)
         with patch.object(router_data, '_edit_preferences') as written:
             router_data.change_priority_menu(add=added)
             document = {}
@@ -202,6 +209,12 @@ class PriorityTests(unittest.TestCase):
         mine = {'schema_version': 2, 'priority_targets': [{'account': added[0], 'model': added[1]}]}
         with patch.object(account_fleet.accounts_override, 'load_override', return_value=mine):
             self.assertEqual([(t['account'], t['model']) for t in priority.targets(account_fleet.load_accounts())], [added])
+        # Through the file: what was added is in the menu the next read shows, and is no longer offered.
+        with patch.object(router_data, 'STATE_DIR', account_fleet.accounts_override_path().parent):
+            router_data.change_priority_menu(add=added)
+        self.assertEqual([(t['account'], t['model']) for t in priority.targets(account_fleet.load_accounts())],
+                         [*shipped, added])
+        self.assertNotIn(added, [(item['account'], item['model']) for item in router_data.menu_additions()])
         self.enable()
         chosen = next(t for t in priority.snapshot(self.now)['targets'] if t['selected'])
         row = self.rows()[0]
@@ -443,7 +456,7 @@ class PriorityTests(unittest.TestCase):
                     unavailable_flag,
                 )
 
-            # Malformed `/` model pins in `priority_targets`, `enable`, or `router_data.add_boost` are refused on new
+            # Malformed `/` model pins in `priority_targets` or `enable` are refused on new
             # writes, while an already-stored malformed entry in `router-overrides.json` stays inert without failing `snapshot`:
             for bad_target in ('/gpt-6-astra', 'openai/', 'openai//gpt-6-astra', ':high', 'auto:codex:codex'):
                 bad_accounts = json.loads(json.dumps(accounts))
@@ -452,8 +465,6 @@ class PriorityTests(unittest.TestCase):
                     priority.targets(bad_accounts)
                 with self.assertRaisesRegex(ValueError, 'invalid_model_pin'):
                     priority.enable('codex', bad_target, 'usage', 24, self.now)
-                with self.assertRaisesRegex(ValueError, 'invalid_model_pin'):
-                    router_data.add_boost('codex', bad_target, 0.2, 6, False, now=self.now)
             self.path.write_text(json.dumps({'v': 1, 'overrides': [
                 {'id': 'legacy_bad', 'account': 'codex', 'model': '/gpt-6-astra', 'boost': 0.35,
                  'until': (self.now + timedelta(hours=6)).isoformat(), 'stop_on_reset': True},

@@ -30,6 +30,7 @@ import worker_sessions
 from tk_test_support import desktop_test, require_tk, import_theatre_without_user_diagnostics
 require_tk()
 decision_theatre = import_theatre_without_user_diagnostics()
+from datetime import timedelta
 import radar_chart
 import router_data
 from router_test_support import profile
@@ -614,13 +615,6 @@ class SettingsTests(unittest.TestCase):
                 self.assertIn('codex-new', saved['known_accounts'])
                 self.assertIn('claude-lab', saved['known_accounts'])
 
-    def test_boost_rules_validate_range_and_duration_before_touching_the_store(self):
-        with mock.patch.object(router_data, "modules", side_effect=AssertionError("store touched")):
-            with self.assertRaises(ValueError):
-                router_data.add_boost("claude", None, 0.8, 6, False)
-            with self.assertRaises(ValueError):
-                router_data.add_boost("claude", None, 0.2, 5, False)
-
     def test_usage_refresh_asks_usage_float_for_named_accounts_only(self):
         accounts = {'accounts': {}, '_discovery': {'accounts': {
             'team-main': {'family': 'claude'}, 'team-backup': {'family': 'claude'}, 'dot': {'family': 'dot'}}}}
@@ -662,7 +656,7 @@ class WorkerDiscoveryTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def iso(self, seconds_ago):
-        return (router_data.now_utc() - router_data.timedelta(seconds=seconds_ago)).isoformat()
+        return (router_data.now_utc() - timedelta(seconds=seconds_ago)).isoformat()
 
     def dispatch_db(self, rows):
         import sqlite3
@@ -684,7 +678,7 @@ class WorkerDiscoveryTests(unittest.TestCase):
         (folder / f"{agent_id}.json").write_text(json.dumps(doc), encoding="utf-8")
 
     def test_active_dispatch_rows_and_live_paseo_agents_are_both_listed(self):
-        future = (router_data.now_utc() + router_data.timedelta(hours=5)).isoformat()
+        future = (router_data.now_utc() + timedelta(hours=5)).isoformat()
         db = self.dispatch_db([
             {"agent_id": "a-started", "state": "started", "hard_until": future, "started_at": self.iso(60),
              "bundle": {"bundle_id": "opus55_high", "model": "claude-opus-5-5"}, "request": {"title": "from db"}},
@@ -1067,7 +1061,7 @@ class WindowHelperTests(unittest.TestCase):
 
         # A pool counts down to its next partial refill; the hover table gives each account's own reset.
         now = router_data.datetime(2026, 11, 6, 12, 0, tzinfo=router_data.timezone.utc)
-        at = lambda hours: (now + router_data.timedelta(hours=hours)).isoformat()
+        at = lambda hours: (now + timedelta(hours=hours)).isoformat()
         rows = router_data.pool_member_rows([
             {"label": "k***@gmail.com", "read_at": at(-0.1), "windows": {
                 "seven_day": {"used_pct": 80, "resets_at": at(2)}, "five_hour": {"used_pct": 40, "resets_at": at(-0.05)}}},
@@ -1113,7 +1107,7 @@ class WindowHelperTests(unittest.TestCase):
         # Verify pool_reservations aggregates active dispatch leases per (account, window_id).
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "dispatch.sqlite3"
-            future = (router_data.now_utc() + router_data.timedelta(hours=2)).isoformat()
+            future = (router_data.now_utc() + timedelta(hours=2)).isoformat()
             conn = sqlite3.connect(db)
             conn.execute("CREATE TABLE dispatches (data TEXT)")
             conn.execute("INSERT INTO dispatches VALUES (?)", (json.dumps({
@@ -1542,7 +1536,7 @@ class ScorerConfigTests(unittest.TestCase):
 
 @pytest.mark.slow
 class ResetEditorTests(unittest.TestCase):
-    def test_editor_uses_time_choices_and_submits_dynamic_rule(self):
+    def test_the_editor_offers_what_can_be_added_adds_it_with_one_button_and_answers_in_its_window(self):
         import router_window
         import tk_test_support
 
@@ -1551,23 +1545,30 @@ class ResetEditorTests(unittest.TestCase):
                 mock.patch.object(router_window.theme, 'set_window_icon'):
             panel = router_window.Panel(root, 'policy')
             panel.open_boost_editor()
-            self.assertEqual(tuple(panel.boost_hours.cget('values')), ('1h', '3h', '6h', '12h', '24h'))
-            self.assertFalse(hasattr(panel, 'boost_value'))
-            self.assertFalse(hasattr(panel, 'boost_reset'))
-            panel.boost_pairs = [('codex', 'gpt-6-astra')]
-            panel.boost_target.configure(values=['Astra'])
-            panel.boost_target.current(0)
-            panel.boost_hours.set('1h')
-            panel.add_boost()
-            work = panel.run.call_args.args[0]
-            with mock.patch.object(router_data, 'add_boost') as save:
-                work()
-            save.assert_called_once_with('codex', 'gpt-6-astra', hours=1)
-            # The same choice goes into the user's quick menu, and a menu entry's own button takes it out again.
+            # The list is what `menu_additions` hands over, each a model; the first is chosen.
+            panel.boost_loaded(([], [{'account': 'codex', 'model': 'gpt-6-astra', 'text': 'Codex / Astra'},
+                                     {'account': 'codex', 'model': 'gpt-6.1-sol', 'text': 'Codex / Sol'}]))
+            self.assertEqual((tuple(panel.boost_target.cget('values')), panel.boost_target.get()),
+                             (('Codex / Astra', 'Codex / Sol'), 'Codex / Astra'))
+
+            def texts_of(widget, kind):
+                found = [widget] if widget.winfo_class() == kind else []
+                return found + [item for child in widget.winfo_children() for item in texts_of(child, kind)]
+            # One button adds, and the answer of an action is shown in this window.
+            buttons = [b.cget('text') for b in texts_of(panel.boost_dialog, 'TButton')]
+            self.assertEqual(buttons, ['加入快捷菜单', '取消所选规则'])
+            self.assertIn(str(panel.status), [str(label.cget('textvariable')) for label in texts_of(panel.boost_dialog, 'TLabel')])
             panel.add_menu_target()
-            with mock.patch.object(router_data, 'change_priority_menu') as change:
-                panel.run.call_args.args[0]()
+            with mock.patch.object(router_data, 'change_priority_menu', return_value='已加入快捷菜单：Astra') as change:
+                answer = panel.run.call_args.args[0]()
             change.assert_called_once_with(add=('codex', 'gpt-6-astra'), remove=None)
+            panel.run.call_args.args[1](answer)
+            self.assertEqual(panel.status.get(), '已加入快捷菜单：Astra')
+            # What is offered follows the menu: the added one is gone and the choice moves on.
+            panel.boost_loaded(([], [{'account': 'codex', 'model': 'gpt-6.1-sol', 'text': 'Codex / Sol'}]))
+            self.assertEqual(panel.boost_target.get(), 'Codex / Sol')
+            panel.boost_loaded(([], [{'account': 'codex', 'model': 'gpt-6-astra', 'text': 'Codex / Astra'}]))
+            panel.add_menu_target()
             frame = next(item[0] for item in panel.priority_frames if item[4])
             fill = next(call.args[1] for call in panel.run.call_args_list
                         if call.args[1].__qualname__.endswith('fill_priority_buttons.<locals>.done')
@@ -1577,12 +1578,13 @@ class ResetEditorTests(unittest.TestCase):
             self.assertEqual(texts, ['Astra', '×'])
             # The entry's button opens the expected reset times; the chosen one is what the priority is set with.
             import tkinter
+            import router_priority
             with mock.patch.object(panel, 'enable_priority') as enable, mock.patch.object(tkinter.Menu, 'tk_popup'), \
                     mock.patch.object(tkinter.Menu, 'add_command') as offered:
                 frame.winfo_children()[0].invoke()
-                self.assertEqual(len(offered.call_args_list), len(router_data.BOOST_HOURS))
+                self.assertEqual(len(offered.call_args_list), len(router_priority.DURATIONS))
                 offered.call_args_list[1].kwargs['command']()
-            enable.assert_called_once_with('codex', 'gpt-6-astra', router_data.BOOST_HOURS[1])
+            enable.assert_called_once_with('codex', 'gpt-6-astra', router_priority.DURATIONS[1])
             frame.winfo_children()[1].invoke()
             with mock.patch.object(router_data, 'change_priority_menu') as change:
                 panel.run.call_args.args[0]()

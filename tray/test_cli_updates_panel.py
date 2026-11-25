@@ -58,7 +58,7 @@ class PanelTests(unittest.TestCase):
             mock.patch.object(router_data, 'harness_model_rows', return_value=[row(), row('pi')]),
             mock.patch.object(router_data, 'refresh_model_catalog', return_value=[row(), row('pi')]),
             mock.patch.object(router_data, 'overrides', return_value=[]),
-            mock.patch.object(router_data, 'boost_targets', return_value=[]),
+            mock.patch.object(router_data, 'menu_additions', return_value=[]),
             mock.patch.object(router_window.theme, 'set_window_icon'),
             mock.patch.object(panel_widgets, 'log_error'),
             mock.patch.object(plugins, 'load', return_value=plugins.defaults()),

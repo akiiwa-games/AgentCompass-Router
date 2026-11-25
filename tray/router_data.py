@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import plugins
@@ -126,9 +126,6 @@ def __getattr__(name):
 
 TUNING_LIMITS = {"safety_margin_pct": (0, 50), "short_window_floor_pct": (0, 50),
                  "rotate_after_carried_tokens": (100000, 10000000)}
-BOOST_RANGE = (0.10, 0.50)
-BOOST_HOURS = router_priority.DURATIONS
-PANEL_INTENT = "panel:boost"
 
 
 def modules():
@@ -1307,17 +1304,16 @@ def overrides(now: datetime | None = None) -> list[dict]:
     return rows
 
 
-def boost_targets() -> list[tuple[str, str]]:
-    """(account, model) pairs with an enabled bundle."""
+def menu_additions() -> list[dict]:
+    """What the quick-priority menu can still take: every model `router_priority.menu_choices` offers that the menu
+    does not show yet, as {account, model, text} in fleet order. Each is a model `change_priority_menu` accepts."""
     modules()
     import account_fleet
-    accounts = _cached_accounts()
-    seen = []
-    for bundle in account_fleet.bundles(accounts).values():
-        pair = (bundle["account"], bundle["model"])
-        if not bundle.get("disabled") and pair not in seen:
-            seen.append(pair)
-    return seen
+    accounts = account_fleet.load_accounts()
+    shown = {(t["account"], t["model"]) for t in router_priority.targets(accounts)}
+    return [{"account": t["account"], "model": t["model"],
+             "text": f"{account_label(t['account'])} / {router_priority.model_label(t['model'], accounts, t['account'])}"}
+            for t in router_priority.menu_choices(accounts) if (t["account"], t["model"]) not in shown]
 
 
 def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, str] | None = None) -> str:
@@ -1359,79 +1355,6 @@ def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, 
             list(stored) if isinstance(stored, list) else [{"account": a, "model": m} for a, m in entries])
     _edit_preferences(write)
     return message
-
-
-def add_boost(account: str, model: str | None, boost: float | None = None, hours: int = 6, stop_on_reset: bool = True,
-              now: datetime | None = None) -> str:
-    """A temporary priority rule in router-overrides.json; never stacks on an existing one for the same model."""
-    if boost is not None and not BOOST_RANGE[0] - 1e-9 <= boost <= BOOST_RANGE[1] + 1e-9:
-        raise ValueError(_tr('加成需在 +{0} ~ +{1} 之间').format(f'{BOOST_RANGE[0]:.2f}', f'{BOOST_RANGE[1]:.2f}'))
-    if hours not in BOOST_HOURS:
-        raise ValueError(_tr("预期重置时间只能是 1h / 3h / 6h / 12h / 24h"))
-    modules()
-    import account_fleet
-    import override_store
-    import quota_overrides
-    import quota_pools
-    now = now or now_utc()
-    accounts = account_fleet.load_accounts()
-    if account not in accounts["accounts"]:
-        raise ValueError(_tr("未知账号"))
-    if model not in (None, ""):
-        import model_resolution
-        model_resolution.check_model_pin(model, "model")
-    as_read = (account_fleet.effective_pin(model, account_fleet.pin_pool(accounts, account=account), accounts)
-               if model else None)
-    stored = account_fleet.stored_form(as_read, accounts, account) if as_read else None
-    model = account_fleet.stored_model(as_read, accounts, account) if as_read else None
-    path = quota_overrides.overrides_path()
-    with override_store.locked(path):
-        document = router_priority.read_document(path)
-        new_until = (now + timedelta(hours=hours)).isoformat()
-        overlapping = [
-            r for r in document["overrides"]
-            if (router_priority.overlaps(r, account, model, now, accounts) if model
-                else (router_priority.active(r, now) and r.get("account") == account))
-        ]
-        if overlapping:
-            ui_rules = [r for r in overlapping if r.get("intent") in (PANEL_INTENT, router_priority.INTENT)
-                        and not r.get("expires_at")]
-            if not ui_rules or any(r.get("until") == new_until and (account_fleet.stored_model(r["model"], accounts, account) if r.get("model") else None) == model
-                                   for r in ui_rules):
-                return _tr("该账号/模型已有临时规则；未叠加权重")
-            existing = ui_rules[0]
-            existing["until"] = new_until
-            existing["basis"] = _tr('用户设置 {0}/{1} 预计 {2} 小时后重置，越近消耗优先级越高').format(account, model or _tr('全部模型'), hours)
-            if model:
-                existing["model"] = stored
-            else:
-                existing.pop("model", None)
-            if boost is not None:
-                existing["boost"] = round(float(boost), 2)
-            document["overrides"] = [r for r in document["overrides"] if r is existing or r not in ui_rules]
-            router_priority.save(path, {**document, "v": 1})
-            return _tr('已更新 {0}{1} 预期重置，{2} 小时后重置前动态优先').format(
-                account_label(account), (' / ' + model_label(model) if model else ''), hours)
-        row = {"id": uuid.uuid4().hex, "intent": PANEL_INTENT, "account": account,
-               "created_at": now.isoformat(), "until": new_until,
-               "basis": _tr('用户设置 {0}/{1} 预计 {2} 小时后重置，越近消耗优先级越高').format(account, model or _tr('全部模型'), hours)}
-        if boost is not None:
-            row['boost'] = round(float(boost), 2)
-        if model:
-            row["model"] = stored
-        if stop_on_reset:
-            windows = [(wid, spec) for wid, spec, _ in quota_pools.applicable_windows(accounts["accounts"][account], model, {}, accounts=accounts)
-                       if spec.get("hours", 0) >= 24]
-            if not windows:
-                raise ValueError(_tr("该账号没有可确认重置的周额度窗口；请取消“重置后自动撤销”"))
-            wid = max(windows, key=lambda w: w[1]["hours"])[0]
-            import usage_reading
-            usage = usage_reading.usage_snapshot(now=now)
-            base = router_priority.baseline(accounts, usage, {"account": account, "window": wid}, now)
-            row.update(window=wid, stop_on_reset=True, reset_confirmation="replenishment", baseline_windows={wid: base})
-        document["overrides"].append(row)
-        router_priority.save(path, {**document, "v": 1})
-    return _tr('已添加 {0}{1} 预期重置，{2} 小时后重置前动态优先').format(account_label(account), (' / ' + model_label(model) if model else ''), hours)
 
 
 def host_policy_state() -> dict:
