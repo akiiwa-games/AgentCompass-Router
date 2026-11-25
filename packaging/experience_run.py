@@ -1176,6 +1176,17 @@ class Play:
             if chain["commands"] >= FOLLOW_LIMIT:
                 chain["outcome"], chain["note"] = "dead_end", f"still pending after {chain['commands']} commands"
                 return
+            retry_at = doc.get("retry_at")
+            if isinstance(retry_at, str) and retry_at:
+                import datetime as dt
+                try:
+                    retry_dt = dt.datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
+                    target_hour = (retry_dt.timestamp() - s.clock.t0) / 3600.0 + 0.001
+                except ValueError:
+                    target_hour = None
+                if target_hour is not None and target_hour > s.clock.now and (target_hour - s.clock.now) <= WAIT_LIMIT_HOURS:
+                    chain["waits"].append(round(target_hour - s.clock.now, 4))
+                    self.note_resets(s.advance_to(target_hour))
             result = s.command(op, [str(a) for a in doc["next_argv"]])
             chain["commands"] += 1
             got = parse(result.stdout) or {}
@@ -1255,7 +1266,7 @@ class Play:
         s = self.s
         got = {}
         while time.time() < deadline:
-            s.call(op, "dispatch", "--dispatch-action", "reconcile", AGENTCOMPASS_CARRY_FALLBACK="1")
+            s.call(op, "dispatch", "--dispatch-action", "reconcile", "--carry-fallback")
             root = parse(s.call(op, "dispatch", "--dispatch-action", "status", "--dispatch-id", root_id).stdout) or {}
             current_id = root.get("current_attempt") or root_id
             if current_id != root_id:

@@ -280,7 +280,7 @@ def test_a_free_spend_is_written_where_the_router_reads_a_free_pools_use(tmp_pat
 
 def test_settle_keeps_non_paseo_delivery_continuations_and_observe_pending_follows_fallback_attempts(tmp_path):
     """Rule 6: Herdr and Grok Bot `pending` answers (`check_delivery_do_not_resend`) run `next_argv`; Paseo fallback
-    `pending` chains advance to `retry_at`, pass `AGENTCOMPASS_CARRY_FALLBACK=1`, and follow `current_attempt`."""
+    `pending` chains advance to `retry_at`, pass `--carry-fallback`, and follow `current_attempt`."""
     import datetime as dt
     import types
 
@@ -301,7 +301,7 @@ def test_settle_keeps_non_paseo_delivery_continuations_and_observe_pending_follo
 
         def call(self, _op, *args, **env):
             if args[:3] == ("dispatch", "--dispatch-action", "reconcile"):
-                reconciles.append(dict(env))
+                reconciles.append((tuple(args), dict(env)))
                 return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
             did = args[-1]
             doc = statuses[did]()
@@ -371,4 +371,4 @@ def test_settle_keeps_non_paseo_delivery_continuations_and_observe_pending_follo
     play.settle(None, chain2, paseo_doc, {}, "b1", ["roll"], 0)
     assert chain2["outcome"] == "relaunched"
     assert chain2["waits"] and chain2["waits"][0] > 0.16
-    assert reconciles and all(r.get("AGENTCOMPASS_CARRY_FALLBACK") == "1" for r in reconciles)
+    assert reconciles and all("--carry-fallback" in argv and "AGENTCOMPASS_CARRY_FALLBACK" not in env for argv, env in reconciles)

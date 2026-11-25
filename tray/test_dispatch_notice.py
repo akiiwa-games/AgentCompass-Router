@@ -1286,7 +1286,7 @@ class DispatchNoticeUnitTests(unittest.TestCase):
         self.assertNotIn("-I", cmd)
         self.assertFalse(any(part.endswith("route_judge.py") for part in cmd), cmd)
         self.assertEqual(Path(cmd[3]).resolve(), (services.ROOT / "agentcompass").resolve())
-        self.assertEqual(cmd[4:], ["dispatch", "--dispatch-action", "reconcile"])
+        self.assertEqual(cmd[4:], ["dispatch", "--dispatch-action", "reconcile", "--carry-fallback"])
 
     def test_missing_cli_and_popen_oserror_are_quiet_and_throttled_to_interval(self):
         seed_dispatch_row(self.db_path, base_paseo_row("d-nocli", state="started"))
@@ -1361,7 +1361,7 @@ class DispatchNoticeUnitTests(unittest.TestCase):
                 mock.patch.object(services, "hidden_popen", return_value=self.child(True)) as popen:
             self.assertTrue(services.dispatch_notice_tick())
         cmd, _env, _cwd, log, flags = popen.call_args.args
-        self.assertEqual(cmd, [str(cli_exe.resolve()), "dispatch", "--dispatch-action", "reconcile"])
+        self.assertEqual(cmd, [str(cli_exe.resolve()), "dispatch", "--dispatch-action", "reconcile", "--carry-fallback"])
         self.assertNotEqual(Path(cmd[0]).resolve(), tray_exe.resolve())
         self.assertEqual(log.name, "dispatch-notice.log")
         self.assertEqual(flags, services.BELOW_NORMAL_PRIORITY_CLASS)
@@ -1520,8 +1520,9 @@ class DispatchNoticeUnitTests(unittest.TestCase):
                             mock.patch.object(services, "hidden_popen", return_value=self.child(True)) as popen:
                         self.assertTrue(services.dispatch_notice_needed(now=now))
                         self.assertTrue(services.dispatch_notice_tick(force=True))
-                        _cmd, child_env, *_rest = popen.call_args.args
-                        self.assertEqual(child_env.get("AGENTCOMPASS_CARRY_FALLBACK"), "1")
+                        cmd, child_env, *_rest = popen.call_args.args
+                        self.assertIn("--carry-fallback", cmd)
+                        self.assertNotIn("AGENTCOMPASS_CARRY_FALLBACK", child_env)
 
 
 class DispatchNoticeIntegrationTests(unittest.TestCase):

@@ -182,6 +182,7 @@ class StageTableTests(RecordCli):
                          (['override', '--account', 'codex', '--basis', 'b', '--resets-in', '2', '--rebaseline'], None)],
             'dispatch': [(['dispatch', '--dispatch-action', 'prepare', '--input', str(self.prepare), '--usage-cache', c],
                           None),
+                         (['dispatch', '--dispatch-action', 'reconcile', '--carry-fallback'], None),
                          (['dispatch', '--dispatch-action', 'release', '--dispatch-id', 'x', '--parent-id', PARENT,
                            '--basis', 'b'], None)],
             'launch': [(['launch', '--dispatch-id', 'x', '--parent-id', PARENT, '--watch-seconds', '10',
@@ -242,6 +243,21 @@ class StageTableTests(RecordCli):
         shown = stage_help.stage_help(route_judge.build_parser(), 'roll')
         self.assertTrue('--task' in shown and '--brief' in shown and '--resets-in' not in shown
                         and '--constraint' not in shown, shown)
+
+    def test_carry_fallback_is_an_explicit_dispatch_reconcile_tooling_option_and_unread_elsewhere(self):
+        """Rule B: `--carry-fallback` is listed in `stage_help`'s dispatch tooling options (`UNLISTED`), opts only
+        `dispatch --dispatch-action reconcile` into `carry_fallback=True` (default `False` even when an env var is set),
+        and is flagged by `unread_flags` on other stages."""
+        calls = []
+        with patch.object(dispatch_flow, 'reconcile', side_effect=lambda *a, **kw: calls.append(kw.get('carry_fallback', False)) or []):
+            self.run_main(['dispatch', '--dispatch-action', 'reconcile'], env={'PASEO_AGENT_ID': PARENT, 'AGENTCOMPASS_CARRY_FALLBACK': '1'})
+            self.run_main(['dispatch', '--dispatch-action', 'reconcile', '--carry-fallback'])
+            self.run_main(['dispatch', '--dispatch-action', 'start', '--dispatch-id', 'x', '--carry-fallback'])
+        self.assertEqual(calls, [False, True, False])
+        for stage, argv in (('plan', ['plan', '--demo', '--dry-run', '--format', 'json', '--carry-fallback']),
+                            ('launch', ['launch', '--dispatch-id', 'x', '--parent-id', PARENT, '--carry-fallback'])):
+            _code, ans = self.run_main(argv)
+            self.assertTrue(any('--carry-fallback' in w and stage in w for w in ans.get('warnings') or ()), ans)
 
 
 class RollPathTests(RecordCli):

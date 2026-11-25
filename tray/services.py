@@ -1191,13 +1191,14 @@ def dispatch_notice_needed(now: datetime | None = None) -> bool:
 
 
 def dispatch_reconcile_command() -> list[str] | None:
-    """argv for `agentcompass dispatch --dispatch-action reconcile` using the console CLI, never the windowed tray or `route_judge.py`."""
+    """argv for `agentcompass dispatch --dispatch-action reconcile --carry-fallback` using the console CLI, never the windowed tray or `route_judge.py`."""
+    tail = ["dispatch", "--dispatch-action", "reconcile", "--carry-fallback"]
     if component_launch.frozen():
         cli = Path(sys.executable).resolve().parent / "cli" / ("agentcompass.exe" if os.name == "nt" else "agentcompass")
         if cli.is_file():
-            return [str(cli), "dispatch", "--dispatch-action", "reconcile"]
+            return [str(cli), *tail]
         found = shutil.which("agentcompass")
-        return [found, "dispatch", "--dispatch-action", "reconcile"] if found else None
+        return [found, *tail] if found else None
     scripts = component_launch.skill_scripts()
     if scripts is None:
         return None
@@ -1212,15 +1213,15 @@ def dispatch_reconcile_command() -> list[str] | None:
             python = console
     checkout_pkg = scripts.parents[2] / "agentcompass" if len(scripts.parents) > 2 else None
     if checkout_pkg is not None and (checkout_pkg / "__main__.py").is_file() and (scripts.parents[2] / "pyproject.toml").is_file():
-        return [str(python), "-X", "utf8", str(checkout_pkg), "dispatch", "--dispatch-action", "reconcile"]
+        return [str(python), "-X", "utf8", str(checkout_pkg), *tail]
     installed_pkg = scripts.parents[3] if len(scripts.parents) > 3 else None
     if installed_pkg is not None and installed_pkg.name == "agentcompass" and (installed_pkg / "__main__.py").is_file():
-        return [str(python), "-X", "utf8", str(installed_pkg), "dispatch", "--dispatch-action", "reconcile"]
+        return [str(python), "-X", "utf8", str(installed_pkg), *tail]
     root_pkg = ROOT / "agentcompass"
     if (root_pkg / "__main__.py").is_file() and (ROOT / "pyproject.toml").is_file():
-        return [str(python), "-X", "utf8", str(root_pkg), "dispatch", "--dispatch-action", "reconcile"]
+        return [str(python), "-X", "utf8", str(root_pkg), *tail]
     found = shutil.which("agentcompass")
-    return [found, "dispatch", "--dispatch-action", "reconcile"] if found else None
+    return [found, *tail] if found else None
 
 
 def _bound_dispatch_notice_log(log_path: Path) -> None:
@@ -1267,7 +1268,6 @@ def dispatch_notice_tick(force: bool = False) -> bool:
         return False
     state_dir = _dispatch_state_dir()
     env = os.environ.copy()
-    env["AGENTCOMPASS_CARRY_FALLBACK"] = "1"
     default_state = Path.home() / ".agent-compass"
     if state_dir != default_state:
         env.setdefault("ROUTER_STATE_DIR", str(state_dir))

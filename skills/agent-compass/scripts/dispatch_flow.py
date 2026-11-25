@@ -549,9 +549,6 @@ def failed_attempts(row, path=None):
     return out
 
 
-CARRY_FALLBACK_ENV = 'AGENTCOMPASS_CARRY_FALLBACK'
-
-
 def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, not_observed=None, *, carry_fallback=False):
     """Observe `dispatch_id`, or every open Paseo dispatch, and return the observations. The returned list holds only
     what the host was asked and answered (launch reads `bool(observations)` as "the host was queried"). By default this
@@ -1080,7 +1077,7 @@ def cli(args):
     if action == 'start' and not args.dispatch_id:
         raise registry.Refused('start acknowledgment requires --dispatch-id; it observes the host rather than trusting caller status')
     if action in ('reconcile', 'start'):
-        carry = action == 'reconcile' and os.environ.pop(CARRY_FALLBACK_ENV, '') == '1'
+        carry = action == 'reconcile' and bool(getattr(args, 'carry_fallback', False))
         not_observed = []
         observations = reconcile(args.dispatch_id, not_observed=not_observed, carry_fallback=carry)
         answer = {'observations': observations, 'not_observed': not_observed, 'active_reservations': registry.reservations()}
