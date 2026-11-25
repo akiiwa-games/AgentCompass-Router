@@ -5,7 +5,6 @@ import math
 import os
 from pathlib import Path
 import re
-import threading
 import time
 
 import env_vars
@@ -17,7 +16,6 @@ import window_scope
 USAGE_CACHE_ENV = 'ROUTER_USAGE_CACHE'
 METERED_NAMES_ENV = 'ROUTER_METERED_NAMES'
 MAX_AGE_SECONDS = 900
-RECOLLECT_SECONDS = 30   # the longest a reader waits for the one collection of a row of an earlier shape
 FLAG_CONFLICT_SECONDS = 24 * 3600   # collector says stale=false but the observation is this old
 DEFAULT_METERED_ACCOUNTS = ()    # metered/proxy accounts are discovered dynamically via billing='metered' or ROUTER_METERED_NAMES
 
@@ -254,52 +252,12 @@ def _metered_usd_details(details):
     return {'kind': 'metered_usd', 'spent_usd': float(spent), 'budget_usd': budget_usd}
 
 
-def _collect_earlier_shape(candidate, accounts, quota_sources, now):
-    """With no collector running, collect once each requested account whose row in the collector's own cache has an
-    earlier version's shape, waiting at most RECOLLECT_SECONDS. The collector's cadence and retry backoff apply, and
-    a failure leaves the row unread with the collector's error."""
-    try:
-        document = usage_cache.read_document(candidate)
-    except (OSError, ValueError, UnicodeError):
-        return
-    rows, polls = document['providers'], document.get('poll')
-    polls = polls if isinstance(polls, dict) else {}
-    wanted = set(rows) if accounts is None else {(quota_sources or {}).get(a, a) for a in accounts}
-    due = []
-    for name in sorted(wanted):
-        poll = polls.get(name)
-        at = poll.get('at') if isinstance(poll, dict) else None
-        running = finite_number(at, high=float('inf')) and 0 <= now.timestamp() - at <= usage_cache.POLL_GRACE_SECONDS
-        if usage_cache.earlier_shape(rows.get(name)) and not running:
-            due.append(name)
-    if not due:
-        return
-    import usage_core
-    if Path(candidate).resolve() != Path(usage_core.CACHE_PATH).resolve():
-        return  # a named file that is not the collector's is only read
-    import usage_collector
-
-    def collect():
-        try:
-            usage_collector.refresh_providers(due, force=False)
-        except Exception:  # noqa: BLE001 - the row stays unread, which the snapshot reports
-            pass
-
-    worker = threading.Thread(target=collect, daemon=True)
-    worker.start()
-    worker.join(RECOLLECT_SECONDS)
-
-
 def usage_snapshot(path=None, accounts=None, now=None, max_age_seconds=MAX_AGE_SECONDS, quota_sources=None, inventory=None):
     """Read the real collector cache; project an allowlist, never credentials or reset grants."""
     now = now or datetime.now(timezone.utc)
     attempts = []
     providers = polls = source = None
-    if quota_sources is None:
-        import account_fleet
-        quota_sources = account_fleet.configured_quota_sources()
     for candidate in cache_paths(path):
-        _collect_earlier_shape(candidate, accounts, quota_sources, now)
         try:
             document = usage_cache.read_document(candidate)
             providers = document['providers']
@@ -314,6 +272,9 @@ def usage_snapshot(path=None, accounts=None, now=None, max_age_seconds=MAX_AGE_S
                 'reason': 'No readable provider usage cache; locate the collector snapshot.'}
     requested = set(providers) if accounts is None else set(accounts)
     # Accounts the fleet document pools onto another account read that account's row.
+    if quota_sources is None:
+        import account_fleet
+        quota_sources = account_fleet.configured_quota_sources()
     sources = quota_sources
     requested |= {sources[name] for name in requested if name in sources}
     home_dir = _usage_home(source)

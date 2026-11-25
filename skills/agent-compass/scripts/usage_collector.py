@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -25,6 +26,7 @@ import usage_core
 import venice_usage
 
 STATE = usage_cache.state_dir()
+RECOLLECT_SECONDS = 30   # the longest a plan waits for the collection of rows of an earlier shape
 
 
 def discovered_subscriptions() -> list[str]:
@@ -103,6 +105,30 @@ def refresh_providers(providers, *, force: bool = True):
     """Collect usage for requested display items/providers using the collector's target resolution."""
     selected = usage_core.active_providers(resolve_targets(providers))
     return usage_core.fetch_all(selected, force=force) if selected else []
+
+
+def recollect_earlier_shape(path) -> None:
+    """Collect the accounts whose row in the collector's own cache has an earlier version's shape, waiting at most
+    RECOLLECT_SECONDS. The collector's retry backoff applies; a failure leaves the row unread with its error."""
+    try:
+        if Path(path).resolve() != usage_core.CACHE_PATH.resolve():
+            return  # a named file that is not the collector's is only read
+        rows = usage_cache.read_document(path)['providers']
+    except (OSError, ValueError):
+        return
+    due = [name for name, row in rows.items() if usage_cache.earlier_shape(row)]
+    if not due:
+        return
+
+    def run():
+        try:
+            refresh_providers(due, force=False)
+        except Exception:  # noqa: BLE001 - the row stays unread, which the plan reports
+            pass
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(RECOLLECT_SECONDS)
 
 
 def collect(*, force: bool = False):
