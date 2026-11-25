@@ -711,7 +711,10 @@ def gui_session(exe, tag, router_only=False):
         document = json.loads(USAGE_CACHE.read_text(encoding="utf-8")) if USAGE_CACHE.is_file() else {}
         return {name: row.get("at") for name, row in (document.get("attempts") or {}).items() if name in ("codex", "claude")}
     attempts_before = attempts()
-    click_shot(720, 79)
+    # The label is anchored to the window's right edge, and the window is as wide as the screen lets it be (the 2000 px
+    # asked for are cut to the screen's width), so the label keeps its distance from the screen's right edge whatever the
+    # screen's size and scaling: 871 cursor units, read at 1351x728 and 150% (screenshot x 720) and at 1157x619 and 175%.
+    click(user32.GetSystemMetrics(0) - 871, 79 / SHOT_PER_CURSOR)
     again = wait_for(lambda: len(attempts_before) == 2 and all(attempts().get(name, 0) > at for name, at in attempts_before.items()), 90, 1.0)
     settle(f"{tag}-quota-after-refresh.png", limit=60)
     check("after clicking the reading label (↻) the window read both accounts again (the usage cache records a newer attempt for each)", bool(again), (attempts_before, attempts()))
