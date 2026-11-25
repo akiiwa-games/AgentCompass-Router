@@ -3132,6 +3132,17 @@ process.stdout.write(JSON.stringify(out));
                                                 "session_id": "claude-session"}, ledger_path=ledger, now=T0)
                 self.assertEqual("reason" in result, blocked)
 
+    def test_schedule_plan_is_this_sessions_by_any_id_that_names_the_caller(self):
+        """Antigravity names its session `conversationId`: the plan it wrote is its own (caller_identities), as a
+        plan written under `session_id` is."""
+        ledger = self.write_ledger(str(self.state), [self.session_plan(session_ids=["agy-conversation"])])
+        command = 'paseo schedule create --every 5m --provider codex/gpt-6-astra "do x"'
+        call = {"conversationId": "agy-conversation", "modelName": "gemini-3.8-flash-high",
+                "toolCall": {"id": "tc-1", "name": "run_command", "args": {"CommandLine": command}}}
+        self.assertEqual(gate.evaluate_payload(call, ledger_path=ledger, now=T0), {"decision": "allow"})
+        other = dict(call, conversationId="another-conversation")
+        self.assertIn("本会话没有 plan 记录", gate.evaluate_payload(other, ledger_path=ledger, now=T0)["reason"])
+
     def test_paseo_schedule_cli_is_the_same_launch_as_the_mcp_tool(self):
         routed = self.write_ledger(str(self.state), [self.session_plan()])
         missing = self.state / "missing.jsonl"

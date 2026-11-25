@@ -1758,8 +1758,8 @@ def schedule_deny_reason(trigger: str, cause: str) -> str:
     return (
         f"[Router Gate] 拦截未路由的定时 agent 启动 ({trigger})：{cause}。"
         "schedule 每次触发都会启动新 agent；roll 不适用（roll 会立即启动 worker，不会建 schedule）。"
-        "先把任务写进 <task.json>（objective 写定时要做的事）并运行\n"
-        f"  {ROUTER_CMD} plan --input <task.json>\n"
+        "先把任务写进 <task.json>，内容为 {\"task\": {\"objective\": \"<定时要做的事>\"}}，并运行\n"
+        f"  {ROUTER_CMD} plan --input <task.json> --hours <每次触发的预计工时>\n"
         "再用返回 bundle 的 provider 与 model 创建：create_schedule 传 provider=\"<provider>/<model>\"，"
         "或 `paseo schedule create --provider <provider>/<model> ...`（update_schedule 同时给出 provider 与 model）。"
         "gate 只接受本会话最近 15 分钟内 provider/model 一致的 plan 记录（plan 须在本会话中运行）。"
@@ -1812,7 +1812,7 @@ def check_schedule_plan(rows: list[dict], args: dict, context: dict, trigger: st
     plans = [row for row in rows if carries_route(row) and row.get("stage") == "plan" and written_by(row, identities)]
     if not plans:
         return schedule_deny_reason(trigger, "最近 15 分钟内本会话没有 plan 记录")
-    row, diagnostic = match_route(plans, requested, context, trigger, accounts=accounts)
+    row, diagnostic = match_route(plans, requested, context, trigger, accounts=accounts, identities=identities)
     return None if row else schedule_deny_reason(trigger, f"与最近的 plan 不一致：{diagnostic}")
 
 
