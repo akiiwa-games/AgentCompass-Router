@@ -1479,7 +1479,8 @@ def recent_routes(
     now: dt.datetime | None = None,
     window_seconds: int = DEFAULT_WINDOW_SECONDS,
 ) -> list[dict]:
-    """Read recent decisions newest first, bounded to the ledger's last 1 MiB (plan lines carry a decision snapshot)."""
+    """Read recent decisions newest first, bounded to the ledger's last 1 MiB (plan lines carry a decision snapshot):
+    the rows that carry a route, and the Workflow records, which name none (check_workflow_record)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     if not ledger_path.is_file():
         return []
@@ -1498,7 +1499,8 @@ def recent_routes(
             row = json.loads(line)
         except ValueError:
             continue
-        if carries_route(row) and (at := parse_ts(row.get("at"))) is not None:
+        if ((carries_route(row) or (isinstance(row, dict) and row.get("trigger") == "workflow"))
+                and (at := parse_ts(row.get("at"))) is not None):
             if -60 <= (now - at).total_seconds() <= window_seconds:
                 rows.append(row)
     return rows
@@ -1789,8 +1791,7 @@ def workflow_deny_reason(cause: str) -> str:
         f"[Router Gate] 拦截未授权的 Workflow 启动 (tool:Workflow)：{cause}。"
         "Workflow 的脚本会在运行时内部启动多个子 agent，roll 不适用（roll 会立即启动一个普通 worker，替换掉 workflow）。"
         "只有用户在本次请求中明确要求用 workflow 时才可调用：在本会话中先运行\n"
-        f"  {ROUTER_CMD} record --constraint user_override --trigger workflow --provider <p> --account <a> "
-        "--model <本会话模型> --effort <e> --basis \"<用户要求 workflow 的原话>\"\n"
+        f"  {ROUTER_CMD} record --trigger workflow --basis \"<用户要求 workflow 的原话>\"\n"
         "再重试（15 分钟内有效，只授权本会话的 Workflow）。用户没有要求 workflow 时不要调用：自己做，或用 roll 派发单个 worker。"
     )
 
@@ -1948,12 +1949,12 @@ def written_by(row: dict, identities: set[str]) -> bool:
 
 
 def check_workflow_record(rows: list[dict], identities: set[str]) -> str | None:
-    """A Workflow passes only on this session's `record --constraint user_override --trigger workflow`."""
+    """A Workflow passes only on this session's `record --trigger workflow` of the user's own naming (`user_override`).
+    The record names no route: a Workflow's agents run on the calling session's own account and model."""
     if not identities:
         return workflow_deny_reason("hook 输入里没有会话 ID，无法确认授权记录属于本会话")
-    carries_route = router_owner("decision_ledger", "carries_route")
     for row in rows:
-        if (carries_route(row) and row.get("stage") == "record" and row.get("constraint") == "user_override"
+        if (row.get("stage") == "record" and row.get("constraint") == "user_override"
                 and row.get("trigger") == "workflow" and written_by(row, identities)):
             return None
     return workflow_deny_reason("最近 15 分钟内本会话没有 `--trigger workflow` 的 user_override 记录")

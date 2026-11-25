@@ -41,7 +41,8 @@ CONSTRAINTS = ('user_override', 'hard_constraint', 'dot_closed_loop')
 REASON_CATEGORIES = ('misclassified', 'quality_insufficient', 'overqualified', 'continuity', 'unavailable', 'other')
 # The constraint of the one record the spawn gate accepts for a Workflow (setup/router_gate_hook.check_workflow_record
 # decides; `record` says it up front). Two holders of one rule: test_record_says_why drives the gate on the rows record
-# writes, so they cannot drift apart.
+# writes, so they cannot drift apart. The record needs no route (record_workflow); one that names a route is an
+# ordinary named route carrying the trigger.
 WORKFLOW_TRIGGER, WORKFLOW_CONSTRAINT = 'workflow', 'user_override'
 
 
@@ -141,24 +142,66 @@ def _cadence_refusal(args, cadence):
             "with the user's words in --basis when the user named this route in this request")
 
 
+def _whole_basis(args):
+    """--basis as the ledger keeps it: whole or not at all (a cut quote is not the user's quote)."""
+    basis = (args.basis or '').strip()
+    if len(basis) > decision_ledger.BASIS_LIMIT:
+        raise ValueError(f"--basis is {len(basis)} characters; a record keeps the user's words whole, up to "
+                         f'{decision_ledger.BASIS_LIMIT}. Quote the words that name this route within that limit.')
+    return basis
+
+
+def _check_workflow_constraint(args):
+    if getattr(args, 'trigger', None) == WORKFLOW_TRIGGER and args.constraint != WORKFLOW_CONSTRAINT:
+        raise ValueError(f'--trigger {WORKFLOW_TRIGGER} is accepted by the spawn gate only on a record with --constraint '
+                         f'{WORKFLOW_CONSTRAINT} (the user asked for the Workflow in this request, in their words in '
+                         f'--basis); a {args.constraint} record does not authorize it. Record it with --constraint '
+                         f'{WORKFLOW_CONSTRAINT} when the user asked for the Workflow, or drop --trigger.')
+
+
+# What a Workflow record reads; any other flag of `record` given beside it is named in the result's warnings.
+WORKFLOW_RECORD_READS = frozenset({'constraint', 'trigger', 'basis', 'dry_run'})
+
+
+def record_workflow(args):
+    """`record --trigger workflow --basis "<the user's words>"`: the user asked for a Claude Code Workflow in this
+    request. A Workflow's agents run on the calling session's own account and model, so the record names no route and
+    nothing is chosen, compared, priced or reserved: its row says in whose session the user asked and in which words,
+    and the spawn gate accepts it from that session (router_gate_hook.check_workflow_record)."""
+    args.constraint = args.constraint or WORKFLOW_CONSTRAINT
+    _check_workflow_constraint(args)
+    basis = _whole_basis(args)
+    if not basis:
+        raise ValueError(f"record --trigger {WORKFLOW_TRIGGER} needs --basis: the user's own words asking for the "
+                         'Workflow in this request. Without them, do the work yourself or roll a worker.')
+    import worker_context
+    now = datetime.now(timezone.utc)
+    sessions = worker_context.own_session_ids()
+    row = {'stage': 'record', 'source': 'workflow_record', 'choice': None, 'constraint': args.constraint, 'basis': basis,
+           'trigger': WORKFLOW_TRIGGER}
+    decision_ledger.append_ledger({'v': 1, 'at': now.isoformat(), **row, 'bundle': None,
+                                   **({'session_ids': sessions} if sessions else {})})
+    unread = [action.option_strings[0] for action in given_flags(args)
+              if action.dest in stage_help.reads('record') and action.dest not in WORKFLOW_RECORD_READS]
+    warnings = [
+        *([f"{', '.join(unread)} had no effect: a Workflow record names no route."] if unread else []),
+        *([] if sessions else ['No session ID is in this environment, so this record names no session and the spawn gate '
+                                'accepts it for none: run it from the session that calls the Workflow.']),
+    ]
+    return {**row, 'observed_at': now.isoformat(), **({'warnings': warnings} if warnings else {}),
+            'next_action': 'Call the Workflow from this session within 15 minutes; this record authorizes nothing else.'}
+
+
 def record_constraint(args, task=None, classified=None):
     """Log a route the caller is forcing. The allocator is run on the same task so the
     ledger shows whether the router would have chosen it and, if not, what the override cost.
 
     `classified` is classify_pinned's answer for a pinned roll: the allocator then plans the classified task, the
     pinned bundle carries that plan's price, and the launch is reserved from the same profile."""
-    basis = (args.basis or '').strip()
     if refusal := roll.named_route_refusal(args, require=True):      # roll owns what a named route needs
         raise ValueError(refusal)
-    if len(basis) > decision_ledger.BASIS_LIMIT:
-        # A cut quote is not the user's quote: the ledger keeps the words whole or not at all.
-        raise ValueError(f"--basis is {len(basis)} characters; a record keeps the user's words whole, up to "
-                         f'{decision_ledger.BASIS_LIMIT}. Quote the words that name this route within that limit.')
-    if getattr(args, 'trigger', None) == WORKFLOW_TRIGGER and args.constraint != WORKFLOW_CONSTRAINT:
-        raise ValueError(f'--trigger {WORKFLOW_TRIGGER} is accepted by the spawn gate only on a record with --constraint '
-                         f'{WORKFLOW_CONSTRAINT} (the user asked for the Workflow in this request, in their words in '
-                         f'--basis); a {args.constraint} record does not authorize it. Record it with --constraint '
-                         f'{WORKFLOW_CONSTRAINT} when the user asked for the Workflow, or drop --trigger.')
+    basis = _whole_basis(args)
+    _check_workflow_constraint(args)
     import account_fleet
     import auto_bundles
     import axis_scores
@@ -1170,8 +1213,8 @@ def build_parser():
     parser.add_argument('--trigger', choices=(WORKFLOW_TRIGGER,),
                         help='record (and a roll that names its route, which records it): the launch this record '
                              'authorizes when it is not a worker roll starts; workflow = a Claude Code Workflow the user '
-                             'asked for in this request (the spawn gate accepts it only on a record of the route the user '
-                             'named, from the same session).')
+                             'asked for in this request: `record --trigger workflow --basis "<user quote>"` needs no route '
+                             'and no --constraint (the spawn gate accepts it from the session that wrote it).')
     parser.add_argument('--intent', help='override: stable intent key for idempotent updates (default: normalized user basis).')
     parser.add_argument('--window', help='override: window targeted by the reset expectation (default: weekly windows).')
     parser.add_argument('--resets-in', type=float, help='override: expected hours until reset; does not replace observed capacity.')
@@ -1384,6 +1427,8 @@ def _stage_result(args):
     elif args.stage == 'override':
         result = quota_overrides.manage_overrides(args)
         code = 0
+    elif args.stage == 'record' and args.trigger == WORKFLOW_TRIGGER and not roll.named_route_given(args):
+        result, code = record_workflow(args), 0
     elif args.stage == 'record':
         if args.constraint is None:
             raise ValueError('record requires --constraint.')

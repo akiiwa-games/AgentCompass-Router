@@ -404,6 +404,20 @@ class SmallerSilencesTests(RecordCli):
                 gate_refuses = router_gate_hook.check_workflow_record([written], identities) is not None
                 self.assertEqual(code == 1, bool(trigger) and gate_refuses, (code, written))
 
+    def test_a_workflow_record_needs_only_the_users_words(self):
+        """record --trigger workflow names no route and no constraint; the gate accepts its row from the writer."""
+        code, result = self.run_main(['record', '--trigger', 'workflow', '--basis', 'run this as a workflow'])
+        self.assertEqual(code, 0, result)
+        row = decision_ledger.read_ledger()[-1]
+        self.assertEqual((row['basis'], row['bundle']), ('run this as a workflow', None), row)
+        rows = router_gate_hook.recent_routes(decision_ledger.ledger_path())
+        identities = {str(v) for v in row['session_ids']}
+        self.assertIsNone(router_gate_hook.check_workflow_record(rows, identities))
+        self.assertIsNotNone(router_gate_hook.check_workflow_record(rows, {'another-session'}))
+        code, result = self.run_main(['record', '--trigger', 'workflow'])
+        self.assertEqual(code, 1, result)
+        self.assertIn('--basis', result['cause'])
+
     def test_a_name_read_as_another_row_names_both(self):
         code, result = self.run_main(['record', '--constraint', 'user_override', '--provider', 'claude', '--account', 'claude',
                                       '--model', 'claude-opus-5', '--basis', 'q'])

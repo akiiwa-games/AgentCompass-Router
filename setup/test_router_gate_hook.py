@@ -3061,7 +3061,6 @@ process.stdout.write(JSON.stringify(out));
         cases = (
             ("no ledger", [], {"session_id": "claude-session"}, "--trigger workflow"),
             ("unrelated record", [unrelated_review], {"session_id": "claude-session"}, "--trigger workflow"),
-            ("routeless workflow record", [routeless_workflow], {"session_id": "claude-session"}, "--trigger workflow"),
             ("worker plan", [self.session_plan("claude", "claude-opus-5-5")],
              {"session_id": "claude-session"}, "--trigger workflow"),
             ("hard constraint", [self.workflow_record(constraint="hard_constraint")],
@@ -3078,6 +3077,9 @@ process.stdout.write(JSON.stringify(out));
             ("expired", [self.workflow_record(at=(T0 - dt.timedelta(minutes=20)).isoformat())],
              {"session_id": "claude-session"}, "--trigger workflow"),
             ("same Claude session", [self.workflow_record()], {"session_id": "claude-session"}, None),
+            # The record names no route (route_judge.record_workflow): a Workflow runs on the session's own model.
+            ("same session, no route", [routeless_workflow], {"session_id": "claude-session"}, None),
+            ("other session, no route", [routeless_workflow], {"session_id": "another-session"}, "--trigger workflow"),
             ("same Paseo agent", [self.workflow_record()], {"parent_agent_id": "paseo-agent"}, None),
         )
         for label, rows, identity, blocked_on in cases:
@@ -3090,8 +3092,6 @@ process.stdout.write(JSON.stringify(out));
                         self.assertNotIn("roll --brief", result["reason"].split("不要调用")[0])
                     else:
                         self.assertEqual(result, {})
-        # Direct check_workflow_record also rejects a workflow record lacking a route bundle.
-        self.assertIsNotNone(gate.check_workflow_record([routeless_workflow], {"claude-session"}))
         # Under Paseo the calling agent's own ID identifies the session too; the parent's ID does not.
         ledger = self.write_ledger(str(self.state), [self.workflow_record()])
         for agent_id, allowed in (("paseo-agent", True), ("paseo-parent", False)):
