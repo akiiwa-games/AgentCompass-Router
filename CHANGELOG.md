@@ -2,6 +2,10 @@
 
 One entry per released tag, newest first. The full notes of each release are on the [Releases](https://github.com/akiiwa-games/AgentCompass-Router/releases) page.
 
+## v0.7.9 - 2026-11-25
+
+- Tray: the quick-menu editor (**Edit menu…**) lists exactly the models the menu can still take, so every row can be added; the list no longer opens with whole-account rows the menu cannot hold. It has one button, **Add to quick menu**, and shows the answer of each action in its own window. The second form, which set a rule for a chosen target and hours, is removed: the expected reset time is chosen on a menu entry. A priority for a whole account is no longer set from the tray.
+
 ## v0.7.8 - 2026-11-25
 
 - A Paseo dispatch that `roll` answers `pending` settles itself: its `--watch` process finds the created worker by its label, binds it, settles the dispatch and notifies the parent. The answer is `caller_action: "wait_for_notification"` when a watcher will act after the command returns, and `"run_next_argv"` otherwise; that command (`launch --dispatch-id ... --watch-seconds N`) carries the operation to its end in the foreground.
