@@ -392,11 +392,27 @@ class Chain:
                 claimed['take'] = False
                 return
             claimed['take'] = before is None or due or stale
+            if claimed['take'] and not closing and self.root is not None and not registry.takeover_allowed(self.root, now):
+                claimed.update(take=False, expired_lifetime=True)
+                return
             if claimed['take'] and closing:
                 why = registry.unclosable(attempt)
                 if why:
                     claimed.update(take=False, unclosable=(why, attempt.get('state')))
                     return
+            if not claimed['take'] and fallback.get('state') == 'relaunching' and not registry.relaunch_held(fallback, now):
+                if action == 'relaunched':
+                    fallback['state'] = 'relaunched'
+                    if before.get('dispatch_id'):
+                        fallback['current'] = before['dispatch_id']
+                    for key in ('until', 'holder', 'released_at'):
+                        fallback.pop(key, None)
+                elif action == 'final':
+                    fallback['state'] = 'final'
+                    fallback['outcome'] = {'result': before.get('result') or 'not_relaunched',
+                                           'next_action': before.get('text') or ''}
+                    for key in ('until', 'holder', 'released_at', 'retry_at', 'retry_of'):
+                        fallback.pop(key, None)
             if claimed['take']:
                 handled[failed_id] = {'action': 'pending', 'at': registry.stamp(now), 'until': registry.stamp(
                     now + timedelta(seconds=registry.RUN_LEASE)), 'holder': registry.process_identity(),
@@ -407,6 +423,8 @@ class Chain:
                     lease = registry.stamp(now + timedelta(seconds=registry.RUN_LEASE))
                     fallback['until'] = max(fallback['until'], lease, key=registry.parse)
         self.root = registry.update_fallback(self.root['dispatch_id'], change, attempt=failed_id if closing else None)
+        if claimed.get('expired_lifetime'):
+            raise AlreadyHandled(_close_expired_fallback(self.root, registry.utcnow(), failed_id=failed_id))
         if claimed.get('unclosable'):
             raise Unclosable(*claimed['unclosable'])
         before = claimed['before']
@@ -931,6 +949,88 @@ def handle(dispatch_id, *, judge=None, host=None):
 
 STEP_STOPPED_DETAIL = ("the step that relaunches it ended twice without an answer (its process exited before it "
                        "finished)")
+STEP_EXPIRED_DETAIL = "the step stopped and was not taken over in time (the dispatch's lifetime ended)"
+
+
+def _close_expired_fallback(root, now, *, failed_id=None, label='step_expired', detail=STEP_EXPIRED_DETAIL,
+                            error_kind='refused'):
+    """Close an unclosed fallback chain once as `final` (`not_relaunched` in `NOTHING_RUNS`) without launching anything
+    or requiring a `decisions` row, release any unsent `prepared` replacement, and queue the parent's one end notice."""
+    fb = (root or {}).get('fallback') or {}
+    current_id = fb.get('current')
+    if fb.get('state') == 'relaunching' and current_id and current_id != root['dispatch_id'] \
+            and not registry.relaunch_held(fb, now):
+        try:
+            cur_row = registry.inspect(current_id)
+            if cur_row.get('state') == 'prepared':
+                registry.release(current_id, root['parent_id'], 'relaunch_not_started', failed=True)
+        except Exception:   # noqa: BLE001
+            pass
+    attempts = [dict(a) for a in (fb.get('attempts') or ())
+                if not (fb.get('state') == 'relaunching' and a.get('dispatch_id') == current_id
+                        and current_id != root['dispatch_id'])]
+    if not attempts:
+        attempts = [{'attempt': 1, **bundle_view(root.get('bundle')),
+                     'dispatch_id': root['dispatch_id'], 'decision_id': root.get('decision_id')}]
+    handled_in = fb.get('handled') or {}
+    open_ids = [fid for fid, item in handled_in.items()
+                if isinstance(item, dict) and item.get('action') in ('pending', 'scheduled')]
+    target_id = failed_id or (open_ids[0] if open_ids else fb.get('retry_of')) or next(
+        (a.get('dispatch_id') for a in reversed(attempts) if a.get('dispatch_id') and a.get('failure')),
+        root['dispatch_id'],
+    )
+    try:
+        target_row = root if target_id == root['dispatch_id'] else registry.inspect(target_id)
+    except Exception:   # noqa: BLE001
+        target_row = root
+    target_attempt = next((a for a in attempts if a.get('dispatch_id') == target_id), None)
+    if target_attempt is None and isinstance(target_row, dict):
+        target_attempt = {'attempt': len(attempts) + 1, **bundle_view(target_row.get('bundle')),
+                          'dispatch_id': target_row['dispatch_id'], 'decision_id': target_row.get('decision_id')}
+        attempts.append(target_attempt)
+    if target_attempt is not None and not target_attempt.get('failure') and isinstance(target_row, dict):
+        info = failure_of(target_row)
+        target_attempt.update(failure=info['label'], kind=info['kind'], covered=info['covered'],
+                              state=target_row.get('state'),
+                              **({'agent_id': target_row['agent_id']} if target_row.get('agent_id') else {}))
+    step = {'failure': label, 'detail': detail, 'error_kind': error_kind}
+    text = final_text('not_relaunched', attempts, {}, step=step, internal=(error_kind == 'internal'))
+    outcome = {'action': 'final', 'result': 'not_relaunched', 'covered': True,
+               'root_dispatch_id': root['dispatch_id'], 'attempts': attempts, 'lines': lines(attempts),
+               'text': text, 'at': registry.stamp(now)}
+
+    def change(fallback):
+        handled = dict(fallback.get('handled') or {})
+        for fid in list(dict.fromkeys([*open_ids, target_id])):
+            if fid:
+                handled[fid] = outcome
+        fallback.update(
+            state='final',
+            attempts=attempts,
+            lines=lines(attempts),
+            handled=handled,
+            outcome={'result': 'not_relaunched', 'next_action': text},
+            current=(attempts[-1].get('dispatch_id') if attempts else None) or root['dispatch_id'],
+        )
+        for key in ('until', 'holder', 'released_at', 'retry_at', 'retry_of'):
+            fallback.pop(key, None)
+
+    registry.update_fallback(root['dispatch_id'], change, now=now)
+    try:
+        import decision_ledger
+        decision_ledger.append_ledger({
+            'v': 1, 'at': registry.stamp(now), 'stage': 'fallback', 'action': 'not_relaunched',
+            'parent_id': root.get('parent_id'), 'task_id': root.get('task_id'),
+            'root_dispatch_id': root['dispatch_id'],
+            'attempt': target_attempt.get('attempt') if target_attempt else 1,
+            'failed': {k: (target_attempt or {}).get(k) for k in (
+                'dispatch_id', 'bundle_id', 'provider', 'account', 'model', 'effort', 'failure') if (target_attempt or {}).get(k)},
+            'next_step': step, 'error_kind': error_kind, 'error': detail,
+        })
+    except Exception:   # noqa: BLE001
+        pass
+    _queue_final_fallback_notice(target_id, outcome, now)
+    return outcome
 
 
 def abandon(dispatch_id, *, judge=None, host=None):
@@ -1038,10 +1138,11 @@ def _queue_final_fallback_notice(target_id, outcome, now):
         tmp.replace(file)
         with registry.transaction(upkeep=True) as connection:
             latest = registry.get(connection, 'dispatches', target_id)
-            cur_notice = latest.get('end_notice') if isinstance(latest.get('end_notice'), dict) else {}
-            if cur_notice.get('state') != 'sent' or cur_notice.get('source') == 'creation_failed':
-                latest['end_notice'] = {'state': 'due', 'message_id': registry.end_notice_message_id(target_id)}
-                registry.save(connection, latest)
+            if latest.get('state') in registry._END_NOTICE_STATES:
+                cur_notice = latest.get('end_notice') if isinstance(latest.get('end_notice'), dict) else {}
+                if cur_notice.get('state') != 'sent' or cur_notice.get('source') == 'creation_failed':
+                    latest['end_notice'] = {'state': 'due', 'message_id': registry.end_notice_message_id(target_id)}
+                    registry.save(connection, latest)
     except Exception:   # noqa: BLE001 - best-effort notice handoff
         pass
 
@@ -1064,8 +1165,9 @@ def _live_retry_watcher(retry_id):
 
 def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
     """Carry what a brief's fallback still owes from an authorized launching owner (`launch`, `roll` of the same task, or
-    the tray's `reconcile` pass): a scheduled same-bundle retry once due, and a failed attempt whose step stopped before
-    it finished (`registry.claim_stopped`). None when nothing is owed."""
+    the tray's `reconcile` pass): inside `registry.takeover_allowed`, a scheduled same-bundle retry once due and a failed
+    attempt whose step stopped before it finished (`registry.claim_stopped`); past `hard_until` (`registry.fallback_expired`),
+    close the chain once as final without launching anything."""
     if not enabled():
         return None
     now = now or registry.utcnow()
@@ -1080,6 +1182,13 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
                 continue
             seen.add(root_id)
             root = by_id.get(root_id, row)
+            if registry.fallback_expired(root, now):
+                done = resume_due(root_id, judge=judge, host=host, now=now)
+                if done is not None:
+                    last = done
+                continue
+            if not registry.takeover_allowed(root, now):
+                continue
             fb = root.get('fallback') or {}
             due_without_watcher = (
                 fb.get('state') == 'retrying'
@@ -1087,7 +1196,7 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
                 and not registry.later(fb.get('retry_at'), now)
                 and (not registry.later(fb.get('until'), now) or not _live_retry_watcher(fb['retry_of']))
             )
-            if registry.claim_stopped(fb, now) or due_without_watcher:
+            if registry.claim_stopped(root, now) or due_without_watcher:
                 done = resume_due(root_id, judge=judge, host=host, now=now)
                 if done is not None:
                     last = done
@@ -1098,6 +1207,10 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
     except (KeyError, ValueError):
         return None
     if root['dispatch_id'] in _ACTIVE_RESUME_DUE:
+        return None
+    if registry.fallback_expired(root, now):
+        return _close_expired_fallback(root, now)
+    if not registry.takeover_allowed(root, now):
         return None
     fallback = root.get('fallback') or {}
     stopped = [failed_id for failed_id, item in (fallback.get('handled') or {}).items()
@@ -1113,7 +1226,34 @@ def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
         return None
     _ACTIVE_RESUME_DUE.add(root['dispatch_id'])
     try:
-        outcome = handle(target_id, judge=judge, host=host)
+        try:
+            outcome = handle(target_id, judge=judge, host=host)
+        except Exception as exc:   # noqa: BLE001 - close unrecoverable takeover so no state spins forever
+            cause = Chain.cause_of(exc)
+            return _close_expired_fallback(
+                registry.inspect(root['dispatch_id']), now, failed_id=target_id,
+                label='takeover_failed', detail=cause['text'], error_kind=cause['kind'],
+            )
+        refreshed = registry.inspect(root['dispatch_id'])
+        if outcome.get('action') == 'unsettled' and registry.claim_stopped(refreshed, now):
+            cur = (refreshed.get('fallback') or {}).get('current')
+            if cur and cur != target_id:
+                try:
+                    cur_row = registry.inspect(cur)
+                    if registry.unresolved(cur_row, now):
+                        registry.update_fallback(
+                            refreshed['dispatch_id'],
+                            lambda fb: (fb.update(state='relaunched', current=cur),
+                                        fb.pop('until', None), fb.pop('holder', None), fb.pop('released_at', None)),
+                            now=now,
+                        )
+                        return {'action': 'relaunched', 'dispatch_id': cur, 'root_dispatch_id': refreshed['dispatch_id']}
+                except Exception:   # noqa: BLE001
+                    pass
+            return _close_expired_fallback(
+                refreshed, now, failed_id=target_id,
+                label='takeover_unsettled', detail=str(outcome.get('meaning') or 'unsettled')[:400],
+            )
         _queue_final_fallback_notice(target_id, outcome, now)
         return outcome
     finally:

@@ -440,23 +440,25 @@ def public(row, now=None):
         out.update(root_dispatch_id=row['attempt_of'], attempt=row.get('attempt'))
     fallback = row.get('fallback') or {}
     if fallback:
-        out = with_fallback(out, row, fallback, now)
+        out = with_fallback(out, row, fallback, now, root=row)
     return out
 
 
-def with_fallback(out, row, fallback, now=None):
+def with_fallback(out, row, fallback, now=None, *, root=None):
     """What the first dispatch's attempt record says about this brief, over what this one row says."""
+    current_now = now or registry.utcnow()
+    root_row = root if isinstance(root, dict) else row
     out = dict(out, attempts=fallback.get('lines') or [], current_attempt=fallback.get('current'))
     outcome = fallback.get('outcome') or {}
     if fallback.get('state') == 'final' and outcome.get('result') != 'declined' and outcome.get('next_action'):
         out['next_action'] = outcome['next_action']
     elif fallback.get('state') == 'retrying' and fallback.get('retry_at') \
-            and registry.fallback_guard({'fallback': fallback}, now or registry.utcnow()):
+            and registry.fallback_guard(root_row, current_now):
         out.update(retry_at=fallback['retry_at'],
                    next_action=FALLBACK_SCHEDULED_NEXT.format(retry_at=fallback['retry_at']))
-    elif registry.fallback_guard({'fallback': fallback}, now or registry.utcnow()):
+    elif registry.fallback_guard(root_row, current_now):
         out['next_action'] = FALLBACK_RUNNING_NEXT.format(where=(fallback.get('lines') or ['attempt 1'])[-1])
-    elif registry.claim_stopped(fallback, now or registry.utcnow()):
+    elif registry.claim_stopped(root_row, current_now):
         out['next_action'] = FALLBACK_STOPPED_NEXT
     elif fallback.get('state') == 'relaunched' and fallback.get('current') not in (None, row['dispatch_id']) \
             and row['state'] in registry.TERMINAL:
@@ -473,7 +475,7 @@ def public_chain(row, path=None, now=None):
         except ValueError:
             return out
         if root.get('fallback'):
-            out = with_fallback(out, row, root['fallback'], now)
+            out = with_fallback(out, row, root['fallback'], now, root=root)
     return out
 
 

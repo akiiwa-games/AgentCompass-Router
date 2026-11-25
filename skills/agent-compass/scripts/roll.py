@@ -1744,10 +1744,12 @@ def _run(args, judge):
         same_task = not getattr(args, 'new_worker', False)
         stopped_roots = [r for r in registry.read_dispatches()
                          if same_task and (r.get('parent_id'), r.get('task_id')) == (parent, task['task_id'])
-                         and (registry.claim_stopped(r.get('fallback') or {}, now)
-                              or ((r.get('fallback') or {}).get('state') == 'retrying'
+                         and (registry.claim_stopped(r, now)
+                              or (registry.takeover_allowed(r, now)
+                                  and (r.get('fallback') or {}).get('state') == 'retrying'
                                   and (r.get('fallback') or {}).get('retry_of')
-                                  and not registry.later((r.get('fallback') or {}).get('retry_at'), now)))]
+                                  and not registry.later((r.get('fallback') or {}).get('retry_at'), now))
+                              or registry.fallback_expired(r, now))]
         pending_rows = [r for r in registry.pending() if r.get('parent_id') == parent]
         if pending_rows or stopped_roots:
             launchers = (provider_inventory.current().get('launchers') or {})

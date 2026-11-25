@@ -1459,6 +1459,13 @@ class DispatchNoticeUnitTests(unittest.TestCase):
                 mock.patch.object(registry, "process_started", return_value=None):
             self.assertTrue(services.dispatch_notice_needed(now=now))
             self.assertTrue(services.dispatch_notice_needed(now=now + timedelta(seconds=registry.RUN_LEASE + 30)))
+            # Past `hard_until` (`MAX_LIFETIME`), `stopped_fallback` is gone (`expired_fallback` wakes once to close it,
+            # and once closed as `final` with `end_notice` sent, the tray never wakes for it again).
+            past_hard = registry.parse(stop_row["hard_until"]) + timedelta(hours=1)
+            self.assertEqual(services._local_dispatch_notice_reasons(now=past_hard), frozenset({("d-stop", "expired_fallback")}))
+            dispatch_fallback._close_expired_fallback(registry.inspect("d-stop", db_stop), past_hard)
+            registry.mark_end_notice_sent("d-stop", "catchup", path=db_stop)
+            self.assertEqual(services._local_dispatch_notice_reasons(now=past_hard), frozenset())
 
         # 2. Scheduled retry past `retry_at` with no restartable watcher (`creation_failed` receipt) wakes once due, not before.
         db_due_retry = self.root / "rule2-due-retry.sqlite3"

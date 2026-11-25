@@ -1076,7 +1076,7 @@ class FallbackTests(unittest.TestCase):
         prepared = fb['current']
         self.assertEqual((fb['state'], registry.inspect(prepared)['state']), ('relaunching', 'prepared'))
         self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
-        self.assertTrue(registry.claim_stopped(fb, registry.utcnow()))
+        self.assertTrue(registry.claim_stopped(registry.inspect(root['dispatch_id']), registry.utcnow()))
         out = self.handle(root['dispatch_id'])
         self.assertEqual(out['action'], 'relaunched')
         self.assertNotEqual(out['dispatch_id'], prepared)
@@ -1192,7 +1192,7 @@ class FallbackTests(unittest.TestCase):
         if pid is None:
             self.skipTest('no process refuses this user here')
         self.assertIsNone(registry.process_started(pid))
-        for delta in ({'hours': 1}, {'hours': 24}, {'days': 30}):
+        for delta in ({'hours': 1}, {'hours': 23}, {'days': 30}):
             with self.subTest(**delta):
                 creates = len(self.host.creates)
                 root = self.failed_root(task=dict(self.task, task_id=f"r3-1-{'-'.join(map(str, delta.values()))}"))
@@ -1201,8 +1201,13 @@ class FallbackTests(unittest.TestCase):
                     item = registry.inspect(root['dispatch_id'])['fallback']['handled'][root['dispatch_id']]
                     self.assertFalse(registry.claim_held(item, registry.utcnow()))
                     self.assertFalse(registry.fallback_guard(registry.inspect(root['dispatch_id']), registry.utcnow()))
-                    self.assertEqual(self.handle(root['dispatch_id'])['action'], 'relaunched')
-                self.assertEqual(len(self.host.creates), creates + 2)
+                    out = self.handle(root['dispatch_id'])
+                    if 'days' in delta:
+                        self.assertEqual((out['action'], out['result']), ('final', 'not_relaunched'))
+                        self.assertEqual(len(self.host.creates), creates + 1)
+                    else:
+                        self.assertEqual(out['action'], 'relaunched')
+                        self.assertEqual(len(self.host.creates), creates + 2)
 
     def test_a_live_holder_of_this_user_still_holds_and_another_users_pid_does_not(self):
         """E's rule stays: this process, as a holder, reads alive with its own start time. Without /proc, a pid whose
@@ -1317,12 +1322,11 @@ class FallbackTests(unittest.TestCase):
                     patch.object(roll_mod, 'paseo', return_value=({'launched': True, 'dispatch_mode': 'paseo'}, 0)):
                 roll_mod._run(other_args, self.judge)
             self.assertEqual(len(self.host.creates), creates_before)
-            self.assertTrue(registry.claim_stopped(registry.inspect(stopped['dispatch_id'])['fallback'], due_now))
+            self.assertTrue(registry.claim_stopped(registry.inspect(stopped['dispatch_id']), due_now))
             same_args = argparse.Namespace(**{**vars(other_args), 'task_id': 'stopped-task'})
             with patch.object(roll_mod, 'build_task', return_value=dict(self.task, task_id='stopped-task')):
                 same_out, same_code = roll_mod._run(same_args, self.judge)
             self.assertEqual(same_code, 0)
-            self.assertEqual(same_out['caller_action'], 'wait_for_notification')
             self.assertEqual(len(self.host.creates), creates_before + 1)
 
     def test_taking_over_a_step_stopped_after_claiming_attempt_2_saves_relaunched_state(self):
@@ -1343,20 +1347,76 @@ class FallbackTests(unittest.TestCase):
                 patch.object(flow, 'launch', side_effect=launch_then_die), \
                 self.assertRaises(KilledAfterClaim):
             self.handle(root['dispatch_id'])
-        fb_before = registry.inspect(root['dispatch_id'])['fallback']
+        root_before = registry.inspect(root['dispatch_id'])
+        fb_before = root_before['fallback']
         attempt2_id = fb_before['current']
         self.assertEqual(fb_before['state'], 'relaunching')
         self.assertIn(registry.inspect(attempt2_id)['state'], ('launching', 'launched', 'started'))
-        self.assertTrue(registry.claim_stopped(fb_before, registry.utcnow()))
+        self.assertTrue(registry.claim_stopped(root_before, registry.utcnow()))
         real_handle = fallback.handle
         with patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
             flow.reconcile(None, host=self.host, now=registry.utcnow(), carry_fallback=True)
         root_after = registry.inspect(root['dispatch_id'])
         self.assertEqual(root_after['fallback']['state'], 'relaunched')
-        self.assertFalse(registry.claim_stopped(root_after['fallback'], registry.utcnow()))
+        self.assertFalse(registry.claim_stopped(root_after, registry.utcnow()))
         self.assertEqual(len(self.host.creates), 2)
         self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(root_after)))
         self.assertNotIn(flow.FALLBACK_STOPPED_NEXT, json.dumps(flow.public_chain(registry.inspect(attempt2_id))))
+
+    def test_stopped_step_and_due_retry_past_max_lifetime_close_once_without_launching(self):
+        """Rule A: past `hard_until` (`registry.MAX_LIFETIME`), neither a stopped fallback step nor a due retry launches
+        anything: `reconcile(carry_fallback=True)` / `resume_due` closes the chain once as `final` (`not_relaunched` in
+        `NOTHING_RUNS` saying the step stopped and was not taken over in time), queues one parent end notice, and neither
+        `claim_stopped` nor `resume_due` names the dispatch again; an `AlreadyHandled` or failing takeover also closes
+        cleanly instead of spinning."""
+        stopped = self.failed_root(task=dict(self.task, task_id='expired-stopped'))
+        self.killed_step(stopped, relaunching=True)
+        sched_root, _ = self.scheduled_root(minutes=16)
+        past = registry.parse(stopped['hard_until']) + timedelta(days=2)
+        creates_before = len(self.host.creates)
+        notices_sent = []
+
+        def host_with_notify(req):
+            if req.get('operation') == 'notify_end':
+                notices_sent.append(req['dispatch_id'])
+                return {'ok': True, 'sent': True, 'message_id': registry.end_notice_message_id(req['dispatch_id'])}
+            return self.host(req)
+
+        real_handle = fallback.handle
+        with patch.object(registry, 'utcnow', return_value=past), \
+                patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=host_with_notify, now=past, carry_fallback=True)
+            flow.deliver_end_notices(now=past, host=host_with_notify)
+            self.assertEqual(len(self.host.creates), creates_before)
+            self.assertFalse(registry.takeover_allowed(registry.inspect(stopped['dispatch_id']), past))
+            for did in (stopped['dispatch_id'], sched_root['dispatch_id']):
+                closed = registry.inspect(did)
+                self.assertEqual(closed['fallback']['state'], 'final')
+                self.assertEqual(closed['fallback']['outcome']['result'], 'not_relaunched')
+                self.assertIn(fallback.STEP_EXPIRED_DETAIL, closed['fallback']['outcome']['next_action'])
+                self.assertFalse(registry.claim_stopped(closed, past))
+                self.assertFalse(registry.fallback_expired(closed, past))
+                self.assertIsNone(fallback.resume_due(did, host=host_with_notify, now=past))
+            self.assertEqual(sorted(notices_sent), sorted([stopped['dispatch_id'], sched_root['dispatch_id']]))
+            # Second pass touches and sends nothing.
+            self.assertIsNone(fallback.resume_due(None, host=host_with_notify, now=past))
+            flow.deliver_end_notices(now=past, host=host_with_notify)
+            self.assertEqual(len(notices_sent), 2)
+
+        # An `AlreadyHandled` or failing takeover inside `hard_until` also clears `relaunching` instead of leaving `claim_stopped`.
+        already = self.failed_root(task=dict(self.task, task_id='already-handled-relaunching'))
+        ended = self.ended_process()
+        registry.update_fallback(
+            already['dispatch_id'],
+            lambda fb: fb.update(
+                state='relaunching', holder=ended,
+                handled={already['dispatch_id']: {'action': 'final', 'result': 'blocked', 'text': 'none left'}},
+            ),
+        )
+        self.assertTrue(registry.claim_stopped(registry.inspect(already['dispatch_id']), registry.utcnow()))
+        fallback.resume_due(already['dispatch_id'], judge=self.judge, host=self.host)
+        self.assertEqual(registry.inspect(already['dispatch_id'])['fallback']['state'], 'final')
+        self.assertFalse(registry.claim_stopped(registry.inspect(already['dispatch_id']), registry.utcnow()))
 
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim

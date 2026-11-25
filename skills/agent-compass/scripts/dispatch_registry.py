@@ -1246,9 +1246,11 @@ def _hold_end(row):
 def _awaits_fallback(by_id, row, now):
     """A failed attempt `reconcile` observes so its watcher is restarted and its fallback runs, whichever reader
     settled it: a worker this dispatch acknowledged (an observation bound it: `observed_at`; a resume the host refused
-    never was), its covered failure unhandled, inside its hold."""
+    never was), its covered failure unhandled, inside its hold and the root dispatch's lifetime."""
+    root = by_id.get(chain_root(row), row)
     return (row.get('dispatch_mode', 'paseo') == 'paseo' and row.get('state') == 'failed' and bool(row.get('launched_at'))
-            and bool(row.get('agent_id')) and bool(row.get('observed_at')) and _unhandled_covered(by_id, row, now) and later(_hold_end(row), now))
+            and bool(row.get('agent_id')) and bool(row.get('observed_at')) and takeover_allowed(root, now)
+            and _unhandled_covered(by_id, row, now) and later(_hold_end(row), now))
 
 
 def awaits_fallback(row, now=None, path=None):
@@ -1294,13 +1296,15 @@ def _chain_hold(by_id, row, now):
     if action == 'final' or not dispatch_fallback.enabled():
         return None, None
     if action == 'scheduled':
-        return ('open', fallback.get('until')) if fallback_guard(root, now) else (None, None)
+        return ('open', fallback.get('until')) if takeover_allowed(root, now) and fallback_guard(root, now) else (None, None)
     if claim_held(handled, now):
         # A live step past its lease still holds it (step_binds): its own end writes the chain's record, or its watcher
         # runs the step again, so no time moves it.
         return 'open', handled['until'] if later(handled.get('until'), now) else None
     if not _unhandled_covered(by_id, row, now):
         return None, None
+    if not takeover_allowed(root, now):
+        return 'close', None
     end = _hold_end(row)
     return ('open', end) if later(end, now) else ('close', None)
 
@@ -1930,7 +1934,8 @@ def fallback_guard(row, now):
     runs, but one is about to, so the brief counts as dispatched until the guard lapses. A relaunch or claim whose step
     stopped (`claim_stopped`) is no guard: nothing is about to run until a step takes it over."""
     guard = row.get('fallback') or {}
-    if guard.get('state') == 'retrying' and later(guard.get('until'), now) or relaunch_held(guard, now):
+    within = 'hard_until' not in row or takeover_allowed(row, now)
+    if (guard.get('state') == 'retrying' and within and later(guard.get('until'), now)) or relaunch_held(guard, now):
         return True
     return any(claim_held(item, now) for item in (guard.get('handled') or {}).values())
 
@@ -2594,14 +2599,39 @@ def relaunch_held(fallback, now):
     return fallback.get('state') == 'relaunching' and step_binds(fallback, now)
 
 
-def claim_stopped(fallback, now):
-    """A step took this brief's failed attempt and stopped before it finished: a claim (or a relaunch in progress) that
-    no longer binds (`step_binds`: its step ended or released it, or a legacy holderless claim outlived `until`) and has
-    not been replaced or closed. Nothing runs the brief until the next step takes the claim over."""
+def takeover_allowed(root, now):
+    """A stopped fallback step or a due retry of `root` is taken over only while the root dispatch's `hard_until`
+    (`MAX_LIFETIME`) is in the future."""
+    return isinstance(root, dict) and later(root.get('hard_until'), now)
+
+
+def _stopped_step(fallback, now):
+    if not isinstance(fallback, dict) or fallback.get('state') == 'final':
+        return False
     if fallback.get('state') == 'relaunching' and not step_binds(fallback, now):
         return True
     return any(isinstance(item, dict) and item.get('action') == 'pending'
                and not step_binds(item, now) for item in (fallback.get('handled') or {}).values())
+
+
+def claim_stopped(root, now):
+    """A step took this brief's failed attempt and stopped before it finished, while the root dispatch is still within
+    its lifetime (`takeover_allowed`). Nothing runs the brief until the next step takes the claim over."""
+    return takeover_allowed(root, now) and _stopped_step((root or {}).get('fallback') or {}, now)
+
+
+def fallback_expired(root, now):
+    """An unclosed stopped fallback step or scheduled retry whose root dispatch is past `hard_until`
+    (`not takeover_allowed`): nothing may launch for it, and the chain must be closed once as final."""
+    if not isinstance(root, dict) or takeover_allowed(root, now):
+        return False
+    fallback = root.get('fallback') or {}
+    if not isinstance(fallback, dict) or fallback.get('state') == 'final':
+        return False
+    if _stopped_step(fallback, now) or fallback.get('state') == 'retrying':
+        return True
+    return any(isinstance(item, dict) and item.get('action') == 'scheduled'
+               for item in (fallback.get('handled') or {}).values())
 
 
 def agent_resumed(snapshot, row, terminal=None):

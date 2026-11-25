@@ -1068,16 +1068,19 @@ def _local_dispatch_notice_reasons(now: datetime | None = None) -> frozenset[tup
         dispatch_id = row.get("dispatch_id")
         fb = row.get("fallback") if isinstance(row.get("fallback"), dict) else {}
         if _safe_dispatch_id(dispatch_id):
-            if dispatch_registry.claim_stopped(fb, current):
+            if dispatch_registry.claim_stopped(row, current):
                 reasons.add((str(dispatch_id), "stopped_fallback"))
             elif (
-                fb.get("state") == "retrying"
+                dispatch_registry.takeover_allowed(row, current)
+                and fb.get("state") == "retrying"
                 and _safe_dispatch_id(fb.get("retry_of"))
                 and not dispatch_registry.later(fb.get("retry_at"), current)
                 and not _watcher_live(fb["retry_of"], state_dir)
                 and (not _watcher_restartable(fb["retry_of"], state_dir) or not dispatch_registry.fallback_guard(row, current))
             ):
                 reasons.add((str(dispatch_id), "due_retry"))
+            elif dispatch_registry.fallback_expired(row, current):
+                reasons.add((str(dispatch_id), "expired_fallback"))
         if state in _DISPATCH_NOTICE_ACTIVE:
             if not row.get("launched_at") or _in_create_send_window(row, current):
                 continue
@@ -1097,6 +1100,10 @@ def _local_dispatch_notice_reasons(now: datetime | None = None) -> frozenset[tup
         elif (
             state == "create_failed"
             and _safe_dispatch_id(dispatch_id)
+            and dispatch_registry.takeover_allowed(row, current)
+            and isinstance(row.get("parent_id"), str)
+            and row["parent_id"].strip()
+            and row["parent_id"] != "top-level"
             and row.get("end_notice") is None
             and not fb
             and any(
