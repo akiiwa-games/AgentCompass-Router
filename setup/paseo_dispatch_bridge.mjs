@@ -265,10 +265,14 @@ function noteUserMessage(record, agent) {
 // on the worker: a create carries them from its first moment, a resume only once it was seen bound (`record.seen`).
 // Returns the later dispatch id, or null. The labels say only that a later dispatch began: whose it is and whether its
 // turn landed are the registry's facts, so this is a claim (`continuedClaim`), never a decision not to send.
+function isResumedRecord(record) {
+  return Boolean(record?.agent_id && record.agent_id !== record.dispatch_id && !record.created_agent);
+}
+
 function continuingDispatch(agent, record) {
   const label = agent?.labels?.['router.dispatch_id'];
   if (typeof label !== 'string' || !label || label === record.dispatch_id) return null;
-  return record.seen || !record.agent_id || record.agent_id === record.dispatch_id ? label : null;
+  return record.seen || !isResumedRecord(record) ? label : null;
 }
 
 // The watcher stops at a later dispatch on its worker: that dispatch has its own watcher. Its receipt keeps the pending
@@ -450,10 +454,18 @@ export function notificationEvents(agent, record, now, creation) {
   const label = agent.labels?.['router.dispatch_id'];
   // Seen under its own labels, so these are not a relabel that has yet to land: a later dispatch took this worker.
   if (record.seen && label && label !== record.dispatch_id) return [{key: 'terminal', reason: SUPERSEDED}];
-  if (record.agent_id && record.agent_id !== record.dispatch_id && label !== record.dispatch_id)
-    // Not bound to this dispatch yet, so its state is the previous turn's. Only its removal says anything about this one.
-    return agent.archivedAt ? [{key: 'terminal', reason: 'worker unavailable'}] : [];
-  if (agent.status === 'running') record.started = true;
+  if (isResumedRecord(record) && label !== record.dispatch_id) {
+    // Not bound to this dispatch yet, so its state is the previous turn's. Past resume_deadline no relabel can arrive.
+    if (agent.archivedAt) return [{key: 'terminal', reason: 'worker unavailable'}];
+    return Number.isFinite(record.resume_deadline) && now >= record.resume_deadline
+      ? [{key: 'terminal', reason: CREATE_FAILED}] : [];
+  }
+  const nowIso = new Date(now).toISOString();
+  if (!record.bound_agent && agent.id) record.bound_agent = {id: agent.id, at: nowIso};
+  if (agent.status === 'running') {
+    record.started = true;
+    if (record.bound_agent && !record.bound_agent.started_at) record.bound_agent.started_at = nowIso;
+  }
   record.seen = true;
   noteUserMessage(record, agent);
   // The watcher stopped a turn its provider kept retrying: the stop's idle or canceled state is not a finish.
@@ -467,7 +479,7 @@ export function notificationEvents(agent, record, now, creation) {
   // A resumed worker is relabeled before its turn is sent: until the turn is seen running or its message lands,
   // idle/finished is still the previous turn's.
   const created = record.created_at ?? (record.creation_deadline ?? 0) - CREATE_LIMIT_MS;
-  const resumed = record.agent_id && record.agent_id !== record.dispatch_id;
+  const resumed = isResumedRecord(record);
   const turnSeen = record.started || (typeof agent.lastUserMessageAt === 'string'
     && Date.parse(agent.lastUserMessageAt) >= created);
   if (agent.status === 'idle' && (resumed ? turnSeen : (agent.attentionReason === 'finished' || record.started)))
@@ -491,7 +503,7 @@ export const TURN_FAILED_CODE = 'provider_turn_failed';
 // Paseo clears lastError when a turn starts, so it is this dispatch's unless this is a resumed worker whose turn has not
 // started yet: then the error is the previous turn's, and says nothing about this one.
 function turnIsCurrent(agent, record) {
-  if (!record?.agent_id || record.agent_id === record.dispatch_id) return true;
+  if (!isResumedRecord(record)) return true;
   const created = record.created_at ?? (record.creation_deadline ?? 0) - CREATE_LIMIT_MS;
   return Boolean(record.started || (typeof agent?.lastUserMessageAt === 'string'
     && Date.parse(agent.lastUserMessageAt) >= created));
@@ -642,7 +654,9 @@ async function loadFinalReply(client, agentId) {
 async function noticeBody(client, record, event) {
   const targetId = record.agent_id ?? record.dispatch_id;
   if (event.reason === CREATE_FAILED)
-    return 'Paseo created no worker for this dispatch and none can appear later; it is safe to roll this brief again.';
+    return isResumedRecord(record)
+      ? 'Paseo never bound this resumed turn to the worker within its send window, so no turn can start from this dispatch; it is safe to roll again.'
+      : 'Paseo created no worker for this dispatch and none can appear later; it is safe to roll this brief again.';
   if (event.reason === WORKER_REMOVED)
     return 'Paseo created this worker and it was removed before this dispatch observed it. It may have done part of the work: check that before rolling this brief again.';
   if (event.reason === RETRY_STUCK) return retryStuckText(record.terminal, targetId);
@@ -820,10 +834,25 @@ export async function notificationStep(client, record, persist, now = Date.now()
     let agent = prefetched !== undefined ? prefetched : expired
       ? await client.fetchAgent(targetId).then(found => found?.agent, () => null)
       : (await client.fetchAgent(targetId))?.agent;
+    if (!expired && !agent && !record.agent_id && typeof client.fetchAgents === 'function') {
+      const page = await client.fetchAgents({filter: {labels: {'router.dispatch_id': record.dispatch_id},
+        includeArchived: true}, page: {limit: 2}});
+      const entries = page?.entries ?? [];
+      if (entries.length === 1) {
+        const id = entries[0]?.agent?.id ?? entries[0]?.id;
+        if (id) agent = (await client.fetchAgent(id))?.agent;
+      }
+    }
     const creation = !expired && !agent && !record.seen && !record.agent_id
       ? await creationRecord(client, record.dispatch_id) : undefined;
     // Read the record, then the agent it names: a create that got this far between the two reads is not "removed".
     if (creation?.agent_id) agent = (await client.fetchAgent(creation.agent_id))?.agent;
+    if (agent?.id && !record.agent_id && agent.id !== record.dispatch_id
+        && agent.labels?.['router.dispatch_id'] === record.dispatch_id) {
+      record.created_agent = true;
+      record.agent_id = agent.id;
+    }
+    const agentId = agent?.id ?? record.agent_id ?? record.dispatch_id;
     const events = expired
       ? [{key: 'terminal', reason: WATCH_EXPIRED}]
       : notificationEvents(agent, record, now, creation);
@@ -832,13 +861,13 @@ export async function notificationStep(client, record, persist, now = Date.now()
     const bound = agent && (agent.labels?.['router.dispatch_id'] === record.dispatch_id
       || !record.agent_id || record.agent_id === record.dispatch_id);
     if (!events.length && !record.terminal && bound && agent.status === 'running') {
-      const stuck = await stuckProviderRetry(client, targetId, now);
+      const stuck = await stuckProviderRetry(client, agentId, now);
       if (stuck) {
         record.terminal = {...stuck, status: agent.status, attentionReason: agent.attentionReason ?? null};
         persist();
         // Retried once at once; a cancel that still fails is said to the parent, never reported as stopped.
-        record.terminal.cancelled = await client.cancelAgent(targetId).then(() => true,
-          () => client.cancelAgent(targetId).then(() => true, () => false));
+        record.terminal.cancelled = await client.cancelAgent(agentId).then(() => true,
+          () => client.cancelAgent(agentId).then(() => true, () => false));
         events.push({key: 'terminal', reason: RETRY_STUCK});
       }
     }
@@ -848,9 +877,12 @@ export async function notificationStep(client, record, persist, now = Date.now()
     if (event?.key === 'terminal' && !record.terminal)
       record.terminal = {reason: event.reason, status: agent?.status ?? null,
         attentionReason: agent?.attentionReason ?? null, at: new Date(now).toISOString(),
+        ...(event.reason === CREATE_FAILED && creation?.phase === 'failed' && !creation.outcome_unknown
+          ? {failure_class: creation.failure_class,
+             ...(creation.failure_code ? {failure_code: creation.failure_code} : {})} : {}),
         ...(event.reason === 'error' ? turnFailure(agent, record) : {}),
         ...(event.reason === 'error' && agent?.providerUnavailable ? {provider_unavailable: true} : {}),
-        ...(event.reason === 'finished' ? {replied: await turnReplied(client, targetId)} : {})};
+        ...(event.reason === 'finished' ? {replied: await turnReplied(client, agentId)} : {})};
     // A failed attempt goes to AgentCompass first: it retries or relaunches the brief, and only a final state reaches
     // the parent. The terminal is saved first, because the step reads it through the registry's observation.
     if ((waiting || (event?.key === 'terminal' && FALLBACK_REASONS.has(event.reason))) && fallback
@@ -1142,12 +1174,17 @@ async function watch(dispatchId, parentId, agentId, createDeadline) {
   let client;
   let record;
   try {
+    const parsedDeadline = Date.parse(createDeadline);
+    const isResume = Boolean(agentId && agentId !== dispatchId);
     record = readRecord(file) ?? {dispatch_id: dispatchId, parent_id: parentId,
-      ...(agentId && agentId !== dispatchId ? {agent_id: agentId} : {}),
+      ...(isResume ? {agent_id: agentId} : {}),
+      ...(isResume && Number.isFinite(parsedDeadline) ? {resume_deadline: parsedDeadline} : {}),
       deadline: Date.now() + WATCH_LIMIT_MS, created_at: Date.now(),
-      creation_deadline: Date.parse(createDeadline) || Date.now() + CREATE_LIMIT_MS,
+      creation_deadline: parsedDeadline || Date.now() + CREATE_LIMIT_MS,
       status: 'watching', delivered: [], pending: null};
-    if (agentId && agentId !== dispatchId && !record.agent_id) record.agent_id = agentId;
+    if (isResume && !record.agent_id) record.agent_id = agentId;
+    if (isResume && Number.isFinite(parsedDeadline) && !Number.isFinite(record.resume_deadline))
+      record.resume_deadline = parsedDeadline;
     if (record.parent_id !== parentId) throw new BridgeError('notification_parent_mismatch');
     if (DONE.has(record.status)) {process.send?.({ready: true}); return;}
     record.pid = process.pid;
@@ -1388,6 +1425,33 @@ async function retireRefusedResume(input) {
   fs.rmSync(file, {force: true});
 }
 
+// A scheduled same-model retry (dispatch_fallback.Chain.schedule) on an attempt whose watcher already stopped (for
+// example a create failure that `stopWatcher` ended before `roll` scheduled the retry) needs that watcher running again
+// until `retry_at`, so the retry starts at `retry_at` with no caller step.
+export async function reviveRetryWatch(dispatchId, parentId, retryAt) {
+  const file = notificationFile(dispatchId);
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  const record = readRecord(file);
+  if (record && record.parent_id !== parentId) throw new BridgeError('notification_parent_mismatch');
+  if (record && fs.existsSync(`${file}.creation-failed`)) {
+    for (let waited = 0; alive(record.pid); waited += 100) {
+      if (waited >= WATCHER_STOP_MS) throw new BridgeError('notification_start_failed');
+      await pause(100);
+    }
+    fs.rmSync(`${file}.creation-failed`, {force: true});
+  }
+  const due = Date.parse(retryAt);
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const base = record ?? {dispatch_id: dispatchId, parent_id: parentId, created_at: now,
+    creation_deadline: now + CREATE_LIMIT_MS, delivered: [], pending: null};
+  const next = {...base, status: 'watching',
+    deadline: Math.max(base.deadline ?? (now + WATCH_LIMIT_MS), Number.isFinite(due) ? due + RETRY_WATCH_MS : 0),
+    terminal: base.terminal ?? {reason: CREATE_FAILED, status: null, attentionReason: null, at: nowIso},
+    fallback: {status: 'scheduled', at: nowIso, ...(Number.isFinite(due) ? {retry_at: new Date(due).toISOString()} : {})}};
+  if (!alive(base.pid)) saveRecord(file, next);
+}
+
 export function project(agent) {
   if (!agent) return null;
   const result = Object.fromEntries(['id', 'provider', 'model', 'status', 'cwd', 'updatedAt', 'createdAt',
@@ -1518,6 +1582,11 @@ export async function execute(client, input, notify = ensureNotification) {
     catch { return {ok: false, sent: false, error: 'notification_start_failed'}; }
     if (alreadyBound)
       return {ok: true, sent: true, agent: project(existing), completion_notification};
+    if (input.send_by && Date.now() > Date.parse(input.send_by)) {
+      stopWatcher(input, 'create_send_window_elapsed');
+      return {ok: false, sent: false, error: 'create_send_window_elapsed',
+        completion_notification: {...completion_notification, status: 'creation_failed'}};
+    }
     let sent = false, relabeled = false;
     const mergedLabels = {...labels, ...(r.labels ?? {}), 'paseo.parent-agent-id': input.parent_id};
     try {
@@ -1654,7 +1723,16 @@ export async function execute(client, input, notify = ensureNotification) {
   if (creation?.agent_id) agent = (await client.fetchAgent(creation.agent_id))?.agent;
   const file = notificationFile(input.dispatch_id);
   const record = readRecord(file);
-  const completion_notification = record ? await notify(record) : notificationReceipt(file);
+  const startMissing = !record && input.ensure_watch && typeof input.parent_id === 'string'
+    && input.parent_id.trim() && input.parent_id !== 'top-level';
+  const completion_notification = record ? await notify(record)
+    : startMissing ? await notify({
+      dispatch_id: input.dispatch_id,
+      parent_id: input.parent_id,
+      ...(input.agent_id ? {agent_id: input.agent_id} : {}),
+      ...(input.create_deadline ? {create_deadline: input.create_deadline} : {}),
+    })
+    : notificationReceipt(file);
   return {ok: true, agent: project(agent), missing: Boolean(input.agent_id && !agent),
     ...(creation !== undefined ? {creation} : {}), completion_notification};
 }
@@ -1769,6 +1847,17 @@ export function hostFailure(error, connected, input, credential = {}) {
 
 async function main() {
   if (process.argv[2] === '--watch') return watch(process.argv[3], process.argv[4], process.argv[5], process.argv[6]);
+  if (process.argv[2] === '--ensure-watch') {
+    const [, , , dispatchId, parentId, agentId, createDeadline, mode, retryAt] = process.argv;
+    if (mode === 'retrying' && retryAt) await reviveRetryWatch(dispatchId, parentId, retryAt);
+    console.log(JSON.stringify(await ensureNotification({
+      dispatch_id: dispatchId,
+      parent_id: parentId,
+      ...(agentId ? {agent_id: agentId} : {}),
+      ...(createDeadline ? {create_deadline: createDeadline} : {}),
+    })));
+    return;
+  }
   const input = JSON.parse(fs.readFileSync(0, 'utf8'));
   const credential = {};
   const client = await createClient(credential);
@@ -1778,7 +1867,13 @@ async function main() {
     connected = true;
     console.log(JSON.stringify(await execute(client, input)));
   } catch (error) {
-    console.log(JSON.stringify(hostFailure(error, connected, input, credential)));
+    const failure = hostFailure(error, connected, input, credential);
+    if (failure.sent && typeof input?.dispatch_id === 'string' && typeof input?.parent_id === 'string'
+        && input.parent_id.trim() && input.parent_id !== 'top-level') {
+      const note = await ensureNotification(input).catch(() => null);
+      if (note) failure.completion_notification = note;
+    }
+    console.log(JSON.stringify(failure));
   } finally { await client.close(); }
 }
 

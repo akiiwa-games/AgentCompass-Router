@@ -1018,6 +1018,21 @@ def apply_ending(connection, row, now, receipt_only=False):
     receipt = watcher_receipt(row['dispatch_id'])
     receipt_state, receipt_reason = state_from_receipt(row, receipt)
     changed = False
+    bound = receipt.get('bound_agent') if isinstance(receipt, dict) and isinstance(receipt.get('bound_agent'), dict) else None
+    if not row.get('agent_id') and isinstance(receipt, dict):
+        found_id = (bound or {}).get('id') or receipt.get('agent_id')
+        if isinstance(found_id, str) and found_id:
+            row['agent_id'] = found_id
+            changed = True
+    if open_row and not row.get('observed_at') and bound and isinstance(bound.get('id'), str) and bound['id']:
+        row['agent_id'] = bound['id']
+        row['observed_at'] = bound.get('at') or stamp(now)
+        if receipt.get('started') is True and not row.get('started_at'):
+            row['started_at'] = bound.get('started_at') or bound.get('at') or stamp(now)
+        if not already and not receipt_state and row['state'] in ('launching', 'expired'):
+            event(row, 'started' if receipt.get('started') else 'launched', now, 'watcher_observed_agent')
+            row['lease_until'] = stamp(min(now + timedelta(seconds=RUN_LEASE), parse(row['hard_until'])))
+        changed = True
     if already:
         target = row['state']
     elif receipt_state:
@@ -1749,8 +1764,8 @@ def _reuse_refusal(agent_id, history, parent_id, now, paseo_home, named):
     if any(r['state'] in ACTIVE or (r['state'] == 'expired' and r.get('launched_at') and parse(r['hard_until']) > now)
            for r in history):
         return Refusal('a dispatch to it is still open',
-                       'Wait for that dispatch to finish (run its next_argv, or `agentcompass dispatch --dispatch-action '
-                       'reconcile`), then roll --resume again.'), None
+                       'Wait for that dispatch\'s completion notification (its next_argv or `agentcompass dispatch '
+                       '--dispatch-action reconcile` is optional to inspect it), then roll --resume again.'), None
     latest = history[-1]
     if latest.get('state') != 'completed':
         return Refusal(f"its last dispatch ended as {latest.get('state')}, not completed",
@@ -2258,6 +2273,27 @@ def create_deadline(row):
     """When a create the daemon never admitted is settled as failed; a claim is what starts the clock."""
     seconds = CREATE_DEADLINES.get(provider_inventory.launcher_family(row['bundle']['provider']), CREATE_DEADLINE)
     return parse(row['launched_at']) + timedelta(seconds=seconds)
+
+
+def resume_deadline(row):
+    """When an unconfirmed resume whose relabel never landed is settled as failed; past `send_by`, no relabel can arrive."""
+    return parse(row['launched_at']) + timedelta(seconds=CREATE_DEADLINE)
+
+
+def resolve_unconfirmed_resume(dispatch_id, now=None, path=None, from_receipt=False):
+    """Settle a resume whose target worker still does not carry this dispatch's labels once its deadline has passed."""
+    now = now or utcnow()
+    with transaction(path) as connection:
+        row = get(connection, 'dispatches', dispatch_id)
+        if row['state'] not in ('launching', 'expired') or row.get('operation') != 'resume' or row.get('observed_at'):
+            return row, False
+        if not from_receipt and now < resume_deadline(row):
+            return row, False
+        event(row, 'create_failed', now, 'host_never_bound_resume')
+        row['creation'] = {'phase': 'not_admitted'}
+        _note_end_notice(row, watcher_receipt(row['dispatch_id']))
+        save(connection, row)
+        return row, True
 
 
 def resolve_creation(dispatch_id, creation, now=None, path=None):

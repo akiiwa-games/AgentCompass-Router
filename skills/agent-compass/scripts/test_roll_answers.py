@@ -489,7 +489,8 @@ class PendingNamesWhatIsKnown(Plain):
                 self.assertEqual((res['status'], res['cause'], code_), ('pending', code, 0))
                 self.assertNotIn('still creating', res['next_action'])
                 self.assertIn('Do not roll again', res['next_action'])
-                self.assertIn('next_argv', res['next_action'])
+                self.assertIn('nothing is required', res['next_action'])
+                self.assertNotIn('Run next_argv', res['next_action'])
                 self.assertIn('next_argv', res)
                 self.setUp()
 
@@ -534,7 +535,78 @@ class PendingNamesWhatIsKnown(Plain):
         res, _ = self.run_roll(host=self.host_answering({'ok': True, 'sent': True}), task_id='t-creating')
         self.assertEqual(res['status'], 'pending')
         self.assertIn('still creating', res['next_action'])
+        self.assertIn('nothing is required', res['next_action'])
+        self.assertNotIn('run next_argv', res['next_action'].lower())
         self.assertNotIn('cause', res)
+
+    def test_pending_paseo_dispatches_settle_unbound_resumes_and_watcher_bindings_without_caller_step(self):
+        import launch_failures
+        failure_store = self.root / 'launch-failures.json'
+        # 1. Structured creation failure written by watcher settles with candidate cooldown (before fake_owners mocks stores).
+        prepared = self.prepare()
+        claimed = registry.claim(prepared['request'], 'parent-a', now=self.now)
+        fail_id = claimed['dispatch_id']
+        note_fail = flow.notification_file(fail_id)
+        note_fail.parent.mkdir(parents=True, exist_ok=True)
+        note_fail.write_text(json.dumps({
+            'dispatch_id': fail_id, 'parent_id': 'parent-a', 'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'creation failed', 'status': None, 'attentionReason': None,
+                         'at': claimed['launched_at'], 'failure_class': 'model_unavailable', 'failure_code': 'INVALID_MODEL'},
+        }), encoding='utf-8')
+        with patch.dict(os.environ, {'ROUTER_LAUNCH_FAILURES': str(failure_store),
+                                     'ROUTER_MODEL_LATCH': str(self.root / 'latch.json')}):
+            settled_fail = flow.settle(fail_id, now=self.now)
+            self.assertEqual(settled_fail['state'], 'create_failed')
+            self.assertTrue(launch_failures.active(now=self.now))
+        self.setUp()
+
+        # 2. Watcher finds an unconfirmed created worker, writes bound_agent + finished receipt, and settle binds and completes it.
+        res, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id='t-bind')
+        full = json.loads(Path(res['details']).read_text(encoding='utf-8'))
+        self.assertEqual(full['caller_action'], 'wait_for_notification')
+        dispatch_id = full['worker']['dispatch_id']
+        launched_at = registry.inspect(dispatch_id)['launched_at']
+        note = flow.notification_file(dispatch_id)
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(json.dumps({
+            'dispatch_id': dispatch_id, 'parent_id': 'parent-a', 'agent_id': 'w-found-by-label',
+            'seen': True, 'started': True,
+            'bound_agent': {'id': 'w-found-by-label', 'at': launched_at, 'started_at': launched_at},
+            'status': 'delivered', 'delivered': ['terminal'],
+            'terminal': {'reason': 'finished', 'status': 'idle', 'attentionReason': 'finished',
+                         'at': launched_at, 'replied': True},
+        }), encoding='utf-8')
+        settled = flow.settle(dispatch_id)
+        self.assertEqual((settled['state'], settled['agent_id'], bool(settled.get('observed_at'))),
+                         ('completed', 'w-found-by-label', True))
+
+        # 3. Unconfirmed resume whose relabel never landed stays open before resume_deadline and settles at resume_deadline.
+        self.setUp()
+        self.make_worker('agent-unrelabeled')
+
+        def resume_host(request):
+            if request['operation'] == 'workspace_agents':
+                return {'ok': True, 'placeable': True, 'agents': []}
+            if request['operation'] == 'resume':
+                return bridge_answer('host_timeout')
+            if request['operation'] == 'observe':
+                return {'ok': True, 'agent': {'id': 'agent-unrelabeled', 'status': 'idle',
+                                              'labels': {'router.dispatch_id': 'prev-dispatch',
+                                                         'router.parent_id': 'parent-a'}}}
+            raise AssertionError(request['operation'])
+
+        res_r, _ = self.run_roll(self.brief_file('r.md'), host=resume_host, resume='agent-unrelabeled', task_id='t-r')
+        r_full = json.loads(Path(res_r['details']).read_text(encoding='utf-8'))
+        self.assertEqual(r_full['caller_action'], 'wait_for_notification')
+        self.assertIn('nothing is required', res_r['next_action'])
+        self.assertNotIn('Run next_argv', res_r['next_action'])
+        r_id = r_full['worker']['dispatch_id']
+        r_row = registry.inspect(r_id)
+        early = registry.resume_deadline(r_row) - timedelta(seconds=1)
+        flow.reconcile(r_id, host=resume_host, now=early)
+        self.assertEqual(registry.inspect(r_id)['state'], 'launching')
+        flow.reconcile(r_id, host=resume_host, now=registry.resume_deadline(r_row))
+        self.assertEqual(registry.inspect(r_id)['state'], 'create_failed')
 
 
 class FallbackKeepsClass(Plain):

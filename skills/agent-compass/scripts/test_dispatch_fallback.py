@@ -1220,6 +1220,52 @@ class FallbackTests(unittest.TestCase):
         with patch.object(registry, 'os', no_proc):
             self.assertIsNone(registry.process_started(987654))
 
+    def test_reconcile_and_fallback_texts_settle_stopped_steps_and_due_retries_without_caller_next_argv(self):
+        """reconcile carries a stopped fallback step and a due scheduled retry without caller next_argv, and no fallback
+        pending text asks the caller to run next_argv."""
+        import provider_retry
+        for text in (flow.FALLBACK_RUNNING_NEXT.format(where='attempt 1'),
+                     flow.FALLBACK_STOPPED_NEXT,
+                     flow.FALLBACK_SCHEDULED_NEXT.format(retry_at='2026-11-25T00:00:00Z'),
+                     flow.FALLBACK_RELAUNCHED_NEXT.format(current='d-2')):
+            self.assertIn('nothing is required', text)
+            self.assertNotIn('run next_argv', text.lower())
+
+        # 1. Stopped fallback step is taken over by `reconcile(None)` without caller `launch`.
+        root = self.failed_root()
+        self.killed_step(root)
+        real_handle = fallback.handle
+        with self.at(minutes=1), patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(
+                did, **dict(kw, judge=self.judge))):
+            flow.reconcile(None, host=self.host, now=registry.utcnow())
+        self.assertEqual(len(self.host.creates), 2)
+        self.assertNotEqual(registry.current_attempt(root['dispatch_id']), root['dispatch_id'])
+        self.assert_one_worker()
+
+        # 2. Scheduled transient retry starts on `reconcile(None)` once due, and not before.
+        retry_store = self.root / provider_retry.FILE
+        with patch.dict(os.environ, {'ROUTER_PROVIDER_RETRY': str(retry_store)}):
+            sched_root = self.first(task=dict(self.task, task_id='sched-self', can_wait_hours=1))
+            failed_at = registry.utcnow()
+            terminal = {'reason': 'error', 'at': failed_at.isoformat(),
+                        'failure_code': 'provider_turn_failed', 'provider_message': '503 upstream overloaded'}
+            provider_retry.record(sched_root['bundle'], terminal, dispatch_id=sched_root['dispatch_id'],
+                                  at=failed_at.isoformat(),
+                                  classify=lambda *_: ('transient', {'source': 'system_one', 'scorer_type': 'fixture'}))
+            self.host.end(sched_root['dispatch_id'], 'error', terminal=terminal)
+            out = self.handle(sched_root['dispatch_id'])
+            self.assertEqual(out['action'], 'scheduled')
+            due_at = registry.parse(out['retry_at'])
+            creates_before = len(self.host.creates)
+            with patch.object(registry, 'utcnow', return_value=due_at - timedelta(seconds=1)), \
+                    patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+                flow.reconcile(None, host=self.host, now=due_at - timedelta(seconds=1))
+            self.assertEqual(len(self.host.creates), creates_before)
+            with patch.object(registry, 'utcnow', return_value=due_at), \
+                    patch.object(fallback, 'handle', side_effect=lambda did, **kw: real_handle(did, **dict(kw, judge=self.judge))):
+                flow.reconcile(None, host=self.host, now=due_at)
+            self.assertEqual(len(self.host.creates), creates_before + 1)
+
     def test_of_processes_racing_for_a_released_claim_exactly_one_takes_it(self):
         """A step runs only once its claim is taken (`handle`): of four processes taking over the same released claim
         on the real SQLite file at once, exactly one takes it and the others read it as being relaunched. Each stays

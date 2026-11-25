@@ -611,10 +611,18 @@ class Chain:
             self.save('relaunched', current=new['dispatch_id'])
         except Exception:   # noqa: BLE001 - the root still names it from `relaunching`
             pass
+        receipt = {}
+        try:
+            import dispatch_flow
+            ensured = dispatch_flow.ensure_watcher(registry.inspect(new['dispatch_id']), host=self.host)
+            if ensured:
+                receipt = {'completion_notification': ensured}
+        except Exception:   # noqa: BLE001 - best-effort watcher start
+            pass
         return self.outcome(failed_id, {'action': 'relaunched', 'dispatch_id': new['dispatch_id'],
                                         'root_dispatch_id': self.root_id, 'attempts': self.attempts,
-                                        'lines': lines(self.attempts), 'receipt': {},
-                                        'detail': 'the launch failed after its claim; observing the dispatch settles it'})
+                                        'lines': lines(self.attempts), 'receipt': receipt,
+                                        'detail': 'the launch failed after its claim; AgentCompass watches and settles it'})
 
     def next_choice(self, attempt):
         """(decision, 'retry_same' | 'switch', 0) for the next attempt now, (None, 'scheduled', seconds) for a same-bundle
@@ -644,8 +652,15 @@ class Chain:
                                                             float(self.task.get('can_wait_hours') or 0) * 3600)))
         self.ledger('scheduled', attempt, wait_seconds=round(wait), retry_at=retry_at)
         self.save('retrying', current=attempt.get('dispatch_id'), retry_of=failed_id, retry_at=retry_at, until=until)
-        return self.outcome(failed_id, {'action': 'scheduled', 'root_dispatch_id': self.root_id, 'retry_at': retry_at,
-                                        'attempts': self.attempts, 'lines': lines(self.attempts)})
+        out = self.outcome(failed_id, {'action': 'scheduled', 'root_dispatch_id': self.root_id, 'retry_at': retry_at,
+                                       'attempts': self.attempts, 'lines': lines(self.attempts)})
+        if failed_id:
+            try:
+                import dispatch_flow
+                dispatch_flow.ensure_watcher(registry.inspect(failed_id), host=self.host, retry_at=retry_at)
+            except Exception:   # noqa: BLE001 - best-effort watcher start
+                pass
+        return out
 
     def same_bundle(self, attempt):
         """The decision for a transient failure's retry on its own bundle. It is issued and written to the ledger like
@@ -707,7 +722,7 @@ class Chain:
         for dispatch_id in seen:
             target = row if row and row['dispatch_id'] == dispatch_id else registry.inspect(dispatch_id)
             if target.get('state') == 'failed' and target.get('launched_at') and target.get('agent_id'):
-                dispatch_flow.reconcile(dispatch_id, host=self.host)
+                dispatch_flow.reconcile(dispatch_id, host=self.host, carry_fallback=False)
                 self.root = registry.inspect(self.root['dispatch_id'])
                 fb = self.root.get('fallback') or {}
                 if fb.get('state') == 'final' and (fb.get('outcome') or {}).get('result') == 'resumed':
@@ -875,14 +890,14 @@ def handle(dispatch_id, *, judge=None, host=None):
     import dispatch_flow
     row = registry.inspect(dispatch_id)
     if row['state'] not in registry.TERMINAL or row['state'] == 'expired':
-        dispatch_flow.reconcile(dispatch_id, host=host)
+        dispatch_flow.reconcile(dispatch_id, host=host, carry_fallback=False)
         row = registry.inspect(dispatch_id)
     if row['state'] not in registry.TERMINAL or row['state'] == 'expired':
         return {'action': 'unsettled', 'state': row['state'], 'meaning': UNSETTLED_MEANING.format(state=row['state'])}
     root_id = registry.chain_root(row)
     root = row if root_id == dispatch_id else registry.inspect(root_id)
     if registry.fallback_guard(root, registry.utcnow()):
-        dispatch_flow.reconcile(root_id, host=host)
+        dispatch_flow.reconcile(root_id, host=host, carry_fallback=False)
         root = registry.inspect(root_id)
     chain = Chain.of(root, judge=judge, host=host)
     try:
@@ -947,29 +962,61 @@ def abandon(dispatch_id, *, judge=None, host=None):
         raise
 
 
-def resume_due(dispatch_id, *, host=None, now=None):
-    """Any observation of a brief (dispatch launch/observe) carries what its fallback still owes, so that does not
-    depend on the failed attempt's watcher alone: a scheduled same-bundle retry once it is due, and a failed attempt
+_ACTIVE_RESUME_DUE = set()
+
+
+def resume_due(dispatch_id=None, *, judge=None, host=None, now=None):
+    """Any observation of a brief (dispatch launch/observe/reconcile) carries what its fallback still owes, so that does
+    not depend on the failed attempt's watcher alone: a scheduled same-bundle retry once it is due, and a failed attempt
     whose step stopped before it finished (inside its lease, a claim whose holder ended or released it:
     registry.claim_held), which this step takes over. None when nothing is owed."""
     if not enabled():
         return None
+    now = now or registry.utcnow()
+    if dispatch_id is None:
+        all_rows = registry.read_dispatches()
+        by_id = {r['dispatch_id']: r for r in all_rows}
+        seen = set()
+        last = None
+        for row in all_rows:
+            root_id = registry.chain_root(row)
+            if root_id in seen:
+                continue
+            seen.add(root_id)
+            root = by_id.get(root_id, row)
+            fb = root.get('fallback') or {}
+            if registry.claim_stopped(fb, now) or (
+                    fb.get('state') == 'retrying' and fb.get('retry_of') and not registry.later(fb.get('retry_at'), now)):
+                done = resume_due(root_id, judge=judge, host=host, now=now)
+                if done is not None:
+                    last = done
+        return last
     try:
         row = registry.inspect(dispatch_id)
         root = row if registry.chain_root(row) == dispatch_id else registry.inspect(registry.chain_root(row))
     except (KeyError, ValueError):
         return None
-    now = now or registry.utcnow()
+    if root['dispatch_id'] in _ACTIVE_RESUME_DUE:
+        return None
     fallback = root.get('fallback') or {}
     stopped = [failed_id for failed_id, item in (fallback.get('handled') or {}).items()
                if isinstance(item, dict) and item.get('action') == 'pending' and registry.later(item.get('until'), now)
                and not registry.claim_held(item, now)]
-    if stopped:
-        return handle(stopped[0], host=host)
-    if fallback.get('state') != 'retrying' or not fallback.get('retry_of') \
-            or registry.later(fallback.get('retry_at'), now):
+    if not stopped and fallback.get('state') == 'relaunching' and registry.later(fallback.get('until'), now) \
+            and not registry.step_binds(fallback, now):
+        last_failed = next((a.get('dispatch_id') for a in reversed(fallback.get('attempts') or [])
+                            if a.get('dispatch_id') and a.get('failure')), None) or root['dispatch_id']
+        stopped = [last_failed]
+    target_id = stopped[0] if stopped else (
+        fallback['retry_of'] if fallback.get('state') == 'retrying' and fallback.get('retry_of')
+        and not registry.later(fallback.get('retry_at'), now) else None)
+    if target_id is None:
         return None
-    return handle(fallback['retry_of'], host=host)
+    _ACTIVE_RESUME_DUE.add(root['dispatch_id'])
+    try:
+        return handle(target_id, judge=judge, host=host)
+    finally:
+        _ACTIVE_RESUME_DUE.discard(root['dispatch_id'])
 
 
 def after_refusal(decision_id, launch, reason, *, access='write', workspace=None, cwd=None, judge=None, host=None):

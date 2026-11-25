@@ -1172,7 +1172,7 @@ class Play:
         if status == "launched" or record["launched"] is True:
             self.launched(op, chain, record, act)
             return
-        if status == "pending" and isinstance(doc.get("next_argv"), list):
+        if status == "pending" and action == "run_next_argv" and isinstance(doc.get("next_argv"), list):
             if chain["commands"] >= FOLLOW_LIMIT:
                 chain["outcome"], chain["note"] = "dead_end", f"still pending after {chain['commands']} commands"
                 return
@@ -1183,10 +1183,13 @@ class Play:
             follow.update({k: record[k] for k in ("account", "model", "effort", "bundle_id", "expected_usd", "decision_id") if follow.get(k) is None})
             if got.get("state") in ("completed", "launched", "started") or got.get("status") == "launched":
                 self.launched(op, chain, follow, act)
-            elif got.get("status") == "pending" and isinstance(got.get("next_argv"), list):
+            elif got.get("status") == "pending" and got.get("caller_action") == "run_next_argv" and isinstance(got.get("next_argv"), list):
                 self.settle(op, chain, got, act, key, argv, depth)
             else:
                 chain["outcome"] = "handed_to_session"
+            return
+        if status == "pending" and record.get("dispatch_id"):
+            self.observe_pending(op, chain, record, act)
             return
         if mode == "split" or action == "roll_each_line":
             parts = self.corpus[key].get("split_into")
@@ -1247,6 +1250,34 @@ class Play:
             except (OSError, ValueError):
                 continue
         return messages
+
+    def observe_pending(self, op, chain, record, act):
+        """A Paseo pending answer says nothing is required and AgentCompass settles the dispatch itself: the session runs
+        no next_argv, and the run observes the dispatch the way the product does (reconcile)."""
+        s = self.s
+        before = len(self.inbox())
+        deadline = time.time() + 40
+        got = {}
+        while time.time() < deadline:
+            s.call(op, "dispatch", "--dispatch-action", "reconcile")
+            result = s.call(op, "dispatch", "--dispatch-action", "status", "--dispatch-id", record["dispatch_id"])
+            got = parse(result.stdout) or {}
+            if got.get("state") in TERMINAL or got.get("state") in ("launched", "started"):
+                break
+            time.sleep(2)
+        mail = self.inbox()[before:]
+        follow = self.answer(chain, got, ["dispatch", "--dispatch-action", "status"], None, None, record["brief"], kind="observe")
+        follow.update({k: record[k] for k in ("account", "model", "effort", "bundle_id", "expected_usd", "decision_id") if follow.get(k) is None})
+        follow["worker_state"] = got.get("state")
+        follow["observed"] = {k: got.get(k) for k in ("state", "cause", "attempt_of", "attempts", "retry_at", "current_attempt") if got.get(k) is not None}
+        follow["mail"] = [m.get("text", "")[:600] for m in mail]
+        if got.get("state") in ("launched", "started", "completed"):
+            self.launched(op, chain, follow, act)
+            if got.get("dispatch_id") != record["dispatch_id"]:
+                chain["outcome"] = "relaunched"
+        else:
+            chain["outcome"] = "handed_to_session"
+            chain["note"] = f"after the pending answer the dispatch is {got.get('state')}; {len(mail)} message(s) reached the parent"
 
     def observe_after_error(self, op, chain, record, act):
         """An error answer that names a dispatch and says the router goes on by itself (a relaunch, a retry): the session runs
