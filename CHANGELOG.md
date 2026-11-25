@@ -2,6 +2,20 @@
 
 One entry per released tag, newest first. The full notes of each release are on the [Releases](https://github.com/akiiwa-games/AgentCompass-Router/releases) page.
 
+## v0.7.8 - 2026-11-25
+
+- A Paseo dispatch that `roll` answers `pending` settles itself: its `--watch` process finds the created worker by its label, binds it, settles the dispatch and notifies the parent. The answer is `caller_action: "wait_for_notification"` when a watcher will act after the command returns, and `"run_next_argv"` otherwise; that command (`launch --dispatch-id ... --watch-seconds N`) carries the operation to its end in the foreground.
+- A notification is promised only when something will send it: a process the command starts is in no Windows job (`host_job.ends_children`; a launcher's own job is read past), or the tray of this session is running, whose pass restarts a watcher the host ended. Otherwise a launched worker gets the unwatched contract and reports to the parent itself.
+- A fallback step (a relaunch, a retry, a replan) runs only from an owner that may launch: the dispatch's watcher, a `roll` of the same task, the tray's pass (`dispatch --dispatch-action reconcile --carry-fallback`). A plain `reconcile` reads and settles. A stopped step or a due retry is taken over only inside the root dispatch's life; past it the chain is closed once and the parent told once.
+- A resume whose send or relabel has no known outcome (a timeout, a dropped connection, an unreadable answer, Paseo's `agent_request_outcome_unknown`) keeps the worker bound or puts its labels back; no second worker is created beside it. A resume the host refused is not a deadline failure, and a resume that was never bound leaves its worker reusable.
+- The gate routes a Paseo schedule itself: `create_schedule` and `update_schedule` are judged by a plan the gate runs for the schedule's prompt. On Antigravity and Pi the planned route and `notifyOnFinish` are filled in; on Claude Code and Codex the call is refused once with the exact values to repeat. A route the user named passes on its `user_override` record. A schedule's plan is the caller's by any ID that names the session.
+- A schedule's route is not checked against the window read now (its runs start at their own times), and an `update_schedule` is judged on the route the schedule ends with: a cleared `model` or another provider asks for the plan's model.
+- A Workflow is authorized by `record --trigger workflow --basis "<the user's words>"`: no route and no `--constraint`.
+- `plan` without `--hours` asks the classifier for them, as `roll` does.
+- A cached pooled usage reading of an earlier shape is collected again by the plan that needs it; no manual `usage --force` after an update.
+- Tray: the pre-reset priority menu is the user's own list (settings, **Edit menu…**, kept as `priority_targets` in `accounts-override.json`); each entry offers the expected time to the reset (1, 3, 6, 12 or 24 hours) in the tray menu and in the settings page, and its own cancel while in effect. The editor changes the stored list entry by entry: an entry whose account or model is switched off, and an entry's label, stay.
+- A turn a worker starts at or past a resume's deadline is not that resume's send: a resume settled as never bound is not attached to the worker's next turn.
+
 ## v0.7.7 - 2026-11-24
 
 - A route the user names is refused only by a fact: a window used up, a confirmed latch, the launch floor, a missing price. The answer is `status: blocked`, `caller_action: tell_user`, exit 2, and names the window, its state and, when known, the time it ends (the row's binding wait over every window that holds it). An estimate never refuses a named route: the full-capacity estimate, the local estimate of a free allowance, a stale or missing reading and the fast-spend estimate launch with one warning. `record` and the re-check before launch read one set of blockers.
