@@ -2015,7 +2015,9 @@ def _run(args, judge):
         effective_host = 'paseo'
     paseo_args = argparse.Namespace(**{**vars(args), 'parent_id': args.parent_id or parent}) if effective_host != parent_host else args
     use_paseo, no_paseo_because = paseo_choice(provider, effective_host, paseo_args)
-    text, prompt_file = prepare_worker_prompt(text, parent, parent_host, parent_address, watched=bool(use_paseo))
+    # Watched only when a watcher will run after this command: otherwise the worker reports to the parent itself.
+    text, prompt_file = prepare_worker_prompt(text, parent, parent_host, parent_address,
+                                              watched=bool(use_paseo) and dispatch_flow.watcher_outlives_command())
     out['worker_prompt_file'] = str(prompt_file)
     decision_profile = (
         decision.get('task_profile')

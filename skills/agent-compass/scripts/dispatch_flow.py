@@ -17,6 +17,7 @@ import dispatch_fallback
 import public_data
 import dispatch_registry as registry
 import entry
+import host_job
 from worker_context import require_parent_id
 
 def paseo_config():
@@ -445,36 +446,6 @@ def watcher_confirmed(receipt, dispatch_id=None):
 
 # The name the tray holds while it runs (tray/app.pyw `single_instance`).
 TRAY_MUTEX = 'Local\\AgentCompassTray'
-_JOB_KILL_ON_CLOSE, _JOB_SILENT_BREAKAWAY = 0x2000, 0x1000
-
-
-def command_job_ends_children():
-    """True when this command runs in a Windows job that kills its processes when it closes and lets none leave it.
-    A host that ends such a job with the command (Antigravity, measured 2026-11-21) ends the detached watcher too. Read
-    from the job this process is in (the innermost one); a job whose limits cannot be read counts as one that kills."""
-    if os.name != 'nt':
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    class BasicLimits(ctypes.Structure):   # JOBOBJECT_BASIC_LIMIT_INFORMATION
-        _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong), ('flags', wintypes.DWORD),
-                    ('min_working_set', ctypes.c_size_t), ('max_working_set', ctypes.c_size_t),
-                    ('active_processes', wintypes.DWORD), ('affinity', ctypes.c_size_t),
-                    ('priority', wintypes.DWORD), ('scheduling', wintypes.DWORD)]
-
-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
-    kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
-                                                 ctypes.c_void_p]
-    inside = wintypes.BOOL()
-    if not kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, ctypes.byref(inside)) or not inside.value:
-        return False
-    limits = BasicLimits()
-    if not kernel.QueryInformationJobObject(None, 2, ctypes.byref(limits), ctypes.sizeof(limits), None):
-        return True
-    return bool(limits.flags & _JOB_KILL_ON_CLOSE) and not limits.flags & _JOB_SILENT_BREAKAWAY
 
 
 def tray_running():
@@ -498,7 +469,7 @@ def tray_running():
 def watcher_outlives_command():
     """True when a watcher this command started, or one that replaces it, runs after the command returns: the host
     leaves the command's processes alone, or it ends them and the tray is running, whose pass restarts the watcher."""
-    return not command_job_ends_children() or tray_running()
+    return not host_job.ends_children() or tray_running()
 
 
 def watcher_carries(receipt, dispatch_id=None):

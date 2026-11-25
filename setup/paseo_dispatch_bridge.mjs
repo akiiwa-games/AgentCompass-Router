@@ -1648,6 +1648,12 @@ export async function execute(client, input, notify = ensureNotification) {
             return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification};
           try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
           catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
+        } else if (outcomeUnknown(error) || SEND_OUTCOME_UNKNOWN.has(hostFailureClass(error, true))) {
+          // The relabel itself has no known outcome: no turn was sent, and the label may be on the worker. The old
+          // labels go back so that a worker created in its place is the only one carrying this dispatch; when that
+          // fails too, the worker stays bound and its watcher settles it.
+          try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
+          catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
         }
         stopWatcher(input, 'host_resume_failed');
         return {ok: false, sent: false, error: 'host_resume_failed', condition: hostFailureClass(error, true),

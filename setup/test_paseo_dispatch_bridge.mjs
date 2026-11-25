@@ -1757,6 +1757,36 @@ test('a resume send whose outcome is not known keeps the worker bound and is not
   }
 });
 
+test('a relabel whose outcome is not known is put back before the resume is reported as not sent', async () => {
+  // The label may be on the worker although the request timed out. A worker created in its place must be the only
+  // one carrying this dispatch; when the old labels cannot be put back either, the worker stays bound and nothing is
+  // created beside it.
+  const timeout = Object.assign(new Error('x'), {name: 'DaemonConnectionError', code: 'DAEMON_REQUEST_TIMEOUT'});
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-relabel-'));
+  const previous = process.env.ROUTER_STATE_DIR;
+  process.env.ROUTER_STATE_DIR = stateDir;
+  try {
+    for (const [restores, expected] of [[true, [false, 'host_resume_failed']],
+                                        [false, [true, 'resume_outcome_uncertain_reconcile_by_agent']]]) {
+      const updates = [];
+      const client = {
+        fetchAgent: async id => ({agent: id === 'parent' ? {cwd: '/fixture'} : resumable}),
+        updateAgent: async (id, patch) => {
+          updates.push(patch.labels['router.dispatch_id']);
+          if (updates.length === 1 || !restores) throw timeout;
+        },
+        sendMessage: async () => { throw new Error('never sent'); },
+      };
+      const result = await execute(client, resumeInput, notifier);
+      assert.deepEqual([result.sent, result.error], expected);
+      assert.deepEqual(updates, ['cond-new', 'old']);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = previous;
+    fs.rmSync(stateDir, {recursive: true, force: true});
+  }
+});
+
 // A class is read from what the real SDK raises, so these use its own classes and clients (the daemon is never needed).
 const sdkModule = await import(pathToFileURL(require.resolve('@getpaseo/client/internal/daemon-client')).href);
 const {WebSocket: SdkWebSocket, WebSocketServer: SdkWebSocketServer} = require('ws');
