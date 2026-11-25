@@ -106,6 +106,7 @@ def main() -> int:
         "cli": name, "pid": os.getpid(), "argv": sys.argv[1:], "cwd": os.getcwd(), "scenario": scenario,
         "started": time.time(), "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "prompt_chars": len(prompt),
         "prompt_has_contract": "Worker final report" in prompt or "worker-communication" in prompt.lower(),
+        "told_a_watcher_reports": "本派发有完成监视" in prompt,
         "prompt_head": prompt[:400],
         "router_env": {key: os.environ.get(key) for key in ROUTER_VARS},
         # names only: a real credential must never end up in a fixture log
@@ -161,7 +162,7 @@ def main() -> int:
     print(f"WORKER-DONE {name} scenario={scenario}")
     sys.stdout.flush()
     body = f"{name} finished the fixture task ({scenario}); output sha {record['prompt_sha256'][:12]}"
-    if "本派发有完成监视" in prompt:
+    if record["told_a_watcher_reports"]:
         # The completion watcher sends the one notice. This process's stdout is the final reply.
         print(body)
         sys.stdout.flush()

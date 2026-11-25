@@ -275,6 +275,13 @@ class Zero:
         return f"{TASK_BODY} [{nonce}]\nFIXTURE-SCENARIO: {scenario}\n"
 
 
+def own_reports_due(z: Zero, brief: str) -> int:
+    """How many workers of this brief report to the parent themselves: those whose contract says no watcher reports
+    for them. roll gives that contract where the host ends a command's processes with the command and no tray runs
+    (a CI runner's job), and AgentCompass's end notice still follows; elsewhere the end notice is the one message."""
+    return sum(1 for w in z.workers() if brief.split("\n")[0] in w.get("prompt_head", "") and not w.get("told_a_watcher_reports"))
+
+
 def default_net_events(z: Zero) -> list[dict]:
     """Events a child with a scrubbed environment logged to the interpreter-level default log."""
     log = z.ctx["base"] / "net-default.jsonl"
@@ -585,8 +592,8 @@ def step_paseo_host(z: Zero):
         fresh = z.inbox(PARENT)[before_mail:]
         return [m for m in fresh if m["text"].startswith("[AgentCompass worker notification]") and "finished the fixture task (ok)" in m["text"]]
     mail = z.wait_for(new_notices, 20)
-    op.check("one end notice carries the worker's final reply",
-             len(mail) == 1 and not any(m["text"].startswith("[Worker final report]") for m in z.inbox(PARENT)[before_mail:]),
+    own = [m for m in z.inbox(PARENT)[before_mail:] if m["text"].startswith("[Worker final report]")]
+    op.check("one end notice carries the worker's final reply", len(mail) == 1 and len(own) == own_reports_due(z, task),
              z.inbox(PARENT)[before_mail:])
     ids = [r for r in (parse(z.call(op, "dispatch", "--dispatch-action", "reconcile", **env).stdout) or {}).get("active_reservations", [])]
     op.check("no active reservation remains after completion", not ids, ids)
@@ -962,7 +969,8 @@ def step_hooks_and_crash(z: Zero):
     # A slow host keeps the bridge inside its create for a while after it logs the request.
     z.set_fault(create_delay_ms=1500)
     calls, answers, inbox = len(z.bridge_calls()), len(z.bridge_answers()), len(z.inbox())
-    process = subprocess.Popen([str(box.agentcompass), "roll", "--task", z.task("slow", "crash-continue")], cwd=str(z.work),
+    brief = z.task("slow", "crash-continue")
+    process = subprocess.Popen([str(box.agentcompass), "roll", "--task", brief], cwd=str(z.work),
                                env=box.env(**z.env(**env)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     created = z.wait_for(lambda: [a for a in z.bridge_answers()[answers:] if a["operation"] == "create" and (a.get("answer") or {}).get("ok")], 60, 0.3)
     op.check("the host answered the create", bool(created),
@@ -983,9 +991,9 @@ def step_hooks_and_crash(z: Zero):
     agent = z.agents().get(did or "none") or {}
     op.check("this dispatch's worker finished on the host", agent.get("status") == "idle" and agent.get("attentionReason") == "finished",
              {k: agent.get(k) for k in ("status", "attentionReason", "lastError")})
+    notices = [m for m in z.inbox()[inbox:] if m.get("text", "").startswith("[AgentCompass worker notification]") and "(slow)" in m["text"]]
     op.check("the worker's report is in the parent's mailbox (one new report)",
-             len(z.inbox()) == inbox + 1 and z.inbox()[-1].get("text", "").startswith("[AgentCompass worker notification]")
-             and "(slow)" in z.inbox()[-1].get("text", ""), z.inbox()[inbox:])
+             len(notices) == 1 and len(z.inbox()) == inbox + 1 + own_reports_due(z, brief), z.inbox()[inbox:])
 
 
 def step_entries(z: Zero):
