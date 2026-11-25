@@ -244,7 +244,7 @@ class MenuTests(TrayTestCase):
         probe.assert_not_called()
         cli.assert_not_called()
 
-    def test_one_click_on_a_menu_target_turns_its_priority_on_and_one_more_turns_it_off(self):
+    def test_a_menu_target_offers_the_expected_reset_times_and_its_own_cancel_when_in_effect(self):
         rule = {'id': 'rule-a', 'revision': 'revision-a'}
         app.PRIORITY = {'label': '优先中：Astra', 'entries': [
             {'label': 'Astra', **rule}, {'label': 'Sol', 'id': 'rule-cli', 'revision': 'revision-cli'}],
@@ -258,16 +258,21 @@ class MenuTests(TrayTestCase):
             items = [i for i in menu.items if i.text != app.Menu.SEPARATOR.text]
             # The targets of the menu, then only the rule no target stands for.
             self.assertEqual([i.text for i in items], ['Astra', 'Argon', 'Opus 5.5', '取消 Sol'])
-            self.assertTrue(all(i.submenu is None and i.enabled for i in items))
+            self.assertTrue(all(i.submenu is not None and i.enabled for i in items[:3]))
+            self.assertIsNone(items[3].submenu)
             self.assertEqual([bool(i.checked) for i in items[:3]], [True, False, False])
             with mock.patch.object(app, 'act') as act, mock.patch.object(app.router_priority, 'perform') as perform:
-                wanted = [{'kind': 'cancel', **rule},
-                          *({'kind': 'enable', **{k: t[k] for k in ('account', 'model', 'window')}}
-                            for t in app.PRIORITY['targets'][1:]),
-                          {'kind': 'cancel', 'id': 'rule-cli', 'revision': 'revision-cli'}]
-                for item, action in zip(items, wanted):
+                def clicked(item):
                     item(mock.Mock()); act.call_args.args[1]()
-                    self.assertEqual(perform.call_args.args[0], action)
+                    return perform.call_args.args[0]
+                self.assertEqual(clicked(items[3]), {'kind': 'cancel', 'id': 'rule-cli', 'revision': 'revision-cli'})
+                # The target in effect offers its cancel first; every target keeps its identity under each time.
+                self.assertEqual(clicked(items[0].submenu.items[0]), {'kind': 'cancel', **rule})
+                for item, target in zip(items, app.PRIORITY['targets']):
+                    times = [i for i in item.submenu.items if i.text.startswith('预计')]
+                    self.assertEqual(len(times), len(app.router_priority.DURATIONS))
+                    self.assertEqual(clicked(times[1]), {'kind': 'enable', 'hours': 3,
+                                                         **{k: target[k] for k in ('account', 'model', 'window')}})
 
     def test_priority_refresh_sees_router_removal_without_changing_service_state(self):
         icon = mock.Mock(); services_before = dict(app.STATE)

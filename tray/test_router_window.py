@@ -1575,6 +1575,14 @@ class ResetEditorTests(unittest.TestCase):
             fill([{'account': 'codex', 'model': 'gpt-6-astra', 'label': 'Astra'}])
             texts = [child.cget('text') for child in frame.winfo_children()]
             self.assertEqual(texts, ['Astra', '×'])
+            # The entry's button opens the expected reset times; the chosen one is what the priority is set with.
+            import tkinter
+            with mock.patch.object(panel, 'enable_priority') as enable, mock.patch.object(tkinter.Menu, 'tk_popup'), \
+                    mock.patch.object(tkinter.Menu, 'add_command') as offered:
+                frame.winfo_children()[0].invoke()
+                self.assertEqual(len(offered.call_args_list), len(router_data.BOOST_HOURS))
+                offered.call_args_list[1].kwargs['command']()
+            enable.assert_called_once_with('codex', 'gpt-6-astra', router_data.BOOST_HOURS[1])
             frame.winfo_children()[1].invoke()
             with mock.patch.object(router_data, 'change_priority_menu') as change:
                 panel.run.call_args.args[0]()

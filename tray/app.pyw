@@ -409,14 +409,19 @@ def build_menu() -> Menu:
         icon.stop()
 
     def priority_menu():
-        # One click on a target of the user's menu turns its priority on (router_priority.DEFAULT_HOURS at most, ended
-        # by the reset) and one more click turns it off; another expected reset time is set in the panel.
+        # A target of the user's menu opens the expected time to its reset: the window is priced as resetting then
+        # (quota_pools.window_state), so a nearer time is a stronger priority. A target in effect offers its cancel first.
         items = []
         for target in PRIORITY["targets"]:
-            rule = target.get("rule")
-            action = ({"kind": "cancel", **rule} if rule else
-                      {"kind": "enable", **{k: target[k] for k in ("account", "model", "window")}})
-            items.append(MenuItem(target["label"], run(lambda a=action: router_priority.perform(a)),
+            choices = []
+            if target.get("rule"):
+                action = {"kind": "cancel", **target["rule"]}
+                choices += [MenuItem(_tr("取消优先"), run(lambda a=action: router_priority.perform(a))), Menu.SEPARATOR]
+            for hours in router_priority.DURATIONS:
+                action = {"kind": "enable", "hours": hours, **{k: target[k] for k in ("account", "model", "window")}}
+                choices.append(MenuItem(_tr('预计 {0} 小时后重置').format(hours),
+                                        run(lambda a=action: router_priority.perform(a))))
+            items.append(MenuItem(target["label"], Menu(*choices),
                                   checked=lambda item, selected=target.get("selected", False): selected))
         # A rule no target of the menu stands for (set in the panel or by the CLI) is cancelled by its own entry.
         toggled = {target["rule"]["id"] for target in PRIORITY["targets"] if target.get("rule")}

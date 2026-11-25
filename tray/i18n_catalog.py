@@ -119,6 +119,8 @@ EN = {
     '已选模型 · 推理档位自动选择': 'Selected models · reasoning effort selected automatically',
     '临时优先加权': 'Temporary boost',
     '编辑菜单…': 'Edit menu…',
+    '预计 {0} 小时后重置': 'Expected reset in {0} hours',
+    '取消优先': 'Cancel Priority',
     '快捷菜单': 'Quick menu',
     '加入快捷菜单': 'Add to quick menu',
     '不能加入快捷菜单：需要一个具体模型，且账号参与自动派发、模型已勾选、有按天或更长的额度窗口': 'Cannot add to the quick menu: it needs one model, on an account in automatic routing, checked, with a quota window of a day or longer',

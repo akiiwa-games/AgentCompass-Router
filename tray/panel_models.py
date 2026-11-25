@@ -475,9 +475,9 @@ class ModelsTab:
                 child.destroy()
             for target in targets or ():
                 pair = (target["account"], target["model"])
-                self.ttk.Button(frame, text=f"{prefix}{target['label']}", style=style,
-                                command=lambda p=pair: self.enable_priority(*p)
-                                ).pack(side="left", padx=(padx[0], 0) if removable else padx)
+                button = self.ttk.Button(frame, text=f"{prefix}{target['label']}", style=style)
+                button.configure(command=lambda p=pair, b=button: self.choose_priority_hours(p, b))
+                button.pack(side="left", padx=(padx[0], 0) if removable else padx)
                 if removable:
                     self.ttk.Button(frame, text="×", style=style, width=2,
                                     command=lambda p=pair: self.change_priority_menu(remove=p)
@@ -500,7 +500,16 @@ class ModelsTab:
             return
         self.change_priority_menu(add=self.boost_pairs[index])
 
-    def enable_priority(self, account, model):
+    def choose_priority_hours(self, pair, button):
+        """The expected time to the reset, chosen under the target's button: a nearer time is a stronger priority."""
+        import router_priority
+        menu = self.tk.Menu(button, tearoff=0)
+        for hours in router_priority.DURATIONS:
+            menu.add_command(label=_tr('预计 {0} 小时后重置').format(hours),
+                             command=lambda h=hours: self.enable_priority(*pair, h))
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
+    def enable_priority(self, account, model, hours):
         import account_fleet
         import router_priority
 
@@ -511,7 +520,8 @@ class ModelsTab:
                            if t["account"] == account and t["model"] == model), None)
             if target is None:
                 return _tr("该模型当前不可设为优先")
-            return router_priority.perform({"kind": "enable", **{k: target[k] for k in ("account", "model", "window")}})
+            return router_priority.perform({"kind": "enable", "hours": hours,
+                                            **{k: target[k] for k in ("account", "model", "window")}})
         self.run(work, self.say(self.load_boost))
 
     def add_boost(self):

@@ -21,7 +21,6 @@ BOOST = 0.35
 INTENT = 'tray:anticipated-reset'
 # Quick reset-priority targets: the fleet document's `priority_targets` ([{account, model, label?}]): the user's own
 # menu once they edited it (accounts-override.json, written by router_data.change_priority_menu), else the shipped one.
-DEFAULT_HOURS = 24
 RESET_BADGE_HOURS = 12
 
 
@@ -370,7 +369,7 @@ def perform(action):
     """Expected local diagnostics are actionable notifications, not generic failures."""
     try:
         if action['kind'] == 'enable':
-            return enable(action['account'], action['model'], action['window'], action.get('hours', DEFAULT_HOURS))
+            return enable(action['account'], action['model'], action['window'], action['hours'])
         if action['kind'] == 'cancel':
             return cancel(action['id'], action['revision'])
         raise ValueError(_tr('未知临时优先操作'))
