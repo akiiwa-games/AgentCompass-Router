@@ -276,8 +276,8 @@ ALLOWED_TAINT_SINK_STATEMENTS = {
     ): 'falls back to default self-test sample objective when --objective is blank',
     (
         'skills/agent-compass/scripts/route_judge.py',
-        'plan_task',
-        "or (not args.dry_run and bool((task.get('objective') or '').strip()) and not isinstance(task.get('profile'), dict))",
+        '_classifies',
+        "or (not getattr(args, 'dry_run', False) and bool((task.get('objective') or '').strip())",
     ): 'checks whether task has non-empty objective to invoke System-One classifier',
     (
         'skills/agent-compass/scripts/route_judge.py',

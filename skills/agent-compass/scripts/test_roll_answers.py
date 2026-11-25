@@ -585,7 +585,7 @@ class PendingNamesWhatIsKnown(Plain):
             return handle
 
         read = {}
-        for name, nested in (('kill', (0x2000,)), ('plain', (0,)), ('launcher', (0x3000,)),
+        for name, nested in (('as the tests run', ()), ('kill', (0x2000,)), ('plain', (0,)), ('launcher', (0x3000,)),
                              ('launcher inside kill', (0x2000, 0x3000))):
             child = subprocess.Popen([sys.executable, '-c', script, flow.host_job.__file__],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -593,7 +593,9 @@ class PendingNamesWhatIsKnown(Plain):
             for flags in nested:   # outermost first
                 self.assertTrue(kernel.AssignProcessToJobObject(job(flags), wintypes.HANDLE(int(child._handle))))
             read[name] = child.communicate('go\n', timeout=60)[0].strip()
-        self.assertEqual(read, {'kill': 'True', 'plain': 'True', 'launcher': 'False', 'launcher inside kill': 'True'})
+        # A CI runner may itself sit in a job: a launcher's job reads as whatever is around it.
+        self.assertEqual(read.pop('launcher'), read.pop('as the tests run'))
+        self.assertEqual(read, {'kill': 'True', 'plain': 'True', 'launcher inside kill': 'True'})
 
     def test_pending_answers_wait_for_notification_only_when_ensure_watcher_confirms_running_pid_else_next_argv_finishes(self):
         """Rule C: `roll` answers `wait_for_notification` only when `ensure_watcher` returns a receipt naming a running

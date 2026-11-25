@@ -770,8 +770,9 @@ def reconcile(dispatch_id=None, host=None, now=None, path=None, timeout=None, no
                         and settled_row.get('state') == 'create_failed'
                         and settled_row.get('end_notice') is None
                         and not settled_row.get('fallback')
-                        and any(isinstance(ev, dict) and ev.get('reason') in ('host_never_admitted_create', 'host_never_bound_resume')
-                                for ev in (settled_row.get('events') or ()))
+                        and any(isinstance(event, dict)
+                                and event.get('reason') in ('host_never_admitted_create', 'host_never_bound_resume')
+                                for event in (settled_row.get('events') or ()))
                         and not notification_file(settled_row['dispatch_id']).exists()):
                     ensure_watcher(settled_row, host=host)
         dispatch_fallback.resume_due(dispatch_id, host=host, now=now)

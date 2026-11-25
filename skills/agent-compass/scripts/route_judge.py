@@ -962,10 +962,7 @@ def plan_task(task, args, unavailable=None):
     extra_alerts, scorer = [], None
     hours_estimate = None
     fatal_gap = bool((readiness_gap(loaded_accounts, usage) or {}).get('fatal'))
-    should_score = not args.no_score and not fatal_gap and (
-        args.score or task.get('auto_score')
-        or (not args.dry_run and bool((task.get('objective') or '').strip()) and not isinstance(task.get('profile'), dict))
-    )
+    should_score = not fatal_gap and _classifies(task, args)
     if not fatal_gap and not should_score and not isinstance(task.get('profile'), dict):
         return scorer_unavailable_result(
             task,
@@ -1043,10 +1040,10 @@ def plan_task(task, args, unavailable=None):
 
 
 def _classifies(task, args):
-    """Whether this run asks the classifier about `task` (plan_task's own condition, before it reads the fleet)."""
+    """Whether this run asks the classifier about `task`: plan_task's condition, also read before it loads the fleet."""
     return not getattr(args, 'no_score', False) and bool(
         getattr(args, 'score', False) or task.get('auto_score')
-        or (not getattr(args, 'dry_run', False) and (task.get('objective') or '').strip()
+        or (not getattr(args, 'dry_run', False) and bool((task.get('objective') or '').strip())
             and not isinstance(task.get('profile'), dict)))
 
 
