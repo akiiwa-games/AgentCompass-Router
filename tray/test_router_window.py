@@ -1563,6 +1563,22 @@ class ResetEditorTests(unittest.TestCase):
             with mock.patch.object(router_data, 'add_boost') as save:
                 work()
             save.assert_called_once_with('codex', 'gpt-6-astra', hours=1)
+            # The same choice goes into the user's quick menu, and a menu entry's own button takes it out again.
+            panel.add_menu_target()
+            with mock.patch.object(router_data, 'change_priority_menu') as change:
+                panel.run.call_args.args[0]()
+            change.assert_called_once_with(add=('codex', 'gpt-6-astra'), remove=None)
+            frame = next(item[0] for item in panel.priority_frames if item[4])
+            fill = next(call.args[1] for call in panel.run.call_args_list
+                        if call.args[1].__qualname__.endswith('fill_priority_buttons.<locals>.done')
+                        and frame in (call.args[1].__closure__ and [c.cell_contents for c in call.args[1].__closure__] or []))
+            fill([{'account': 'codex', 'model': 'gpt-6-astra', 'label': 'Astra'}])
+            texts = [child.cget('text') for child in frame.winfo_children()]
+            self.assertEqual(texts, ['Astra', '×'])
+            frame.winfo_children()[1].invoke()
+            with mock.patch.object(router_data, 'change_priority_menu') as change:
+                panel.run.call_args.args[0]()
+            change.assert_called_once_with(add=None, remove=('codex', 'gpt-6-astra'))
 
 
 @pytest.mark.slow

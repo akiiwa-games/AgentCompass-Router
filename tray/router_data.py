@@ -1320,6 +1320,34 @@ def boost_targets() -> list[tuple[str, str]]:
     return seen
 
 
+def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, str] | None = None) -> str:
+    """Add or remove one (account, model) of the user's quick-priority menu (`priority_targets` of
+    accounts-override.json; the tray menu and the panel's one-click buttons show it). The first change starts from the
+    entries shown now, so the menu the user edits is the one they see."""
+    modules()
+    import account_fleet
+    accounts = account_fleet.load_accounts()
+    entries = [(t["account"], t["model"]) for t in router_priority.targets(accounts)]
+    if add is not None:
+        account, model = add
+        found = router_priority.targets(accounts, [{"account": account, "model": model}]) if model else []
+        if not found:
+            return _tr("不能加入快捷菜单：需要一个具体模型，且账号参与自动派发、模型已勾选、有按天或更长的额度窗口")
+        pair = (found[0]["account"], found[0]["model"])
+        if pair in entries:
+            return _tr("快捷菜单里已有 {0}").format(found[0]["label"])
+        entries.append(pair)
+        message = _tr("已加入快捷菜单：{0}").format(found[0]["label"])
+    elif remove is not None and tuple(remove) in entries:
+        entries.remove(tuple(remove))
+        message = _tr("已从快捷菜单移除")
+    else:
+        return _tr("快捷菜单没有变化")
+    _edit_preferences(lambda document: document.__setitem__(
+        "priority_targets", [{"account": account, "model": model} for account, model in entries]))
+    return message
+
+
 def add_boost(account: str, model: str | None, boost: float | None = None, hours: int = 6, stop_on_reset: bool = True,
               now: datetime | None = None) -> str:
     """A temporary priority rule in router-overrides.json; never stacks on an existing one for the same model."""

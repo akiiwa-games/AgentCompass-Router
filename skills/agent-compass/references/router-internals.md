@@ -108,7 +108,8 @@ The shipped template plus discovery is the whole fleet: accounts and second logi
 from discovery, plan capacity from the discovered plan through
 [`plan-templates.json`](plan-templates.json), and the calibrated scoring weights, route
 order and priority targets ship in `accounts.json`. Sparse `accounts-override.json`
-preferences (disabled bundles and harnesses, sign-in vetoes, scoring tweaks) apply after
+preferences (disabled bundles and harnesses, sign-in vetoes, scoring tweaks, the user's own
+`priority_targets` list, which replaces the shipped one whole) apply after
 discovery; its `scoring` merges key by key, so defaults it does not set still apply.
 There is no machine-local fleet document: a clean install reaches the same routing from
 discovery plus public data alone. Keep explanations in `~/.agent-compass/host-rules/*.md`.

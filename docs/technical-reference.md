@@ -309,7 +309,8 @@ The tray hosts local services for the agents on this machine: it installs each o
 
 ### Temporary Pre-Reset Priority
 
-Selecting a model in the **Pre-Reset Priority** submenu applies a `+0.35` score boost to that subscription's weekly window for up to 24 hours (`~/.agent-compass/router-overrides.json`):
+One click on a model in the **Pre-Reset Priority** submenu applies a `+0.35` score boost to that subscription's weekly window for up to 24 hours (`~/.agent-compass/router-overrides.json`); one more click on it cancels the boost:
+- The submenu and the one-click buttons of the panel's model page show the same menu. It is the user's own list once edited (model page, **Edit menu…**: add any model of an account in automatic routing that a window of a day or longer binds, remove an entry with its `×`), kept as `priority_targets` in `~/.agent-compass/accounts-override.json`; until then it is the list shipped in `accounts.json`. Another expected reset time than 24 hours is set in the same editor.
 - Requires a fresh usage reading no older than 15 minutes and remaining weekly quota above `safety_margin_pct` (`5%`).
 - Once the weekly window resets, the allocator latches `reset_confirmed_at` and retires the boost automatically, displaying a `Reset Confirmed` badge for 12 hours.
 

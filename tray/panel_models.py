@@ -45,7 +45,7 @@ class ModelsTab:
         quick = ttk.Frame(strip, style="Card.TFrame")
         quick.pack(side="left")
         self.fill_priority_buttons(quick, "Tiny.TButton", (0, 4), "+ ")
-        ttk.Button(strip, text=_tr("自定义…"), style="Small.TButton", command=self.open_boost_editor).pack(side="right")
+        ttk.Button(strip, text=_tr("编辑菜单…"), style="Small.TButton", command=self.open_boost_editor).pack(side="right")
         self.boost_chips = ttk.Frame(strip, style="Card.TFrame")
         self.boost_chips.pack(side="left", fill="x", expand=True, padx=(6, 4))
         box = theme.card(frame, padding=(12, 6), fill="both", expand=True, pady=(8, 0))
@@ -396,8 +396,10 @@ class ModelsTab:
         box = theme.card(frame, padding=14, fill="both", expand=True)
         quick = ttk.Frame(box, style="Card.TFrame")
         quick.pack(fill="x")
-        ttk.Label(quick, text=_tr("一键优先"), style="CardH3.TLabel").pack(side="left", padx=(0, 10))
-        self.fill_priority_buttons(quick, "Small.TButton", (0, 6))
+        ttk.Label(quick, text=_tr("快捷菜单"), style="CardH3.TLabel").pack(side="left", padx=(0, 10))
+        entries = ttk.Frame(quick, style="Card.TFrame")
+        entries.pack(side="left")
+        self.fill_priority_buttons(entries, "Small.TButton", (0, 6), removable=True)
         form = ttk.Frame(box, style="Card.TFrame")
         form.pack(fill="x", pady=(12, 10))
         ttk.Label(form, text=_tr("设定预期重置时间"), style="CardH3.TLabel").pack(side="left", padx=(0, 10))
@@ -407,6 +409,7 @@ class ModelsTab:
         self.boost_hours.set("6h")
         self.boost_hours.pack(side="left")
         ttk.Button(form, text=_tr("添加"), style="SmallAccent.TButton", command=self.add_boost).pack(side="left", padx=10)
+        ttk.Button(form, text=_tr("加入快捷菜单"), style="Small.TButton", command=self.add_menu_target).pack(side="left")
         ttk.Label(box, text=_tr("后重置 · 越近越优先，额度回升后自动撤销"), style="CardTiny.TLabel").pack(fill="x")
         bottom = ttk.Frame(box, style="Card.TFrame")
         bottom.pack(side="bottom", fill="x", pady=(8, 0))
@@ -455,8 +458,9 @@ class ModelsTab:
         if not self.boost_target.get() and self.boost_pairs:
             self.boost_target.current(0)
 
-    def fill_priority_buttons(self, frame, style, padx, prefix=""):
-        """One-click reset-priority buttons for the targets the router derives from this fleet."""
+    def fill_priority_buttons(self, frame, style, padx, prefix="", removable=False):
+        """One-click reset-priority buttons for the targets of the user's menu; `removable` adds the button that takes
+        a target out of the menu (the editor). Every frame filled here is filled again when the menu changes."""
         import account_fleet
         import router_priority
 
@@ -465,11 +469,36 @@ class ModelsTab:
             return router_priority.targets(account_fleet.load_accounts())
 
         def done(targets):
+            if not frame.winfo_exists():
+                return
+            for child in frame.winfo_children():
+                child.destroy()
             for target in targets or ():
+                pair = (target["account"], target["model"])
                 self.ttk.Button(frame, text=f"{prefix}{target['label']}", style=style,
-                                command=lambda a=target["account"], m=target["model"]: self.enable_priority(a, m)
-                                ).pack(side="left", padx=padx)
+                                command=lambda p=pair: self.enable_priority(*p)
+                                ).pack(side="left", padx=(padx[0], 0) if removable else padx)
+                if removable:
+                    self.ttk.Button(frame, text="×", style=style, width=2,
+                                    command=lambda p=pair: self.change_priority_menu(remove=p)
+                                    ).pack(side="left", padx=(0, padx[1]))
+        frames = self.__dict__.setdefault("priority_frames", [])
+        frames[:] = [item for item in frames if item[0].winfo_exists() and item[0] is not frame]
+        frames.append((frame, style, padx, prefix, removable))
         self.run(work, done)
+
+    def change_priority_menu(self, add=None, remove=None):
+        def refill():
+            for frame, style, padx, prefix, removable in list(getattr(self, "priority_frames", ())):
+                self.fill_priority_buttons(frame, style, padx, prefix, removable)
+        self.run(lambda: self.data_module().change_priority_menu(add=add, remove=remove), self.say(refill))
+
+    def add_menu_target(self):
+        index = self.boost_target.current()
+        if index < 0:
+            self.status.set(_tr("先选择账号 / 模型"))
+            return
+        self.change_priority_menu(add=self.boost_pairs[index])
 
     def enable_priority(self, account, model):
         import account_fleet

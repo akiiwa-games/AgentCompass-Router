@@ -100,6 +100,9 @@ def load_accounts(path=None, document=None, *, read_only=False):
         if user_doc is not None:
             if isinstance(user_doc.get('scoring'), dict):
                 accounts['scoring'] = accounts_override.merge(accounts['scoring'], user_doc['scoring'])
+            if isinstance(user_doc.get('priority_targets'), list):
+                # The user's own quick-priority menu (the tray's menu editor writes it) replaces the shipped one whole.
+                accounts['priority_targets'] = user_doc['priority_targets']
         provider_inventory.apply(accounts)
         if user_doc is not None:
             accounts_override.apply(accounts, user_doc)

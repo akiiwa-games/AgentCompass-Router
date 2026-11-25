@@ -409,22 +409,23 @@ def build_menu() -> Menu:
         icon.stop()
 
     def priority_menu():
-        # A model's submenu selects the expected reset deadline, not a fixed score.
+        # One click on a target of the user's menu turns its priority on (router_priority.DEFAULT_HOURS at most, ended
+        # by the reset) and one more click turns it off; another expected reset time is set in the panel.
         items = []
         for target in PRIORITY["targets"]:
-            durations = []
-            for hours in router_priority.DURATIONS:
-                action = {"kind": "enable", "hours": hours, **{k: target[k] for k in ("account", "model", "window")}}
-                durations.append(MenuItem(_tr('预计 {0} 小时后重置').format(hours),
-                                          run(lambda a=action: router_priority.perform(a))))
-            items.append(MenuItem(target["label"], Menu(*durations),
+            rule = target.get("rule")
+            action = ({"kind": "cancel", **rule} if rule else
+                      {"kind": "enable", **{k: target[k] for k in ("account", "model", "window")}})
+            items.append(MenuItem(target["label"], run(lambda a=action: router_priority.perform(a)),
                                   checked=lambda item, selected=target.get("selected", False): selected))
-        if PRIORITY["entries"]:
+        # A rule no target of the menu stands for (set in the panel or by the CLI) is cancelled by its own entry.
+        toggled = {target["rule"]["id"] for target in PRIORITY["targets"] if target.get("rule")}
+        others = [entry for entry in PRIORITY["entries"] if entry["id"] not in toggled]
+        if others and items:
             items.append(Menu.SEPARATOR)
-        for entry in PRIORITY["entries"]:
+        for entry in others:
             action = {"kind": "cancel", "id": entry["id"], "revision": entry["revision"]}
-            label = _tr("取消优先") if len(PRIORITY["entries"]) == 1 else _tr('取消 {0}').format(f"{entry['label']}")
-            items.append(MenuItem(label, run(lambda a=action: router_priority.perform(a))))
+            items.append(MenuItem(_tr('取消 {0}').format(f"{entry['label']}"), run(lambda a=action: router_priority.perform(a))))
         return Menu(*items)
 
     def plugin_item(plugin):

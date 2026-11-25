@@ -19,7 +19,8 @@ import uuid
 DURATIONS = (1, 3, 6, 12, 24)
 BOOST = 0.35
 INTENT = 'tray:anticipated-reset'
-# Quick reset-priority targets: the fleet document's `priority_targets` ([{account, model, label?}]).
+# Quick reset-priority targets: the fleet document's `priority_targets` ([{account, model, label?}]): the user's own
+# menu once they edited it (accounts-override.json, written by router_data.change_priority_menu), else the shipped one.
 DEFAULT_HOURS = 24
 RESET_BADGE_HOURS = 12
 
@@ -155,8 +156,9 @@ def _weekly_window(accounts, account, model, bundle=None):
     return max(windows, key=lambda w: w[1]['hours'])[0] if windows else None
 
 
-def targets(accounts):
-    """The configured targets with an enabled bundle. A target's model matches over every bundle existing on that
+def targets(accounts, configured=None):
+    """The configured targets with an enabled bundle (`configured`: another list read the same way, default the fleet
+    document's `priority_targets`). A target's model matches over every bundle existing on that
     account first (account_fleet.pin_pool -> pin_matching_bundles), before filtering to enabled launchable bundles: a
     bare target names every bundle of its row on the account, while a prefixed target obeys its prefix and never
     re-targets onto another provider's same-leaf bundle."""
@@ -164,7 +166,8 @@ def targets(accounts):
     import host_policy
     import model_resolution
     policy = host_policy.load_policy()
-    configured = [t for t in accounts.get('priority_targets') or () if isinstance(t, dict)]
+    configured = [t for t in (accounts.get('priority_targets') if configured is None else configured) or ()
+                  if isinstance(t, dict)]
     pairs = []
     for target in configured:
         account, wanted = target.get('account'), target.get('model')
@@ -193,6 +196,14 @@ def targets(accounts):
         if labels.count(t['label']) > 1:
             t['label'] = f"{t['label']} · {account_label(t['account'])}"
     return result
+
+
+def menu_choices(accounts):
+    """Everything the user's menu may hold: each model of an enabled launchable bundle that `targets` would offer (an
+    account in automatic routing, a window of a day or longer), in fleet order."""
+    import model_resolution
+    return targets(accounts, [{'account': b['account'], 'model': b['model']} for b in _candidates(accounts)
+                              if model_resolution.model_pin_problem(b['model']) is None])
 
 
 def baseline(accounts, usage, target, now):
@@ -343,7 +354,10 @@ def snapshot(now=None):
     choices = targets(accounts)
     for t in choices:
         key = account_fleet.stored_model(t['model'], accounts, t['account'])
-        t['selected'] = any(overlaps(r, t['account'], key, now, accounts) for r in rows)
+        rule = next((r for r in rows if overlaps(r, t['account'], key, now, accounts)), None)
+        t['selected'] = rule is not None
+        if rule is not None:
+            t['rule'] = {'id': rule['id'], 'revision': revision(rule)}     # what one more click on the target cancels
     last = doc.get('last_reset') or {}
     reset_at = quota_pools.parse_time(last.get('at')) if isinstance(last, dict) else None
     recent = reset_at is not None and timedelta(0) <= now-reset_at < timedelta(hours=RESET_BADGE_HOURS)

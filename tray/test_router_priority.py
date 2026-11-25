@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import router_data
 import router_priority as priority
 from router_test_support import isolated_router_state
 
@@ -166,6 +167,38 @@ class PriorityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.enable()
             self.assertEqual(self.path.read_text(), value)
+
+    def test_the_menu_is_the_users_list_and_a_selected_target_names_the_rule_one_more_click_cancels(self):
+        """The user's `priority_targets` (accounts-override.json) replaces the shipped menu whole; `menu_choices` is
+        what it may hold; `change_priority_menu` starts from the entries shown and refuses what `targets` would not
+        offer."""
+        accounts = account_fleet.load_accounts()
+        shipped = [(t['account'], t['model']) for t in priority.targets(accounts)]
+        choices = [(t['account'], t['model']) for t in priority.menu_choices(accounts)]
+        self.assertTrue(shipped and set(shipped) <= set(choices), (shipped, choices))
+        added = next(pair for pair in choices if pair not in shipped)
+        with patch.object(router_data, '_edit_preferences') as written:
+            router_data.change_priority_menu(add=added)
+            document = {}
+            written.call_args.args[0](document)
+            self.assertEqual(document['priority_targets'],
+                             [{'account': a, 'model': m} for a, m in [*shipped, added]])
+            written.reset_mock()
+            router_data.change_priority_menu(add=('codex', None))          # an account without a model is no target
+            router_data.change_priority_menu(add=('no-such-account', 'gpt-6-astra'))
+            router_data.change_priority_menu(remove=added)                 # not in the menu shown
+            written.assert_not_called()
+            router_data.change_priority_menu(remove=shipped[0])
+            written.call_args.args[0](document)
+            self.assertEqual(document['priority_targets'], [{'account': a, 'model': m} for a, m in shipped[1:]])
+        # The list as load_accounts hands it on: the user's, whole.
+        mine = {'schema_version': 2, 'priority_targets': [{'account': added[0], 'model': added[1]}]}
+        with patch.object(account_fleet.accounts_override, 'load_override', return_value=mine):
+            self.assertEqual([(t['account'], t['model']) for t in priority.targets(account_fleet.load_accounts())], [added])
+        self.enable()
+        chosen = next(t for t in priority.snapshot(self.now)['targets'] if t['selected'])
+        row = self.rows()[0]
+        self.assertEqual(chosen['rule'], {'id': row['id'], 'revision': priority.revision(row)})
 
     def test_only_top_models_and_weekly_windows_are_offered(self):
         with patch.object(host_policy, 'load_policy', return_value=None):

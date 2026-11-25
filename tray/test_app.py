@@ -244,28 +244,30 @@ class MenuTests(TrayTestCase):
         probe.assert_not_called()
         cli.assert_not_called()
 
-    def test_priority_menu_selects_model_and_expected_reset_duration(self):
+    def test_one_click_on_a_menu_target_turns_its_priority_on_and_one_more_turns_it_off(self):
+        rule = {'id': 'rule-a', 'revision': 'revision-a'}
         app.PRIORITY = {'label': '优先中：Astra', 'entries': [
-            {'label': 'Astra', 'id': 'rule-a', 'revision': 'revision-a'}],
+            {'label': 'Astra', **rule}, {'label': 'Sol', 'id': 'rule-cli', 'revision': 'revision-cli'}],
             'targets': [
-                {'account': a, 'model': m, 'window': 'usage', 'label': label, 'selected': label == 'Astra'}
+                {'account': a, 'model': m, 'window': 'usage', 'label': label, 'selected': label == 'Astra',
+                 **({'rule': rule} if label == 'Astra' else {})}
                 for a, m, label in (('codex', 'gpt-6-astra', 'Astra'), ('antigravity', 'gemini-4-argon-high', 'Argon'),
                                     ('claude', 'claude-opus-5-5', 'Opus 5.5'))]}
         with mock.patch.object(app.router_priority, 'snapshot', side_effect=AssertionError('UI must not read files')):
             menu = app.build_menu().items[1].submenu
             items = [i for i in menu.items if i.text != app.Menu.SEPARATOR.text]
-            self.assertEqual([i.text for i in items], ['Astra', 'Argon', 'Opus 5.5', '取消优先'])
-            self.assertTrue(all(i.submenu is not None and i.enabled for i in items[:-1]))
-            self.assertIsNone(items[-1].submenu)
-            self.assertTrue(items[0].checked)
+            # The targets of the menu, then only the rule no target stands for.
+            self.assertEqual([i.text for i in items], ['Astra', 'Argon', 'Opus 5.5', '取消 Sol'])
+            self.assertTrue(all(i.submenu is None and i.enabled for i in items))
+            self.assertEqual([bool(i.checked) for i in items[:3]], [True, False, False])
             with mock.patch.object(app, 'act') as act, mock.patch.object(app.router_priority, 'perform') as perform:
-                items[-1](mock.Mock()); act.call_args.args[1]()
-                self.assertEqual(perform.call_args.args[0], {'kind': 'cancel', 'id': 'rule-a', 'revision': 'revision-a'})
-                for item, target in zip(items, app.PRIORITY['targets']):
-                    # A click on a duration must retain this target's identity.
-                    item.submenu.items[1](mock.Mock()); act.call_args.args[1]()
-                    self.assertEqual(perform.call_args.args[0], {'kind': 'enable', 'hours': 3,
-                        **{k: target[k] for k in ('account', 'model', 'window')}})
+                wanted = [{'kind': 'cancel', **rule},
+                          *({'kind': 'enable', **{k: t[k] for k in ('account', 'model', 'window')}}
+                            for t in app.PRIORITY['targets'][1:]),
+                          {'kind': 'cancel', 'id': 'rule-cli', 'revision': 'revision-cli'}]
+                for item, action in zip(items, wanted):
+                    item(mock.Mock()); act.call_args.args[1]()
+                    self.assertEqual(perform.call_args.args[0], action)
 
     def test_priority_refresh_sees_router_removal_without_changing_service_state(self):
         icon = mock.Mock(); services_before = dict(app.STATE)
