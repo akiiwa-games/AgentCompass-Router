@@ -888,6 +888,9 @@ def plan_task(task, args, unavailable=None):
             provider_retry.ingest()
         except Exception:  # noqa: BLE001 - a hold that cannot be recorded now is recorded by the next observation
             pass
+        import usage_collector
+        # Before `now`, so that the snapshot judges a row collected here by a later time than its own.
+        usage_collector.recollect_earlier_shape(usage_reading.cache_paths(args.usage_cache)[0])
     now = datetime.now(timezone.utc)
     usage = usage_reading.usage_snapshot(args.usage_cache, None, now)
     unavailable = list(unavailable) if isinstance(unavailable, (list, tuple)) else []

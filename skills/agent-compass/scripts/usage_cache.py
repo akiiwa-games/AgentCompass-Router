@@ -110,6 +110,19 @@ def providers(home=None, environ=None):
     return document['providers'] if document else {}
 
 
+def earlier_shape(row):
+    """True for a cached provider row that routing cannot use because an earlier version wrote it: a pooled window
+    without its members' own windows. Such a row is collected again (derived state is never converted)."""
+    windows = row.get('windows') if isinstance(row, dict) else None
+    for window in windows if isinstance(windows, list) else []:
+        count = window.get('accounts') if isinstance(window, dict) else None
+        if isinstance(count, int) and count > 1:
+            members = window.get('members')
+            if not (isinstance(members, list) and any(isinstance(m, dict) for m in members)):
+                return True
+    return False
+
+
 def poll_max_age(poll, now, default):
     """Freshness limit for one account: its published cadence plus grace, while that decision is itself recent."""
     if not isinstance(poll, dict):
