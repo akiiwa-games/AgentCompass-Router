@@ -1115,7 +1115,7 @@ def paseo(args, out, decision, task, text, parent, usage, judge=None):
               'do not sleep or poll (paseo ls, get_agent_status, or result files) in a shell command. '
               'The bounded watcher PID, deadline and durable receipt are in worker.completion_notification. '
               'Use worker.continuation_argv to recover observation if that watcher stops.') \
-        if notification.get('status') == 'watching' else \
+        if dispatch_flow.notice_promised(notification) == 'watching' else \
         ('The completion notification has been delivered to the parent; read that notification instead of waiting or polling.'
          if notification.get('status') == 'delivered' else
          'No active completion notification is confirmed. The caller must collect the result using '
@@ -1161,7 +1161,7 @@ def fallback_result(out, outcome, decision, parent, args):
                 ensured = dispatch_flow.ensure_watcher(relaunch_row)
                 if ensured:
                     worker['completion_notification'] = ensured
-            watched = dispatch_flow.watcher_confirmed(ensured, dispatch_id)
+            watched = dispatch_flow.watcher_carries(ensured, dispatch_id)
             worker['watcher_confirmed'] = watched
             if not watched:
                 worker['next_action'] = dispatch_flow.unwatched_pending_next(worker, row=relaunch_row) or (
@@ -1179,7 +1179,7 @@ def fallback_result(out, outcome, decision, parent, args):
                         caller_action='wait_for_notification' if watched else 'run_next_argv',
                         next=worker.get('next_action') or default_relaunch_next, worker=worker), 0
         notification = receipt.get('completion_notification') or {}
-        notif_status = notification.get('status')
+        notif_status = dispatch_flow.notice_promised(notification)
         if notif_status == 'watching':
             notif_text = ('A completion notification will be sent to the parent; finish any independent work and '
                           'end your turn to wait for it instead of sleeping or polling in a shell command.')
@@ -1225,7 +1225,7 @@ def fallback_result(out, outcome, decision, parent, args):
                 watch_row = None
             if watch_row is not None:
                 ensured = dispatch_flow.ensure_watcher(watch_row, retry_at=retry_at if scheduled else None)
-        watched = dispatch_flow.watcher_confirmed(ensured, watch_id)
+        watched = dispatch_flow.watcher_carries(ensured, watch_id)
         watch_sec = dispatch_flow.continuation_watch_seconds(retry_at if scheduled else None)
         text = ((dispatch_flow.FALLBACK_SCHEDULED_NEXT.format(retry_at=retry_at) if scheduled
                  else dispatch_flow.FALLBACK_RUNNING_NEXT.format(where='its watcher is starting the next attempt'))
@@ -1488,7 +1488,7 @@ def launched_next(result, worker, argv):
             return (f"Worker is running as PID {worker.get('pid')} and nothing calls back: watch worker_output until it exits, "
                     'or stop it before you finish.')
         return 'Worker finished; read worker_output.' if exit_code == 0 else f'Worker exited with code {exit_code}; read worker_output and worker_stderr.'
-    notif_status = (worker.get('completion_notification') or {}).get('status')
+    notif_status = dispatch_flow.notice_promised(worker.get('completion_notification'))
     if notif_status == 'watching':
         return ('Worker launched; do not launch another. Its completion arrives as a notification: '
                 'finish any independent work and end your turn to wait for it; do not sleep or poll '
@@ -1829,7 +1829,7 @@ def _run(args, judge):
                 retry_at = fb.get('retry_at') if fb.get('state') == 'retrying' else None
                 watch_row = registry.inspect(fb['retry_of']) if retry_at and fb.get('retry_of') else current_row
                 notification = dispatch_flow.ensure_watcher(watch_row, retry_at=retry_at)
-                watched = dispatch_flow.watcher_confirmed(notification, watch_row['dispatch_id'])
+                watched = dispatch_flow.watcher_carries(notification, watch_row['dispatch_id'])
                 pub = dispatch_flow.public_chain(row)
                 pub['watcher_confirmed'] = watched
                 if notification:

@@ -42,6 +42,10 @@ def fresh_reference_set():
 def no_real_state_or_processes(request, monkeypatch):
     for name in WORKER_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+    flow = sys.modules.get('dispatch_flow')
+    if hasattr(flow, 'command_job_ends_children'):
+        # The job the test runner sits in is the machine's, not the test's (and with it the developer's own tray).
+        monkeypatch.setattr(flow, 'command_job_ends_children', lambda: False)
     hermetic_run.CURRENT['test'] = request.node.nodeid
     before = len(VIOLATIONS)
     yield

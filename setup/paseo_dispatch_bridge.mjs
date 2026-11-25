@@ -316,6 +316,8 @@ function noticeMessageId(dispatchId, key, attempt = 0) {
 // new message id. The SDK raises it as a plain Error whose message is the daemon's error token, matched whole.
 const OUTCOME_UNKNOWN = 'agent_request_outcome_unknown';
 const outcomeUnknown = error => error?.message === OUTCOME_UNKNOWN;
+// The classes of a failed send (`hostFailureClass`) that do not say whether the daemon took the message.
+const SEND_OUTCOME_UNKNOWN = new Set(['timeout', 'connection_lost', 'invalid_response']);
 const TIMELINE_PAGE = 200;
 // After Paseo answers that an id's outcome is unknown and the parent's timeline does not hold the notice, the next id is
 // derived no sooner than this after the previous one was first sent: 15 minutes after id 0, 60 after id 1. A parent whose
@@ -1639,6 +1641,11 @@ export async function execute(client, input, notify = ensureNotification) {
               agent: project({...after, labels: {...(after.labels ?? {}), ...mergedLabels}}),
               completion_notification};
           }
+          // Only the daemon's own answer says the turn was refused. A request that timed out, a connection that dropped,
+          // an answer that could not be read, or Paseo's "outcome unknown" leaves a turn the daemon can still take: the
+          // worker stays bound to this dispatch and its watcher settles it, so nothing is created beside it.
+          if (outcomeUnknown(error) || SEND_OUTCOME_UNKNOWN.has(hostFailureClass(error, true)))
+            return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification};
           try { await client.updateAgent(input.agent_id, {name: existing.title, labels}); }
           catch { return {ok: false, sent: true, error: 'resume_outcome_uncertain_reconcile_by_agent', completion_notification}; }
         }

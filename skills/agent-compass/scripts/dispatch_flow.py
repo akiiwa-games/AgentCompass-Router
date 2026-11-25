@@ -443,6 +443,77 @@ def watcher_confirmed(receipt, dispatch_id=None):
     return registry.process_started(pid) is not None
 
 
+# The name the tray holds while it runs (tray/app.pyw `single_instance`).
+TRAY_MUTEX = 'Local\\AgentCompassTray'
+_JOB_KILL_ON_CLOSE, _JOB_SILENT_BREAKAWAY = 0x2000, 0x1000
+
+
+def command_job_ends_children():
+    """True when this command runs in a Windows job that kills its processes when it closes and lets none leave it.
+    A host that ends such a job with the command (Antigravity, measured 2026-11-21) ends the detached watcher too. Read
+    from the job this process is in (the innermost one); a job whose limits cannot be read counts as one that kills."""
+    if os.name != 'nt':
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):   # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong), ('flags', wintypes.DWORD),
+                    ('min_working_set', ctypes.c_size_t), ('max_working_set', ctypes.c_size_t),
+                    ('active_processes', wintypes.DWORD), ('affinity', ctypes.c_size_t),
+                    ('priority', wintypes.DWORD), ('scheduling', wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                                 ctypes.c_void_p]
+    inside = wintypes.BOOL()
+    if not kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, ctypes.byref(inside)) or not inside.value:
+        return False
+    limits = BasicLimits()
+    if not kernel.QueryInformationJobObject(None, 2, ctypes.byref(limits), ctypes.sizeof(limits), None):
+        return True
+    return bool(limits.flags & _JOB_KILL_ON_CLOSE) and not limits.flags & _JOB_SILENT_BREAKAWAY
+
+
+def tray_running():
+    """True when a tray of this logon session holds its single-instance mutex: its periodic pass restarts a watcher
+    that a host ended (`dispatch --dispatch-action reconcile --carry-fallback`)."""
+    if os.name != 'nt':
+        return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.OpenMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenMutexW(0x00100000, False, TRAY_MUTEX)   # SYNCHRONIZE
+    if not handle:
+        return False
+    kernel.CloseHandle(handle)
+    return True
+
+
+def watcher_outlives_command():
+    """True when a watcher this command started, or one that replaces it, runs after the command returns: the host
+    leaves the command's processes alone, or it ends them and the tray is running, whose pass restarts the watcher."""
+    return not command_job_ends_children() or tray_running()
+
+
+def watcher_carries(receipt, dispatch_id=None):
+    """True when something acts on this dispatch after this command returns: its `--watch` process runs now
+    (`watcher_confirmed`) and `watcher_outlives_command`. The one condition of `wait_for_notification`."""
+    return watcher_confirmed(receipt, dispatch_id) and watcher_outlives_command()
+
+
+def notice_promised(notification):
+    """The watcher's status for an answer about a launched worker: `watching` only while `watcher_outlives_command`,
+    so the answer promises a notification only when something will send it."""
+    status = (notification or {}).get('status')
+    return None if status == 'watching' and not watcher_outlives_command() else status
+
+
 def continuation_watch_seconds(retry_at=None, now=None):
     """Watch window for `continuation_argv`: 120 s by default, or `wait + 121` s (capped at 86400 s) when a scheduled
     retry must first wait out `retry_at`."""
@@ -1032,7 +1103,7 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
             ensured = ensure_watcher(row, host=host)
             if ensured:
                 notification = result['completion_notification'] = ensured
-        watched = watcher_confirmed(ensured, row['dispatch_id'])
+        watched = watcher_carries(ensured, row['dispatch_id'])
         result['watcher_confirmed'] = watched
         if observe_error:
             # The host could not be read; says nothing about the worker. A create the host has not finished is `creating`.
@@ -1063,7 +1134,7 @@ def launch(dispatch_id, parent_id, host=None, watch_seconds=3600, poll_seconds=5
         retry_at = fb_end.get('retry_at') if fb_end.get('state') == 'retrying' else None
         watch_id = fb_end.get('retry_of') if retry_at and fb_end.get('retry_of') else dispatch_id
         ensured = ensure_watcher(registry.inspect(watch_id, path), host=host, retry_at=retry_at)
-        watched = watcher_confirmed(ensured, watch_id)
+        watched = watcher_carries(ensured, watch_id)
         result['watcher_confirmed'] = watched
         if ensured:
             result['completion_notification'] = ensured

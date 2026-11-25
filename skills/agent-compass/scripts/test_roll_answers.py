@@ -539,6 +539,52 @@ class PendingNamesWhatIsKnown(Plain):
         self.assertIn('run next_argv', res['next_action'].lower())
         self.assertNotIn('cause', res)
 
+    def test_wait_is_answered_only_when_a_watcher_outlives_the_command(self):
+        """Rule: where the host ends the command's processes with it (`command_job_ends_children`), a watcher running
+        now is not one that will act. The answer promises the notification only when the tray runs, whose pass
+        restarts the watcher; otherwise it is the foreground `next_argv`."""
+        live = {'status': 'watching', 'pid': os.getpid()}
+        answers = {}
+        for tray in (False, True):
+            self.setUp()
+            with patch.object(flow, 'ensure_watcher', return_value=live), \
+                    patch.object(flow, 'command_job_ends_children', return_value=True), \
+                    patch.object(flow, 'tray_running', return_value=tray):
+                res, _ = self.run_roll(host=self.host_answering(bridge_answer('host_timeout')), task_id=f't-job-{tray}')
+                answers[tray] = (res.get('caller_action'), flow.notice_promised(live))
+        self.assertEqual(answers, {False: ('run_next_argv', None), True: ('wait_for_notification', 'watching')})
+        # The name asked for is the one the tray holds.
+        tray_source = (Path(__file__).resolve().parents[3] / 'tray' / 'app.pyw').read_text(encoding='utf-8')
+        self.assertIn(json.dumps(flow.TRAY_MUTEX), tray_source)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows job objects')
+    def test_the_job_fact_is_read_from_the_job_the_command_runs_in(self):
+        """`command_job_ends_children` is true inside a kill-on-close job and false inside a job without that limit."""
+        import ctypes
+        import subprocess
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        script = ('import sys; sys.stdin.readline(); sys.path.insert(0, sys.argv[1]); import dispatch_flow; '
+                  'print(dispatch_flow.command_job_ends_children())')
+        read = {}
+        for flags in (0x2000, 0):
+            limits = (ctypes.c_byte * 144)()   # JOBOBJECT_EXTENDED_LIMIT_INFORMATION; LimitFlags is the DWORD at 16
+            ctypes.cast(limits, ctypes.POINTER(wintypes.DWORD))[4] = flags
+            job = kernel.CreateJobObjectW(None, None)
+            self.addCleanup(kernel.CloseHandle, job)
+            self.assertTrue(kernel.SetInformationJobObject(job, 9, limits, ctypes.sizeof(limits)))
+            child = subprocess.Popen([sys.executable, '-c', script, str(Path(__file__).resolve().parent)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(child.kill)
+            self.assertTrue(kernel.AssignProcessToJobObject(job, wintypes.HANDLE(int(child._handle))))
+            read[flags] = child.communicate('go\n', timeout=60)[0].strip()   # it reads only once it is in the job
+        self.assertEqual(read, {0x2000: 'True', 0: 'False'})
+
     def test_pending_answers_wait_for_notification_only_when_ensure_watcher_confirms_running_pid_else_next_argv_finishes(self):
         """Rule C: `roll` answers `wait_for_notification` only when `ensure_watcher` returns a receipt naming a running
         `--watch` process; when `ensure_watcher` returns `None` or a dead PID, `roll` answers `run_next_argv` and running

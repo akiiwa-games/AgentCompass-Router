@@ -1718,7 +1718,6 @@ test('a refused send after the relabel carries the class of the failure and no t
   process.env.ROUTER_STATE_DIR = stateDir;
   try {
     for (const [thrown, expected] of [
-      [Object.assign(new Error(canary), {name: 'DaemonConnectionError', code: 'DAEMON_REQUEST_TIMEOUT'}), 'timeout'],
       [Object.assign(new Error(canary), {name: 'DaemonRpcError'}), 'daemon_error'],
       [new TypeError(canary), 'bridge_error'],
     ]) {
@@ -1735,6 +1734,26 @@ test('a refused send after the relabel carries the class of the failure and no t
   } finally {
     if (previous === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = previous;
     fs.rmSync(stateDir, {recursive: true, force: true});
+  }
+});
+
+test('a resume send whose outcome is not known keeps the worker bound and is not reported as refused', async () => {
+  // The daemon can take the turn after the request timed out or the connection dropped. Reporting `sent: false` lets
+  // the router create a second worker beside a worker that then runs the same brief.
+  for (const thrown of [
+    Object.assign(new Error('x'), {name: 'DaemonConnectionError', code: 'DAEMON_REQUEST_TIMEOUT'}),
+    Object.assign(new Error('x'), {name: 'DaemonConnectionError', code: 'DAEMON_CONNECTION_LOST'}),
+    new Error('agent_request_outcome_unknown'),
+  ]) {
+    const updates = [];
+    const client = {
+      fetchAgent: async id => ({agent: id === 'parent' ? {cwd: '/fixture'} : resumable}),   // the turn is not shown yet
+      updateAgent: async (id, patch) => { updates.push(patch.labels['router.dispatch_id']); },
+      sendMessage: async () => { throw thrown; },
+    };
+    const result = await execute(client, resumeInput, notifier);
+    assert.deepEqual([result.ok, result.sent, result.error], [false, true, 'resume_outcome_uncertain_reconcile_by_agent']);
+    assert.deepEqual(updates, ['cond-new']);   // bound to this dispatch, and not rolled back to the old one
   }
 });
 
