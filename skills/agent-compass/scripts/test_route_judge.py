@@ -845,6 +845,10 @@ class SystemOneScorerTests(unittest.TestCase):
                                           stdout=self.envelope(estimate))
             self.assertNotIn('hours_estimate', explicit)
             self.assertEqual(explicit['decision']['task']['hours'], 0.25)
+            # A plan that gives no hours asks the classifier for them, as roll does: the caller writes no mark.
+            code, unmarked, _ = self.run_cli(directory, 'plan', {'objective': task['objective'], 'expected_hours': None},
+                                             stdout=self.envelope(estimate))
+            self.assertEqual((code, unmarked['hours_estimate']), (0, {'hours': 3.0, 'source': 'classifier_estimate'}))
         for bad in ({'expected_hours': 'x'}, {'expected_hours': True}):
             with self.assertRaises(ValueError):
                 task_intake.validate_profile(dict(base, **bad))

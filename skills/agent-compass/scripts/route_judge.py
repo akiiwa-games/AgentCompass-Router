@@ -996,6 +996,14 @@ def plan_task(task, args, unavailable=None):
     return result, 0 if result.get('choice') != 'none' else 2
 
 
+def _classifies(task, args):
+    """Whether this run asks the classifier about `task` (plan_task's own condition, before it reads the fleet)."""
+    return not getattr(args, 'no_score', False) and bool(
+        getattr(args, 'score', False) or task.get('auto_score')
+        or (not getattr(args, 'dry_run', False) and (task.get('objective') or '').strip()
+            and not isinstance(task.get('profile'), dict)))
+
+
 def _plan_input_task(document, args):
     """The document's task with --hours and --can-wait-hours applied where it gives none; it must carry its hours unless
     the classifier is to estimate them."""
@@ -1014,6 +1022,9 @@ def _plan_input_task(document, args):
             raise ValueError('--can-wait-hours must be a non-negative number of hours.')
         task = {**task, 'can_wait_hours': float(cwh)}
     hours = task.get('expected_hours')
+    if hours is None and getattr(args, 'stage', None) == 'plan' and _classifies(task, args):
+        # As roll does (roll.build_task): no hours given, so the allocator budgets the classifier's own estimate.
+        task = {**task, 'hours_source': 'classifier_estimate'}
     if hours is None and task.get('hours_source') == 'classifier_estimate':
         pass  # The allocator budgets the classification's own expected_hours; roll reports it.
     elif not (isinstance(hours, (int, float)) and not isinstance(hours, bool) and math.isfinite(hours) and hours > 0):
