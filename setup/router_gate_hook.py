@@ -6,19 +6,23 @@ Dispatch-labelled Paseo launches consume a task-bound, one-use durable claim.
 Native sub-agent launches pass only on one of two writer facts:
 1. an unconsumed `status: native` hand-over recorded by `roll` in `dispatch_registry`;
 2. a recent standalone `record` row of this session in `router-ledger.jsonl`.
-A `plan` row authorizes Paseo schedule creation/re-targeting (`create_schedule` / `update_schedule`), never a worker launch.
+A Paseo schedule (`create_schedule`, a re-targeting `update_schedule`) is routed by the gate itself: it plans the
+schedule's prompt and answers with the provider and model to create it with. A `plan` row never authorizes a worker launch.
 """
 from __future__ import annotations
 
 import ast
 import datetime as dt
+import hashlib
 import importlib
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import sqlite3
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -67,6 +71,19 @@ def attempt(check: str, call, default):
 def unevaluated_notice() -> str:
     return ("[Router Gate] Allowed without checking: " + "; ".join(UNEVALUATED)
             + ". The call was not judged on these; nothing was blocked because of them.") if UNEVALUATED else ""
+
+
+# What the gate fills into the call it allows, under the call's own argument names (`format_response`). Only a host
+# whose hook may change a call's arguments without also deciding its permission takes it:
+#   antigravity  `overwrite`: "Replacement arguments merged (shallow top-level merge) into toolCall.args before
+#                execution" beside any decision (antigravity.google/docs/hooks, PreToolUse)
+#   pi           a `tool_call` handler may mutate `event.input` in place (pi docs, extensions.md), which the generated
+#                extension does with this answer's `input` (sync_host_globals.PI_ROUTER_GATE_TS)
+# Claude Code and Codex take `updatedInput` together with `permissionDecision: "allow"`, which also skips the host's own
+# permission prompt (code.claude.com/docs/en/hooks, PreToolUse decision control); the gate decides no permission, so
+# there the same values go back as a refusal the caller repeats the call with (`fill_reason`).
+REWRITE: dict = {}
+REWRITING_HARNESSES = frozenset({"antigravity", "pi"})
 DEFAULT_PASEO_AGENTS = HOME / ".paseo" / "agents"
 DEFAULT_WINDOW_SECONDS = 900  # 15 minutes
 
@@ -318,7 +335,14 @@ def normalize_launch(spec: dict) -> dict[str, str]:
 
 
 # `paseo schedule create|update` options that name the launch, as the MCP tools' argument keys normalize_launch reads.
-PASEO_SCHEDULE_OPTIONS = {"--provider": "provider", "--model": "model", "--thinking": "thinkingOptionId", "--mode": "mode"}
+PASEO_SCHEDULE_OPTIONS = {"--provider": "provider", "--model": "model", "--thinking": "thinkingOptionId", "--mode": "mode",
+                          "--prompt": "prompt", "--cwd": "cwd"}
+# Every option of `paseo schedule create|update` that takes a value (`--help`, paseo 0.17), so the one word left is the
+# command's argument: the prompt of a create, the id of an update.
+PASEO_SCHEDULE_VALUE_OPTIONS = frozenset({
+    "--every", "--cron", "--timezone", "--name", "--provider", "--model", "--mode", "--thinking", "--cwd", "--prompt",
+    "--max-runs", "--expires-in", "--host", "--home", "-o", "--format"})
+PASEO_SCHEDULE_ARGUMENT = {"create_schedule": "prompt", "update_schedule": "id"}
 ORCA_LAUNCH_OPTIONS = {
     "--agent": "provider", "-a": "provider", "--provider": "provider",
     "--model": "model", "-m": "model",
@@ -717,6 +741,23 @@ def cli_flag_options(words: list, mapping: dict[str, str]) -> dict[str, str]:
     return options
 
 
+def paseo_schedule_args(tool: str, words: list) -> dict[str, str]:
+    """A `paseo schedule create|update` command as the arguments of the MCP tool it is: its launch options, and its one
+    argument when that is a literal."""
+    args = cli_flag_options(words, PASEO_SCHEDULE_OPTIONS)
+    argument, skip = None, False
+    for word in words:
+        if skip:
+            skip = False
+        elif isinstance(word, str) and word.startswith("-"):
+            skip = word in PASEO_SCHEDULE_VALUE_OPTIONS
+        elif argument is None:
+            argument = word
+    if isinstance(argument, str) and argument:
+        args.setdefault(PASEO_SCHEDULE_ARGUMENT[tool], argument)
+    return args
+
+
 def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
     """Normalize the static Paseo CLI sends, schedule launches and worker launchers a call runs; never execute it.
 
@@ -824,7 +865,7 @@ def cli_turn_calls(tool_name: str, tool_input: dict) -> list[tuple[str, dict]]:
         path, rest = parsed
         if path in PASEO_SCHEDULE_COMMANDS:
             # Same launch as MCP create_schedule / update_schedule: the provider settings become its arguments.
-            targets.append((PASEO_SCHEDULE_COMMANDS[path], cli_flag_options(rest, PASEO_SCHEDULE_OPTIONS)))
+            targets.append((PASEO_SCHEDULE_COMMANDS[path], paseo_schedule_args(PASEO_SCHEDULE_COMMANDS[path], rest)))
         elif path in PASEO_LAUNCH_COMMANDS:
             launch("paseo agent create")
         elif path in (('send',), ('agent', 'send')):
@@ -1438,7 +1479,8 @@ def recent_routes(
     now: dt.datetime | None = None,
     window_seconds: int = DEFAULT_WINDOW_SECONDS,
 ) -> list[dict]:
-    """Read recent decisions newest first, bounded to the ledger's last 1 MiB (plan lines carry a decision snapshot)."""
+    """Read recent decisions newest first, bounded to the ledger's last 1 MiB (plan lines carry a decision snapshot):
+    the rows that carry a route, and the Workflow records, which name none (check_workflow_record)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     if not ledger_path.is_file():
         return []
@@ -1457,7 +1499,8 @@ def recent_routes(
             row = json.loads(line)
         except ValueError:
             continue
-        if carries_route(row) and (at := parse_ts(row.get("at"))) is not None:
+        if ((carries_route(row) or (isinstance(row, dict) and row.get("trigger") == "workflow"))
+                and (at := parse_ts(row.get("at"))) is not None):
             if -60 <= (now - at).total_seconds() <= window_seconds:
                 rows.append(row)
     return rows
@@ -1748,22 +1791,140 @@ def workflow_deny_reason(cause: str) -> str:
         f"[Router Gate] 拦截未授权的 Workflow 启动 (tool:Workflow)：{cause}。"
         "Workflow 的脚本会在运行时内部启动多个子 agent，roll 不适用（roll 会立即启动一个普通 worker，替换掉 workflow）。"
         "只有用户在本次请求中明确要求用 workflow 时才可调用：在本会话中先运行\n"
-        f"  {ROUTER_CMD} record --constraint user_override --trigger workflow --provider <p> --account <a> "
-        "--model <本会话模型> --effort <e> --basis \"<用户要求 workflow 的原话>\"\n"
+        f"  {ROUTER_CMD} record --trigger workflow --basis \"<用户要求 workflow 的原话>\"\n"
         "再重试（15 分钟内有效，只授权本会话的 Workflow）。用户没有要求 workflow 时不要调用：自己做，或用 roll 派发单个 worker。"
     )
 
 
-def schedule_deny_reason(trigger: str, cause: str) -> str:
-    return (
-        f"[Router Gate] 拦截未路由的定时 agent 启动 ({trigger})：{cause}。"
-        "schedule 每次触发都会启动新 agent；roll 不适用（roll 会立即启动 worker，不会建 schedule）。"
-        "先把任务写进 <task.json>，内容为 {\"task\": {\"objective\": \"<定时要做的事>\"}}，并运行\n"
-        f"  {ROUTER_CMD} plan --input <task.json> --hours <每次触发的预计工时>\n"
-        "再用返回 bundle 的 provider 与 model 创建：create_schedule 传 provider=\"<provider>/<model>\"，"
-        "或 `paseo schedule create --provider <provider>/<model> ...`（update_schedule 同时给出 provider 与 model）。"
-        "gate 只接受本会话最近 15 分钟内 provider/model 一致的 plan 记录（plan 须在本会话中运行）。"
-    )
+# A schedule is routed by the gate itself: the caller is asked for nothing it does not know. The plan of the schedule's
+# prompt runs in a process of its own, inside the hook's time limit (sync_host_globals.HOOK_TIMEOUT_SECONDS): the
+# classifier call is cut at SCHEDULE_SCORE_SECONDS and the whole plan at SCHEDULE_PLAN_SECONDS.
+SCHEDULE_SCORE_SECONDS = 20
+SCHEDULE_PLAN_SECONDS = 35
+SCHEDULE_LOCAL_ONLY = "a Paseo schedule starts its agent on this machine"
+SCHEDULE_ROUTE = "the schedule's route"      # what an allow says it did not judge (note_unevaluated)
+SCHEDULE_ROUTE_FIELDS = ("provider", "model")
+
+
+def schedule_task_id(objective: str) -> str:
+    """The task a schedule's prompt is planned as: the same prompt reads the same plan, whoever asks and however often."""
+    return "schedule-" + hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16]
+
+
+def run_schedule_plan(objective: str, cwd: str | None) -> str | None:
+    """Plan a schedule's prompt as `agentcompass plan --input` does; the plan row it writes is what the gate reads.
+    Returns why no plan was made (a word for the notice, never the plan's own text), else None."""
+    task = {"objective": objective, "task_id": schedule_task_id(objective),
+            "needs": {"local_only": True, "local_only_reason": SCHEDULE_LOCAL_ONLY}, **({"cwd": cwd} if cwd else {})}
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "task.json"
+        source.write_text(json.dumps({"task": task}, ensure_ascii=False), encoding="utf-8", newline="\n")
+        command = router_owner("entry", "argv")("plan", "--input", str(source), "--score-timeout", SCHEDULE_SCORE_SECONDS)
+        try:
+            done = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=SCHEDULE_PLAN_SECONDS, **options)
+        except subprocess.TimeoutExpired:
+            return f"the plan did not answer in {SCHEDULE_PLAN_SECONDS}s"
+        except OSError as exc:
+            return type(exc).__name__
+    return None if done.returncode == 0 else f"the plan ended with exit {done.returncode}"
+
+
+def stored_schedule(schedule_id: object, paseo_agents_dir: Path | None = None) -> dict[str, str]:
+    """What Paseo keeps of the schedule an update names (`schedules/<id>.json` beside its agents): its prompt and the
+    provider and model of its new-agent target. {} when it cannot be read."""
+    base = paseo_agents_dir or Path(os.environ.get("ROUTER_PASEO_AGENTS_DIR", DEFAULT_PASEO_AGENTS))
+    if not isinstance(schedule_id, str) or not re.fullmatch(r"[\w-]+", schedule_id):
+        return {}
+    try:
+        doc = json.loads((base.parent / "schedules" / f"{schedule_id}.json").read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    target = doc.get("target") if isinstance(doc, dict) and isinstance(doc.get("target"), dict) else {}
+    config = target.get("config") if isinstance(target.get("config"), dict) else {}
+    kept = {"prompt": doc.get("prompt") if isinstance(doc, dict) else None,
+            **{k: v for k, v in normalize_launch(config).items() if k in SCHEDULE_ROUTE_FIELDS}}
+    return {k: v for k, v in kept.items() if isinstance(v, str) and v}
+
+
+def schedule_fill_reason(trigger: str, fill: dict) -> str:
+    """The refusal of a host that takes no fill: the same call again with the values the gate chose, and no other step."""
+    said = "，".join(f'{k}="{v}"' for k, v in fill.items())
+    flags = " ".join(f"--{k} {v}" for k, v in fill.items())
+    return (f"[Router Gate] 已为这个 schedule 选好路由 ({trigger})，本次调用没有创建或修改任何 schedule。"
+            f"原样重试并加上 {said}（命令行形式：{flags}）。不需要运行其他命令。")
+
+
+def schedule_mismatch_reason(trigger: str, given: dict, want: dict) -> str:
+    route = "/".join(want[k] for k in SCHEDULE_ROUTE_FIELDS)
+    asked = "，".join(f"{k}={v!r}" for k, v in given.items())
+    return (f"[Router Gate] 这个 schedule 的请求与路由不一致 ({trigger})：请求 {asked}，路由为它的 prompt 选的是 {route}。"
+            f"改用 provider=\"{route}\" 重试（update_schedule 同时给出 provider 与 model）。"
+            "用户在本次请求中点名了该模型时，先在本会话运行\n"
+            f"  {ROUTER_CMD} record --constraint user_override --provider <p> --account <a> --model <m> --effort <e> "
+            "--basis \"<用户原话>\"\n再原样重试（15 分钟内有效）。")
+
+
+def judge_schedule(
+    rows: list[dict], args: dict, context: dict, trigger: str, accounts: dict | None, identities: set[str], *,
+    unchecked: str | None = None, cwd: str | None = None, paseo_agents_dir: Path | None = None, reread=None,
+) -> tuple[str | None, dict]:
+    """(refusal, fill) for a schedule call; (None, {}) lets it through as it is.
+
+    1. A route the call names passes when this session planned it, or the user named it (a `user_override` record of
+       this session). An unchecked model passes on the user's naming only.
+    2. Otherwise the gate plans the schedule's prompt itself, once per prompt in the window, and the call takes the
+       plan's provider and model: what the call left out is the fill, and a route it names otherwise is refused with
+       the plan's.
+    3. A prompt or route that is not a literal in the call, and a plan that could not be made, are not judged: the
+       call passes and the answer says so (note_unevaluated)."""
+    carries_route = router_owner("decision_ledger", "carries_route")
+    stored = stored_schedule(args.get("id"), paseo_agents_dir) if trigger == "tool:update_schedule" else {}
+    named = {k: v for k, v in normalize_launch(args).items() if k in SCHEDULE_ROUTE_FIELDS}
+    if UNKNOWN_CLI_VALUE in named.values():
+        note_unevaluated(SCHEDULE_ROUTE, "its provider or model is not a literal in the call")
+        return unchecked, {}
+    route = {**{k: v for k, v in stored.items() if k in SCHEDULE_ROUTE_FIELDS}, **named}
+    if len(route) == len(SCHEDULE_ROUTE_FIELDS) and identities:
+        own = [row for row in rows if carries_route(row) and written_by(row, identities)]
+        by_user = [row for row in own if row.get("stage") == "record" and row.get("constraint") == "user_override"
+                   and row.get("trigger") != "workflow"]
+        plans = [] if unchecked else [row for row in own if row.get("stage") == "plan"]
+        for candidates in (by_user, plans):
+            if candidates and match_route(candidates, route, context, trigger, accounts=accounts, identities=identities)[0]:
+                return None, {}
+    if unchecked:
+        return unchecked, {}
+    objective = args.get("prompt") if isinstance(args.get("prompt"), str) and args["prompt"] != UNKNOWN_CLI_VALUE else None
+    objective = (objective or stored.get("prompt") or "").strip()
+    if not objective:
+        note_unevaluated(SCHEDULE_ROUTE, "its prompt is not a literal in the call")
+        return None, {}
+    task_id = schedule_task_id(objective)
+
+    def planned(found: list[dict]) -> dict | None:
+        return next((row for row in found if carries_route(row) and row.get("stage") == "plan"
+                     and row.get("task_id") == task_id), None)
+
+    row = planned(rows)
+    if row is None:
+        why = run_schedule_plan(objective, cwd)
+        row = planned(reread() if reread else rows)
+        if row is None:
+            note_unevaluated(SCHEDULE_ROUTE, why or "the plan chose no route")
+            return None, {}
+    want = {k: v for k, v in route_spec(row, accounts).items() if k in SCHEDULE_ROUTE_FIELDS}
+    if is_dot_route(row) or len(want) != len(SCHEDULE_ROUTE_FIELDS):
+        note_unevaluated(SCHEDULE_ROUTE, "the plan chose a route Paseo does not start")
+        return None, {}
+    if any(route[k] != want[k] for k in route):
+        return schedule_mismatch_reason(trigger, route, want), {}
+    if len(route) == len(want):
+        return None, {}
+    if trigger == "tool:create_schedule":
+        return None, {"provider": "/".join(want[k] for k in SCHEDULE_ROUTE_FIELDS)}
+    return None, want
 
 
 def caller_identities(payload: dict, caller_id: str | None) -> set[str]:
@@ -1788,32 +1949,15 @@ def written_by(row: dict, identities: set[str]) -> bool:
 
 
 def check_workflow_record(rows: list[dict], identities: set[str]) -> str | None:
-    """A Workflow passes only on this session's `record --constraint user_override --trigger workflow`."""
+    """A Workflow passes only on this session's `record --trigger workflow` of the user's own naming (`user_override`).
+    The record names no route: a Workflow's agents run on the calling session's own account and model."""
     if not identities:
         return workflow_deny_reason("hook 输入里没有会话 ID，无法确认授权记录属于本会话")
-    carries_route = router_owner("decision_ledger", "carries_route")
     for row in rows:
-        if (carries_route(row) and row.get("stage") == "record" and row.get("constraint") == "user_override"
+        if (row.get("stage") == "record" and row.get("constraint") == "user_override"
                 and row.get("trigger") == "workflow" and written_by(row, identities)):
             return None
     return workflow_deny_reason("最近 15 分钟内本会话没有 `--trigger workflow` 的 user_override 记录")
-
-
-def check_schedule_plan(rows: list[dict], args: dict, context: dict, trigger: str,
-                        accounts: dict | None, identities: set[str]) -> str | None:
-    """A schedule passes only on this session's recent plan with its provider and model (records do not count)."""
-    requested = normalize_launch(args)
-    missing = [key for key in ("provider", "model") if not requested.get(key)]
-    if missing:
-        return schedule_deny_reason(trigger, f"未指定 {'/'.join(missing)}，无法与路由比对")
-    if not identities:
-        return schedule_deny_reason(trigger, "hook 输入里没有会话 ID，无法确认 plan 属于本会话")
-    carries_route = router_owner("decision_ledger", "carries_route")
-    plans = [row for row in rows if carries_route(row) and row.get("stage") == "plan" and written_by(row, identities)]
-    if not plans:
-        return schedule_deny_reason(trigger, "最近 15 分钟内本会话没有 plan 记录")
-    row, diagnostic = match_route(plans, requested, context, trigger, accounts=accounts, identities=identities)
-    return None if row else schedule_deny_reason(trigger, f"与最近的 plan 不一致：{diagnostic}")
 
 
 def format_response(allowed: bool, harness_kind: str, reason: str = "") -> dict:
@@ -1825,12 +1969,13 @@ def format_response(allowed: bool, harness_kind: str, reason: str = "") -> dict:
     notice = unevaluated_notice() if allowed else ""
     if notice and harness_kind == "pi":
         print(notice, file=sys.stderr)
+    fill = dict(REWRITE) if allowed and harness_kind in REWRITING_HARNESSES else {}
     if harness_kind == "antigravity":
         if allowed:
-            return {"decision": "allow", "reason": notice} if notice else {"decision": "allow"}
+            return {"decision": "allow", **({"reason": notice} if notice else {}), **({"overwrite": fill} if fill else {})}
         return {"decision": "deny", "reason": reason}
     if harness_kind == "pi":
-        return {"block": False} if allowed else {"block": True, "reason": reason}
+        return {"block": False, **({"input": fill} if fill else {})} if allowed else {"block": True, "reason": reason}
     if allowed:
         return {"systemMessage": notice} if notice else {}
     return {
@@ -1851,6 +1996,7 @@ def evaluate_payload(
     """The hook's answer to one payload (`decide`). The one place a failure inside the decision is caught: the call is
     allowed, as every unmade check is, and the answer names the failure's type (`format_response`)."""
     UNEVALUATED.clear()
+    REWRITE.clear()
     try:
         return decide(payload, ledger_path, now, window_seconds, usage_cache_path, paseo_agents_dir)
     except Exception as exc:
@@ -1918,6 +2064,9 @@ def _decide_checked(
                 # Only persisted ownership proves direction; absent/conflicting
                 # labels or caller identity leave this notification check open.
                 if owns_worker(load_paseo_agent(agent_id, paseo_agents_dir), agent_id, identities, paseo_agents_dir):
+                    if harness_kind in REWRITING_HARNESSES and name == tool_name and len(calls) == 1:
+                        REWRITE["notifyOnFinish"] = True    # the one value it may have: the host fills it in
+                        break
                     return format_response(False, harness_kind,
                         '[Router Gate] Parent-to-worker send_agent_prompt must keep completion '
                         'notifications enabled. Set notifyOnFinish: true or omit it; completion '
@@ -2009,17 +2158,28 @@ def _decide_checked(
             except (ValueError, OSError, ImportError, sqlite3.Error) as exc:
                 return format_response(False, harness_kind, '[Router Gate] Bound dispatch rejected: ' + str(exc))
             continue
-        if unchecked and (trigger == WORKFLOW_TRIGGER or trigger in SCHEDULE_TRIGGERS
-                          or name == 'create_agent' or trigger == 'shell:paseo agent create'):
+        if unchecked and (trigger == WORKFLOW_TRIGGER or name == 'create_agent' or trigger == 'shell:paseo agent create'):
             return format_response(False, harness_kind, unchecked)
         # Workflow and schedules are not worker launches roll can make: each has its own authorization.
         if trigger == WORKFLOW_TRIGGER or trigger in SCHEDULE_TRIGGERS:
             if rows is None:
                 rows = recent_routes(ledger, now=now, window_seconds=win)
-            reason = (check_workflow_record(rows, identities) if trigger == WORKFLOW_TRIGGER else
-                      check_schedule_plan(rows, args, correlation_fields(payload, tool_input, args), trigger, accounts, identities))
+            if trigger == WORKFLOW_TRIGGER:
+                reason, fill = check_workflow_record(rows, identities), {}
+            else:
+                reason, fill = judge_schedule(
+                    rows, args, correlation_fields(payload, tool_input, args), trigger, accounts, identities,
+                    unchecked=unchecked, cwd=next((v for v in (args.get("cwd"), payload.get("cwd"))
+                                                   if isinstance(v, str) and v and v != UNKNOWN_CLI_VALUE), None),
+                    paseo_agents_dir=paseo_agents_dir,
+                    reread=lambda: recent_routes(ledger, now=now, window_seconds=win))
             if reason:
                 return format_response(False, harness_kind, reason)
+            if fill:
+                # The host applies a fill only to the call it shows the hook: a schedule tool called as itself.
+                if harness_kind not in REWRITING_HARNESSES or name != tool_name or len(executing) != 1:
+                    return format_response(False, harness_kind, schedule_fill_reason(trigger, fill))
+                REWRITE.update(fill)
             continue
         if name == 'create_agent' or trigger == 'shell:paseo agent create':
             return format_response(False, harness_kind,

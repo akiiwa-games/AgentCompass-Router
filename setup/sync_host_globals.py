@@ -69,6 +69,10 @@ ROUTER_HOOK_CMD = shlex.join(ROUTER_HOOK_ARGV)
 
 # The gate's own tool list decides what reaches it: any `mcp__<server>__` prefix of those names, nothing else.
 ROUTER_GATE_MATCHER = router_gate_hook.hook_matcher()
+# The longest a host waits for the gate (each host's hook `timeout`, in seconds; Pi's is in the extension). The gate
+# answers an ordinary call at once; the limit holds the one thing it does that takes time, the plan of a schedule it
+# routes itself (router_gate_hook.SCHEDULE_PLAN_SECONDS).
+HOOK_TIMEOUT_SECONDS = 45
 
 _PI_ROUTER_GATE_TEMPLATE = """import { spawnSync } from "node:child_process";
 
@@ -99,7 +103,7 @@ export default function (pi: any) {
       const res = spawnSync(HOOK_ARGV[0], HOOK_ARGV.slice(1), {
         input: payload,
         encoding: "utf-8",
-        timeout: 8000,
+        timeout: __HOOK_TIMEOUT_MS__,
         windowsHide: true,
       });
       // What the gate could not check comes beside an allow on stderr: a `tool_call` return only controls blocking.
@@ -119,6 +123,11 @@ export default function (pi: any) {
         if (parsed && parsed.block) {
           return { block: true, reason: parsed.reason || "Blocked by Router Gate" };
         }
+        // What the gate fills into a call it allows (router_gate_hook.REWRITE): a `tool_call` handler may mutate
+        // `event.input` in place (pi docs, extensions.md).
+        if (parsed && parsed.input && typeof parsed.input === "object" && event?.input && typeof event.input === "object") {
+          Object.assign(event.input, parsed.input);
+        }
       }
     } catch {
       // Fail-open if the hook command is unexpectedly unavailable
@@ -133,7 +142,8 @@ def render_pi_router_gate_ts(hook_argv: list[str] | None = None) -> str:
     argv = ROUTER_HOOK_ARGV if hook_argv is None else hook_argv
     return _PI_ROUTER_GATE_TEMPLATE.replace("__HOOK_ARGV__", json.dumps(argv)).replace(
         "__TOOL_NAME_PATTERN__", json.dumps(f"^{router_gate_hook.TOOL_NAME_PATTERN}$")).replace(
-        "__WORKER_QUESTION_TOOLS__", json.dumps(sorted(router_gate_hook.WORKER_QUESTION_TOOLS)))
+        "__WORKER_QUESTION_TOOLS__", json.dumps(sorted(router_gate_hook.WORKER_QUESTION_TOOLS))).replace(
+        "__HOOK_TIMEOUT_MS__", str(HOOK_TIMEOUT_SECONDS * 1000))
 
 
 PI_ROUTER_GATE_TS = render_pi_router_gate_ts()
@@ -1071,7 +1081,7 @@ def ensure_hook_in_list(hook_entries: list, command_str: str, matcher: str | Non
             new_group = dict(group)
             new_group["hooks"] = other_hooks
             filtered.append(new_group)
-    entry: dict = {"hooks": [{"type": "command", "command": command_str, "timeout": 10}]}
+    entry: dict = {"hooks": [{"type": "command", "command": command_str, "timeout": HOOK_TIMEOUT_SECONDS}]}
     if matcher is not None:
         entry["matcher"] = matcher
     # Put router gate first so blocked tool calls don't even proceed
@@ -1172,7 +1182,7 @@ def configure_hooks(homes: list[tuple[str, Path]] | None = None) -> None:
             new_gemini_data = {
                 "router-gate": {
                     "PreToolUse": [
-                        {"matcher": ROUTER_GATE_MATCHER, "hooks": [{"type": "command", "command": ROUTER_HOOK_CMD, "timeout": 10}]}
+                        {"matcher": ROUTER_GATE_MATCHER, "hooks": [{"type": "command", "command": ROUTER_HOOK_CMD, "timeout": HOOK_TIMEOUT_SECONDS}]}
                     ]
                 }
             }

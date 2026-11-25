@@ -295,7 +295,7 @@ for (const [name, extension, tool, input, hasUI, worker, notifyThrows] of JSON.p
     } },
   };
   const returned = await handlers[extension]({ toolName: tool, toolCallId: "pi-tc-7", input }, ctx);
-  out[name] = { returned: returned ?? null, shown: shown, stderr: [...written] };
+  out[name] = { returned: returned ?? null, shown: shown, stderr: [...written], ...(extension === "fill" ? { input } : {}) };
 }
 process.stdout.write(JSON.stringify(out));
 """
@@ -315,6 +315,7 @@ process.stdout.write(JSON.stringify(out));
             "deny": "import sys; sys.stderr.write('[Router Gate] note\\\n'); print('{\"block\": true, \"reason\": \"deny\"}')",
             "crash": "import sys; sys.stderr.write('Traceback: boom\\\n'); sys.exit(1)",
             "echo": "import json, sys; d = json.load(sys.stdin); print(json.dumps({'block': True, 'reason': f\"{d.get('sessionId')}|{d.get('tool_call_id')}\"}))",
+            "fill": "print('{\"block\": false, \"input\": {\"provider\": \"codex/gpt-6-astra\"}}')",
         }
         argvs = {"real": [sys.executable, "-X", "utf8", str(Path(gate.__file__).resolve())],
                  **{name: [sys.executable, "-c", code] for name, code in fakes.items()}}
@@ -326,7 +327,8 @@ process.stdout.write(JSON.stringify(out));
                      ["deny-with-stderr", "deny", "bash", {"command": "ls"}, True, False, False],
                      ["deny-with-stderr-notify-throws", "deny", "bash", {"command": "ls"}, True, False, True],
                      ["crash", "crash", "bash", {"command": "ls"}, True, False, False],
-                     ["echo-ids", "echo", "bash", {"command": "ls"}, True, False, False]]
+                     ["echo-ids", "echo", "bash", {"command": "ls"}, True, False, False],
+                     ["fill", "fill", "create_schedule", {"prompt": "x"}, True, False, False]]
         with tempfile.TemporaryDirectory() as directory:
             for name, hook in argvs.items():
                 source = sg.PI_ROUTER_GATE_TS.replace(argv, json.dumps(hook))
@@ -355,6 +357,9 @@ process.stdout.write(JSON.stringify(out));
         self.assertEqual(out["crash"], {"returned": None, "shown": [], "stderr": []})
         # F3: generated Pi extension forwards ctx.sessionManager.getSessionId() and event.toolCallId to the gate.
         self.assertEqual(out["echo-ids"]["returned"], {"block": True, "reason": "pi-sess-42|pi-tc-7"})
+        # What the gate fills into a call it allows (REWRITE) is put into the call's own input; the call is not blocked.
+        self.assertEqual((out["fill"]["returned"], out["fill"]["input"]),
+                         (None, {"prompt": "x", "provider": "codex/gpt-6-astra"}))
 
     def test_unreadable_stdin_is_allowed_with_a_word_in_the_shape_of_an_unknown_host(self):
         for label, raw in (('empty', ''), ('blank', '  \n'), ('not json', '{oops'), ('a list', '[1]')):
@@ -395,6 +400,9 @@ process.stdout.write(JSON.stringify(out));
         inventory = mock.patch.object(gate.router_module("provider_inventory"), "current", return_value={"accounts": {}})
         inventory.start()
         self.addCleanup(inventory.stop)
+        no_plan = mock.patch.object(gate, "run_schedule_plan", return_value="no plan in this test")
+        no_plan.start()
+        self.addCleanup(no_plan.stop)
 
     def route(self, provider="codex", model=_UNSET, effort=_UNSET, **fields):
         return writer_ledger_row(provider, model, effort, **fields)
@@ -549,14 +557,21 @@ process.stdout.write(JSON.stringify(out));
         # by each transport representation.
         agent_file.write_text(json.dumps({'labels': {'router.parent_id': 'parent'}}), encoding='utf-8')
         args = {'agentId': worker_id, 'prompt': 'continue', 'notifyOnFinish': False}
-        for payload in (
-            {'tool_name': 'mcp__paseo__send_agent_prompt', 'tool_input': args},
-            {'toolName': 'send_agent_prompt', 'input': args},
-            {'toolCall': {'name': 'send_agent_prompt', 'args': args}},
-            {'tool_name': 'exec', 'tool_input': 'await tools.mcp__paseo__send_agent_prompt(' + json.dumps(args) + ')'},
+        # A host that may change the call (REWRITING_HARNESSES) fills the one value it may have in; the others refuse.
+        fill = {'notifyOnFinish': True}
+        for payload, answer in (
+            ({'tool_name': 'mcp__paseo__send_agent_prompt', 'tool_input': args}, None),
+            ({'toolName': 'send_agent_prompt', 'input': args}, {'block': False, 'input': fill}),
+            ({'toolCall': {'name': 'send_agent_prompt', 'args': args}}, {'decision': 'allow', 'overwrite': fill}),
+            ({'tool_name': 'exec', 'tool_input': 'await tools.mcp__paseo__send_agent_prompt(' + json.dumps(args) + ')'}, None),
         ):
-            with self.subTest(format=payload), mock.patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent'}):
-                self.assertIn('notifyOnFinish', gate.evaluate_payload(payload)['reason'])
+            with self.subTest(format=payload), mock.patch.dict(os.environ, {'PASEO_AGENT_ID': 'parent'}), \
+                    mock.patch.object(gate, 'load_dispatch_accounts', return_value={}):
+                result = gate.evaluate_payload(payload)
+                if answer is None:
+                    self.assertIn('notifyOnFinish', result['reason'])
+                else:
+                    self.assertEqual(result, answer)
 
 
     def exhausted_cache(self, **changes):
@@ -2884,8 +2899,11 @@ process.stdout.write(JSON.stringify(out));
                 self.assertEqual(gate.base_tool_name(name), base)
 
     def test_every_sub_agent_launch_name_blocks_without_a_route_prefixed_or_not(self):
-        """Each launcher, bare and behind one or two MCP prefixes, is blocked for want of a router record."""
+        """Each launcher, bare and behind one or two MCP prefixes, is blocked for want of a router record; a schedule
+        (judge_schedule) for naming another route than the plan of its prompt."""
         missing = self.state / "missing.jsonl"
+        self.planner(missing, model="gpt-6.1-sol")
+        self.stored_schedule()
         launches = {
             "Agent": {"subagent_type": "Explore", "prompt": "look"},
             "Task": {"prompt": "look"},
@@ -3043,7 +3061,6 @@ process.stdout.write(JSON.stringify(out));
         cases = (
             ("no ledger", [], {"session_id": "claude-session"}, "--trigger workflow"),
             ("unrelated record", [unrelated_review], {"session_id": "claude-session"}, "--trigger workflow"),
-            ("routeless workflow record", [routeless_workflow], {"session_id": "claude-session"}, "--trigger workflow"),
             ("worker plan", [self.session_plan("claude", "claude-opus-5-5")],
              {"session_id": "claude-session"}, "--trigger workflow"),
             ("hard constraint", [self.workflow_record(constraint="hard_constraint")],
@@ -3060,6 +3077,9 @@ process.stdout.write(JSON.stringify(out));
             ("expired", [self.workflow_record(at=(T0 - dt.timedelta(minutes=20)).isoformat())],
              {"session_id": "claude-session"}, "--trigger workflow"),
             ("same Claude session", [self.workflow_record()], {"session_id": "claude-session"}, None),
+            # The record names no route (route_judge.record_workflow): a Workflow runs on the session's own model.
+            ("same session, no route", [routeless_workflow], {"session_id": "claude-session"}, None),
+            ("other session, no route", [routeless_workflow], {"session_id": "another-session"}, "--trigger workflow"),
             ("same Paseo agent", [self.workflow_record()], {"parent_agent_id": "paseo-agent"}, None),
         )
         for label, rows, identity, blocked_on in cases:
@@ -3072,8 +3092,6 @@ process.stdout.write(JSON.stringify(out));
                         self.assertNotIn("roll --brief", result["reason"].split("不要调用")[0])
                     else:
                         self.assertEqual(result, {})
-        # Direct check_workflow_record also rejects a workflow record lacking a route bundle.
-        self.assertIsNotNone(gate.check_workflow_record([routeless_workflow], {"claude-session"}))
         # Under Paseo the calling agent's own ID identifies the session too; the parent's ID does not.
         ledger = self.write_ledger(str(self.state), [self.workflow_record()])
         for agent_id, allowed in (("paseo-agent", True), ("paseo-parent", False)):
@@ -3081,108 +3099,177 @@ process.stdout.write(JSON.stringify(out));
                 result = gate.evaluate_payload({"tool_name": "Workflow", **call}, ledger_path=ledger, now=T0)
                 self.assertEqual(result == {}, allowed)
 
-    def test_schedule_needs_this_sessions_recent_plan_with_its_provider_and_model(self):
+    def planner(self, ledger, provider="codex", model="gpt-6-astra"):
+        """Stand-in for the plan the gate runs for a schedule: appends the plan row `agentcompass plan` writes for that
+        prompt to `ledger`, and lists the prompts it was run for."""
+        runs = []
+
+        def run(objective, cwd):
+            runs.append(objective)
+            row = self.route(provider, model, "high", task_id=gate.schedule_task_id(objective), session_ids=["the-plan"])
+            with Path(ledger).open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(row) + "\n")
+
+        patch = mock.patch.object(gate, "run_schedule_plan", side_effect=run)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return runs
+
+    def stored_schedule(self, schedule_id="s1", provider="codex", model="gpt-6-astra", prompt="work"):
+        """A new-agent schedule as Paseo keeps it, beside the agents directory the gate reads."""
+        directory = self.state / "schedules"
+        directory.mkdir(exist_ok=True)
+        (directory / f"{schedule_id}.json").write_text(json.dumps({
+            "id": schedule_id, "prompt": prompt,
+            "target": {"type": "new-agent", "config": {"provider": provider, "model": model}}}), encoding="utf-8")
+
+    def test_the_gate_plans_a_schedule_itself_and_the_call_takes_the_plans_route(self):
+        """Rule 2 of judge_schedule: what the call left out is the plan's; a route it names otherwise is refused with
+        the plan's; the plan is made once per prompt."""
+        ledger = self.write_ledger(str(self.state), [])
+        runs = self.planner(ledger)
+        call = {"prompt": "x", "cron": "7 * * * *"}
+
+        def ask(args, name="mcp__paseo__create_schedule"):
+            return gate.evaluate_payload({"tool_name": name, "tool_input": args, "session_id": "claude-session"},
+                                         ledger_path=ledger, now=T0)
+
+        for label, args in (("no provider", call), ("provider only", dict(call, provider="codex"))):
+            with self.subTest(case=label):
+                reason = ask(args)["reason"]
+                self.assertIn('provider="codex/gpt-6-astra"', reason)
+                self.assertIn("--provider codex/gpt-6-astra", reason)
+                self.assertNotIn("plan --input", reason)        # no step is asked of the caller but the call itself
+        self.assertEqual(ask(dict(call, provider="codex/gpt-6-astra")), {})
+        other = ask(dict(call, provider="codex/gpt-6.1-sol"))["reason"]
+        self.assertIn("codex/gpt-6-astra", other)
+        self.assertIn("user_override", other)
+        self.assertEqual(runs, ["x"])                           # four calls for one prompt, one plan
+        self.assertEqual(ask(dict(call, prompt="another prompt", provider="codex/gpt-6-astra")), {})
+        self.assertEqual(runs, ["x", "another prompt"])
+
+    def test_a_host_that_may_change_a_call_fills_the_plans_route_in(self):
+        """REWRITING_HARNESSES: Antigravity merges `overwrite` into the call, Pi's extension the answer's `input`; the
+        fill reaches only a schedule tool called as itself, so the same command in a shell is refused with it."""
+        ledger = self.write_ledger(str(self.state), [])
+        self.planner(ledger)
+        args = {"prompt": "x", "cron": "7 * * * *"}
+        fill = {"provider": "codex/gpt-6-astra"}
+        agy = {"conversationId": "c1", "toolCall": {"id": "t1", "name": "mcp__paseo__create_schedule", "args": args}}
+        self.assertEqual(gate.evaluate_payload(agy, ledger_path=ledger, now=T0), {"decision": "allow", "overwrite": fill})
+        pi = {"toolName": "create_schedule", "input": args, "sessionId": "p1"}
+        self.assertEqual(gate.evaluate_payload(pi, ledger_path=ledger, now=T0), {"block": False, "input": fill})
+        shell = {"conversationId": "c1", "toolCall": {"id": "t2", "name": "run_command",
+                                                      "args": {"CommandLine": 'paseo schedule create --every 5m "x"'}}}
+        answer = gate.evaluate_payload(shell, ledger_path=ledger, now=T0)
+        self.assertEqual(answer["decision"], "deny")
+        self.assertIn("--provider codex/gpt-6-astra", answer["reason"])
+
+    def test_a_schedule_route_this_session_planned_or_the_user_named_passes_as_it_is(self):
+        """Rule 1 of judge_schedule: this session's plan, or its `user_override` record, of the route the call names."""
         plan = self.session_plan()
-        routeless_plan = dict(plan, bundle=None)
-        review_record = self.workflow_record(trigger=None)
-        same_as_plan_record = dict(plan, stage="record", choice="constraint", constraint="user_override")
-        mcp_cases = (
-            ("no provider", [plan], {"prompt": "x", "cron": "7 * * * *"}, "未指定 provider/model"),
-            ("provider only", [plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex"}, "未指定 model"),
-            ("no plan", [review_record], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"},
-             "没有 plan 记录"),
-            ("routeless plan", [routeless_plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"},
-             "没有 plan 记录"),
-            ("record is not a plan", [same_as_plan_record],
-             {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}, "没有 plan 记录"),
-            # R2: a plan another session made, or one that names no writer, is not this session's.
-            ("other session's plan", [dict(plan, session_ids=["session-a"])],
-             {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}, "本会话没有 plan 记录"),
-            ("plan without session_ids", [self.route("codex", "gpt-6-astra", "high")],
-             {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}, "本会话没有 plan 记录"),
-            ("other model", [plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6.1-sol"},
-             "model: requested='gpt-6.1-sol'"),
-            ("matching plan", [plan], {"prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}, None),
+        named = self.session_plan(model="gpt-6.1-sol", stage="record", constraint="user_override")
+        call = {"prompt": "x", "cron": "7 * * * *"}
+        cases = (
+            ("this session's plan", [plan], "codex/gpt-6-astra", True),
+            ("the user named it", [named], "codex/gpt-6.1-sol", True),
+            ("another session's record", [dict(named, session_ids=["session-a"])], "codex/gpt-6.1-sol", False),
+            ("a workflow record", [dict(named, trigger="workflow")], "codex/gpt-6.1-sol", False),
         )
-        for label, rows, args, blocked_on in mcp_cases:
+        for label, rows, provider, passes in cases:
             ledger = self.write_ledger(str(self.state), rows)
-            for name in ("create_schedule", "mcp__paseo__create_schedule", "mcp__magpie__mcp__paseo__create_schedule"):
-                with self.subTest(case=label, name=name):
-                    result = gate.evaluate_payload({"tool_name": name, "tool_input": args, "session_id": "claude-session"},
-                                                   ledger_path=ledger, now=T0)
-                    if blocked_on:
-                        self.assertIn(blocked_on, result["reason"])
-                        self.assertIn("plan --input", result["reason"])
-                        self.assertNotIn("roll --brief", result["reason"])
-                    else:
-                        self.assertEqual(result, {})
-        self.assertIn("没有 plan 记录", gate.check_schedule_plan(
-            [routeless_plan], {"provider": "codex/gpt-6-astra"}, {}, "tool:create_schedule", None, {"claude-session"}) or "")
-        ledger = self.write_ledger(str(self.state), [plan])
-        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": ""}):
-            anonymous = gate.evaluate_payload({"tool_name": "create_schedule", "tool_input": {
-                "prompt": "x", "cron": "7 * * * *", "provider": "codex/gpt-6-astra"}}, ledger_path=ledger, now=T0)
-        self.assertIn("会话 ID", anonymous["reason"])
-        for args, blocked in (({"id": "s1", "provider": "codex", "model": "gpt-6-astra"}, False),
-                              ({"id": "s1", "provider": "codex", "model": "gpt-6.1-sol"}, True),
-                              ({"id": "s1", "model": "gpt-6-astra"}, True),
+            runs = self.planner(ledger)
+            with self.subTest(case=label):
+                result = gate.evaluate_payload({"tool_name": "create_schedule", "tool_input": dict(call, provider=provider),
+                                                "session_id": "claude-session"}, ledger_path=ledger, now=T0)
+                self.assertEqual((result == {}, runs), (passes, [] if passes else ["x"]))
+
+    def test_a_schedule_the_gate_cannot_plan_passes_and_the_answer_says_so(self):
+        """Rule 3 of judge_schedule: no plan, or a prompt or route that is not a literal, is not judged."""
+        ledger = self.write_ledger(str(self.state), [])
+        dynamic = "import subprocess; subprocess.run(['paseo', 'schedule', 'create', '--provider', p, 'work'])"
+        unread_prompt = "import subprocess; subprocess.run(['paseo', 'schedule', 'create', '--every', '5m', prompt])"
+        for label, payload in (
+            ("no plan was made", {"tool_name": "create_schedule", "tool_input": {"prompt": "x", "cron": "7 * * * *"}}),
+            ("provider not a literal", {"tool_name": "Bash", "tool_input": {"command": f'python -c "{dynamic}"'}}),
+            ("prompt not a literal", {"tool_name": "Bash", "tool_input": {"command": f'python -c "{unread_prompt}"'}}),
+        ):
+            with self.subTest(case=label):
+                result = gate.evaluate_payload(dict(payload, session_id="claude-session"), ledger_path=ledger, now=T0)
+                self.assertEqual(list(result), ["systemMessage"])
+                self.assertIn(gate.SCHEDULE_ROUTE, result["systemMessage"])
+
+    def test_an_update_is_judged_on_the_route_the_schedule_ends_with(self):
+        """An update names what it changes: the rest of its route and its prompt are the stored schedule's."""
+        ledger = self.write_ledger(str(self.state), [])
+        runs = self.planner(ledger)
+        self.stored_schedule()
+        for args, blocked in (({"id": "s1", "model": "gpt-6-astra"}, False),
+                              ({"id": "s1", "provider": "codex", "model": "gpt-6-astra"}, False),
+                              ({"id": "s1", "model": "gpt-6.1-sol"}, True),
                               ({"id": "s1", "cron": "9 * * * *"}, False)):
             with self.subTest(update=args):
                 result = gate.evaluate_payload({"tool_name": "mcp__paseo__update_schedule", "tool_input": args,
-                                                "session_id": "claude-session"}, ledger_path=ledger, now=T0)
+                                                "session_id": "claude-session"}, ledger_path=ledger, now=T0,
+                                               paseo_agents_dir=self.state / "agents")
                 self.assertEqual("reason" in result, blocked)
+        self.assertEqual(runs, ["work"])
 
     def test_schedule_plan_is_this_sessions_by_any_id_that_names_the_caller(self):
         """Antigravity names its session `conversationId`: the plan it wrote is its own (caller_identities), as a
         plan written under `session_id` is."""
         ledger = self.write_ledger(str(self.state), [self.session_plan(session_ids=["agy-conversation"])])
+        runs = self.planner(ledger, model="gpt-6.1-sol")
         command = 'paseo schedule create --every 5m --provider codex/gpt-6-astra "do x"'
         call = {"conversationId": "agy-conversation", "modelName": "gemini-3.8-flash-high",
                 "toolCall": {"id": "tc-1", "name": "run_command", "args": {"CommandLine": command}}}
         self.assertEqual(gate.evaluate_payload(call, ledger_path=ledger, now=T0), {"decision": "allow"})
+        self.assertEqual(runs, [])
         other = dict(call, conversationId="another-conversation")
-        self.assertIn("本会话没有 plan 记录", gate.evaluate_payload(other, ledger_path=ledger, now=T0)["reason"])
+        self.assertEqual(gate.evaluate_payload(other, ledger_path=ledger, now=T0)["decision"], "deny")
+        self.assertEqual(runs, ["do x"])
 
     def test_paseo_schedule_cli_is_the_same_launch_as_the_mcp_tool(self):
-        routed = self.write_ledger(str(self.state), [self.session_plan()])
-        missing = self.state / "missing.jsonl"
+        ledger = self.write_ledger(str(self.state), [self.session_plan()])
+        self.planner(ledger)
+        self.stored_schedule()
         script = ("import subprocess; subprocess.run(['paseo', 'schedule', 'create', '--cron', '7 * * * *', "
                   "'--provider', 'codex/gpt-6-astra', 'work'])")
-        dynamic = "import subprocess; subprocess.run(['paseo', 'schedule', 'create', '--provider', p, 'work'])"
         cases = (
-            # (command, ledger, blocked)
-            ('paseo schedule create --cron "*/5 * * * *" --provider codex "do x"', missing, True),
-            ('paseo schedule create --every 5m --provider codex/gpt-6-astra --run-now "do x"', missing, True),
-            ('paseo schedule create --every 5m --provider=codex/gpt-6-astra "do x"', routed, False),
-            ('paseo schedule create --every 5m --provider codex/gpt-6-astra "do x"', routed, False),
-            ('paseo schedule create --every 5m --provider codex/gpt-6.1-sol "do x"', routed, True),
-            ('paseo schedule create --every 5m "do x"', routed, True),               # caller's default provider
-            (r'& "C:\Program Files\Paseo\paseo.cmd" schedule create --every 5m --provider codex "x"', missing, True),
-            ("paseo schedule update s1 --provider codex --model gpt-6-astra", routed, False),
-            ("paseo schedule update s1 --model gpt-6.1-sol --provider codex", routed, True),
-            ("paseo schedule update s1 --model gpt-6-astra", routed, True),
-            ("paseo schedule update s1 --cron '9 * * * *' --prompt 'use --provider x'", missing, False),
-            (f'python -c "{script}"', missing, True),
-            (f'python -c "{script}"', routed, False),
-            (f'python -c "{dynamic}"', routed, True),
-            ("paseo schedule create --help", missing, False),
-            ("paseo schedule run-once s1", missing, False),
-            ("paseo schedule ls", missing, False),
-            ('echo "paseo schedule create --provider codex x"', missing, False),
+            # (command, refused): the plan of every prompt here is codex/gpt-6-astra
+            ('paseo schedule create --cron "*/5 * * * *" --provider codex "do x"', True),       # model left out
+            ('paseo schedule create --every 5m "do x"', True),                                  # route left out
+            ('paseo schedule create --every 5m --provider codex/gpt-6-astra --run-now "do x"', False),
+            ('paseo schedule create --every 5m --provider=codex/gpt-6-astra "do x"', False),
+            ('paseo schedule create --every 5m --provider codex/gpt-6.1-sol "do x"', True),
+            (r'& "C:\Program Files\Paseo\paseo.cmd" schedule create --every 5m --provider codex "x"', True),
+            ("paseo schedule update s1 --provider codex --model gpt-6-astra", False),
+            ("paseo schedule update s1 --model gpt-6.1-sol --provider codex", True),
+            ("paseo schedule update s1 --model gpt-6-astra", False),
+            ("paseo schedule update s1 --cron '9 * * * *' --prompt 'use --provider x'", False),
+            (f'python -c "{script}"', False),
+            ("paseo schedule create --help", False),
+            ("paseo schedule run-once s1", False),
+            ("paseo schedule ls", False),
+            ('echo "paseo schedule create --provider codex x"', False),
         )
-        for command, ledger, blocked in cases:
+        for command, refused in cases:
             for payload in ({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "claude-session"},
                             {"tool_name": "mcp__magpie__PowerShell", "tool_input": {"command": command},
                              "session_id": "claude-session"}):
                 with self.subTest(command=command, tool=payload["tool_name"]):
-                    result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0)
-                    self.assertEqual("reason" in result, blocked)
-                    if blocked:
-                        self.assertIn("plan --input", result["reason"])
+                    result = gate.evaluate_payload(payload, ledger_path=ledger, now=T0,
+                                                   paseo_agents_dir=self.state / "agents")
+                    self.assertEqual(result != {}, refused)
+                    if refused:
+                        self.assertIn("codex/gpt-6-astra", result["reason"])
 
     def test_paseo_cli_global_options_and_wrappers_do_not_hide_a_launch(self):
-        """R1: commander takes global options before and between command words; wrappers run the same argv."""
+        """R1: commander takes global options before and between command words; wrappers run the same argv. A schedule
+        seen as one is refused here for naming another route than the plan of its prompt."""
         missing = self.state / "missing.jsonl"
+        self.planner(missing, model="gpt-6.1-sol")
+        self.stored_schedule()
         schedule = "schedule create --provider codex/gpt-6-astra --run-now x"
         launches = [
             f"paseo --json {schedule}", f"paseo -q {schedule}", f"paseo --quiet {schedule}",

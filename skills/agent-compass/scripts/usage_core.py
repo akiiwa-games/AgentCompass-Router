@@ -763,7 +763,8 @@ def cache_put_provider(p: ProviderUsage) -> None:
         # A different pool membership or reading rule is a new observation, whatever its vendor time.
         pool = lambda details: tuple((details or {}).get(k) for k in ('pool_key', 'aggregation'))
         same_pool = pool(old.get('usage_details')) == pool(p.usage_details)
-        if old.get('credential_key') == key and same_pool:
+        # A row of an earlier version's shape is replaced too: it cannot be read, whatever its vendor time.
+        if old.get('credential_key') == key and same_pool and not usage_cache.earlier_shape(old):
             new_at, old_at = _iso_epoch(p.fetched_at, 0), _iso_epoch(old.get('fetched_at'), 0)
             # A stale observation (e.g. an old gateway readAt) is kept, still
             # flagged stale, only when it is strictly newer than what we hold.
@@ -3388,7 +3389,9 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                 resets = [_iso_epoch(w.resets_at, 0) for w in (cached.windows if cached else []) if w.resets_at]
                 passed = [r for r in resets if observed < r <= now_ts]
                 reset_due = bool(passed) and (last_attempt < max(passed) or now_ts - last_attempt >= REFRESH_SECONDS)
-                if not force and not reset_due and 0 <= age < throttle:
+                # A row this version cannot read is due now; after a failed attempt the retry cadence applies.
+                outdated = usage_cache.earlier_shape(raw) and not prior_failures
+                if not force and not reset_due and not outdated and 0 <= age < throttle:
                     if cached:
                         # Keep exactly the same numbers/titles. Staleness is
                         # metadata for routing, not an extra panel label.

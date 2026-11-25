@@ -6,14 +6,17 @@ import unittest
 from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import host_policy
+import route_judge
 import router_test_support as support
 import state_upgrade
 import usage_cache
 import usage_collector as collector
 import usage_core
+import usage_reading
 import venice_usage
 
 
@@ -402,6 +405,43 @@ class HostedCollectorEntryTests(CollectorBase):
             self.assertFalse(claim['ok'])
             self.assertIn('退避', claim['message'])
             self.assertEqual(len(calls), 1)
+
+
+class EarlierShapeTests(CollectorBase):
+    def test_a_plan_reads_the_row_of_an_earlier_shape_it_collects_as_current(self):
+        home = self.root
+        (home / '.claude').mkdir(parents=True, exist_ok=True)
+        (home / '.claude' / 'settings.json').write_text(json.dumps({'env': {
+            'ANTHROPIC_BASE_URL': 'https://example.com', 'ANTHROPIC_AUTH_TOKEN': 'test-key'}}), encoding='utf-8')
+        (home / '.claude' / 'usage-float.json').write_text(json.dumps({'source': 'magpie'}), encoding='utf-8')
+
+        def gateway(url, **kwargs):
+            now = datetime.now(timezone.utc)
+            return 200, {'data': [{'provider': 'claude', 'kind': 'subscription', 'user': name, 'plan': 'pro',
+                                   'readAt': now.isoformat(), 'windows': [
+                                       {'name': '7 days', 'used': 10, 'resetsAt': (now + timedelta(days=2)).isoformat()}]}
+                                  for name in 'ab']}
+
+        class Read(Exception):
+            pass
+
+        real = usage_reading.usage_snapshot
+
+        def snapshot(path, accounts, now):
+            raise Read(real(path, ['claude'], now))
+
+        with patch.object(usage_core, 'http_json', side_effect=gateway):
+            usage_core.collect_local_usage(['claude'])
+
+            def as_earlier_version(cache):
+                for window in cache['providers']['claude']['windows']:
+                    del window['members']
+            usage_core.update_usage_cache(as_earlier_version)
+            with patch.object(usage_reading, 'usage_snapshot', side_effect=snapshot), self.assertRaises(Read) as read:
+                route_judge.plan_task({}, SimpleNamespace(dry_run=False, usage_cache=None))
+        row = read.exception.args[0]['accounts']['claude']
+        self.assertEqual(row['status'], 'fresh')
+        self.assertEqual(len(row['windows'][0]['members']), 2)
 
 
 if __name__ == '__main__':

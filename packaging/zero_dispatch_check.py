@@ -900,6 +900,31 @@ def step_hooks_and_crash(z: Zero):
                                capture_output=True, text=True, encoding="utf-8", errors="replace", env=box.env(**z.env()), cwd=str(z.work), timeout=60)
         op.check("an unrelated tool call is untouched", (parse(other.stdout) or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny", other.stdout[:200])
 
+        # A schedule needs no step from its caller: the gate runs the real plan stage on the schedule's prompt (the
+        # classifier fixture answers it) and its answer carries the plan's provider and model.
+        op = run.operation("gate plans a schedule", "a create_schedule that names no route: the gate plans its prompt and answers with the plan's route; the same call with that route passes without another plan")
+
+        def schedule(**route):
+            asked = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "mcp__paseo__create_schedule", "session_id": "gate-session",
+                                "tool_input": {"prompt": "Check the nightly build and report what failed", "every": "1d", **route}})
+            done = z.call(op, "gate-hook", stdin=asked)
+            return (parse(done.stdout) or {}).get("hookSpecificOutput") or {}, done
+        ledger = box.state / "router-ledger.jsonl"
+        requests = len(z.scorer.requests)
+        first, done = schedule()
+        plans = [row for row in (json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip())
+                 if row.get("stage") == "plan" and str(row.get("task_id", "")).startswith("schedule-")]
+        op.check("the gate asked the classifier once and the plan of the schedule's prompt is in the ledger",
+                 len(z.scorer.requests) == requests + 1 and len(plans) == 1, f"{len(z.scorer.requests) - requests} request(s), {len(plans)} plan row(s) " + done.stderr[-300:])
+        named = re.search(r'provider="([^"]+)"', first.get("permissionDecisionReason", ""))
+        op.check("the answer creates nothing and names the provider and model to repeat the call with",
+                 first.get("permissionDecision") == "deny" and bool(named) and "/" in (named.group(1) if named else ""), json.dumps(first, ensure_ascii=False)[:500])
+        if named:
+            again, done = schedule(provider=named.group(1))
+            op.check("the same call with that route passes, judged on the plan already made",
+                     again.get("permissionDecision") != "deny" and "UNEVALUATED" not in done.stdout and len(z.scorer.requests) == requests + 1,
+                     done.stdout[:400] + done.stderr[-200:])
+
         # Issue #2: a roll from Claude Code inside an Orca terminal records the Orca session as the parent; the
         # Claude hook reports the Claude session. The launch from that Claude session must match the route.
         op = run.operation("gate under an Orca terminal", "roll inside an Orca terminal running Claude Code: the Claude session's own launch matches the route, another session's does not")
