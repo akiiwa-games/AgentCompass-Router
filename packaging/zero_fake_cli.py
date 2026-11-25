@@ -162,11 +162,11 @@ def main() -> int:
     print(f"WORKER-DONE {name} scenario={scenario}")
     sys.stdout.flush()
     body = f"{name} finished the fixture task ({scenario}); output sha {record['prompt_sha256'][:12]}"
-    if record["told_a_watcher_reports"]:
-        # The completion watcher sends the one notice. This process's stdout is the final reply.
-        print(body)
-        sys.stdout.flush()
-    else:
+    # This process's stdout is the final reply, which a completion watcher's notice carries. A worker told that no
+    # watcher reports for it also reports to the parent itself.
+    print(body)
+    sys.stdout.flush()
+    if not record["told_a_watcher_reports"]:
         report(f"[Worker final report] {body}")
     agent("idle", attentionReason="finished")
     return 0
