@@ -158,6 +158,26 @@ class MagpiePoolTests(unittest.TestCase):
                 self.assertEqual(cached.usage_details['aggregation'], 'plan_sum')
                 self.assertEqual(cached.windows[0].label, '7d×2')
 
+    def test_a_cached_pool_without_members_is_collected_without_force(self):
+        with TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / 'settings.json').write_text(json.dumps({'env': {
+                'ANTHROPIC_BASE_URL': self.source.url,
+                'ANTHROPIC_AUTH_TOKEN': self.source.token}}), encoding='utf-8')
+            (home / 'usage-float.json').write_text(json.dumps({'source': 'magpie'}), encoding='utf-8')
+            self.a['readAt'] = self.b['readAt'] = (self.now - timedelta(hours=6)).isoformat()  # stale, same time
+            with patch.object(usage, 'CLAUDE_HOME_2', home), patch.object(usage, 'CACHE_PATH', home / 'cache.json'), \
+                    patch.object(usage, 'http_json', return_value=(200, {'data': [self.a, self.b]})):
+                usage.collect_local_usage(['claude-2'])
+
+                def as_earlier_version(cache):
+                    for window in cache['providers']['claude-2']['windows']:
+                        del window['members']
+                usage.update_usage_cache(as_earlier_version)
+                usage.collect_local_usage(['claude-2'])  # just attempted, so only the shape makes it due
+                row = usage.load_usage_cache()['providers']['claude-2']
+                self.assertEqual([len(w['members']) for w in row['windows']], [2, 2])
+
     def test_old_readings_are_read_again_by_magpie(self):
         self.b['readAt'] = (self.now - timedelta(hours=5)).isoformat()
         now = self.now.timestamp()
