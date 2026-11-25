@@ -1349,10 +1349,19 @@ def change_priority_menu(add: tuple[str, str] | None = None, remove: tuple[str, 
     else:
         return _tr("快捷菜单没有变化")
 
+    def shown_now() -> list:
+        """What the first change starts from: the shipped entries that show now, as shipped (an entry's label stays)."""
+        kept, pairs = [], []
+        for entry in accounts.get("priority_targets") or ():
+            pair = shows(entry)
+            if pair is not None and pair not in pairs:
+                pairs.append(pair)
+                kept.append(dict(entry))
+        return kept
+
     def write(document: dict) -> None:
         stored = document.get("priority_targets")
-        document["priority_targets"] = change(
-            list(stored) if isinstance(stored, list) else [{"account": a, "model": m} for a, m in entries])
+        document["priority_targets"] = change(list(stored) if isinstance(stored, list) else shown_now())
     _edit_preferences(write)
     return message
 

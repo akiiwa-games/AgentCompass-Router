@@ -4,7 +4,7 @@ One entry per released tag, newest first. The full notes of each release are on 
 
 ## v0.7.9 - 2026-11-25
 
-- Tray: the quick-menu editor (**Edit menu…**) lists exactly the models the menu can still take, so every row can be added; the list no longer opens with whole-account rows the menu cannot hold. It has one button, **Add to quick menu**, and shows the answer of each action in its own window. The second form, which set a rule for a chosen target and hours, is removed: the expected reset time is chosen on a menu entry. A priority for a whole account is no longer set from the tray.
+- Tray: the quick-menu editor (**Edit menu…**) lists exactly the models the menu can still take, so every row can be added; the list no longer opens with whole-account rows the menu cannot hold. It has one button, **Add to quick menu**, and shows the answer of each action in its own window. The second form, which set a rule for a chosen target and hours, is removed: the expected reset time is chosen on a menu entry. A priority for a whole account is no longer set from the tray. The first edit keeps the names of the shipped entries.
 
 ## v0.7.8 - 2026-11-25
 

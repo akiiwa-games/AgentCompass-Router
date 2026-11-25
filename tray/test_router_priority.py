@@ -188,8 +188,10 @@ class PriorityTests(unittest.TestCase):
             router_data.change_priority_menu(add=added)
             document = {}
             written.call_args.args[0](document)
-            self.assertEqual(document['priority_targets'],
-                             [{'account': a, 'model': m} for a, m in [*shipped, added]])
+            # The first change starts from the shipped entries that show, as shipped: an entry's label stays.
+            seed = [dict(entry) for entry in accounts['priority_targets'] if priority.targets(accounts, [entry])]
+            self.assertTrue(len(seed) == len(shipped) and any(entry.get('label') for entry in seed), seed)
+            self.assertEqual(document['priority_targets'], [*seed, {'account': added[0], 'model': added[1]}])
             written.reset_mock()
             router_data.change_priority_menu(add=('codex', None))          # an account without a model is no target
             router_data.change_priority_menu(add=('no-such-account', 'gpt-6-astra'))
@@ -197,7 +199,7 @@ class PriorityTests(unittest.TestCase):
             written.assert_not_called()
             router_data.change_priority_menu(remove=shipped[0])
             written.call_args.args[0](document)
-            self.assertEqual(document['priority_targets'], [{'account': a, 'model': m} for a, m in [*shipped[1:], added]])
+            self.assertEqual(document['priority_targets'], [*seed[1:], {'account': added[0], 'model': added[1]}])
             # The user's list is edited entry by entry: an entry that shows nothing now and an entry's label stay.
             off = {'account': 'no-such-account', 'model': 'gpt-6-astra'}
             labelled = {'account': shipped[0][0], 'model': shipped[0][1], 'label': 'Mine'}
