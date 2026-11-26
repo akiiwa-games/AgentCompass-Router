@@ -4002,6 +4002,27 @@
      "effort": "xhigh",
      "modeId": "full-access"
     },
+    "carbon_low": {
+     "provider": "antigravity-resilient",
+     "model": "gemini-4-carbon",
+     "launch_model": "gemini-4-carbon-low",
+     "effort": "low",
+     "modeId": "full-access"
+    },
+    "carbon_medium": {
+     "provider": "antigravity-resilient",
+     "model": "gemini-4-carbon",
+     "launch_model": "gemini-4-carbon-medium",
+     "effort": "medium",
+     "modeId": "full-access"
+    },
+    "carbon_high": {
+     "provider": "antigravity-resilient",
+     "model": "gemini-4-carbon",
+     "launch_model": "gemini-4-carbon-high",
+     "effort": "high",
+     "modeId": "full-access"
+    },
     "agy_opus55_low": {
      "provider": "antigravity-resilient",
      "model": "claude-opus-5-5-low",
@@ -4289,19 +4310,19 @@
  },
  "priority_targets": [
   {
-   "account": "codex",
-   "model": "gpt-6-astra",
-   "label": "Astra"
-  },
-  {
    "account": "antigravity",
-   "model": "gemini-4-argon-high",
-   "label": "Argon"
+   "model": "gemini-4-carbon",
+   "label": "Carbon"
   },
   {
    "account": "claude",
    "model": "claude-opus-5-5",
    "label": "Opus 5.5"
+  },
+  {
+   "account": "codex",
+   "model": "gpt-6.2-astra",
+   "label": "Astra 6.2"
   }
  ]
 }

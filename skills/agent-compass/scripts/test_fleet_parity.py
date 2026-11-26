@@ -187,7 +187,7 @@ class CleanInstallParityTests(unittest.TestCase):
         self.assertEqual(policy['routes']['code_implementation']['harness_order'], ['codex', 'pi'])
         self.assertEqual(policy['routes']['exploration_forensics']['harness_order'], ['pi', 'codex'])
         self.assertEqual(policy['remote_reroute_guard'], {'enabled': True, 'bundle_id': 'dot_text', 'window_seconds': 600})
-        self.assertEqual([t['label'] for t in self.accounts['priority_targets']], ['Astra', 'Argon', 'Opus 5.5'])
+        self.assertEqual([t['label'] for t in self.accounts['priority_targets']], ['Carbon', 'Opus 5.5', 'Astra 6.2'])
 
     def test_a_sparse_scoring_override_keeps_the_defaults(self):
         merged = accounts_override.merge(self.accounts['scoring'], {'safety_margin_pct': 7})

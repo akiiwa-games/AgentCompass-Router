@@ -225,8 +225,17 @@ class PriorityTests(unittest.TestCase):
     def test_only_top_models_and_weekly_windows_are_offered(self):
         with patch.object(host_policy, 'load_policy', return_value=None):
             choices = priority.targets(account_fleet.load_accounts())
+            shipped_doc = account_fleet.load_accounts(account_fleet.REFERENCES / 'accounts.json')
+            for spec in shipped_doc['accounts'].values():
+                spec['verified'] = True
+            shipped = priority.targets(shipped_doc)
         self.assertEqual({t['model'] for t in choices}, {'gpt-6-astra', 'gemini-4-argon-high', 'claude-opus-5-5'})
         self.assertEqual({t['account'] for t in choices}, {'codex', 'antigravity', 'claude'})
+        self.assertEqual([(t['account'], t['model'], t['label']) for t in shipped], [
+            ('antigravity', 'gemini-4-carbon', 'Carbon'),
+            ('claude', 'claude-opus-5-5', 'Opus 5.5'),
+            ('codex', 'gpt-6.2-astra', 'Astra 6.2'),
+        ])
 
     def test_a_target_stored_under_a_moved_name_reaches_the_bundle_of_its_row(self):
         """Rule (router_priority.targets): a target's model matches a bundle's as the same row (account_fleet.row_key),
