@@ -2,6 +2,14 @@
 
 One entry per released tag, newest first. The full notes of each release are on the [Releases](https://github.com/akiiwa-games/AgentCompass-Router/releases) page.
 
+## v0.7.10 - 2026-11-26
+
+- Antigravity through Paseo (`antigravity-resilient`) launches on the bare model id with a separate `thinkingOptionId` (matching plugin v0.3.0), each model at the options it lists itself (`thinkingOptionIds`); models that take no thinking options (`gemini-pro-orchestrator`, `gpt-oss-120b-medium`) omit `thinkingOptionId`. Direct `agy` CLI callers (`roll` without Paseo, native `invoke_subagent`, Orca, T3) keep naming models `<model>-<effort>` (`account_fleet.agy_cli_model`).
+- Discovery (`paseo_dispatch_bridge.mjs`, `live_models`, `tray/model_catalog`) preserves each model's `thinkingOptionIds` and `defaultThinkingOptionId`; `auto_bundles` derives one bundle per option; named `<model>-<option>` aliases resolve to the bare model at that option. Earlier stored bundle choices (such as `gpt-oss-120b@medium`) and active `<model>-<effort>` holds continue to apply, and Antigravity telemetry reads either `conversationId` or `sessionId`. Model-scoped holds on `antigravity-resilient` now hold the bare model across its options, matching Claude and Codex.
+- Reference data moves to schema 9 (`published/9/`; `published/8/` stays untouched for earlier installs) and drops unused schema-8 keys (`defer_if_reset_within_hours`, `needs_judgment_margin`). Shipped quick-menu defaults (`priority_targets`) are set to **Carbon**, **Opus 5.5**, and **Astra 6.2** (with static `carbon_*` bundles on `antigravity`).
+- Fixed: `record` checks the overlaid fleet for free-pool accounts and refuses uncatalogued effort levels when the launch contract offers none; pooled window `refusal_schedule` reports the binding member's reset time; Paseo bridge stops stuck retry loops on workers bound from an unlabeled state (`bound_unlabeled_from`) and `reviveRetryWatch` does not overwrite a completed receipt; `audit/router_audit.py` classifies `specialist:pro` from `specialty`.
+- Tray: unified `accounts-override.json` path resolution with `account_fleet.accounts_override_path()`; the quick-menu priority editor recognizes legacy `panel:boost` rules; completed missing English catalog entries.
+
 ## v0.7.9 - 2026-11-25
 
 - Tray: the quick-menu editor (**Edit menu…**) lists exactly the models the menu can still take, so every row can be added; the list no longer opens with whole-account rows the menu cannot hold. It has one button, **Add to quick menu**, and shows the answer of each action in its own window. The second form, which set a rule for a chosen target and hours, is removed: the expected reset time is chosen on a menu entry. A priority for a whole account is no longer set from the tray. The first edit keeps the names of the shipped entries.
