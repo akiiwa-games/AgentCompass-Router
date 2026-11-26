@@ -133,6 +133,21 @@ def modules():
     return router_priority.modules()
 
 
+def _accounts_override_path() -> Path:
+    """Single owner of `accounts-override.json` (`account_fleet.accounts_override_path`), while keeping tests that
+    patch only `router_data.STATE_DIR` (without `AGENTCOMPASS_ACCOUNTS_OVERRIDE`) isolated."""
+    if os.environ.get("AGENTCOMPASS_ACCOUNTS_OVERRIDE"):
+        modules()
+        import account_fleet
+        return account_fleet.accounts_override_path()
+    default_state = Path(os.environ.get("ROUTER_STATE_DIR") or Path.home() / ".agent-compass").expanduser()
+    if STATE_DIR != default_state:
+        return STATE_DIR / "accounts-override.json"
+    modules()
+    import account_fleet
+    return account_fleet.accounts_override_path()
+
+
 _ACCOUNTS_CACHE_LOCK = threading.Lock()
 _ACCOUNTS_CACHE: tuple[tuple, float, dict] | None = None
 
@@ -167,7 +182,7 @@ def _accounts_fingerprint() -> tuple | None:
     files = (
         refs / "accounts.json",
         _reference_state(),
-        STATE_DIR / "accounts-override.json",
+        _accounts_override_path(),
         STATE_DIR / "host-policy.json",
         STATE_DIR / "plugins.json",
         STATE_DIR / "model-catalog.json",
@@ -1447,7 +1462,7 @@ def _reference_state() -> Path:
 
 
 def _user_accounts_path(create: bool = False) -> Path:
-    user_file = STATE_DIR / "accounts-override.json"
+    user_file = _accounts_override_path()
     if create:
         modules()  # Install the router scripts path before importing the shared transaction helper.
         import accounts_override
@@ -1470,7 +1485,7 @@ def read_tuning(path: Path | None = None) -> dict:
     if path is None:
         modules()
         import accounts_override
-        override = accounts_override.load_override(STATE_DIR / "accounts-override.json")
+        override = accounts_override.load_override(_accounts_override_path())
         if override is not None:
             document = accounts_override.merge(document, override)
     scoring = document.get("scoring") or {}
@@ -1579,7 +1594,7 @@ def save_tuning(values: dict | str, path: Path | None = None) -> str:
 
 def restore_tuning(path: Path | None = None) -> str:
     if path is None:
-        user_file = STATE_DIR / "accounts-override.json"
+        user_file = _accounts_override_path()
         if user_file.is_file():
             _edit_preferences(lambda doc: doc.pop("scoring", None))
             return _tr("已恢复默认路由参数")
@@ -1640,7 +1655,7 @@ def harness_model_rows() -> list[dict]:
     import provider_inventory
     accounts = _cached_accounts()
     policy = host_policy.load_policy()
-    preferences = accounts_override.load_override(STATE_DIR / "accounts-override.json") or {"schema_version": accounts_override.SCHEMA_VERSION}
+    preferences = accounts_override.load_override(_accounts_override_path()) or {"schema_version": accounts_override.SCHEMA_VERSION}
     inventory = (accounts.get("_discovery") or {}).get("accounts") or {}
     table = accounts.get("accounts") or {}
     groups = {}
@@ -2044,7 +2059,7 @@ def model_probe_definitions(rows: list[dict]) -> dict:
     """Private in-memory connection settings; these never enter row data or the model cache."""
     modules()
     import accounts_override
-    document = accounts_override.load_override(STATE_DIR / "accounts-override.json") or {}
+    document = accounts_override.load_override(_accounts_override_path()) or {}
     accounts = document.get("accounts") if isinstance(document.get("accounts"), dict) else {}
     overrides = {name: spec for name, spec in accounts.items() if isinstance(spec, dict)}
     baseline = (_public_accounts().get("accounts") or {})
@@ -2085,7 +2100,7 @@ def read_account_cwd(account: str) -> str:
     modules()
     import accounts_override
     spec = _cached_accounts().get("accounts", {}).get(account) or {}
-    override_doc = accounts_override.load_override(STATE_DIR / "accounts-override.json") or {}
+    override_doc = accounts_override.load_override(_accounts_override_path()) or {}
     saved = ((override_doc.get("accounts") or {}).get(account) or {})
     if "cwd_regex" in saved:
         return saved["cwd_regex"] or ""

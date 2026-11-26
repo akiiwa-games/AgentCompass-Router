@@ -50,6 +50,35 @@ class EffortOrderTests(unittest.TestCase):
             self.assertIn(label, EN, effort)
         self.assertEqual(set(display_names.EFFORTS), known)      # no label for an effort the order does not know
 
+    def test_every_single_argument_tr_call_in_tray_is_in_english_catalog_without_duplicates(self):
+        """Rule (i18n): every one-argument literal `_tr(...)` in tray modules has an English entry in
+        `i18n_catalog.EN`, and the catalog defines each Chinese key once."""
+        import ast
+        tray_dir = Path(__file__).resolve().parent
+        catalog_tree = ast.parse((tray_dir / 'i18n_catalog.py').read_text(encoding='utf-8'))
+        dups = []
+        for node in ast.walk(catalog_tree):
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'EN' for t in node.targets):
+                seen = set()
+                for key_node in node.value.keys:
+                    key = ast.literal_eval(key_node)
+                    if key in seen:
+                        dups.append(key)
+                    seen.add(key)
+        self.assertEqual(dups, [], f'Duplicate keys in i18n_catalog.EN: {dups}')
+        missing = []
+        for path in sorted(tray_dir.iterdir()):
+            if not path.is_file() or path.suffix not in ('.py', '.pyw') or path.name.startswith('test_'):
+                continue
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '_tr'
+                        and len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)):
+                    if node.args[0].value not in EN:
+                        missing.append((path.name, node.lineno, node.args[0].value))
+        self.assertEqual(missing, [], f'Missing English translations: {missing}')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -476,6 +476,36 @@ class PriorityTests(unittest.TestCase):
             self.assertIn('已开启', priority.enable('codex', 'gpt-6-astra', 'usage', 12, self.now))
             self.assertEqual({r['id'] for r in self.rows()}, {'legacy_bad'} | {r['id'] for r in self.rows() if r['model'] == 'gpt-6-astra'})
 
+    def test_tray_override_writes_use_account_fleet_override_path_and_enable_updates_legacy_panel_boost(self):
+        """Rules (router_data._accounts_override_path, router_priority.enable): tray preference writes follow
+        `AGENTCOMPASS_ACCOUNTS_OVERRIDE` via `account_fleet.accounts_override_path()` without patching `STATE_DIR`,
+        and `router_priority.enable` updates a legacy `panel:boost` rule in place."""
+        accounts = account_fleet.load_accounts()
+        shipped = [(t['account'], t['model']) for t in priority.targets(accounts)]
+        added = next(
+            (t['account'], t['model']) for t in priority.menu_choices(accounts)
+            if (t['account'], t['model']) not in shipped
+        )
+        # Without patching router_data.STATE_DIR, change_priority_menu writes to account_fleet.accounts_override_path().
+        custom = Path(self.temp.name) / 'custom-override.json'
+        with patch.dict(os.environ, {'AGENTCOMPASS_ACCOUNTS_OVERRIDE': str(custom)}):
+            router_data.change_priority_menu(add=added)
+            self.assertTrue(custom.is_file())
+            self.assertEqual([(t['account'], t['model']) for t in priority.targets(account_fleet.load_accounts())],
+                             [*shipped, added])
+        # A legacy `panel:boost` stop-on-reset rule is updated in place rather than blocking a new expected reset time.
+        self.path.write_text(json.dumps({'v': 1, 'overrides': [
+            {'id': 'old_panel_boost', 'intent': 'panel:boost', 'account': 'codex', 'model': 'gpt-6-astra',
+             'window': 'usage', 'boost': 0.35, 'until': (self.now + timedelta(hours=3)).isoformat(),
+             'stop_on_reset': True},
+        ]}), encoding='utf-8')
+        message = priority.enable('codex', 'gpt-6-astra', 'usage', 12, self.now)
+        self.assertIn('已更新', message)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['id'], 'old_panel_boost')
+        self.assertEqual(rows[0]['until'], (self.now + timedelta(hours=12)).isoformat())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -260,7 +260,7 @@ def enable(account, model, window, hours, now=None):
         new_until = (now+timedelta(hours=hours)).isoformat()
         overlapping = [r for r in doc['overrides'] if overlaps(r, account, canonical_model, now, accounts)]
         if overlapping:
-            ui_rules = [r for r in overlapping if r.get('intent') in (INTENT, 'panel:temporary-boost')
+            ui_rules = [r for r in overlapping if r.get('intent') in (INTENT, 'panel:temporary-boost', 'panel:boost')
                         and r.get('stop_on_reset') and not r.get('expires_at')]
             if not ui_rules or any(r.get('until') == new_until for r in ui_rules):
                 return _tr('该账号/模型已有临时规则；未叠加权重，也未延长截止时间')
