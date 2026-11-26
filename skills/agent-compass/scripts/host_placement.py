@@ -107,8 +107,9 @@ def native_handover_spec(parent_host, bundle, accounts=None, *, parent_model=Non
     if bundle.get('fast'):
         return None, f'{tool} has no fast-mode launch field for {wire_model!r}'
     effort = str(bundle.get('effort') or '').strip() or None
-    if effort and harness in account_fleet.EFFORT_IN_MODEL:
-        effort = None
+    if harness == 'antigravity-resilient':
+        # Every host here runs the agy CLI, whose model ids carry the effort: no separate effort field.
+        wire_model, effort = account_fleet.agy_cli_model(wire_model, effort), None
 
     if decl['account_scope'] == 'own_session':
         if harness != decl['harness']:
@@ -299,7 +300,9 @@ def native_next(host, bundle, address, workspace=None, *, native_spec=None):
     tool = (native_spec or {}).get('tool')
     wire_model = _wire_model(bundle)
     provider = bundle.get('provider')
-    effort = None if bundle.get('harness') == 'antigravity-resilient' else bundle.get('effort')
+    effort = bundle.get('effort')
+    if bundle.get('harness') == 'antigravity-resilient':
+        wire_model, effort = account_fleet.agy_cli_model(wire_model, effort), None
     if host == 'orca' or tool == 'shell:orca worker launch':
         agent_val = fields.get('--agent') or account_fleet.harness_family(provider)
         model_val = fields.get('--model') or wire_model

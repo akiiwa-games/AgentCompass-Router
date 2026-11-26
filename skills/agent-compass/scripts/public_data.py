@@ -52,13 +52,16 @@ import state_upgrade  # noqa: E402
 # by an install whose SCHEMA_VERSION is N, from published/N/. Bump it with any change after which an installed reader
 # of the previous schema would misread data written for this code (a new required field, a renamed key, a changed
 # meaning); `publish --check-released` runs every released reader of this schema against a new publication.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # Schema 7 (2026-11-18, v0.7.0): level 3 is the panel maximum. five-axis-scores.json is `agent-compass.five-axis-scores/6`
 # and user-scores.json `schema_version = 3`.
 # Schema 8 (2026-11-19, v0.7.1): a value at every (model, effort) a host offers, `none` to `ultra`. five-axis-scores.json
 # is `agent-compass.five-axis-scores/12` (`effort_steps`, `size_steps`, `effort_readings`, cells that may carry
 # `drift_correction`); accounts.json gains `effort_readings`, `series_versions`, `estimation_order`, the `listed_as`
 # and `listed_as_source` board identities and the panel `members`. A schema-7 reader refuses the scores file.
+# Schema 9 (2026-11-26): an Antigravity bundle holds the bare model and its effort apart (`model: gemini-4-neon`,
+# `effort: low`, no `launch_model`), and `dispatch_efforts['antigravity-resilient']` lists each model's own thinking
+# options. A schema-8 reader launches that bundle on the bare model with no `thinkingOptionId`, so the effort is lost.
 UPDATE_APP = 'update AgentCompass to the latest release to receive new reference data'
 # What a run-time reader reads (router-internals.md, Reference data). Left out on purpose: level-3-conversion.json (the
 # frozen conversion of the user-scores upgrade step, owned with that code), public-measurements.json (read only by the

@@ -330,7 +330,7 @@ Always pass the explicit permission mode from `selected_bundle.modeId` (never re
 | **`codex`** | Paseo / Codex CLI | `--mode full-access` | Engineering & GUI (`cua_repl`) harness for `gpt-6-astra` and `gpt-6.1-sol`. |
 | **`pi`** | Paseo (`provider: "pi"`) | No `modeId` (adapter has fixed tool access and advertises no modes) | Exploration & research-packet harness for GPT models (`launch_model: "openai-codex/<model>"`). Passing `full-access` is rejected by Paseo. |
 | **`claude`** | Paseo / Claude CLI | `--mode bypassPermissions` | Use the discovered launcher and configured account policy. |
-| **`antigravity-resilient`** | Paseo / `agy` CLI | `modeId: "full-access"` | Use a model and effort advertised by the adapter. |
+| **`antigravity-resilient`** | Paseo / `agy` CLI | `modeId: "full-access"` | Paseo launches the bare model id (`gemini-4-neon`) with the effort as `thinkingOptionId`, each model at the options it lists itself (`thinkingOptionIds` of the live list; a model with none gets no effort). Callers that start or recognise the `agy` CLI directly (`roll` without Paseo, a native `invoke_subagent`, Orca, T3) name the model `<model>-<effort>` (`account_fleet.agy_cli_model`). |
 | **`opencode`** | Paseo (`provider: "opencode"`) | `modeId: "build"` | OpenCode free worker (`deepseek-v4.1-flash-free`, `launch_model: "opencode/deepseek-v4.1-flash-free"`). |
 | **`dot`** | [`dot-subagent`](../../dot-subagent/SKILL.md) | `run_dot_task.py` | Remote worker (`dot2api`); requires `needs.outbound_ok: true` if sending private material. |
 | **`grok-bot`** | [Grok Bot adapter](grok-bot.md) | `run_grok_bot.py` | Automatic remote text candidate; no local file transfer, private material requires outbound authorization. |

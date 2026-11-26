@@ -7,10 +7,8 @@
   "safety_margin_pct": 5,
   "short_window_floor_pct": 10,
   "short_window_hours": 24,
-  "defer_if_reset_within_hours": 6,
   "rotate_after_carried_tokens": 4000000,
   "context_burn_extra_at_250k": 0.5,
-  "needs_judgment_margin": 0.02,
   "harness_order": [
    "codex",
    "pi"
@@ -3600,6 +3598,33 @@
    ]
   },
   "antigravity-resilient": {
+   "gemini-4-neon": [
+    "low",
+    "medium",
+    "high",
+    "xhigh"
+   ],
+   "gemini-4-hydrogen": [
+    "low",
+    "medium",
+    "high",
+    "xhigh"
+   ],
+   "gemini-4-carbon": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "gemini-4-argon": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "gemini-3.8-flash": [
+    "low",
+    "medium",
+    "high"
+   ],
    "claude-opus-5-5": [
     "low",
     "medium",
@@ -3730,6 +3755,43 @@
      "url": "https://platform.claude.com/docs/en/build-with-claude/effort",
      "as_of": "2026-11-18",
      "statement": "Anthropic effort documentation: Claude Haiku 5.5 supports all five effort levels (low, medium, high, xhigh, max), medium the default"
+    }
+   },
+   "antigravity-resilient": {
+    "gemini-4-neon": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives gemini-4-neon the thinking options low, medium, high, xhigh; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "gemini-4-hydrogen": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives gemini-4-hydrogen the thinking options low, medium, high, xhigh; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "gemini-4-carbon": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives gemini-4-carbon the thinking options low, medium, high; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "gemini-4-argon": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives gemini-4-argon the thinking options low, medium, high; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "gemini-3.8-flash": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives gemini-3.8-flash the thinking options low, medium, high; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "claude-opus-5-5": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives claude-opus-5-5 the thinking options low, medium, high; the plugin accepts them as `thinkingOptionId` next to the bare model id"
+    },
+    "claude-sonnet-5-5": {
+     "kind": "maintainer",
+     "as_of": "2026-11-26",
+     "statement": "maintainer: Paseo's model list of provider antigravity-resilient (listProviderModels, plugin v0.3.0) gives claude-sonnet-5-5 the thinking options low, medium, high; the plugin accepts them as `thinkingOptionId` next to the bare model id"
     }
    }
   }
@@ -3958,75 +4020,67 @@
    "bundles": {
     "flash_high": {
      "provider": "antigravity-resilient",
-     "model": "gemini-3.8-flash-high",
+     "model": "gemini-3.8-flash",
      "effort": "high",
      "modeId": "full-access"
     },
     "argon_high": {
      "provider": "antigravity-resilient",
-     "model": "gemini-4-argon-high",
+     "model": "gemini-4-argon",
      "effort": "high",
      "modeId": "full-access"
     },
     "hydrogen_high": {
      "provider": "antigravity-resilient",
-     "model": "gemini-4-hydrogen-high",
+     "model": "gemini-4-hydrogen",
      "effort": "high",
      "modeId": "full-access"
     },
     "neon_low": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-neon",
-     "launch_model": "gemini-4-neon-low",
      "effort": "low",
      "modeId": "full-access"
     },
     "neon_medium": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-neon",
-     "launch_model": "gemini-4-neon-medium",
      "effort": "medium",
      "modeId": "full-access"
     },
     "neon_high": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-neon",
-     "launch_model": "gemini-4-neon-high",
      "effort": "high",
      "modeId": "full-access"
     },
     "neon_xhigh": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-neon",
-     "launch_model": "gemini-4-neon-xhigh",
      "effort": "xhigh",
      "modeId": "full-access"
     },
     "carbon_low": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-carbon",
-     "launch_model": "gemini-4-carbon-low",
      "effort": "low",
      "modeId": "full-access"
     },
     "carbon_medium": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-carbon",
-     "launch_model": "gemini-4-carbon-medium",
      "effort": "medium",
      "modeId": "full-access"
     },
     "carbon_high": {
      "provider": "antigravity-resilient",
      "model": "gemini-4-carbon",
-     "launch_model": "gemini-4-carbon-high",
      "effort": "high",
      "modeId": "full-access"
     },
     "agy_opus55_low": {
      "provider": "antigravity-resilient",
-     "model": "claude-opus-5-5-low",
-     "launch_model": "claude-opus-5-5-low",
+     "model": "claude-opus-5-5",
      "effort": "low",
      "modeId": "full-access",
      "draws": [
@@ -4036,8 +4090,7 @@
     },
     "agy_opus55_medium": {
      "provider": "antigravity-resilient",
-     "model": "claude-opus-5-5-medium",
-     "launch_model": "claude-opus-5-5-medium",
+     "model": "claude-opus-5-5",
      "effort": "medium",
      "modeId": "full-access",
      "draws": [
@@ -4047,8 +4100,7 @@
     },
     "agy_opus55_high": {
      "provider": "antigravity-resilient",
-     "model": "claude-opus-5-5-high",
-     "launch_model": "claude-opus-5-5-high",
+     "model": "claude-opus-5-5",
      "effort": "high",
      "modeId": "full-access",
      "draws": [
@@ -4058,8 +4110,7 @@
     },
     "agy_sonnet55_low": {
      "provider": "antigravity-resilient",
-     "model": "claude-sonnet-5-5-low",
-     "launch_model": "claude-sonnet-5-5-low",
+     "model": "claude-sonnet-5-5",
      "effort": "low",
      "modeId": "full-access",
      "draws": [
@@ -4069,8 +4120,7 @@
     },
     "agy_sonnet55_medium": {
      "provider": "antigravity-resilient",
-     "model": "claude-sonnet-5-5-medium",
-     "launch_model": "claude-sonnet-5-5-medium",
+     "model": "claude-sonnet-5-5",
      "effort": "medium",
      "modeId": "full-access",
      "draws": [
@@ -4080,8 +4130,7 @@
     },
     "agy_sonnet55_high": {
      "provider": "antigravity-resilient",
-     "model": "claude-sonnet-5-5-high",
-     "launch_model": "claude-sonnet-5-5-high",
+     "model": "claude-sonnet-5-5",
      "effort": "high",
      "modeId": "full-access",
      "draws": [

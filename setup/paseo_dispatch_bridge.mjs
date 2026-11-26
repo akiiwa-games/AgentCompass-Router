@@ -1503,7 +1503,15 @@ export function normalizeProviderModels(models) {
       ? item.aliases.filter(a => typeof a === 'string' && a.trim()).map(a => a.trim())
       : [];
     const label = typeof item.label === 'string' && item.label.trim() ? item.label.trim() : undefined;
-    out.push({id, ...(aliases.length ? {aliases} : {}), ...(label ? {label} : {})});
+    // The model's own thinking options (Paseo `thinkingOptions`: `{id, label}` entries). A listed empty array is
+    // kept: it says the model takes none, which differs from a provider that lists no options at all.
+    const thinking = Array.isArray(item.thinkingOptions)
+      ? item.thinkingOptions.map(o => typeof o === 'string' ? o : o?.id).filter(o => typeof o === 'string' && o.trim()).map(o => o.trim())
+      : undefined;
+    const fallback = typeof item.defaultThinkingOptionId === 'string' && item.defaultThinkingOptionId.trim()
+      ? item.defaultThinkingOptionId.trim() : undefined;
+    out.push({id, ...(aliases.length ? {aliases} : {}), ...(label ? {label} : {}),
+      ...(thinking ? {thinkingOptionIds: thinking} : {}), ...(thinking && fallback ? {defaultThinkingOptionId: fallback} : {})});
   }
   return out;
 }

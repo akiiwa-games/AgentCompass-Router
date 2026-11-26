@@ -242,12 +242,7 @@ class PublicationHistoryTests(unittest.TestCase):
 
 # Keys of accounts.json `scoring` this code does not read that released readers of a data schema still index: a set published for
 # that schema keeps them, and they go with the next schema. Key -> (that schema, the released readers and how they read it).
-RELEASED_READER_KEYS = {
-    'needs_judgment_margin': (8, "v0.7.1 to v0.7.3, whose allocator.plan indexes policy['needs_judgment_margin'] "
-                                 "(KeyError once two models are eligible)"),
-    'defer_if_reset_within_hours': (8, "v0.7.1 to v0.7.6, whose candidate_eval.evaluate_bundle indexes "
-                                       "policy['defer_if_reset_within_hours'] (KeyError on any quota or cadence window)"),
-}
+RELEASED_READER_KEYS = {}
 
 
 class ReleasedReaderKeyTests(unittest.TestCase):

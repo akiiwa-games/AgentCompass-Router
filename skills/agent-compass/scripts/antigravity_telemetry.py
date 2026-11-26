@@ -29,7 +29,9 @@ def transcript(persistence, home):
             return None
     data = payload.get('data') if isinstance(payload, dict) else None
     data = data if isinstance(data, dict) else {}
-    conversation = data.get('conversationId')
+    # The ACP-based plugin persists `sessionId` and `conversationId` (the same value); the older fork `conversationId`
+    # only; a pre-init fork persistence a `sessionKey` bound later.
+    conversation = data.get('conversationId') or data.get('sessionId') or persistence.get('conversationId')
     if not conversation and isinstance(data.get('sessionKey'), str):
         binding = Path(home) / '.paseo/antigravity-resilient/conversations/session-keys' / (safe_key(data['sessionKey']) + '.json')
         try:

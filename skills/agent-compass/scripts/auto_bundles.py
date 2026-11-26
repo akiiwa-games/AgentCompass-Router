@@ -35,6 +35,10 @@ HARNESS_DEFAULT_EFFORT = {'codex': 'high', 'pi': 'high', 'claude': 'high', 'open
                           'antigravity-resilient': None, 'grok': 'high'}
 HARNESS_MODE = {'codex': 'full-access', 'claude': 'bypassPermissions',
                 'opencode': 'build', 'antigravity-resilient': 'full-access'}
+# Harnesses whose provider lists, with each model, the thinking options that model takes (`thinkingOptionIds` of a
+# catalog entry's model, `[]` for a model that takes none): a bundle is one model at one of its own options, and a
+# model with none has no effort. Other harnesses keep HARNESS_DEFAULT_EFFORT and the launch contract (`dispatch_efforts`).
+LISTED_EFFORT_HARNESSES = ('antigravity-resilient',)
 # A model catalog entry of an endpoint (tray/model_catalog.py: an OpenAI-compatible base URL) lists ids in its own
 # namespace, so the endpoint is the name's serving provider; any other entry is a launcher's list, whose `provider/name`
 # ids name the provider it launches (model_resolution.serving_providers).
@@ -456,19 +460,26 @@ def derive(accounts, catalog, now, overrides=None, seen=None, account_families=N
                 if status == 'excluded':
                     out['excluded'].append({'account': account, 'harness': harness, 'model': raw, 'reason': reason})
                     continue
-                effort = id_effort or HARNESS_DEFAULT_EFFORT.get(harness)
-                if (harness, key, effort) in manual or (id_effort is None and (harness, key) in manual_models):
-                    continue
-                released_id = auto_bundle_id(account, harness, default_profile(raw, released_accounts)['model'], effort)
-                if released.get(released_id, raw) != raw:
-                    released_id += name_tag(raw)
-                released[released_id] = raw
-                model_name = profile['model'] if profile['source'] != 'calibrated' else key
-                pending.append((raw, harness, key, effort, released_id, model_name, provider, entry, profile, status,
-                                reason, pair_harness, served, presets))
+                options = item.get('thinkingOptionIds') if isinstance(item, dict) and harness in LISTED_EFFORT_HARNESSES else None
+                # The model's own options: one bundle per option, or one without effort for a model that takes none.
+                # `released_effort` is what v0.7.0 read from the id (`-<effort>` in the name), for its id replay.
+                levels = ([(o, o) for o in options] if options
+                          else [(None, id_effort)] if isinstance(options, list) else [(id_effort, id_effort)])
+                for level, released_effort in levels:
+                    effort = (level if isinstance(options, list) else level or HARNESS_DEFAULT_EFFORT.get(harness))
+                    if (harness, key, effort) in manual or (level is None and (harness, key) in manual_models):
+                        continue
+                    released_id = auto_bundle_id(account, harness, default_profile(raw, released_accounts)['model'],
+                                                 released_effort or HARNESS_DEFAULT_EFFORT.get(harness))
+                    if released.get(released_id, raw) != raw:
+                        released_id += name_tag(raw)
+                    released[released_id] = raw
+                    model_name = profile['model'] if profile['source'] != 'calibrated' else key
+                    pending.append((raw, harness, key, effort, released_id, model_name, provider, entry, profile, status,
+                                    reason, pair_harness, served, presets, options))
         owners = {released_id: model_name for _, _, _, _, released_id, model_name, *_ in pending}
         for raw, harness, key, effort, released_id, model_name, provider, entry, profile, status, reason, pair_harness, \
-                served, presets in pending:
+                served, presets, options in pending:
             bid = auto_bundle_id(account, harness, key, effort)
             taken = out['bundles'].get(account, {}).get(bid)
             # The id v0.7.0 gave another model's name stays that name's own: this one takes its tagged id.
@@ -489,6 +500,7 @@ def derive(accounts, catalog, now, overrides=None, seen=None, account_families=N
             bundle = {
                 'provider': provider, 'harness': harness, 'model': model_name, 'launch_model': raw,
                 **({'effort': effort} if effort else {}),
+                **({'efforts': list(options)} if options else {}),   # the model's own options: its launch contract
                 **({'modeId': HARNESS_MODE[harness]} if harness in HARNESS_MODE else {}),
                 'draws': _metered_draws(spec) if metered else _draws(spec, key, accounts),
                 'disabled': bool(default_disabled if chosen is None else chosen) or availability == 'expired',

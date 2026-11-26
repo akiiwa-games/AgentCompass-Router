@@ -554,8 +554,17 @@ def entry_for(bundle, entries):
     if entries.get(key(account)):
         return entries[key(account)]
     pooled = next((v for v in pool_holds(entries, account).values() if in_pool(bundle, hold_pool(v))), None)
-    return pooled or entries.get(key(account, launch_model(bundle))) \
-        or entries.get(key(account, (bundle or {}).get('model')))
+    names = (launch_model(bundle), (bundle or {}).get('model'), _legacy_model(bundle))
+    return pooled or next((entries[key(account, n)] for n in names if n and entries.get(key(account, n))), None)
+
+
+def _legacy_model(bundle):
+    """The `<model>-<effort>` name an Antigravity bundle was held under before the provider listed its thinking options
+    as a separate field (a hold lasts at most hours, so one written by an earlier version still counts until it ends)."""
+    if (bundle or {}).get('harness') != 'antigravity-resilient' or not (bundle or {}).get('effort'):
+        return None
+    import account_fleet
+    return account_fleet.agy_cli_model(launch_model(bundle), bundle['effort'])
 
 
 def retry_text(entry):

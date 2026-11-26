@@ -2452,8 +2452,9 @@ class RollTests(unittest.TestCase):
                  ('claude does not inherit the caller account', 'sonnet55_high',
                   ['claude', '-p', '--model', 'claude-sonnet-5-5', '--effort', 'high', '--permission-mode', 'bypassPermissions', '--settings', '{"fastMode": false}'],
                   None, self.brief),
+                 # agy's own model ids carry the effort; the bundle holds the bare model and the effort apart.
                  ('agy takes the brief as its last argument', 'flash_high',
-                  ['agy', '--dangerously-skip-permissions', '--model', bundles['flash_high']['model'], '--add-dir',
+                  ['agy', '--dangerously-skip-permissions', '--model', 'gemini-3.8-flash-high', '--add-dir',
                    str(Path.cwd())] + brief, None, None))
         for label, choice, argv, config_dir, stdin in cases:
             calls = []
@@ -4875,9 +4876,8 @@ class LiveModelCheckTests(unittest.TestCase):
                 'ok': True,
                 'status': 'ready',
                 'models': [
-                    {'id': 'gemini-3.8-flash-high'},
-                    {'id': 'gemini-3.8-flash-medium'},
-                    {'id': 'gemini-3.8-flash-low'},
+                    {'id': 'gemini-3.8-flash', 'thinkingOptionIds': ['low', 'medium', 'high'],
+                     'aliases': ['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-high']},
                     {'id': 'claude-sonnet-4-6'},
                     {'id': 'claude-opus-4-6-thinking'},
                     {'id': 'gpt-oss-120b-medium'},
@@ -5009,9 +5009,9 @@ class LiveModelCheckTests(unittest.TestCase):
 
     def test_a_bundle_missing_from_the_live_list_is_excluded_with_reason_and_the_next_one_launches_in_the_same_roll(self):
         import live_models
-        # Without live filtering (when gemini-4-argon-high IS offered), argon_high wins a creativity-heavy task.
+        # Without live filtering (when gemini-4-argon IS offered), argon_high wins a creativity-heavy task.
         full_providers = copy.deepcopy(self.live_providers)
-        full_providers['antigravity-resilient']['models'].append({'id': 'gemini-4-argon-high'})
+        full_providers['antigravity-resilient']['models'].append({'id': 'gemini-4-argon'})
         with patch.object(live_models, 'fetch_from_paseo', side_effect=lambda provs, **kw: {
             'ok': True, 'fetched_at': self.now.isoformat(), 'providers': {p: full_providers[p] for p in provs}
         }):
@@ -5020,15 +5020,15 @@ class LiveModelCheckTests(unittest.TestCase):
         self.assertNotIn(winner, (None, 'none'))
         live_models.invalidate()
 
-        # Incident reproduction: antigravity-resilient offers only the 6 starter models (no gemini-4-argon-high).
+        # Incident reproduction: antigravity-resilient offers only the 6 starter models (no gemini-4-argon).
         with patch.object(live_models, 'fetch_from_paseo', side_effect=self.fetch_live):
             result, code = self.roll()
             self.assertEqual((result['status'], code), ('launched', 0))
             self.assertNotEqual(self.choices[0], winner)
             self.assertEqual(len(self.creates), 1)
-            self.assertNotEqual(self.creates[0], 'antigravity-resilient/gemini-4-argon-high')
+            self.assertNotEqual(self.creates[0], 'antigravity-resilient/gemini-4-argon')
             self.assertTrue(
-                any('provider no longer offers gemini-4-argon-high' in w for w in result.get('warnings') or ()),
+                any('provider no longer offers gemini-4-argon' in w for w in result.get('warnings') or ()),
                 result,
             )
             # Both plan and prepare inside the roll shared the 60s cache, so Paseo was queried only once.
@@ -5036,9 +5036,9 @@ class LiveModelCheckTests(unittest.TestCase):
             plan = allocator.plan(dict(self.creative_task), self.usage, self.now, accounts=self.accounts)
             self.assertEqual(len(self.fetched_providers), 1)
             argon_row = next(c for c in plan['ranking'] if c['id'] == 'argon_high')
-            self.assertIn('provider no longer offers gemini-4-argon-high', argon_row['excluded'])
+            self.assertIn('provider no longer offers gemini-4-argon', argon_row['excluded'])
             flash_row = next(c for c in plan['ranking'] if c['id'] == 'flash_high')
-            self.assertNotIn('provider no longer offers gemini-3.8-flash-high', flash_row['excluded'])
+            self.assertNotIn('provider no longer offers gemini-3.8-flash', flash_row['excluded'])
             # Past the 60s TTL, the cache refreshes.
             allocator.plan(dict(self.creative_task), self.usage,
                            self.now + timedelta(seconds=live_models.TTL_SECONDS + 1), accounts=self.accounts)
@@ -5080,7 +5080,7 @@ class LiveModelCheckTests(unittest.TestCase):
         # 3. Fallback when the live list was unreadable and launch fails with INVALID_MODEL: one mechanism, the
         # existing model latch, holds only that model (no provider_retry hold) and gives one warning on the next roll.
         def reject_argon(request):
-            if request['operation'] == 'create' and request['request']['provider'] == 'antigravity-resilient/gemini-4-argon-high':
+            if request['operation'] == 'create' and request['request']['provider'] == 'antigravity-resilient/gemini-4-argon':
                 self.creates.append(request['request']['provider'])
                 return {'ok': False, 'sent': False, 'error': 'host_creation_failed',
                         'failure_class': 'model_unavailable', 'failure_code': 'INVALID_MODEL'}
@@ -5090,11 +5090,11 @@ class LiveModelCheckTests(unittest.TestCase):
             first, code1 = self.roll(host=reject_argon)
             # The same roll goes on to the next candidate (2026-11-10).
             self.assertEqual((first['status'], code1), ('launched', 0))
-            self.assertEqual(self.creates[0], 'antigravity-resilient/gemini-4-argon-high')
+            self.assertEqual(self.creates[0], 'antigravity-resilient/gemini-4-argon')
             self.assertEqual(len(self.creates), 2)
             self.assertNotEqual(self.choices[1], 'argon_high')
             self.assertIn('INVALID_MODEL', first['attempts'][0])
-            self.assertEqual(set(model_latch.active(now=self.now)), {'antigravity/gemini-4-argon-high'})
+            self.assertEqual(set(model_latch.active(now=self.now)), {'antigravity/gemini-4-argon'})
             self.assertEqual(provider_retry.active(now=self.now), {})
             # The refusal invalidated the cached list, so the relaunch's plan read it again.
             reread = json.loads(self.live_store.read_text(encoding='utf-8'))['providers']['antigravity-resilient']
@@ -5105,7 +5105,7 @@ class LiveModelCheckTests(unittest.TestCase):
             self.assertEqual((second['status'], code2), ('launched', 0))
             self.assertNotEqual(self.choices[2], 'argon_high')
             plan = allocator.plan(dict(self.creative_task), self.usage, self.now, accounts=self.accounts)
-            lines = [w for w in plan['decision'].get('warnings') or () if 'gemini-4-argon-high' in w]
+            lines = [w for w in plan['decision'].get('warnings') or () if 'gemini-4-argon' in w]
             self.assertEqual(len(lines), 1, lines)
 
     def test_a_provider_paseo_does_not_know_gives_no_warning_and_no_exclusion(self):
@@ -5163,9 +5163,9 @@ class LiveModelCheckTests(unittest.TestCase):
         import live_models
         accounts = copy.deepcopy(self.accounts)
         live_doc = {'providers': copy.deepcopy(self.live_providers)}
-        self.assertTrue(any('gemini-4-argon-high' in w for w in live_models.warnings(live_doc, accounts)))
+        self.assertTrue(any('gemini-4-argon' in w for w in live_models.warnings(live_doc, accounts)))
         accounts['accounts']['antigravity']['bundles']['argon_high']['disabled'] = True
-        self.assertFalse(any('gemini-4-argon-high' in w for w in live_models.warnings(live_doc, accounts)))
+        self.assertFalse(any('gemini-4-argon' in w for w in live_models.warnings(live_doc, accounts)))
 
     def test_structural_model_id_and_paseo_alias_matching(self):
         import live_models

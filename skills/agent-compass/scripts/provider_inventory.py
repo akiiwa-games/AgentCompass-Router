@@ -2134,9 +2134,16 @@ def listed_rows(accounts, account, provider, model, effort, live_doc):
     if not live_models.offers_model(provider, model, entry):
         return None, f'provider {provider} does not list {model}'
     families = {name: row.get('family') for name, row in (((accounts.get('_discovery') or {}).get('accounts')) or {}).items()}
+    # A model the provider lists with its own thinking options is derived from that listing: a `<model>-<option>` alias
+    # the user typed reads as the model at that option, whatever spelling it was named by.
+    read = live_models.listing(provider, model, entry)
+    item = ({'id': read['id'], 'thinkingOptionIds': read['options']}
+            if read and read['options'] is not None else model)
+    effort = effort or (read or {}).get('effort')
     derived = auto_bundles.derive(accounts, {'providers': {provider: {'ok': True, 'checked_at': time.time(),
-                                                                      'models': [model]}}},
-                                  time.time(), account_families=families, named={(account, model)})
+                                                                      'models': [item]}}},
+                                  time.time(), account_families=families,
+                                  named={(account, item['id'] if isinstance(item, dict) else model)})
     rows = dict(derived['bundles'].get(account) or {})
     if not rows:
         excluded = [e['reason'] for e in derived['excluded'] if e.get('account') == account]

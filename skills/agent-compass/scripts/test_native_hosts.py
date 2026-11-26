@@ -353,6 +353,7 @@ class NativeExpressibilityContractTests(unittest.TestCase):
         fable51 = {'provider': 'claude', 'account': 'claude', 'model': 'claude-fable-5-1', 'effort': 'high', 'bundle_id': 'fable51_high'}
         sol = dict(bundles['sol_high'], bundle_id='sol_high', account='codex')
         flash = dict(bundles['flash_high'], bundle_id='flash_high', account='antigravity')
+        agy_flash = self.account_fleet.agy_cli_model(flash['model'], flash['effort'])
         pi_astra = dict(bundles['pi_astra_high'], bundle_id='pi_astra_high', account='pi')
 
         cases = (
@@ -379,11 +380,12 @@ class NativeExpressibilityContractTests(unittest.TestCase):
              {'CODEX_THREAD_ID': 'x-1'},
              lambda lf: {'session_id': 'x-1', 'tool_use_id': 'u-x1', 'tool_name': 'spawn_agent',
                          'tool_input': {'message': 'go', **lf}}),
+            # The agy CLI and its hooks name the model with its effort (`agy_cli_model`); the bundle holds them apart.
             ('antigravity', flash,
              ['--parent-host', 'native', '--parent-id', 'a-1', '--parent-address', 'inbox:a1',
-              '--parent-model', flash['model'], '--new-worker', '--task-id', 'ta-1'],
+              '--parent-model', agy_flash, '--new-worker', '--task-id', 'ta-1'],
              {'ANTIGRAVITY_CONVERSATION_ID': 'a-1'},
-             lambda lf: {'conversationId': 'a-1', 'modelName': flash['model'],
+             lambda lf: {'conversationId': 'a-1', 'modelName': agy_flash,
                          'toolCall': {'id': 'u-a1', 'name': 'invoke_subagent', 'args': {'TypeName': 'self', **lf}}}),
             ('orca-pi', pi_astra,
              ['--new-worker', '--task-id', 'to-1'],
@@ -658,7 +660,8 @@ class NativeExpressibilityContractTests(unittest.TestCase):
             (['--parent-host', 'native', '--parent-id', 'na-1', '--parent-address', 'in:na1',
               '--parent-model', 'gemini-3.8-flash-high',
               '--provider', 'antigravity-resilient', '--account', 'antigravity', '--model', 'gemini-4-argon-high', '--basis', 'user named argon'],
-             {'ANTIGRAVITY_CONVERSATION_ID': 'na-1'}, 'gemini-4-argon-high', 'antigravity'),
+             # `-high` is the effort of the named model: the worker runs the bare model, its effort a separate field.
+             {'ANTIGRAVITY_CONVERSATION_ID': 'na-1'}, 'gemini-4-argon', 'antigravity'),
             (['--parent-host', 'native', '--parent-id', 'np-1', '--parent-address', 'in:np1',
               '--provider', 'claude', '--account', 'claude', '--model', 'claude-sonnet-5-5', '--effort', 'high', '--basis', 'user named sonnet'],
              {'PI_SESSION_ID': 'np-1'}, 'claude-sonnet-5-5', 'claude'),

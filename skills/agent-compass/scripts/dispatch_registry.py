@@ -611,7 +611,7 @@ def launch_request(bundle, launch):
     mode = None if family == 'pi' else bundle.get('modeId') or PASEO_LAUNCHER_MODES[family]
     if mode:
         settings['modeId'] = mode
-    if bundle.get('effort') and family != 'antigravity-resilient':
+    if bundle.get('effort'):
         settings['thinkingOptionId'] = bundle['effort']
     if bundle.get('fast'):
         import account_fleet

@@ -545,8 +545,9 @@ class AllocatorTests(unittest.TestCase):
                 bundle = flat[f'agy_{family}55_{effort}']
                 self.assertEqual(quota_pools.bundle_pools(bundle, accounts), ['3p-5h', '3p-weekly'])
                 self.assertEqual(account_fleet.canonical(bundle['model'], accounts), canonical_name)
-                self.assertEqual(bundle['model'], f'{canonical_name}-{effort}')
-                self.assertEqual(bundle['launch_model'], bundle['model'])
+                # The bundle holds the bare model; Paseo takes the effort as `thinkingOptionId` (launch_request).
+                self.assertEqual(bundle['model'], canonical_name)
+                self.assertNotIn('launch_model', bundle)
                 self.assertEqual((bundle['provider'], bundle['modeId']), ('antigravity-resilient', 'full-access'))
                 self.assertNotIn('disabled', bundle)
         self.assertNotIn('when', flat['agy_opus55_low'])
@@ -580,16 +581,17 @@ class AllocatorTests(unittest.TestCase):
             {'provider': 'antigravity-resilient', 'account': 'antigravity', 'model': 'claude-opus-5-5', 'effort': 'high'},
             accounts)
         self.assertEqual(resolved['id'], 'agy_opus55_high')
-        self.assertEqual(resolved['launch_model'], 'claude-opus-5-5-high')
+        self.assertEqual(resolved['model'], 'claude-opus-5-5')
         with self.assertRaises(ValueError):
             dispatch_registry.resolve_bundle(
                 {'provider': 'antigravity-resilient', 'account': 'antigravity', 'model': 'claude-opus-5-5', 'effort': 'xhigh'},
                 accounts, explicit_override=True)
         request = dispatch_registry.launch_request(
             account_fleet.bundles(accounts)['agy_opus55_high'], {'title': 'agy claude', 'initialPrompt': 'fixture'})
-        self.assertEqual(request['provider'], 'antigravity-resilient/claude-opus-5-5-high')
+        # The bare model and a separate thinking option (the plugin lists `claude-opus-5-5-high` only as an alias).
+        self.assertEqual(request['provider'], 'antigravity-resilient/claude-opus-5-5')
         self.assertEqual(request['settings'].get('modeId'), 'full-access')
-        self.assertNotIn('thinkingOptionId', request['settings'])
+        self.assertEqual(request['settings'].get('thinkingOptionId'), 'high')
 
         sparse = account_fleet.load_accounts()
         accounts_override.apply(sparse, {'accounts': {'antigravity': {'bundles': {

@@ -1316,6 +1316,19 @@ test('provider_models reads live models per provider with structural ids and ali
     [{id: 'm1', aliases: ['a1'], label: 'L1'}]);
 });
 
+test('provider_models keeps each model its own thinking options, an empty list included, and its default', () => {
+  assert.deepEqual(normalizeProviderModels([
+    {id: 'base', aliases: ['base-low', 'base-high'], thinkingOptions: [{id: 'low', label: 'Low'}, {id: ' high '}, {}],
+      defaultThinkingOptionId: 'high'},
+    {id: 'plain', thinkingOptions: [], defaultThinkingOptionId: null},
+    {id: 'unlisted'},
+  ]), [
+    {id: 'base', aliases: ['base-low', 'base-high'], thinkingOptionIds: ['low', 'high'], defaultThinkingOptionId: 'high'},
+    {id: 'plain', thinkingOptionIds: []},
+    {id: 'unlisted'},
+  ]);
+});
+
 test('provider_models cannot tell a Paseo provider apart without the snapshot, so an unread snapshot reports unavailable', async () => {
   const asked = [];
   const fake = {

@@ -173,6 +173,31 @@ def offers_model(provider: str, model_id: str, provider_entry: dict | None) -> b
     return bool(candidates & offered_model_ids(provider, provider_entry))
 
 
+def listing(provider: str, model_id: str, provider_entry: dict | None) -> dict | None:
+    """The live listing a named model reads as: `{'id', 'effort', 'options', 'default'}` for an exact model `id`
+    (`effort` None) or for the `<id>-<option>` alias a model with thinking options lists (`effort` that option), else
+    None. `options` is the model's own `thinkingOptionIds` (None when the provider lists none for it, `[]` when it
+    takes none); an exact id wins over an alias, so `gpt-oss-120b-medium` stays a model that takes no effort."""
+    if not isinstance(provider_entry, dict) or provider_entry.get('ok') is not True:
+        return None
+    wanted = set(_structural_ids(provider, model_id))
+    models = [m for m in provider_entry.get('models') or () if isinstance(m, dict) and isinstance(m.get('id'), str)]
+
+    def row(item, effort):
+        options = item.get('thinkingOptionIds')
+        return {'id': item['id'], 'effort': effort, 'options': list(options) if isinstance(options, list) else None,
+                'default': item.get('defaultThinkingOptionId')}
+    for item in models:
+        if wanted & set(_structural_ids(provider, item['id'])):
+            return row(item, None)
+    for item in models:
+        for option in item.get('thinkingOptionIds') or ():
+            alias = f"{item['id']}-{option}"
+            if alias in (item.get('aliases') or ()) and wanted & set(_structural_ids(provider, alias)):
+                return row(item, option)
+    return None
+
+
 def _default_fetch_from_paseo(providers: list[str], cwd: str | None = None, timeout: int = FETCH_TIMEOUT_SECONDS) -> dict:
     import dispatch_flow
     payload: dict = {'operation': 'provider_models', 'providers': list(providers), 'timeout_seconds': timeout}
@@ -261,6 +286,11 @@ def _normalize_entry(raw_entry: dict | None, fetched_at_iso: str, fallback_error
                     normalized['aliases'] = aliases
                 if isinstance(item.get('label'), str) and item['label'].strip():
                     normalized['label'] = item['label'].strip()
+                if isinstance(item.get('thinkingOptionIds'), list):   # [] = the model takes none
+                    normalized['thinkingOptionIds'] = [o.strip() for o in item['thinkingOptionIds']
+                                                       if isinstance(o, str) and o.strip()]
+                    if isinstance(item.get('defaultThinkingOptionId'), str) and item['defaultThinkingOptionId'].strip():
+                        normalized['defaultThinkingOptionId'] = item['defaultThinkingOptionId'].strip()
                 models.append(normalized)
         return {
             'ok': True,

@@ -559,8 +559,15 @@ def dispatch_allowed_efforts(bundle, accounts, model=None):
 CLI_FAMILIES = ('claude', 'codex', 'pi', 'omp', 'opencode', 'grok', 'grok-bot', 'antigravity')
 LAUNCH_FAMILIES = (*CLI_FAMILIES, 'dot', 'chatgpt-web')
 LAUNCH_HARNESSES = (*(f for f in LAUNCH_FAMILIES if f != 'antigravity'), 'antigravity-resilient')
-# Harnesses whose launch passes no effort (dispatch_registry, roll.CLI_RUNS): the model id carries it.
-EFFORT_IN_MODEL = ('antigravity-resilient',)
+
+
+def agy_cli_model(model, effort):
+    """The model id the agy CLI itself takes and its hooks report: `<model>-<effort>` (`agy models` lists no other form).
+    Paseo's antigravity-resilient provider takes the bare model and a separate `thinkingOptionId` instead; this id is
+    for the callers that start or recognise the CLI directly (`roll` without Paseo, a native `invoke_subagent`, Orca,
+    T3). A model that has no effort, or a name that already ends in it, is returned as given."""
+    name = str(model or '').strip()
+    return f'{name}-{effort}' if name and effort and not name.lower().endswith(f'-{effort}'.lower()) else name
 
 
 def launch_problems(doc):
@@ -602,7 +609,7 @@ def launch_problems(doc):
                 found.append(f'{account}.bundles.{bundle_id} runs on harness {harness!r}, which this code does not launch')
             effort = bundle.get('effort') or split_model_effort(bundle.get('model') or '')[1]
             offered = dispatch_allowed_efforts({**bundle, 'account': account}, doc)
-            if effort and harness not in EFFORT_IN_MODEL and offered is not None and effort not in offered:
+            if effort and offered is not None and effort not in offered:
                 found.append(f'{account}.bundles.{bundle_id} effort {effort!r} is not one the launch contract offers '
                              f'{bundle.get("model")!r} ({", ".join(offered) or "none"})')
     return found
@@ -687,7 +694,8 @@ NATIVE_HOST_TOOLS = {
         # - https://antigravity.google/docs/hooks.md (`modelName` on PreToolUse payload)
         #   `invoke_subagent` `Model` accepts only `inherit` / `flash_lite` / `flash` / `pro` with no published model+effort
         #   mapping for the abstract tiers; only `Model: "inherit"` expresses a concrete route, when the caller's own active
-        #   model is known (`--parent-model`) and equals the bundle's wire `launch_model`. Effort is in the model ID.
+        #   model is known (`--parent-model`) and equals the bundle's agy CLI model id (`agy_cli_model`: the agy CLI's
+        #   own ids and its hooks carry the effort in the id, unlike Paseo's separate `thinkingOptionId`).
         'tool': 'invoke_subagent',
         'account_scope': 'own_session',
         'session_family': 'antigravity',

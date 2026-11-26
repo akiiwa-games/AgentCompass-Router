@@ -229,7 +229,7 @@ class PriorityTests(unittest.TestCase):
             for spec in shipped_doc['accounts'].values():
                 spec['verified'] = True
             shipped = priority.targets(shipped_doc)
-        self.assertEqual({t['model'] for t in choices}, {'gpt-6-astra', 'gemini-4-argon-high', 'claude-opus-5-5'})
+        self.assertEqual({t['model'] for t in choices}, {'gpt-6-astra', 'gemini-4-argon', 'claude-opus-5-5'})
         self.assertEqual({t['account'] for t in choices}, {'codex', 'antigravity', 'claude'})
         self.assertEqual([(t['account'], t['model'], t['label']) for t in shipped], [
             ('antigravity', 'gemini-4-carbon', 'Carbon'),
@@ -271,7 +271,7 @@ class PriorityTests(unittest.TestCase):
     def test_switch_model_is_atomic_and_failed_baseline_preserves_current_choice(self):
         self.enable(); before = self.path.read_bytes()
         with patch.object(host_policy, 'load_policy', return_value=None):
-            target = next(t for t in priority.targets(account_fleet.load_accounts()) if t['model']=='gemini-4-argon-high')
+            target = next(t for t in priority.targets(account_fleet.load_accounts()) if t['model']=='gemini-4-argon')
             with self.assertRaises(ValueError):
                 priority.enable(target['account'], target['model'], target['window'], 24, self.now)
             self.assertEqual(self.path.read_bytes(), before)
@@ -279,7 +279,7 @@ class PriorityTests(unittest.TestCase):
             obs['windows'][0]['id'] = target['window']
             self.usage['accounts']['antigravity'] = obs
             priority.enable(target['account'], target['model'], target['window'], 24, self.now)
-        self.assertEqual([r['model'] for r in self.rows()], ['gemini-4-argon-high'])
+        self.assertEqual([r['model'] for r in self.rows()], ['gemini-4-argon-high'])   # the stored rule names the model row
         self.assertTrue(priority.snapshot(self.now)['label'].startswith('优先中：Argon'))
 
     def test_receipt_clock_does_not_slide_and_restart_can_read_it(self):

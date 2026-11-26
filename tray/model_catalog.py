@@ -75,7 +75,13 @@ def query_paseo(spec: dict) -> list[dict]:
     rows = value if isinstance(value, list) else value.get('models')
     if not isinstance(rows, list):
         raise ValueError('Invalid model discovery result')
-    return [{'id': row['id'], 'label': row.get('label') or row.get('model') or row['id']}
+    return [{'id': row['id'], 'label': row.get('label') or row.get('model') or row['id'],
+             # The model's own thinking options (`paseo provider models` prints them as `thinkingOptionIds`); an empty
+             # list says it takes none, and a provider that prints none leaves the key out.
+             **({'thinkingOptionIds': [o for o in row['thinkingOptionIds'] if isinstance(o, str) and o],
+                 **({'defaultThinkingOptionId': row['defaultThinkingOptionId']}
+                    if isinstance(row.get('defaultThinkingOptionId'), str) and row['defaultThinkingOptionId'] else {})}
+                if isinstance(row.get('thinkingOptionIds'), list) else {})}
             for row in rows if isinstance(row, dict) and isinstance(row.get('id'), str)]
 
 

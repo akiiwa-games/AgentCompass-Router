@@ -38,19 +38,22 @@ def store(tmp_path, monkeypatch):
     return path
 
 
-def bundle(accounts, launch):
-    return next(b for b in account_fleet.bundles(accounts).values() if provider_retry.launch_model(b) == launch)
+def bundle(accounts, launch, account=None):
+    """The first bundle launching `launch`; `account` when another account launches the same model (Antigravity's
+    `claude-opus-5-5` is the bare model Claude Code launches too)."""
+    return next(b for b in account_fleet.bundles(accounts).values()
+                if provider_retry.launch_model(b) == launch and account in (None, b['account']))
 
 
-def hold(accounts, launch, scope, dispatch_id, at=NOW, message=MESSAGE):
-    return provider_retry.record(bundle(accounts, launch), {'failure_code': 'provider_turn_failed',
+def hold(accounts, launch, scope, dispatch_id, at=NOW, message=MESSAGE, account=None):
+    return provider_retry.record(bundle(accounts, launch, account), {'failure_code': 'provider_turn_failed',
                                                             'provider_message': message, 'at': at.isoformat()},
                                  dispatch_id=dispatch_id, accounts=accounts,
                                  classify=lambda *args: (scope, {'source': 'system_one'}))
 
 
-def held_out(accounts, launch, at=NOW):
-    return provider_retry.reason(bundle(accounts, launch), provider_retry.active(now=at))
+def held_out(accounts, launch, at=NOW, account=None):
+    return provider_retry.reason(bundle(accounts, launch, account), provider_retry.active(now=at))
 
 
 def test_discovery_places_go_models_beside_zen_ones_and_the_prefix_splits_the_pools(accounts):
@@ -84,25 +87,25 @@ def test_a_go_hold_leaves_zen_dispatchable(accounts, store):
 
 
 def test_an_antigravity_third_party_hold_leaves_gemini_dispatchable_and_the_other_way(accounts, store):
-    hold(accounts, 'claude-opus-5-5-high', 'account', 'd1', message=QUOTA)
+    hold(accounts, 'claude-opus-5-5', 'account', 'd1', message=QUOTA, account='antigravity')
     assert set(provider_retry.active(now=NOW)) == {f'antigravity#{THIRD_PARTY_POOL}'}
-    for third in ('claude-opus-5-5-low', 'claude-sonnet-5-5-high'):
-        assert held_out(accounts, third)
-    for gemini in ('gemini-3.8-flash-high', 'gemini-4-argon-high'):
-        assert held_out(accounts, gemini) is None
+    for third in ('claude-opus-5-5', 'claude-sonnet-5-5'):
+        assert held_out(accounts, third, account='antigravity')
+    for gemini in ('gemini-3.8-flash', 'gemini-4-argon'):
+        assert held_out(accounts, gemini, account='antigravity') is None
     # A Gemini model the windows' scope binds, discovered after the hold, stays out of the third-party pool.
     assert provider_retry.reason({'account': 'antigravity', 'provider': 'antigravity-resilient',
                                   'model': 'gemini-5-pro-high', 'launch_model': 'gemini-5-pro-high'},
                                  provider_retry.active(now=NOW)) is None
 
     provider_retry.clear('antigravity')
-    hold(accounts, 'gemini-4-argon-high', 'account', 'd2', message=QUOTA)
+    hold(accounts, 'gemini-4-argon', 'account', 'd2', message=QUOTA, account='antigravity')
     assert set(provider_retry.active(now=NOW)) == {f'antigravity#{GEMINI_POOL}'}
-    assert held_out(accounts, 'gemini-3.8-flash-high')
+    assert held_out(accounts, 'gemini-3.8-flash', account='antigravity')
     assert provider_retry.reason({'account': 'antigravity', 'provider': 'antigravity-resilient',
                                   'model': 'gemini-5-pro-high', 'launch_model': 'gemini-5-pro-high'},
                                  provider_retry.active(now=NOW))
-    assert held_out(accounts, 'claude-sonnet-5-5-high') is None
+    assert held_out(accounts, 'claude-sonnet-5-5', account='antigravity') is None
 
 
 def test_single_pool_accounts_are_held_whole_as_before(accounts, store):
@@ -132,13 +135,13 @@ def test_unknown_widens_to_the_pool_and_never_across_pools(accounts, store):
 
 
 def test_clearing_a_pool_clears_its_models_and_keeps_the_other_pool(accounts, store):
-    hold(accounts, 'claude-opus-5-5-high', 'account', 'd1', message=QUOTA)
-    hold(accounts, 'claude-sonnet-5-5-low', 'model', 'd2', message=QUOTA)
-    hold(accounts, 'gemini-4-argon-high', 'account', 'd3', message=QUOTA)
-    hold(accounts, 'gemini-3.8-flash-high', 'transient', 'd4', message='503')
+    hold(accounts, 'claude-opus-5-5', 'account', 'd1', message=QUOTA, account='antigravity')
+    hold(accounts, 'claude-sonnet-5-5', 'model', 'd2', message=QUOTA, account='antigravity')
+    hold(accounts, 'gemini-4-argon', 'account', 'd3', message=QUOTA, account='antigravity')
+    hold(accounts, 'gemini-3.8-flash', 'transient', 'd4', message='503', account='antigravity')
     assert provider_retry.clear_key(f'antigravity#{THIRD_PARTY_POOL}') is True
     assert set(provider_retry.active(now=NOW)) == {f'antigravity#{GEMINI_POOL}',
-                                                    'antigravity/gemini-3.8-flash-high'}
+                                                    'antigravity/gemini-3.8-flash'}
     assert provider_retry.clear_key(f'antigravity#{THIRD_PARTY_POOL}') is False
     assert provider_retry.clear('antigravity', pool=GEMINI_POOL) is True
     assert provider_retry.active(now=NOW) == {}
@@ -155,15 +158,15 @@ def test_a_completed_probe_lifts_its_own_pool_only(accounts, store):
 
 def test_a_good_reading_or_a_re_login_lifts_each_pool_hold_on_its_own_evidence(accounts, store, monkeypatch):
     monkeypatch.setattr(provider_retry.account_state, '_latch_context', lambda account: ('cred-a', None))
-    hold(accounts, 'claude-opus-5-5-high', 'account', 'd1', message=QUOTA)
-    hold(accounts, 'claude-sonnet-5-5-low', 'model', 'd2', message=QUOTA)
-    hold(accounts, 'gemini-4-argon-high', 'account', 'd3', at=NOW + timedelta(hours=1), message=QUOTA)
-    hold(accounts, 'gemini-3.8-flash-high', 'model', 'd4', at=NOW + timedelta(hours=1), message='overloaded')
+    hold(accounts, 'claude-opus-5-5', 'account', 'd1', message=QUOTA, account='antigravity')
+    hold(accounts, 'claude-sonnet-5-5', 'model', 'd2', message=QUOTA, account='antigravity')
+    hold(accounts, 'gemini-4-argon', 'account', 'd3', at=NOW + timedelta(hours=1), message=QUOTA, account='antigravity')
+    hold(accounts, 'gemini-3.8-flash', 'model', 'd4', at=NOW + timedelta(hours=1), message='overloaded', account='antigravity')
     # A good reading between the two holds lifts the older pool (and its model holds), not the newer one.
     good = (NOW + timedelta(minutes=30)).isoformat()
     assert provider_retry.lift_after_reading('antigravity', last_good=good, credential_key='cred-a') is True
     assert set(provider_retry.active(now=NOW)) == {f'antigravity#{GEMINI_POOL}',
-                                                    'antigravity/gemini-3.8-flash-high'}
+                                                    'antigravity/gemini-3.8-flash'}
     assert provider_retry.lift_after_reading('antigravity', last_good=good, credential_key='cred-a') is False
     # Another credential lifts what was taken under the old one.
     assert provider_retry.lift_after_reading('antigravity', credential_key='cred-b') is True
@@ -189,7 +192,7 @@ def test_an_account_hold_from_a_single_pool_account_narrows_to_its_pool_once_go_
     fleet = account_fleet.load_accounts(account_fleet.reference_fleet_path())
     entry = hold(fleet, 'opencode/deepseek-v4.1-flash-free', 'account', 'd1')
     assert ('pool' not in entry, set(provider_retry.active(now=NOW))) == (True, {'opencode'})
-    hold(fleet, 'claude-opus-5-5-high', 'model', 'd2', message=QUOTA)
+    hold(fleet, 'claude-opus-5-5', 'model', 'd2', message=QUOTA, account='antigravity')
     # Nothing to narrow while the account still has one pool.
     assert provider_retry.scope_account_holds(fleet) == []
     catalog = {'providers': {'opencode': {'ok': True, 'type': 'paseo_provider', 'checked_at': 1,
@@ -217,8 +220,8 @@ def test_loading_the_accounts_narrows_a_legacy_account_hold(store, monkeypatch, 
         'models': ['claude-opus-5-5-high'], 'source': 'd-old'}}}), encoding='utf-8')
     accounts = account_fleet.load_accounts(account_fleet.reference_fleet_path())
     assert set(provider_retry.active(now=NOW)) == {f'antigravity#{THIRD_PARTY_POOL}'}
-    assert held_out(accounts, 'claude-sonnet-5-5-high')
-    assert held_out(accounts, 'gemini-4-argon-high') is None
+    assert held_out(accounts, 'claude-sonnet-5-5', account='antigravity')
+    assert held_out(accounts, 'gemini-4-argon', account='antigravity') is None
 
 
 def test_unreadable_accounts_hold_the_whole_account(store):

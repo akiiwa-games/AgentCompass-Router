@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 
+import account_fleet
 import dispatch_fallback
 import dispatch_flow
 import entry
@@ -60,8 +61,9 @@ CLI_RUNS = {
                                                                '--dangerously-bypass-approvals-and-sandbox',
                                                                '--skip-git-repo-check', '-C', cwd, '-']),
     'pi': ('pi', lambda model, effort, cwd, fast=False: ['-p', '--model', model if '/' in model else f'openai-codex/{model}', *(['--thinking', effort] if effort else [])]),
-    'antigravity-resilient': ('agy', lambda model, effort, cwd, fast=False: ['--dangerously-skip-permissions', '--model', model,
-                                                                             '--add-dir', cwd, '--print']),
+    # agy's own model ids carry the effort (account_fleet.agy_cli_model); it has no separate effort flag.
+    'antigravity-resilient': ('agy', lambda model, effort, cwd, fast=False: [
+        '--dangerously-skip-permissions', '--model', account_fleet.agy_cli_model(model, effort), '--add-dir', cwd, '--print']),
     'grok': ('grok', lambda model, effort, cwd, fast=False: ['--always-approve', '-m', model,
                                                            *(['--reasoning-effort', effort] if effort else []), '--cwd', cwd]),
     'opencode': ('opencode', lambda model, effort, cwd, fast=False: [
