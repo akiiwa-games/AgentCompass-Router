@@ -301,7 +301,7 @@ def native_next(host, bundle, address, workspace=None, *, native_spec=None):
     wire_model = _wire_model(bundle)
     provider = bundle.get('provider')
     effort = bundle.get('effort')
-    if bundle.get('harness') == 'antigravity-resilient':
+    if (bundle.get('harness') or provider) == 'antigravity-resilient':
         wire_model, effort = account_fleet.agy_cli_model(wire_model, effort), None
     if host == 'orca' or tool == 'shell:orca worker launch':
         agent_val = fields.get('--agent') or account_fleet.harness_family(provider)

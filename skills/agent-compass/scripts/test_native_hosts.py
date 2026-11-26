@@ -122,6 +122,14 @@ class NativeHandOffTests(unittest.TestCase):
         self.assertIn('--agent pi', text)
         self.assertIn('--model openai-codex/gpt-6-astra', text)
 
+    def test_orca_and_t3_native_next_compose_agy_cli_model_without_effort_flag(self):
+        agy_bundle = {'provider': 'antigravity-resilient', 'model': 'gemini-4-neon', 'effort': 'low'}
+        orca_text = roll.native_next('orca', agy_bundle, 'orca_session_id:s')
+        self.assertIn('--model gemini-4-neon-low', orca_text)
+        self.assertNotIn('--effort', orca_text)
+        t3_text = roll.native_next('t3', agy_bundle, 'thread-1')
+        self.assertIn('"model": "gemini-4-neon-low"', t3_text)
+
 
 class NativeExpressibilityContractTests(unittest.TestCase):
     """Contract tests for `status: native` expressibility (asserting rules, never pinning routing winners)."""

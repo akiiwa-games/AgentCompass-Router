@@ -561,7 +561,8 @@ def entry_for(bundle, entries):
 def _legacy_model(bundle):
     """The `<model>-<effort>` name an Antigravity bundle was held under before the provider listed its thinking options
     as a separate field (a hold lasts at most hours, so one written by an earlier version still counts until it ends)."""
-    if (bundle or {}).get('harness') != 'antigravity-resilient' or not (bundle or {}).get('effort'):
+    harness = (bundle or {}).get('harness') or (bundle or {}).get('provider')
+    if harness != 'antigravity-resilient' or not (bundle or {}).get('effort'):
         return None
     import account_fleet
     return account_fleet.agy_cli_model(launch_model(bundle), bundle['effort'])
