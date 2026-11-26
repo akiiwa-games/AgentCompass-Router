@@ -3250,6 +3250,34 @@ test('observe with ensure_watch starts a missing watcher and reviveRetryWatch cl
     assert.equal(revived.status, 'watching');
     assert.equal(revived.fallback?.status, 'scheduled');
     assert.equal(revived.fallback?.retry_at, retryAt);
+
+    // A receipt that already ended otherwise than `creation_failed` is left untouched by reviveRetryWatch.
+    const doneFile = notificationFile('d-already-delivered');
+    const deliveredRecord = {dispatch_id: 'd-already-delivered', parent_id: 'parent-1', pid: 999999,
+      status: 'delivered', delivered: ['terminal'], pending: null, terminal: {reason: 'replied'}};
+    fs.writeFileSync(doneFile, JSON.stringify(deliveredRecord));
+    await reviveRetryWatch('d-already-delivered', 'parent-1', retryAt);
+    assert.deepEqual(JSON.parse(fs.readFileSync(doneFile, 'utf8')), deliveredRecord);
+
+    // An unlabelled resumed worker (`bound_unlabeled_from`) is bound for stuckProviderRetry and stopped when stuck.
+    let cancelledId = null;
+    const unlabeledClient = {
+      async fetchAgent() {
+        return {agent: {id: 'w-unlabeled', status: 'running', labels: {'router.dispatch_id': 'prev-d'},
+          lastUserMessageAt: new Date(T0 - MINUTE).toISOString()}};
+      },
+      async fetchAgentTimeline() {
+        return {hasOlder: false, entries: [progress(T0 - MINUTE), retryEntry(1, T0), retryEntry(2, T0 + 2 * MINUTE)]};
+      },
+      async cancelAgent(id) { cancelledId = id; },
+      async sendMessage() {},
+    };
+    const unlabeledRec = {dispatch_id: 'd-unlabeled-stuck', parent_id: 'parent-1', agent_id: 'w-unlabeled',
+      resumed: true, bound_unlabeled_from: 'prev-d', seen: true, status: 'watching',
+      created_at: T0 - 2 * MINUTE, deadline: T0 + 24 * 60 * MINUTE, delivered: [], pending: null};
+    await notificationStep(unlabeledClient, unlabeledRec, () => {}, T0 + 6 * MINUTE, null);
+    assert.equal(cancelledId, 'w-unlabeled');
+    assert.equal(unlabeledRec.terminal?.failure_code, RETRY_STUCK_CODE);
   } finally {
     if (prevState === undefined) delete process.env.ROUTER_STATE_DIR; else process.env.ROUTER_STATE_DIR = prevState;
     fs.rmSync(root, {recursive: true, force: true});

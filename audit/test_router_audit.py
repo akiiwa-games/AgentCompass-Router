@@ -31,6 +31,9 @@ class ClassifyTests(unittest.TestCase):
                          "fixed:retained_owner")
         pro = {"provider": "chatgpt-web", "model": "gpt-6-pro"}
         self.assertEqual(audit.classify(row(0, bundle=pro)), "specialist:pro")
+        self.assertEqual(audit.classify(row(0, specialty="pro", bundle={"provider": "codex", "model": "x"})), "specialist:pro")
+        self.assertEqual(audit.classify(row(0, choice="deepseek_v4_pro_high",
+                                            bundle={"provider": "opencode", "model": "deepseek-v4-pro"})), "open")
         self.assertEqual(audit.classify(row(0, bundle={"provider": "codex", "model": "gpt-6-astra"})), "specialist:astra")
 
     def test_instruction_fields_mark_a_fixed_route_and_free_text_reason_stays_open(self):

@@ -879,7 +879,10 @@ export async function notificationStep(client, record, persist, now = Date.now()
       : notificationEvents(agent, record, now, creation);
     // A running worker bound to this dispatch whose provider keeps retrying without progress is stopped here: the
     // terminal is saved before the cancel, so the stop's idle state can never read as a finish.
-    const bound = agent && (agent.labels?.['router.dispatch_id'] === record.dispatch_id
+    const label = agent?.labels?.['router.dispatch_id'];
+    const matchesUnlabeled = Object.prototype.hasOwnProperty.call(record, 'bound_unlabeled_from')
+      && (label ?? '') === record.bound_unlabeled_from;
+    const bound = agent && (label === record.dispatch_id || matchesUnlabeled
       || !record.agent_id || record.agent_id === record.dispatch_id);
     if (!events.length && !record.terminal && bound && agent.status === 'running') {
       const stuck = await stuckProviderRetry(client, agentId, now);
@@ -1457,6 +1460,8 @@ export async function reviveRetryWatch(dispatchId, parentId, retryAt) {
   fs.mkdirSync(path.dirname(file), {recursive: true});
   const record = readRecord(file);
   if (record && record.parent_id !== parentId) throw new BridgeError('notification_parent_mismatch');
+  // Never overwrite a receipt that already ended otherwise than `creation_failed`.
+  if (record && DONE.has(record.status) && record.status !== 'creation_failed') return;
   if (record && fs.existsSync(`${file}.creation-failed`)) {
     for (let waited = 0; alive(record.pid); waited += 100) {
       if (waited >= WATCHER_STOP_MS) throw new BridgeError('notification_start_failed');

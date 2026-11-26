@@ -166,7 +166,7 @@ def classify(row: dict) -> str:
         return f"fixed:{row.get('constraint')}"
     bundle = row.get("bundle") or {}
     model = str(bundle.get("model") or "")
-    if bundle.get("provider") == "chatgpt-web" or "pro" in str(row.get("choice") or "").lower():
+    if bundle.get("provider") == "chatgpt-web" or row.get("specialty") == "pro":
         return "specialist:pro"
     if "astra" in model:
         return "specialist:astra"
