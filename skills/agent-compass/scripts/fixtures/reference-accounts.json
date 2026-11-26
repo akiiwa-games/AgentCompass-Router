@@ -199,11 +199,9 @@
       "api_family": "claude"
     },
     "claude-fable-5-2": {
-      "fast_capable": true,
       "api_family": "claude"
     },
     "claude-opus-5-5": {
-      "fast_capable": true,
       "api_family": "claude"
     },
     "gpt-6.1-sol": {
@@ -310,7 +308,6 @@
       "api_family": "claude"
     },
     "claude-opus-4-8": {
-      "fast_capable": true,
       "api_family": "claude"
     },
     "grok-4.5": {},

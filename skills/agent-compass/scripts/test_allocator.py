@@ -1774,6 +1774,34 @@ class ExplainPoolWordingTests(unittest.TestCase):
         self.assertIn('seven_day: 27% left,', text)
         self.assertNotIn('pool', text)
 
+    def test_refusal_schedule_pool_member_alignment_and_named_pin_block_fast_wait_fallback(self):
+        """Rules (allocator.refusal_schedule F5, allocator.named_pin_block F7): (1) when a pool's soonest member is
+        stale, `refusal_schedule` returns both `start_after_hours` and `retry_at` from the non-stale member `after_reset`
+        actually chose; (2) `named_pin_block` with `pinned_bundle` + `force_fast` falls back to the plain row when no
+        fast twin exists, reporting its exclusion instead of 'no configured bundle offers it'."""
+        now = datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
+        accounts = copy.deepcopy(account_fleet.load_accounts())
+        accounts['accounts']['codex']['windows'] = {'usage': {'hours': 168, 'launch_min_remaining_pct': 5}}
+        stale_reset = (now + timedelta(hours=2)).isoformat()
+        fresh_reset = (now + timedelta(hours=6)).isoformat()
+        m1 = {**usage_reading.window_state({'id': 'usage', 'used_pct': 100.0, 'resets_at': stale_reset}, now),
+              'position': 1, 'remaining_pct_before_reset': None}
+        m2 = {**usage_reading.window_state({'id': 'usage', 'used_pct': 100.0, 'resets_at': fresh_reset}, now),
+              'position': 2}
+        pooled = usage_reading.pooled_reading('usage', [m1, m2])
+        usage = {'read_ok': True, 'accounts': {'codex': {
+            'status': 'fresh', 'fetched_at': now.isoformat(), 'windows': [pooled],
+        }}}
+        bundle = {'id': 'astra_high', 'account': 'codex', 'provider': 'codex', 'model': 'gpt-6-astra', 'draws': ['usage']}
+        hours, retry_at, wid = allocator.refusal_schedule(bundle, accounts, usage, now, blocked_wids={'usage'})
+        self.assertEqual((hours, retry_at, wid), (6.0, fresh_reset, 'usage'))
+
+        import candidate_eval
+        plain = {'id': 'astra_high', 'base_id': 'astra_high', 'bundle': {'fast': False},
+                 'excluded': [candidate_eval.FAST_WAIT_REFUSAL]}
+        lines = allocator.named_pin_block({'pinned_bundle': 'astra_high', 'force_fast': True}, [plain])
+        self.assertEqual(lines, [f"astra_high via astra_high: {candidate_eval.FAST_WAIT_REFUSAL}"])
+
 
 if __name__ == '__main__':
     unittest.main()

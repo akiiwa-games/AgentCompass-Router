@@ -110,7 +110,17 @@ def refusal_schedule(bundle, accounts, usage, now, *, blocked_wids=None, latched
         available_at, waiting_on = candidate_eval.binding_wait(
             available_at, waiting_on, renewed['deferred_hours'], wid, waits,
         )
-        reset_dt = quota_pools.parse_time(state.get('reset_at')) or (now + timedelta(hours=renewed['deferred_hours']))
+        if state.get('members'):
+            matched_reset = next(
+                (quota_pools.parse_time(m.get('reset_at')) for m in state['members']
+                 if m.get('known') and not m.get('stale')
+                 and abs(float(m.get('reset_hours', -1)) - float(renewed['deferred_hours'])) < 1e-6
+                 and quota_pools.parse_time(m.get('reset_at')) is not None),
+                None,
+            )
+            reset_dt = matched_reset or (now + timedelta(hours=renewed['deferred_hours']))
+        else:
+            reset_dt = quota_pools.parse_time(state.get('reset_at')) or (now + timedelta(hours=renewed['deferred_hours']))
         reset_times[wid] = reset_dt.isoformat()
     if seen != blocked_wids or not available_at or not waiting_on:
         return None, None, None
@@ -123,8 +133,12 @@ def named_pin_block(task, candidates):
         return []
     off_pin = ('explicit model constraint', 'explicit effort constraint')
     pinned = task.get('pinned_bundle')
-    rows = [c for c in candidates if (pinned and candidate_ranking.candidate_for_bundle([c], pinned, task.get('force_fast')) is c)
-            or (not pinned and not any(r in off_pin for r in c['excluded']))]
+    if pinned:
+        matched = (candidate_ranking.candidate_for_bundle(candidates, pinned, task.get('force_fast'))
+                   or (task.get('force_fast') and candidate_ranking.candidate_for_bundle(candidates, pinned)))
+        rows = [matched] if matched is not None else []
+    else:
+        rows = [c for c in candidates if not any(r in off_pin for r in c['excluded'])]
     raw = task.get('constraint_raw_model')
     spelled, colon_eff = task_intake.split_model_effort(raw) if raw else (task.get('constraint_model'), None)
     eff = task.get('constraint_effort')

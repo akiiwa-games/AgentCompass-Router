@@ -293,15 +293,16 @@ def record_constraint(args, task=None, classified=None):
     cadence_records, cadence = cadence_reading(args.account, accounts, now)
     if cadence and args.constraint != 'user_override':
         raise ValueError(_cadence_refusal(args, cadence))
-    discovered = account_fleet.bundles(accounts).get(chosen) or {}
+    overlaid_accounts = axis_scores.five_axis_overlay(accounts)
+    discovered = account_fleet.bundles(overlaid_accounts).get(chosen) or {}
     if discovered.get('discovery_unavailable'):
         raise dispatch_registry.RouteFactRefused(discovered['discovery_unavailable'], user_named=user_named)
     # The account's other row of this model supplies the launch fields of an effort it has no row for.
-    sibling_id = (chosen or match_bundle(accounts, _with_effort(pin, None))
-                  or match_bundle(accounts, _with_effort(pin, None), include_disabled=True))
-    sibling = account_fleet.bundles(accounts).get(sibling_id) or {}
+    sibling_id = (chosen or match_bundle(overlaid_accounts, _with_effort(pin, None))
+                  or match_bundle(overlaid_accounts, _with_effort(pin, None), include_disabled=True))
+    sibling = account_fleet.bundles(overlaid_accounts).get(sibling_id) or {}
     inherited = {k: sibling[k] for k in NAMED_ROW_FIELDS if k in sibling}
-    acc_spec = (accounts.get('accounts') or {}).get(args.account) or {}
+    acc_spec = (overlaid_accounts.get('accounts') or {}).get(args.account) or {}
     if not account_fleet.account_cwd_allowed(acc_spec, (task or {}).get('cwd')):
         raise dispatch_registry.RouteFactRefused(
             cwd_policy.refusal(args.account, acc_spec.get('cwd_regex'), (task or {}).get('cwd'))
@@ -310,15 +311,18 @@ def record_constraint(args, task=None, classified=None):
         )
     # External runners dispatch directly after record; apply the same registered
     # window protection used by prepared dispatches.
-    base_b = account_fleet.bundles(accounts).get(chosen) or {}
+    base_b = account_fleet.bundles(overlaid_accounts).get(chosen) or {}
     row_model = base_b.get('model') or sibling.get('model') or account_fleet.stored_form(pin.model, accounts, args.account)
     quota_bundle = {**discovered, **inherited, 'account': args.account, 'provider': args.provider, 'model': row_model,
                     'effort': pin.effort or discovered.get('effort')}
+    resolved_plan_bundle = None
     if chosen:
         quota_bundle['id'] = chosen
         quota_bundle.setdefault('bundle_id', chosen)
-    planned = bool(user_named and classified and chosen and (isinstance(classified['task'].get('profile'), dict)
-                                                             or classified.get('unclassified')))
+    elif user_named and classified and pin.effort:
+        resolved_plan_bundle = dispatch_registry.resolve_bundle(quota_bundle, overlaid_accounts, True)
+    planned = bool(user_named and classified and (chosen or resolved_plan_bundle)
+                   and (isinstance(classified['task'].get('profile'), dict) or classified.get('unclassified')))
     # A preview (`--dry-run`) classifies nothing: with no profile and no --hours there is no plan to read, and a launch
     # fact keeps allocator.refusal_schedule's time; with a plan row the time is the row's, as at `prepare`.
     c_model = account_fleet.canonical(row_model, accounts)
@@ -328,10 +332,15 @@ def record_constraint(args, task=None, classified=None):
         account_fleet.bundle_harness(discovered or sibling or {'provider': args.provider}, args.account),
         c_model, account_fleet.row_spec(accounts, c_model)) if getattr(args, 'fast', False) else None
     fast_requested = bool(getattr(args, 'fast', False)) and not fast_not_applied
-    fact = _check_record_launch(args, pin, quota_bundle, accounts, usage, now, timed_by_plan=planned)
+    fact = _check_record_launch(args, pin, quota_bundle, overlaid_accounts, usage, now, timed_by_plan=planned)
     if planned:
-        _check_named_plan_row(task, classified, quota_bundle, accounts, usage, now, fast_requested, fact=fact)
-    unobserved = quota_unobserved(accounts, usage, quota_bundle)
+        plan_accounts, plan_bundle = overlaid_accounts, quota_bundle
+        if resolved_plan_bundle and not chosen:
+            plan_accounts = copy.deepcopy(overlaid_accounts)
+            plan_accounts['accounts'][args.account]['bundles'][resolved_plan_bundle['id']] = resolved_plan_bundle
+            plan_bundle = {**quota_bundle, 'id': resolved_plan_bundle['id'], 'bundle_id': resolved_plan_bundle['id']}
+        _check_named_plan_row(task, classified, plan_bundle, plan_accounts, usage, now, fast_requested, fact=fact)
+    unobserved = quota_unobserved(overlaid_accounts, usage, quota_bundle)
     # A model the user names on a held account or model is the probe that can lift the hold: it goes, with a warning.
     retrying = provider_retry.reason(quota_bundle, provider_retry.active(now=now))
     warnings = []
@@ -370,7 +379,6 @@ def record_constraint(args, task=None, classified=None):
               'reason_category': getattr(args, 'reason_category', None),
               'selected_bundle': bundle, 'observed_at': now.isoformat(), 'usage': usage,
               **({'fast_not_applied': fast_not_applied} if fast_not_applied else {})}
-    overlaid_accounts = axis_scores.five_axis_overlay(accounts)
     overlaid_spec = (overlaid_accounts.get('accounts') or {}).get(args.account) or {}
     if overlaid_spec.get('capacity_unknown') and overlaid_spec.get('five_axis_free_pool'):
         warnings = [f"{args.account}/{pin.model}: capacity_unknown (quota unknown, spend unpriced); dispatched because the user named it", *warnings]

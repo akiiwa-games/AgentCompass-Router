@@ -982,6 +982,64 @@ class UnpublishedFreePoolTests(unittest.TestCase):
         self.assertEqual(at_record.exception.cause, at_prepare.exception.cause)
         self.assertIsNone(at_record.exception.retry_at)
 
+    def test_record_constraint_refuses_latched_free_pool_without_task_and_named_effort_without_catalog_row(self):
+        """Rules (route_judge.record_constraint; F1 & F3): (1) a dry-run / taskless record on a latched free pool sees
+        the overlaid free-pool window and refuses at record; (2) a named effort with no catalog row of its own checks
+        its resolved plan row at record and refuses before writing a ledger row."""
+        import account_fleet
+        import dispatch_registry
+        import route_judge
+        import usage_reading
+        from types import SimpleNamespace
+        # F1: latched opencode free pool refused on a taskless --dry-run record (before prepare).
+        acc_free = self.only('opencode')
+        bid_free, b_free = next(iter(acc_free['accounts']['opencode']['bundles'].items()))
+        latched_reset = (self.now + timedelta(hours=4)).isoformat()
+        acc_free['_discovery'] = {'accounts': {'opencode': {
+            'status': 'ready', 'exhausted_windows': ['allowance'], 'exhausted_resets_at': latched_reset,
+            'exhausted_reset_stated': True,
+        }}}
+        free_args = SimpleNamespace(
+            provider=b_free.get('provider') or 'opencode', account='opencode', model=b_free['model'],
+            effort=b_free.get('effort'), constraint='user_override', basis='the user said: use opencode free',
+            specialty=None, reason_category=None, trigger=None, input=None, usage_cache=None, accounts=None,
+            dry_run=True, fast=False, parent_id=None,
+        )
+        with tf._synthetic_doc_ctx(self.doc), \
+                patch.object(account_fleet, 'load_accounts', return_value=copy.deepcopy(acc_free)), \
+                patch.object(usage_reading, 'usage_snapshot', return_value={'read_ok': True, 'accounts': {}}):
+            with self.assertRaises(dispatch_registry.RouteFactRefused) as latched_err:
+                route_judge.record_constraint(free_args)
+        self.assertEqual(latched_err.exception.waiting_on, 'allowance')
+        self.assertEqual(latched_err.exception.retry_at, latched_reset)
+
+        # F3: named effort with no catalog row of its own is checked via resolve_bundle at record time.
+        acc = self.only('claude')
+        acc['accounts']['claude']['expires_at'] = (self.now + timedelta(hours=10)).isoformat()
+        opus_rows = [(b, r) for b, r in acc['accounts']['claude']['bundles'].items() if r.get('model') == 'claude-opus-5-5']
+        existing_efforts = {r.get('effort') for _, r in opus_rows}
+        allowed = set(acc.get('dispatch_efforts', {}).get('claude', {}).get('claude-opus-5-5') or ())
+        missing_effort = next(e for e in sorted(allowed) if e not in existing_efforts)
+        task = {'objective': 't', 'profile': dict(tf.PROFILE), 'expected_hours': 8.0, 'parent_agent_id': 'parent-f3',
+                'task_id': 'named-effort-no-row'}
+        effort_args = SimpleNamespace(
+            provider='claude', account='claude', model='claude-opus-5-5', effort=missing_effort,
+            constraint='user_override', basis='the user said: use Opus at that effort',
+            specialty=None, reason_category=None, trigger=None, input=None, usage_cache=None, accounts=None,
+            dry_run=True, fast=False, parent_id='parent-f3',
+        )
+        with tf._synthetic_doc_ctx(self.doc):
+            usage = sim.snapshot(sim.synthetic_document(acc, self.now, sim.STATES['ample']), acc, self.now)
+            row = usage['accounts']['claude']
+            row['windows'] = [w if w['id'] != 'seven_day' else usage_reading.window_state(
+                {'id': 'seven_day', 'used_pct': 88.0, 'resets_at': (self.now + timedelta(hours=20)).isoformat()},
+                self.now) for w in row['windows']]
+            with patch.object(account_fleet, 'load_accounts', return_value=copy.deepcopy(acc)), \
+                    patch.object(usage_reading, 'usage_snapshot', return_value=usage):
+                with self.assertRaises(dispatch_registry.RouteFactRefused) as effort_err:
+                    route_judge.record_constraint(effort_args, task=task, classified={'task': task})
+        self.assertIn('subscription ends before the work would finish', effort_err.exception.cause)
+
 class PaidLatchReadingTests(unittest.TestCase):
     """Review round 2 N2. Rule (quota_exhaustion.exhausted_windows, candidate_eval.evaluate_bundle): where the account has
     a usage reader, the reading decides. A good reading newer than the latch releases it; the latch's end is a wait only
